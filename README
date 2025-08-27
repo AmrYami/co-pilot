@@ -1,0 +1,80 @@
+# keep both GPUs visible
+unset CUDA_VISIBLE_DEVICES
+
+# include both arches (or 8.6 + 9.0 if 12.0 is not supported by your nvcc)
+export TORCH_CUDA_ARCH_LIST=8.6;12.0
+export EXLLAMAV2_CUDA_ARCHS=86,120
+
+rm -rf ~/.cache/torch_extensions
+find venv/lib/python3.12/site-packages/exllamav2 -name build -type d -prune -exec rm -rf {} +
+
+python -m flask run --reload
+
+
+
+curl -s http://127.0.0.1:5000/fa/metrics | jq
+
+
+
+
+{
+  "namespace": "fa::common",
+  "updated_by": "amr",
+  "settings": [
+    { "key": "AUTH_EMAIL",     "value": "amr.yami1@gmail.com" },
+    { "key": "ADMIN_EMAILS",   "value": ["ops@example.com", "dev@example.com"] },
+    { "key": "RESEARCH_MODE",  "value": true },
+    { "key": "ALERTS_ENABLED",  "value": true },
+    { "key": "VALIDATE_WITH_EXPLAIN_ONLY",  "value": true },
+    { "key": "ALERTS_EMAILS", "value": ["ops@example.com","dev@example.com"], "scope": "global" },
+    {"key":"LEARNING_MODE","value":true,"scope":"global"},
+    { "key": "ASK_MODE", "value": "metric_first", "scope": "global" } //metric_first or always_ask
+
+  ]
+}
+
+
+
+
+
+
+RESEARCH_MODE (bool, global/namespace) – master toggle.
+
+RESEARCH_ALLOWED_DOMAINS (json, global) – e.g. ["frontaccounting.com","wiki.frontaccounting.com","github.com/FrontAccountingSAP"]
+
+RESEARCH_MAX_PAGES (int, global) – e.g. 3
+
+RESEARCH_TIMEOUT_S (int, global) – e.g. 8
+
+RESEARCH_USER_AGENT (string, global) – e.g. "Copilot/1.0 (+https://yourdomain)"
+
+RESEARCH_EXTRACT_PDFS (bool, global) – true/false
+
+RESEARCH_MIN_CONFIDENCE (float 0–1, namespace) – threshold to accept extracted facts.
+
+
+
+
+
+About “research” itself
+
+Open-source web research isn’t wired yet. We designed the flag, but we didn’t add a web client or scraping/LLM-with-browsing. If you want that later, we can:
+
+Add a pluggable research() step (e.g., SerpAPI or a simple HTTP fetcher + boilerplate parsing).
+
+Store pages into mem_sources (+ mem_citations).
+
+Summarize into research_summary for the mem_inquiries row.
+
+Only escalate to admins if research still can’t disambiguate.
+
+
+Next things you might consider (optional improvements):
+
+Admin Dashboard API: list open/awaiting inquiries so admins don’t rely only on email.
+
+Rate limiting / deduplication: avoid flooding admins with identical “needs clarification” alerts.
+
+Metrics overlay: use your /fa/metrics definitions to shortcut common finance KPIs (e.g. AR, Sales, etc.).
+
+Feedback analysis: nightly job that summarizes feedback scores per namespace.

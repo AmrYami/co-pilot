@@ -1,0 +1,25 @@
+# Canonical (unprefixed) semantic metrics for FA-like schemas
+# Example metrics the planner can reference; expand to prefixes at runtime.
+
+metrics:
+  sales_amount:
+    label: Sales Amount
+    description: Sum of line totals from debtor transactions for sales (type=10)
+    calculation_sql: |
+      SELECT SUM(dt.ov_amount + dt.ov_gst) AS sales_amount
+      FROM debtor_trans dt
+      WHERE dt.type = 10
+    depends_on:
+      tables: [debtor_trans]
+      columns: [debtor_trans.type, debtor_trans.ov_amount, debtor_trans.ov_gst]
+
+  ar_outstanding:
+    label: Accounts Receivable Outstanding
+    description: Balance of unpaid invoices minus credit notes
+    calculation_sql: |
+      SELECT SUM(CASE WHEN dt.type IN (10, 13) THEN dt.ov_amount + dt.ov_gst ELSE 0 END)
+           - SUM(CASE WHEN dt.type IN (11) THEN dt.ov_amount + dt.ov_gst ELSE 0 END) AS ar_outstanding
+      FROM debtor_trans dt
+    depends_on:
+      tables: [debtor_trans]
+      columns: [debtor_trans.type, debtor_trans.ov_amount, debtor_trans.ov_gst]

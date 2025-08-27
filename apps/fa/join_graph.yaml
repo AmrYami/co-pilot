@@ -1,0 +1,24 @@
+# Canonical (unprefixed) join graph for FA-like schemas
+# Expand with apps/fa/adapters.expand_join_graph_for_prefix(prefix)
+
+joins:
+  - name: debtor_trans_to_master
+    from: debtor_trans
+    to: debtors_master
+    on: "debtor_trans.debtor_no = debtors_master.debtor_no"
+    type: INNER
+    cardinality: N:1
+
+  - name: sales_to_debtor
+    from: sales_orders
+    to: debtors_master
+    on: "sales_orders.debtor_no = debtors_master.debtor_no"
+    type: INNER
+    cardinality: N:1
+
+  - name: gl_trans_to_accounts
+    from: gl_trans
+    to: chart_master
+    on: "gl_trans.account = chart_master.account_code"
+    type: INNER
+    cardinality: N:1
