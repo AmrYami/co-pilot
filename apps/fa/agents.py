@@ -9,12 +9,12 @@ from typing import Any, Dict, Iterable, List, Tuple
 
 from core.agents import ClarifierAgent as CoreClarifier, PlannerAgent as CorePlanner, ValidatorAgent as CoreValidator
 from apps.fa.adapters import match_metric, parse_date_range, inject_date_filter, union_for_prefixes
+from .adapters import expand_keywords
+from .config import get_metrics
+from core.pipeline import SQLRewriter
 
 
-class ClarifierAgentFA(CoreClarifier):
-    def __init__(self, llm_handle, settings):
-        super().__init__(llm_handle)
-        self.settings = settings
+class ClarifierAgentFA:
     """
         ClarifierAgentFA
         ----------------
@@ -73,11 +73,6 @@ class ClarifierAgentFA(CoreClarifier):
 
 
 class PlannerAgentFA(CorePlanner):
-    def __init__(self, llm_handle, settings):
-        super().__init__(llm_handle)
-        self.settings = settings
-
-
     """
        PlannerAgentFA
        --------------
@@ -90,50 +85,27 @@ class PlannerAgentFA(CorePlanner):
          3) Return canonical (unprefixed) SQL + rationale for the Validator.
          4) Else, fall back to the core planner prompt.
        """
+    def plan(self, question: str, context: Dict[str, Any]) -> Tuple[str, str]:
+        metrics: Dict[str, Dict[str, Any]] = context.get("metrics", {}) or {}
 
-    def plan(self, question: str, context: Dict[str, Any], hints: Dict[str, Any] | None = None) -> Tuple[str, str]:
-        """
-        Plan canonical (unprefixed) SQL for FA-like schemas using tables/columns in context
-        and FA-specific hints (dates, categories, dimensions, items).
-        """
-        tables = ", ".join(sorted({t['table_name'] for t in context.get('tables', [])}))
-        cols = ", ".join(sorted({f"{c['table_name']}.{c['column_name']}" for c in context.get('columns', [])}))
-        metrics = context.get("metrics", {}) or {}
+        # 1) Metric match?
+        match = match_metric(question, metrics)
+        if match:
+            key, meta = match
+            base_sql = (meta.get("calculation_sql") or "").strip()
+            why = f"Matched metric '{key}' ({meta.get('label') or key})."
+            if not base_sql:
+                return super().plan(question, context)
 
-        # marshal hints for prompt
-        h: List[str] = []
-        if hints:
-            if dr := hints.get("date_range"): h.append(
-                f"DateRange: {dr['start']}..{dr['end']} (grain={dr.get('grain', 'day')})")
-            if eq := hints.get("eq_filters"): h.append("EqFilters: " + ", ".join([f"{k}={v}" for k, v in eq.items()]))
-            if cats := hints.get("categories"):
-                pretty = [f"{c.get('table')} types={c.get('types')}" for c in cats]
-                h.append("Categories: " + "; ".join(pretty))
-            if dims := hints.get("dimensions"):
-                pretty = [f"{k} IN {v}" for k, v in dims.items()]
-                h.append("Dimensions: " + "; ".join(pretty))
-            if items := hints.get("items"):
-                h.append("Items: " + ", ".join(items))
-        hint_txt = "\n".join(h) if h else "(none)"
+            # 2) Optional date filter
+            dr = parse_date_range(question)
+            sql = inject_date_filter(base_sql, dr["sql_predicate"]) if dr else base_sql
+            if dr:
+                why += f" Applied date filter: {dr['label']}."
+            return sql, why
 
-        prompt = (
-            "You are an expert SQL planner over a FrontAccounting-like schema.\n"
-            "Constraints:\n"
-            "- Use ONLY the given tables and columns.\n"
-            "- Prefer known metrics when directly relevant (list provided).\n"
-            "- If filters reference columns from other tables, add the necessary JOINs.\n"
-            "- If no date column is explicit, default sales to debtor_trans.tran_date.\n"
-            "- Apply day-level ranges when provided (BETWEEN :start AND :end inclusive).\n"
-            "- Dimensions can be dimension1_id..dimension4_id when present; join as needed.\n"
-            "- Items come from stock_master.stock_id; join via debtor_trans_details/sales_order_details when needed.\n"
-            "- Return canonical SQL with UNQUALIFIED table names (no prefixes) + a short rationale.\n\n"
-            f"Tables: {tables}\nColumns: {cols}\n"
-            f"Metrics: {', '.join(metrics.keys()) if metrics else '(none)'}\n"
-            f"Hints:\n{hint_txt}\n"
-            "Return as:\nSQL:\n<sql>\nRationale:\n<why>\n"
-        )
-        out = self.llm.generate(prompt, max_new_tokens=256, temperature=0.2, top_p=0.9)
-        return self._split(out)
+        # 3) Fallback to generic planning
+        return super().plan(question, context)
 
     def _rule_based_plan(self, question: str, context: Dict[str, Any]) -> Tuple[str, str]:
         q = question.lower()
@@ -169,7 +141,6 @@ class ValidatorAgentFA(CoreValidator):
         if not re.match(r"(?is)^(with|select|insert|update|delete|explain)\b", sql_strip):
             return False, {"error": "planner returned non-SQL text", "preview": sql_strip[:160]}
         return super().quick_validate(sql_strip)
-
 
 
 

@@ -10,43 +10,10 @@ import re
 from typing import Dict, Optional, Any, Iterable, List, Tuple
 from datetime import date, timedelta
 
-_METRIC_SYNONYMS = {
-    "revenue": "sales_amount",
-    "sales": "sales_amount",
-    "turnover": "sales_amount",
-    "ar": "ar_outstanding",
-    "receivables": "ar_outstanding",
-    "accounts receivable": "ar_outstanding",
-}
-
 try:
     import yaml  # type: ignore
 except Exception:  # pragma: no cover
     yaml = None
-
-
-def match_metric_key(question: str, metrics: Dict[str, dict]) -> Optional[str]:
-    """Return a metric_key from the question if it clearly matches one we have."""
-    q = question.lower()
-    # direct key name
-    for key in metrics.keys():
-        if re.search(rf"\b{re.escape(key)}\b", q):
-            return key
-        # label match
-        lbl = (metrics[key].get("label") or "").lower()
-        if lbl and re.search(rf"\b{re.escape(lbl)}\b", q):
-            return key
-    # synonyms
-    for word, target in _METRIC_SYNONYMS.items():
-        if re.search(rf"\b{re.escape(word)}\b", q) and target in metrics:
-            return target
-    return None
-
-def default_date_column_for_metric(metric_key: str) -> Optional[str]:
-    """For FA metrics, tell the SQL date column to filter on."""
-    if metric_key in ("sales_amount", "ar_outstanding"):
-        return "debtor_trans.tran_date"
-    return None
 
 def expand_keywords(words: List[str]) -> List[str]:
     base = [w.lower() for w in words]
@@ -237,25 +204,3 @@ def inject_date_filter(sql: str, predicate: str) -> str:
     if re.search(r"(?is)\bwhere\b", s):
         return f"{s} AND {predicate}"
     return f"{s} WHERE {predicate}"
-
-def similar_inquiry_hints(mem_engine, namespace: str, question: str, limit: int = 20) -> str:
-    from sqlalchemy import text
-    toks = set(re.findall(r"[A-Za-z0-9_]+", question.lower()))
-    with mem_engine.connect() as c:
-        rows = c.execute(text("""
-            SELECT id, question, admin_reply
-            FROM mem_inquiries
-            WHERE namespace=:ns AND status='answered'
-            ORDER BY created_at DESC
-            LIMIT :lim
-        """), {"ns": namespace, "lim": limit}).mappings().all()
-    best = None; best_j = 0.0
-    for r in rows:
-        t2 = set(re.findall(r"[A-Za-z0-9_]+", (r["question"] or "").lower()))
-        inter = len(toks & t2); union = len(toks | t2) or 1
-        j = inter/union
-        if j > best_j:
-            best, best_j = r, j
-    if best and best_j >= 0.6:
-        return f"Past similar answer (Jaccard={best_j:.2f}) notes: {best.get('admin_reply') or '(none)'}"
-    return ""
