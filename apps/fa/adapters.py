@@ -10,43 +10,10 @@ import re
 from typing import Dict, Optional, Any, Iterable, List, Tuple
 from datetime import date, timedelta
 
-_METRIC_SYNONYMS = {
-    "revenue": "sales_amount",
-    "sales": "sales_amount",
-    "turnover": "sales_amount",
-    "ar": "ar_outstanding",
-    "receivables": "ar_outstanding",
-    "accounts receivable": "ar_outstanding",
-}
-
 try:
     import yaml  # type: ignore
 except Exception:  # pragma: no cover
     yaml = None
-
-
-def match_metric_key(question: str, metrics: Dict[str, dict]) -> Optional[str]:
-    """Return a metric_key from the question if it clearly matches one we have."""
-    q = question.lower()
-    # direct key name
-    for key in metrics.keys():
-        if re.search(rf"\b{re.escape(key)}\b", q):
-            return key
-        # label match
-        lbl = (metrics[key].get("label") or "").lower()
-        if lbl and re.search(rf"\b{re.escape(lbl)}\b", q):
-            return key
-    # synonyms
-    for word, target in _METRIC_SYNONYMS.items():
-        if re.search(rf"\b{re.escape(word)}\b", q) and target in metrics:
-            return target
-    return None
-
-def default_date_column_for_metric(metric_key: str) -> Optional[str]:
-    """For FA metrics, tell the SQL date column to filter on."""
-    if metric_key in ("sales_amount", "ar_outstanding"):
-        return "debtor_trans.tran_date"
-    return None
 
 def expand_keywords(words: List[str]) -> List[str]:
     base = [w.lower() for w in words]

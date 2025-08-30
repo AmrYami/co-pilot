@@ -29,9 +29,6 @@ from apps.fa.adapters import expand_keywords
 from apps.fa.config import FAConfig, get_metrics
 from core.inquiries import set_feedback
 from core.alerts import queue_alert, notify_admins_via_email
-from core.sql_exec import validate_select, explain, run_select, as_csv
-from core.mailer import send_email_with_attachments
-from core.agents import ValidatorAgent
 
 fa_bp = Blueprint("fa", __name__)
 PREFIX_RE = re.compile(r"^[0-9]+_$")
@@ -51,74 +48,6 @@ def _validate_prefixes(prefixes: Iterable[str]) -> List[str]:
             raise ValueError(f"Invalid prefix: {p}")
     return ps
 
-@fa_bp.post("/run")
-def run_query():
-    """
-    Execute a SELECT/CTE against FA (safe runner).
-    Body:
-      {
-        "prefixes": ["579_"],
-        "question": "top 10 customers last month",  # optional when sql provided
-        "sql": "...",                               # optional; canonical or prefixed
-        "limit": 500,
-        "email": true,
-        "auth_email": "user@example.com"
-      }
-    """
-    data = request.get_json(force=True) or {}
-    prefixes = data.get("prefixes") or []
-    sql_in = (data.get("sql") or "").strip()
-    question = (data.get("question") or "").strip()
-    limit = int(data.get("limit") or 500)
-    do_email = bool(data.get("email", False))
-    auth_email = data.get("auth_email") or current_app.config["SETTINGS"].get("AUTH_EMAIL")
-
-    pipeline: Pipeline = current_app.config["PIPELINE"]
-    if isinstance(pipeline.settings, Settings) and prefixes:
-        pipeline.settings.set_namespace(f"fa::{prefixes[0]}")
-
-    if not sql_in:
-        plan = pipeline.answer(source="fa", prefixes=prefixes, question=question)
-        if plan.get("status") != "ok":
-            return jsonify({"error": "planning_failed", "detail": plan}), 400
-        sql_in = plan["sql"]
-
-    from core.pipeline import SQLRewriter
-    sql_exec = SQLRewriter.rewrite_for_prefixes(sql_in, prefixes) if prefixes else sql_in
-
-    ok, msg = validate_select(sql_exec)
-    if not ok:
-        return jsonify({"error": msg}), 400
-
-    fa_engine = pipeline.fa_engine
-    if not fa_engine:
-        return jsonify({"error": "FA DB not configured"}), 500
-
-    try:
-        explain(fa_engine, sql_exec)
-        result = run_select(fa_engine, sql_exec, limit=limit)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
-
-    if do_email:
-        s = current_app.config["SETTINGS"]
-        try:
-            send_email_with_attachments(
-                smtp_host=s.get("SMTP_HOST", "localhost"),
-                smtp_port=int(s.get("SMTP_PORT", "465") or 465),
-                smtp_user=s.get("SMTP_USER"),
-                smtp_password=s.get("SMTP_PASSWORD"),
-                mail_from=s.get("SMTP_FROM", "no-reply@example.com"),
-                to=[auth_email] if auth_email else [],
-                subject="[Copilot] Your data export",
-                body_text="Your CSV export is attached.",
-                attachments=[("result.csv", as_csv(result), "text/csv")]
-            )
-            return jsonify({"ok": True, "emailed_to": auth_email, "rowcount": result["rowcount"]})
-        except Exception as e:
-            return jsonify({"error": f"email failed: {e}", "result": result}), 200
-
-    return jsonify({"ok": True, "result": result})
 
 @fa_bp.post("/ingest")
 def ingest_prefixes():  # type: ignore[no-redef]
@@ -143,33 +72,63 @@ def ingest_prefixes():  # type: ignore[no-redef]
     except Exception as e:
         return jsonify({"error": str(e)}), 400
 
-from apps.fa.hints import make_fa_hints
 
 @fa_bp.post("/answer")
 def answer():
-    data = request.get_json(force=True)
+    """
+    Handle a user question:
+      - Build context and plan via pipeline
+      - Normalize status
+      - Persist a mem_inquiries row
+      - If auto-escalation is enabled and we need clarification, email admins
+
+    Body:
+      { "prefixes": ["579_"], "question": "..." , "auth_email": "user@example.com" }
+
+    Returns:
+      { "status": "...", "context": {...}, "questions": [...], "inquiry_id": 123, ... }
+    """
+    data = request.get_json(force=True) or {}
     prefixes = data.get("prefixes", [])
     question = (data.get("question") or "").strip()
     auth_email = data.get("auth_email") or current_app.config["SETTINGS"].get("AUTH_EMAIL")
 
     pipeline: Pipeline = current_app.config["PIPELINE"]
-    s = current_app.config["SETTINGS"]
 
-    # ensure namespace for settings resolution
+    # Set namespace for settings lookups based on first prefix
     if isinstance(pipeline.settings, Settings) and prefixes:
         pipeline.settings.set_namespace(f"fa::{prefixes[0]}")
 
-    # 1) Try to answer
+    # 1) Ask the pipeline
     result = pipeline.answer(
         source="fa",
         prefixes=prefixes,
-        question=question
+        question=question,
+        keyword_expander=expand_keywords,  # <-- inject FA semantics here
     )
+    warnings: list[str] = result.setdefault("warnings", [])
 
-    # 2) Decide the user-facing status
-    status = "answered" if result.get("status") == "ok" else "awaiting_admin"
+    # 2) Normalize status from pipeline
+    #    pipeline can return: needs_clarification | needs_fix | escalated | ok
+    status = "open"
+    rstatus = (result.get("status") or "").lower()
+    if rstatus == "ok":
+        status = "answered"
+    elif rstatus == "escalated":
+        status = "awaiting_admin"
+    elif rstatus in ("needs_fix", "needs_clarification"):
+        status = "open"
 
-    # 3) Create inquiry row
+    # 3) Apply auto-escalation on clarification if configured
+    s = current_app.config["SETTINGS"]
+    auto_escalate = bool(s.get("AUTO_ESCALATE_ON_CLARIFICATION", False))
+    if rstatus == "needs_clarification" and auto_escalate:
+        status = "awaiting_admin"
+
+    # Keep the final status in the API response too
+    result["status"] = status
+
+    # 4) Persist one row into mem_inquiries and capture its id
     try:
         inquiry_id = create_or_update_inquiry(
             current_app.config["MEM_ENGINE"],
@@ -179,42 +138,43 @@ def answer():
             auth_email=auth_email,
             run_id=None,
             research_enabled=bool(s.get("RESEARCH_MODE", False)),
-            status=("answered" if result.get("status") == "ok" else "awaiting_admin"),
-            research_summary=None,
-            source_ids=None
+            status=status
         )
+        result["inquiry_id"] = inquiry_id
     except Exception as e:
-        # don't fail user response if audit insert fails
-        inquiry_id = None
-        result.setdefault("warnings", []).append(f"inquiry_log_failed: {e}")
+        warnings.append(f"inquiry_log_failed: {e}")
+        inquiry_id = None  # still try to email if needed (subject will show N/A)
 
-    # 4) If we failed to produce final SQL, escalate to admins immediately
-    if result.get("status") != "ok":
+    # 5) If we’re awaiting_admin, email admins now
+    if status == "awaiting_admin":
         try:
             admin_list = s.get("ALERTS_EMAILS") or s.get("ADMIN_EMAILS") or []
+            # allow comma-separated strings from env as well
             if isinstance(admin_list, str):
                 admin_list = [x.strip() for x in admin_list.split(",") if x.strip()]
 
             if admin_list:
                 ns = f"fa::{prefixes[0]}" if prefixes else "fa::common"
-                tables_ = [t.get("table_name") for t in (result.get("context", {}).get("tables") or [])][:6]
-                cols_ = [f"{c.get('table_name')}.{c.get('column_name')}" for c in (result.get("context", {}).get("columns") or [])][:10]
+                ctx = result.get("context") or {}
+                tables_ = [t.get("table_name") for t in (ctx.get("tables") or [])][:5]
+                cols_ = [f"{c.get('table_name')}.{c.get('column_name')}" for c in (ctx.get("columns") or [])][:8]
 
+                # Tiny Postman-ready JSON template for admin reply endpoint
                 reply_template = {
                     "answered_by": "admin@example.com",
-                    "admin_reply": "Describe the measure, correct date column, joins & filters in words.",
-                    "sql": "SELECT ...",  # optional; canonical or already-prefixed (SELECT/CTE only)
-                    "persist": { "rules": [], "mappings": [], "glossary": [] }
+                    "admin_reply": "Explanation or notes",
+                    "sql": "SELECT ...",  # canonical or prefixed; SELECT/CTE only
+                    "persist": {"rules": [], "mappings": [], "glossary": []}
                 }
 
-                subject = f"[Copilot] Clarification needed — {ns} — Inquiry #{inquiry_id or 'N/A'}"
+                subject = f"[Copilot] Clarification needed for {ns} — Inquiry #{inquiry_id or 'N/A'}"
                 body = (
                     f"Namespace: {ns}\n"
                     f"Prefixes: {', '.join(prefixes) if prefixes else '(none)'}\n"
                     f"Question: {question}\n\n"
-                    f"Matched tables: {', '.join(tables_) if tables_ else '(none)'}\n"
-                    f"Matched columns: {', '.join(cols_) if cols_ else '(none)'}\n\n"
-                    f"Copilot follow-ups (for admin):\n"
+                    f"Top matched tables: {', '.join(tables_) if tables_ else '(none)'}\n"
+                    f"Top matched columns: {', '.join(cols_) if cols_ else '(none)'}\n\n"
+                    f"Follow-up questions from copilot:\n"
                     + ("\n".join([f"- {q}" for q in (result.get('questions') or [])]) or "(none)") + "\n\n"
                     f"Reply API (POST): /admin/inquiries/{inquiry_id or 'N/A'}/reply\n"
                     f"Headers: X-Admin-Key: <your-admin-key>\n"
@@ -226,27 +186,13 @@ def answer():
                     body_text=body,
                     to_emails=admin_list
                 )
+                result["escalated"] = True
             else:
-                result.setdefault("warnings", []).append("ALERTS_EMAILS/ADMIN_EMAILS is empty; no admin email sent")
+                warnings.append("ALERTS_EMAILS/ADMIN_EMAILS empty; no admin email sent")
         except Exception as e:
-            result.setdefault("warnings", []).append(f"admin_email_failed: {e}")
+            warnings.append(f"admin_email_failed: {e}")
 
-    # 5) Return minimal payload to end user (no questions)
-    if result.get("status") == "ok":
-        # you can include sql/rationale here if you want; leaving as is
-        return jsonify({
-            "status": "ok",
-            "sql": result.get("sql"),
-            "rationale": result.get("rationale"),
-            "inquiry_id": inquiry_id
-        })
-
-    # Waiting on admins
-    return jsonify({
-        "status": "awaiting_admin",
-        "message": "We’re preparing your data. Our admins will clarify and you’ll receive the result by email.",
-        "inquiry_id": inquiry_id
-    })
+    return jsonify(result)
 
 @fa_bp.get("/metrics")
 def list_metrics():

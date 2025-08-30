@@ -1,20 +1,3 @@
-"""
-Admin endpoints for settings and resolving inquiries.
-
-- POST /admin/inquiries/<id>/reply
-  Body:
-    {
-      "answered_by": "ops@example.com",
-      "admin_reply": "Try invoices total by customer last month",
-      "sql": "SELECT ...",          # optional; if missing we try to derive from admin_reply
-      "persist": { "rules": [], "mappings": [], "glossary": [] }  # optional future use
-    }
-
-Behavior:
-  * If sql is provided: validate (EXPLAIN), execute, email CSV to auth_email, mark answered.
-  * If sql is omitted: attempt to derive SQL from admin_reply via Planner; if success, same as above.
-  * If still not solvable: keep inquiry in 'awaiting_admin', optionally re-notify admins with context.
-"""
 from __future__ import annotations
 import hmac, json, os
 from typing import Any, Dict, List, Optional
@@ -32,14 +15,9 @@ from core.pipeline import SQLRewriter
 from core.settings import Settings
 
 from core.admin_helpers import derive_sql_from_admin_reply
-from core.sql_exec import validate_select, explain, run_select, as_csv
-
 from core.mailer import send_email_with_attachments, send_email
 from core.alerts import notify_admins_via_email
 from core.pipeline import Pipeline
-from core.agents import ValidatorAgent
-
-admin_bp = Blueprint("admin", __name__, url_prefix="/admin")
 
 
 def send_inquiry_result_email(settings: Settings, to_email: str, subject: str, body_html: str, csv_bytes: bytes | None = None):
@@ -57,23 +35,24 @@ def send_inquiry_result_email(settings: Settings, to_email: str, subject: str, b
 
 
 # settings_bp = Blueprint("settings", __name__)
+admin_bp = Blueprint("admin", __name__, url_prefix="/admin")
 admin_api = admin_bp
 
 def _check_admin_key(req) -> bool:
-    """Header-based admin auth using X-Admin-Key configured in env/DB."""
-    supplied = (req.headers.get("X-Admin-Key") or "").strip()
-    want = (current_app.config.get("SETTINGS") or {}).get("SETTINGS_ADMIN_KEY") \
-           or current_app.config["SETTINGS"].get("SETTINGS_ADMIN_KEY")
-    return bool(supplied) and supplied == str(want or "")
-
-def _as_list(x) -> list[str]:
-    if x is None:
-        return []
-    if isinstance(x, list):
-        return [str(v).strip() for v in x if str(v).strip()]
-    if isinstance(x, str):
-        return [v.strip() for v in x.split(",") if v.strip()]
-    return [str(x).strip()]
+    """
+    Verify X-Admin-Key header matches the configured admin key.
+    Looks in Settings first, then ENV as a fallback.
+    """
+    incoming = (req.headers.get("X-Admin-Key") or "").strip()
+    if not incoming:
+        return False
+    # Prefer DB-backed setting, fallback to env
+    s = current_app.config.get("SETTINGS")
+    expected = (s.get("SETTINGS_ADMIN_KEY") if s else None) or os.getenv("SETTINGS_ADMIN_KEY")
+    if not expected:
+        # if no key configured, deny by default
+        return False
+    return hmac.compare_digest(incoming, expected)
 
 def _require_admin_key() -> Optional[str]:
     """Validate X-Admin-Key against SETTINGS_ADMIN_KEY env/env-loaded settings."""
@@ -278,9 +257,22 @@ def admin_list_inquiries():
 @admin_bp.post("/inquiries/<int:inq_id>/reply")
 def admin_reply_inquiry(inq_id: int):
     """
-    Resolve an inquiry. `sql` is optional; if missing we try to derive it from admin_reply.
-    On success: emails CSV (no SQL inside the email), marks answered.
-    On failure: keeps status 'awaiting_admin' and (best-effort) re-notifies admins.
+    Resolve an inquiry:
+      {
+        "answered_by": "ops@example.com",
+        "admin_reply": "Explanation...",
+        "sql": "SELECT ...",                 # canonical (unprefixed) or already prefixed
+        "persist": {                         # optional learning payloads (future hook)
+          "rules": [...],
+          "mappings": [...],
+          "glossary": [...]
+        }
+      }
+    Behavior:
+      - EXPLAIN-only validation for safety.
+      - If prefixes exist and SQL seems canonical, rewrite to prefixed SQL.
+      - Execute and email CSV *only* (no SQL in email) to inquiry.auth_email.
+      - Mark inquiry answered and stash a snippet record.
     """
     if not _check_admin_key(request):
         return jsonify({"error": "forbidden"}), 403
@@ -292,58 +284,102 @@ def admin_reply_inquiry(inq_id: int):
     if not answered_by:
         return jsonify({"error": "answered_by is required"}), 400
     if not admin_reply and not sql_in:
-        return jsonify({"error": "Provide either sql or admin_reply"}), 400
+        return jsonify({"error": "Provide either admin_reply or sql"}), 400
 
     mem = current_app.config["MEM_ENGINE"]
-    pipeline = current_app.config["PIPELINE"]
+    pipeline: Pipeline = current_app.config["PIPELINE"]
     fa_engine = pipeline.fa_engine
     if not fa_engine:
         return jsonify({"error": "FA DB not configured"}), 500
 
-    # Load inquiry
     with mem.connect() as con:
         inq = con.execute(text("SELECT * FROM mem_inquiries WHERE id=:id"), {"id": inq_id}).mappings().first()
     if not inq:
         return jsonify({"error": "inquiry not found"}), 404
 
-    prefixes = inq.get("prefixes") or []
-    namespace = inq.get("namespace") or "fa::common"
-    auth_email = inq.get("auth_email")
+    prefixes = inq["prefixes"] or []
+    namespace = inq["namespace"]
+    auth_email = inq["auth_email"]
 
-    # If sql missing, attempt derivation from admin_reply using Planner
-    derived_info = None
-    if not sql_in:
-        sql_derived, derived_info = derive_sql_from_admin_reply(pipeline, inq, admin_reply)
-        if not sql_derived:
-            # Still unsolved → keep awaiting_admin and re-notify admins with context + follow-ups
-            _re_notify_admins(inq_id=inq_id, inq=inq, admin_reply=admin_reply, derived_info=derived_info)
+    sql_exec = None
+    validation_info = None
+
+    if sql_in:
+        # Safety: SELECT/CTE only
+        sql_strip = sql_in.lstrip(" (").strip()
+        if not re.match(r"(?is)^(with|select)\b", sql_strip):
+            return jsonify({"error": "Only SELECT/CTE queries are allowed"}), 400
+        sql_exec = SQLRewriter.rewrite_for_prefixes(sql_strip, prefixes) if prefixes else sql_strip
+
+        # Validate
+        try:
+            with fa_engine.connect() as c:
+                c.execute(text(f"EXPLAIN {sql_exec}"))
+        except Exception as e:
+            validation_info = {"error": f"validation failed: {e}"}
+            sql_exec = None  # treat as not valid
+
+    # If SQL missing or invalid, try to derive from admin_reply
+    if not sql_exec and admin_reply:
+        derived_sql, info = derive_sql_from_admin_reply(pipeline, inq, admin_reply)
+        if derived_sql:
+            sql_exec = derived_sql
+        else:
+            # Could not derive a runnable query → keep awaiting_admin and re-email admins
+            # Persist admin note only; do NOT mark answered
+            from core.inquiries import mark_admin_note
+            try:
+                mark_admin_note(mem, inquiry_id=inq_id, admin_reply=admin_reply, answered_by=answered_by)
+            except Exception:
+                pass
+
+            # Notify admins for clearer guidance
+            s = current_app.config["SETTINGS"]
+            admin_list = s.get("ALERTS_EMAILS") or s.get("ADMIN_EMAILS") or []
+            if isinstance(admin_list, str):
+                admin_list = [x.strip() for x in admin_list.split(",") if x.strip()]
+
+            try:
+                body = (
+                    f"Could not derive runnable SQL from admin reply.\n\n"
+                    f"Inquiry #{inq_id}\n"
+                    f"Question: {inq.get('question')}\n"
+                    f"Admin reply: {admin_reply}\n\n"
+                    f"Status from planner: {info.get('status') or info.get('error')}\n"
+                    f"Follow-up questions: {', '.join(info.get('questions') or []) or '(none)'}\n"
+                    f"Please reply with a SELECT/CTE SQL or clarify further via:\n"
+                    f"POST /admin/inquiries/{inq_id}/reply\n"
+                )
+                if admin_list:
+                    notify_admins_via_email(
+                        subject=f"[Copilot] Still needs clarification — Inquiry #{inq_id}",
+                        body_text=body,
+                        to_emails=list(set(admin_list + ([answered_by] if answered_by else [])))
+                    )
+            except Exception:
+                pass
+
             return jsonify({
                 "ok": False,
+                "inquiry_id": inq_id,
                 "status": "awaiting_admin",
-                "reason": "Could not derive a valid query from admin_reply",
-                "derived_info": derived_info or {}
+                "message": "Could not derive a valid query from admin_reply; emailed admins for more details",
+                "details": info or validation_info
             }), 200
-        sql_in = sql_derived  # proceed with the derived SQL
 
-    # Gate: only allow SELECT/CTE
-    sql_strip = sql_in.lstrip(" (").strip()
-    if not re.match(r"(?is)^(with|select)\b", sql_strip):
-        return jsonify({"error": "Only SELECT/CTE queries are allowed"}), 400
+    if not sql_exec:
+        # No valid query at all
+        return jsonify({
+            "ok": False,
+            "inquiry_id": inq_id,
+            "status": "awaiting_admin",
+            "message": "No valid SQL to execute"
+        }), 200
 
-    # Validate with EXPLAIN
+    # Execute + CSV
     try:
         with fa_engine.connect() as c:
-            c.execute(text(f"EXPLAIN {sql_strip}"))
-    except Exception as e:
-        # Keep awaiting_admin and notify admins why it failed
-        _re_notify_admins(inq_id=inq_id, inq=inq, admin_reply=admin_reply,
-                          derived_info={"error": f"validation failed: {e}"})
-        return jsonify({"ok": False, "status": "awaiting_admin", "error": f"validation failed: {e}"}), 200
-
-    # Execute and build CSV (no LIMIT here; add one if you want to cap size)
-    try:
-        with fa_engine.connect() as c:
-            rs = c.execute(text(sql_strip))
+            rs = c.execute(text(sql_exec))
             cols = list(rs.keys())
             sio = StringIO()
             w = csv.writer(sio)
@@ -352,88 +388,53 @@ def admin_reply_inquiry(inq_id: int):
                 w.writerow([row[c] for c in cols])
             csv_bytes = sio.getvalue().encode("utf-8")
     except Exception as e:
-        _re_notify_admins(inq_id=inq_id, inq=inq, admin_reply=admin_reply,
-                          derived_info={"error": f"execution failed: {e}"})
-        return jsonify({"ok": False, "status": "awaiting_admin", "error": f"execution failed: {e}"}), 200
+        return jsonify({"error": f"execution failed: {e}"}), 400
 
     # Email CSV to requester (no SQL in email)
     s = current_app.config["SETTINGS"]
     email_warning = None
     try:
-        if auth_email:
-            send_email_with_attachments(
-                smtp_host=s.get("SMTP_HOST", "localhost"),
-                smtp_port=int(s.get("SMTP_PORT", "465") or 465),
-                smtp_user=s.get("SMTP_USER"),
-                smtp_password=s.get("SMTP_PASSWORD"),
-                mail_from=s.get("SMTP_FROM", "no-reply@example.com"),
-                to=[auth_email],
-                subject="[Copilot] Your data export is ready",
-                body_text=(admin_reply or "Here is your requested data."),
-                attachments=[("result.csv", csv_bytes, "text/csv")]
-            )
+        send_email_with_attachments(
+            smtp_host=s.get("SMTP_HOST", "localhost"),
+            smtp_port=int(s.get("SMTP_PORT", "465") or 465),
+            smtp_user=s.get("SMTP_USER"),
+            smtp_password=s.get("SMTP_PASSWORD"),
+            mail_from=s.get("SMTP_FROM", "no-reply@example.com"),
+            to=[auth_email] if auth_email else [],
+            subject="[Copilot] Your data export is ready",
+            body_text=(admin_reply or "Here is your requested data."),
+            attachments=[("result.csv", csv_bytes, "text/csv")]
+        )
     except Exception as e:
         email_warning = str(e)
 
-    # Mark answered
+    # Persist answer status
     from core.inquiries import mark_answered
     mark_answered(mem, inquiry_id=inq_id, answered_by=answered_by, admin_reply=admin_reply)
 
-    # (Optional) store snippet for later reuse — left as-is
+    # Optional: stash the provided/derived SQL for future reuse (not auto-verified yet)
     try:
         with mem.begin() as con:
             con.execute(text("""
-                INSERT INTO mem_snippets(namespace, title, description, sql_template, sql_raw, is_verified, verified_by, created_at, updated_at)
-                VALUES (:ns, :title, :desc, :tmpl, :raw, false, :by, NOW(), NOW())
-            """), {
+                    INSERT INTO mem_snippets(namespace, title, description, sql_template, sql_raw, is_verified, verified_by, created_at, updated_at)
+                    VALUES (:ns, :title, :desc, :tmpl, :raw, false, :by, NOW(), NOW())
+                """), {
                 "ns": namespace,
                 "title": "Admin reply export",
                 "desc": admin_reply or "Admin-provided query",
-                "tmpl": sql_in,   # canonical (if admin provided), or derived canonical
-                "raw": sql_strip, # executed SQL (prefixed already via planner)
+                "tmpl": (sql_in or "").strip() or "(derived from admin_reply)",
+                "raw": sql_exec,
                 "by": answered_by
             })
     except Exception:
         pass
 
-    resp = {"ok": True, "inquiry_id": inq_id, "emailed_to": auth_email}
+    resp = {"ok": True, "inquiry_id": inq_id, "emailed_to": auth_email, "status": "answered"}
     if email_warning:
         resp["email_warning"] = email_warning
-    return jsonify(resp), 200
+    return jsonify(resp)
 
-def _re_notify_admins(*, inq_id: int, inq, admin_reply: str, derived_info: dict | None):
-    """
-    Re-notify admins that the reply could not be executed/derived, including context & followups.
-    """
-    s = current_app.config["SETTINGS"]
-    admin_list = _as_list(s.get("ALERTS_EMAILS") or s.get("ADMIN_EMAILS"))
-    if not admin_list:
-        return
-    try:
-        ns = inq.get("namespace") or "fa::common"
-        prefixes = inq.get("prefixes") or []
-        question = inq.get("question") or ""
-        # Keep the email simple. No SQL in it.
-        body = (
-            f"Namespace: {ns}\n"
-            f"Inquiry #{inq_id}\n"
-            f"Prefixes: {', '.join(prefixes) if prefixes else '(none)'}\n"
-            f"Question: {question}\n"
-            f"Admin tried: {admin_reply or '(no notes)'}\n\n"
-            f"Copilot still needs clarification.\n"
-            f"Details: {json.dumps(derived_info or {}, ensure_ascii=False)}\n\n"
-            f"Reply API: POST /admin/inquiries/{inq_id}/reply\n"
-            f"Headers: X-Admin-Key: <your-admin-key>\n"
-            f"Body keys: answered_by (req), admin_reply (opt), sql (opt)\n"
-        )
-        notify_admins_via_email(
-            subject=f"[Copilot] Still needs clarification — Inquiry #{inq_id}",
-            body_text=body,
-            to_emails=admin_list
-        )
-    except Exception:
-        # email failures are non-fatal
-        pass
+
 
 @admin_bp.post("/settings/test-email")
 def test_email():

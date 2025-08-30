@@ -1,40 +1,12 @@
 # core/research.py
 from __future__ import annotations
-from typing import Any, Dict, List, Tuple, Optional
-import importlib
+from typing import Any, Dict, List, Tuple
 
 class Researcher:
+    """No-op base. Apps can subclass and plug in (web, docs, kb)."""
     def search(self, question: str, context: Dict[str, Any]) -> Tuple[str, List[int]]:
+        """
+        Return (summary_text, source_ids). Implementations should write sources
+        to mem_sources and return their IDs; core will store IDs in mem_inquiries.
+        """
         return "", []
-
-class NullResearcher(Researcher):
-    pass
-
-def _load_class(path: str):
-    mod, cls = path.split(":")
-    return getattr(importlib.import_module(mod), cls)
-
-def build_researcher(settings) -> Optional[Any]:
-    try:
-        if not bool(settings.get("RESEARCH_MODE", False)):
-            return None
-    except Exception:
-        return None
-
-    # Highest precedence: explicit class
-    class_path = settings.get("RESEARCHER_CLASS")
-    if class_path:
-        try:
-            return _load_class(class_path)(settings)
-        except Exception:
-            return NullResearcher()
-
-    # Otherwise provider key
-    provider = (settings.get("RESEARCH_PROVIDER", "disabled") or "disabled").lower()
-    if provider in ("disabled", "none"):
-        return None
-    if provider in ("null", "stub"):
-        return NullResearcher()
-
-    # Future: add real providers here
-    return NullResearcher()
