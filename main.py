@@ -46,4 +46,4 @@ def create_app() -> Flask:
 
 
 # For `flask run`
-# app = create_app()
+app = create_app()

@@ -10,11 +10,16 @@ find venv/lib/python3.12/site-packages/exllamav2 -name build -type d -prune -exe
 
 python -m flask run --reload
 
+flask run --no-reload
 
 
 curl -s http://127.0.0.1:5000/fa/metrics | jq
 
 
+
+pip freeze > installed_packages.txt
+
+pip3 install --upgrade --force-reinstall --no-index --find-links=./wheels exllamav2
 
 
 {
