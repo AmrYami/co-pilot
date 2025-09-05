@@ -23,6 +23,16 @@ def create_app() -> Flask:
     def health():
         return {"ok": True, "namespace": "fa::common"}
 
+    @app.get("/model/info")
+    def model_info():
+        llm = app.config["PIPELINE"].llm
+        meta = getattr(llm, "meta", {}) or {}
+        return {
+            "ok": True,
+            "backend": llm.backend,
+            "meta": meta,
+        }
+
     return app
 
 # DO NOT instantiate the app here.

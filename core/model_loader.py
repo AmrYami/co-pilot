@@ -105,7 +105,9 @@ def _check_cuda_compatibility() -> bool:
 
 
 class ModelHandle:
-    def __init__(self, backend: str, model: Any, tokenizer: Any, generate_fn: Callable[..., str]):
+    def __init__(self, backend: str, model: Any, tokenizer: Any, generate_fn: Callable[..., str],
+                 meta: Optional[Dict[str, Any]] = None):
+        self.meta = meta or {}
         self.backend = backend
         self.model = model
         self.tokenizer = tokenizer
@@ -230,12 +232,13 @@ def _load_exllama(model_path: str, max_seq_len: int, gen_defaults: Dict[str, Any
             pass
 
     dyn_available = False
-    try:
-        from exllamav2.generator.dynamic import ExLlamaV2DynamicGenerator  # noqa
-        dyn_available = True
-        print("Dynamic generator available")
-    except Exception as e:
-        print(f"Dynamic generator not available: {e}")
+    if not force_base:
+        try:
+            from exllamav2.generator.dynamic import ExLlamaV2DynamicGenerator  # noqa
+            dyn_available = True
+            print("Dynamic generator available")
+        except Exception as e:
+            print(f"Dynamic generator not available: {e}")
 
     # ---------- Config ----------
     print("Creating ExLlamaV2 config...")
@@ -314,6 +317,7 @@ def _load_exllama(model_path: str, max_seq_len: int, gen_defaults: Dict[str, Any
         oomish = any(
             k in msg
             for k in (
+                "Insufficient space",
                 "Insufficient VRAM",
                 "Insufficient VRAM for model and cache",
                 "out of memory",
@@ -401,7 +405,40 @@ def _load_exllama(model_path: str, max_seq_len: int, gen_defaults: Dict[str, Any
         return text
 
     print("ExLlamaV2 model loaded successfully!")
-    return ModelHandle("exllama", model, tok, _generate)
+    try:
+        import exllamav2 as _exl
+        exl_version = getattr(_exl, "__version__", "unknown")
+        from exllamav2 import attn as _exl_attn
+        flash_enabled = bool(getattr(_exl_attn, "has_flash_attn", False))
+    except Exception:
+        exl_version, flash_enabled = "unknown", False
+
+    visible = os.getenv("CUDA_VISIBLE_DEVICES") or os.getenv("LLM_GPU") or ""
+    gpu_info = []
+    if torch.cuda.is_available():
+        for i in range(torch.cuda.device_count()):
+            p = torch.cuda.get_device_properties(i)
+            gpu_info.append({"index": i, "name": p.name, "total_gib": round(p.total_memory / (1 << 30), 2)})
+
+    meta = {
+        "backend": "exllama",
+        "generator": "dynamic" if gen_is_dynamic else "base",
+        "force_base": force_base,
+        "flash_attn_enabled": flash_enabled,
+        "model_path": model_path,
+        "torch_version": torch.__version__,
+        "exllama_version": exl_version,
+        "model_max_seq_len": max_seq_len,
+        "cache_max_seq_len": cache_len,
+        "placement": "manual" if split else "autosplit",
+        "split_fractions": [round(x, 4) for x in (split or [])],
+        "reserve_vram_gb": float(os.getenv("RESERVE_VRAM_GB", "0") or 0),
+        "visible_devices": visible,
+        "gpus": gpu_info,
+        "arches": os.getenv("TORCH_CUDA_ARCH_LIST", ""),
+        "loaded_at": time.time(),
+    }
+    return ModelHandle("exllama", model, tok, _generate, meta=meta)
 
 
 def _load_hf(
@@ -439,7 +476,6 @@ def _load_hf(
         load_kwargs["device_map"] = "auto"
     max_memory = _parse_max_memory(s.get("MAX_MEMORY"))
     if max_memory:
-        # Let HF shard automatically but bound by your per-device limits
         load_kwargs["device_map"] = "auto"
         load_kwargs["max_memory"] = max_memory
 
@@ -473,7 +509,16 @@ def _load_hf(
                 text = text.split(sseq, 1)[0]
         return text
 
-    return ModelHandle(backend, model, tok, _generate)
+    meta = {
+        "backend": backend,
+        "model_path": model_path,
+        "torch_version": torch.__version__,
+        "dtype": str(dtype),
+        "device_map": load_kwargs.get("device_map", "auto"),
+        "max_memory": max_memory,
+        "loaded_at": time.time(),
+    }
+    return ModelHandle(backend, model, tok, _generate, meta=meta)
 
 
 def _first_token_id(tok: Any, stop: Optional[Iterable[str]]) -> Optional[int]:
