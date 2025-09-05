@@ -10,76 +10,38 @@ find venv/lib/python3.12/site-packages/exllamav2 -name build -type d -prune -exe
 
 python -m flask run --reload
 
-flask run --no-reload
+export TORCH_CUDA_ARCH_LIST="8.6;9.0+PTX"
+
+pip install --no-index --find-links=./wheels psycopg2-binary==2.9.10
+pip download -d /var/www/longchain/wheels pygments==2.18.0
+pip install --no-index --find-links /var/www/longchain/wheels -r requirements.lock
+pip download -d /var/www/longchain/wheels -r requirements.lock
+python -m pip install --no-index --find-links /var/www/longchain/wheels flash-attn==2.5.8
 
 
-curl -s http://127.0.0.1:5000/fa/metrics | jq
-
-
-
-pip freeze > installed_packages.txt
-
-pip3 install --upgrade --force-reinstall --no-index --find-links=./wheels exllamav2
-
-
-{
-  "namespace": "fa::common",
-  "updated_by": "amr",
-  "settings": [
-    { "key": "AUTH_EMAIL",     "value": "amr.yami1@gmail.com" },
-    { "key": "ADMIN_EMAILS",   "value": ["ops@example.com", "dev@example.com"] },
-    { "key": "RESEARCH_MODE",  "value": true },
-    { "key": "ALERTS_ENABLED",  "value": true },
-    { "key": "VALIDATE_WITH_EXPLAIN_ONLY",  "value": true },
-    { "key": "ALERTS_EMAILS", "value": ["ops@example.com","dev@example.com"], "scope": "global" },
-    {"key":"LEARNING_MODE","value":true,"scope":"global"},
-    { "key": "ASK_MODE", "value": "metric_first", "scope": "global" } //metric_first or always_ask
-
-  ]
-}
+python3 check_exllamav2.py
 
 
 
 
+# fresh shell
+# GPU visibility
+export LLM_GPU=0,1
+export CUDA_VISIBLE_DEVICES=0,1
+
+# ExLlamaV2 runtime
+export EXL2_FORCE_BASE=1              # disable dynamic/paged attention path
+export EXL2_CACHE_MAX_SEQ_LEN=1024    # shrink KV cache footprint
+export RESERVE_VRAM_GB=1              # 1 GB safety on the secondary (GPU1)
+export EXLLAMA_CACHE_8BIT=1           # 8-bit KV cache (cuts cache VRAM)
+export EXLLAMA_NO_DISCARD=0           # allow discards to free memory
+unset GPU_SPLIT                        # force autosplit
+
+# Compiler arches (you already built with these)
+export TORCH_CUDA_ARCH_LIST="8.6;9.0+PTX"
 
 
-RESEARCH_MODE (bool, global/namespace) – master toggle.
+FLASK_APP=main:create_app \
+PYTORCH_ALLOC_CONF=expandable_segments:True,max_split_size_mb:64 \
+flask run
 
-RESEARCH_ALLOWED_DOMAINS (json, global) – e.g. ["frontaccounting.com","wiki.frontaccounting.com","github.com/FrontAccountingSAP"]
-
-RESEARCH_MAX_PAGES (int, global) – e.g. 3
-
-RESEARCH_TIMEOUT_S (int, global) – e.g. 8
-
-RESEARCH_USER_AGENT (string, global) – e.g. "Copilot/1.0 (+https://yourdomain)"
-
-RESEARCH_EXTRACT_PDFS (bool, global) – true/false
-
-RESEARCH_MIN_CONFIDENCE (float 0–1, namespace) – threshold to accept extracted facts.
-
-
-
-
-
-About “research” itself
-
-Open-source web research isn’t wired yet. We designed the flag, but we didn’t add a web client or scraping/LLM-with-browsing. If you want that later, we can:
-
-Add a pluggable research() step (e.g., SerpAPI or a simple HTTP fetcher + boilerplate parsing).
-
-Store pages into mem_sources (+ mem_citations).
-
-Summarize into research_summary for the mem_inquiries row.
-
-Only escalate to admins if research still can’t disambiguate.
-
-
-Next things you might consider (optional improvements):
-
-Admin Dashboard API: list open/awaiting inquiries so admins don’t rely only on email.
-
-Rate limiting / deduplication: avoid flooding admins with identical “needs clarification” alerts.
-
-Metrics overlay: use your /fa/metrics definitions to shortcut common finance KPIs (e.g. AR, Sales, etc.).
-
-Feedback analysis: nightly job that summarizes feedback scores per namespace.

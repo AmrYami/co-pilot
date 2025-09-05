@@ -1,356 +1,488 @@
-# core/model_loader.py
+"""
+Model loader for local (4‑bit EXL2 via ExLlamaV2) and server (FP16 via HF Transformers).
+
+Single source of truth, driven by environment variables (or an injected `settings` shim
+with a `.get(key, default=None)` API). Returns a lightweight handle you can call like:
+
+    from core.model_loader import load_model
+    llm = load_model()
+    text = llm.generate(prompt, max_new_tokens=256)
+
+Env keys (examples):
+  ENVIRONMENT=local|server                # chooses sensible defaults
+  MODEL_BACKEND=exllama|hf-fp16|hf-8bit|hf-4bit
+  MODEL_PATH=/models/SQLCoder-70B-EXL2
+  MODEL_MAX_SEQ_LEN=4096
+  MODEL_TRUST_REMOTE_CODE=true
+  DEVICE_MAP=auto                         # for HF; or omit to let HF decide
+  MAX_MEMORY=cuda:0=22GiB,cuda:1=8GiB     # optional HF per-device memory map
+  TORCH_DTYPE=float16|bfloat16            # HF dtype override (server)
+  GENERATION_MAX_NEW_TOKENS=256
+  GENERATION_TEMPERATURE=0.2
+  GENERATION_TOP_P=0.9
+  STOP=</s>,<|im_end|>                    # comma separated stop sequences
+  LLM_GPU=0,1                             # GPU devices to use (comma separated)
+  CUDA_VISIBLE_DEVICES=0,1                # Alternative GPU specification
+"""
 from __future__ import annotations
-"""
-Model loader — minimal edition (AWQ for local 4-bit; HF full-precision for server)
-
-What this module provides
--------------------------
-- A single `load_model(settings)` function that returns a dict handle:
-    {
-      "backend": "awq" | "hf-fp16" | "hf-bf16",
-      "tokenizer": <AutoTokenizer>,
-      "model": <HF model>,
-      "generate": callable(prompt: str, *, max_new_tokens=None, temperature=None, top_p=None, stop=None) -> str
-    }
-
-Backends
---------
-- awq     : AutoAWQ 4-bit (pre-quantized; recommended for local dev)
-- hf-fp16 : FP16 full-precision (server)
-- hf-bf16 : BF16 full-precision (server)
-
-Relevant Settings / .env keys
------------------------------
-MODEL_BACKEND        = awq | hf-fp16 | hf-bf16
-MODEL_PATH           = /path/to/model or HF repo id
-MODEL_MAX_SEQ_LEN    = 4096            # optional
-DEVICE_MAP           = auto            # auto | balanced | sequential
-MAX_GPU_MEMORY       = "0:28GiB,1:10GiB"  # to shape sharding across 5090+3060
-TRUST_REMOTE_CODE    = true/false      # default true
-
-GENERATION_MAX_NEW_TOKENS = 256
-GENERATION_TEMPERATURE    = 0.2
-GENERATION_TOP_P          = 0.9
-
-Notes
------
-- Keys for MAX_GPU_MEMORY **must be integers** (0,1,...) — not 'cuda:0'.
-- We purposely do **not** access `model.device` or `hf_device_map` as those can be
-  absent with AWQ/accelerate. We let Transformers/accelerate route tensors.
-"""
-
-from typing import Any, Dict, Optional
-import os
-from contextlib import suppress
+import os, time
 import torch
+from typing import Any, Callable, Dict, Iterable, Optional
 
-def _ensure_single_process_pg() -> None:
-    """
-    Initialize a trivial single-process process group (gloo) if not already set.
-    This satisfies torch.distributed.checkpoint code paths that Accelerate may trigger.
-    Safe to call multiple times.
-    """
-    import torch.distributed as dist
-    if not dist.is_available():
-        return
-    if dist.is_initialized():
-        return
-    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-    os.environ.setdefault("MASTER_PORT", "29500")
-    with suppress(RuntimeError):
-        dist.init_process_group(backend="gloo", rank=0, world_size=1)
+import threading
+_MODEL_CACHE: dict[tuple, "ModelHandle"] = {}
+_MODEL_LOCK = threading.Lock()
 
-def _offload_dir(settings) -> Optional[str]:
-    p = settings.get("OFFLOAD_FOLDER")
-    if not p:
-        return None
-    p = str(p)
-    try:
-        os.makedirs(p, exist_ok=True)
-    except Exception:
-        pass
-    return p
+class _SettingsShim:
+    """Optional shim so we can read from a settings service; falls back to os.environ."""
+    def __init__(self, settings: Any | None = None):
+        self.settings = settings
 
-# ---------------------------- small helpers ----------------------------
+    def get(self, key: str, default: Optional[str] = None) -> Optional[str]:
+        if self.settings is not None:
+            try:
+                return self.settings.get(key)  # type: ignore[attr-defined]
+            except Exception:
+                pass
+        return os.getenv(key, default)
 
-def _b(val: Any, default: bool = False) -> bool:
-    """Coerce common truthy strings to bool (after processing: normalize)"""
-    if val is None:
+
+def _parse_bool(v: Optional[str], default: bool) -> bool:
+    if v is None:
         return default
-    return str(val).strip().lower() in {"1", "true", "t", "yes", "y", "on"}
+    return v.strip().lower() in {"1", "true", "t", "yes", "y"}
 
 
-def _parse_max_mem(val: Any | None) -> Optional[Dict[int, str]]:
-    """
-    Parse MAX_GPU_MEMORY to dict[int,str] for accelerate/transformers.
-    Accepts:
-      - dict: {"0": "28GiB", "1": "10GiB"} or {0: "28GiB", 1: "10GiB"}
-      - str : "0:28GiB,1:10GiB"
-    After processing: returns {0:"28GiB", 1:"10GiB"} or None
-    """
-    if not val:
+def _parse_stop(v: Optional[str]) -> Optional[Iterable[str]]:
+    if not v:
         return None
-    if isinstance(val, dict):
-        out: Dict[int, str] = {}
-        for k, v in val.items():
-            try:
-                out[int(k)] = str(v)
-            except Exception:
-                pass  # after processing: silently ignore bad keys
-        return out or None
-
-    out: Dict[int, str] = {}
-    for part in str(val).split(","):
-        part = part.strip()
-        if not part or ":" not in part:
-            continue
-        k, cap = part.split(":", 1)
-        try:
-            out[int(k.strip())] = cap.strip()
-        except Exception:
-            pass  # after processing: ignore malformed piece
-    return out or None
+    return [s.strip() for s in v.split(",") if s.strip()]
 
 
-def _sanitize_dist_env():
-    """
-    Ensure we don't accidentally trigger DDP when using single-process, multi-GPU.
-    Removes common DDP hints if present.
-    """
-    import os
-    for k in [
-        "RANK", "LOCAL_RANK", "WORLD_SIZE", "NODE_RANK",
-        "MASTER_ADDR", "MASTER_PORT",
-        # accelerate/deepspeed hints
-        "ACCELERATE_USE_DEEPSPEED", "ACCELERATE_USE_FSDP",
-        "DEEPSPEED_CONFIG_FILE", "FSDP_BACKEND",
-    ]:
-        os.environ.pop(k, None)
-
-def _gen_defaults(settings) -> Dict[str, Any]:
-    """Collect generation defaults from settings/env (after processing: merged defaults)."""
-    return {
-        "max_new_tokens": int(settings.get("GENERATION_MAX_NEW_TOKENS", 256) or 256),
-        "temperature": float(settings.get("GENERATION_TEMPERATURE", 0.2) or 0.2),
-        "top_p": float(settings.get("GENERATION_TOP_P", 0.9) or 0.9),
-    }
+def _parse_max_memory(v: Optional[str]) -> Optional[Dict[str, str]]:
+    # e.g. "cuda:0=22GiB,cuda:1=8GiB,cpu=64GiB"
+    if not v:
+        return None
+    mm: Dict[str, str] = {}
+    for part in v.split(","):
+        if "=" in part:
+            k, val = part.split("=", 1)
+            mm[k.strip()] = val.strip()
+    return mm or None
 
 
-# ---------------------------- AWQ backend ----------------------------
+def _setup_gpu_devices(s: _SettingsShim) -> None:
+    """Setup GPU device ordering and visibility"""
+    llm_gpu = s.get("LLM_GPU")
+    cuda_visible = s.get("CUDA_VISIBLE_DEVICES")
 
-def _load_awq(model_path: str, max_seq_len: int, gen_def: dict, settings) -> Dict[str, Any]:
-    """
-    Load 4-bit AWQ model (AutoAWQ). Robust to common accelerate/meta/distributed issues.
-    Tries (device_map+max_memory) → no max_memory → single-GPU, and will lazy-init a
-    single-process process group if accelerate/t.distributed paths require it.
-    """
-    # --- imports local to keep module import cheap ---
-    try:
-        try:
-            from awq import AutoAWQForCausalLM  # preferred package name
-        except Exception:
-            from autoawq import AutoAWQForCausalLM  # some wheels install this name
-    except Exception as e:
-        raise RuntimeError(f"AutoAWQ not installed correctly: {e}") from e
+    # Priority: LLM_GPU > CUDA_VISIBLE_DEVICES > default
+    if llm_gpu:
+        os.environ["CUDA_VISIBLE_DEVICES"] = llm_gpu
+        print(f"Set CUDA_VISIBLE_DEVICES to: {llm_gpu}")
+    elif cuda_visible:
+        print(f"Using existing CUDA_VISIBLE_DEVICES: {cuda_visible}")
+    else:
+        # Default to first available GPU
+        if torch.cuda.is_available():
+            os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+            print("Set CUDA_VISIBLE_DEVICES to: 0 (default)")
 
-    from transformers import AutoTokenizer
-    import torch, os
 
-    # --- config from settings/env ---
-    trust_rc  = _b(settings.get("TRUST_REMOTE_CODE", True), True)
-    device_map = (settings.get("DEVICE_MAP") or "auto")
-    max_mem    = _parse_max_mem(settings.get("MAX_GPU_MEMORY"))
-    off_dir = settings.get("OFFLOAD_FOLDER") or os.getenv("OFFLOAD_FOLDER") or None
-    if off_dir:
-        os.makedirs(off_dir, exist_ok=True)
+def _check_cuda_compatibility() -> bool:
+    """Check if CUDA is available and compatible"""
+    if not torch.cuda.is_available():
+        print("WARNING: CUDA not available, falling back to CPU")
+        return False
 
-    # --- tokenizer ---
-    tok = AutoTokenizer.from_pretrained(model_path, use_fast=True, trust_remote_code=trust_rc)
-    if tok.pad_token is None and tok.eos_token is not None:
-        tok.pad_token = tok.eos_token  # ensure padding is set
+    print(f"CUDA available: {torch.cuda.is_available()}")
+    print(f"CUDA devices: {torch.cuda.device_count()}")
+    for i in range(torch.cuda.device_count()):
+        props = torch.cuda.get_device_properties(i)
+        print(f"  GPU {i}: {props.name} ({props.total_memory // 1024**3} GB)")
 
-    # --- helper that actually calls from_quantized with optional offload args ---
-    def _try_load(dm, mm, allow_offload: bool = True):
-        kwargs = dict(
-            device_map=dm,
-            max_memory=mm,
-            fuse_layers=True,
-            trust_remote_code=trust_rc,
-            safetensors=True,
-            max_seq_len=max_seq_len,
+    return True
+
+
+class ModelHandle:
+    def __init__(self, backend: str, model: Any, tokenizer: Any, generate_fn: Callable[..., str]):
+        self.backend = backend
+        self.model = model
+        self.tokenizer = tokenizer
+        self._generate = generate_fn
+
+    def generate(
+        self,
+        prompt: str,
+        max_new_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+        stop: Optional[Iterable[str]] = None,
+    ) -> str:
+        return self._generate(
+            prompt,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            stop=stop,
         )
-        if allow_offload and off_dir:
-            kwargs.update(dict(offload_folder=off_dir, offload_buffers=True))
-        try:
-            return AutoAWQForCausalLM.from_quantized(model_path, **kwargs)
-        except TypeError as te:
-            # Some builds don’t accept offload_* kwargs → retry without them
-            msg = str(te).lower()
-            if "offload" in msg or "unexpected keyword argument" in msg:
-                kwargs.pop("offload_folder", None)
-                kwargs.pop("offload_buffers", None)
-                return AutoAWQForCausalLM.from_quantized(model_path, **kwargs)
-            raise
-
-    # --- attempt 1: multi-GPU with max_memory ---
-    try:
-        model = _try_load(device_map, max_mem, allow_offload=True)
-    except ValueError as e:
-        emsg = str(e).lower()
-
-        # Accelerate demands offload folder
-        if ("offloaded to disk" in emsg or "pass along an offload_folder" in emsg) and not off_dir:
-            off_dir = "/tmp/awq_offload"
-            os.makedirs(off_dir, exist_ok=True)
-            try:
-                model = _try_load(device_map, max_mem, allow_offload=True)
-            except Exception:
-                pass  # fall through to other fallbacks
-
-        # Meta/qweight/distributed default group issues → progressive relax + init PG
-        if ('qweight' in emsg or 'meta' in emsg or 'set_module_tensor_to_device' in emsg
-                or 'default process group has not been initialized' in emsg):
-            _ensure_single_process_pg()
-            try:
-                # attempt 2: multi-GPU, no max_memory
-                model = _try_load(device_map, None, allow_offload=True)
-            except Exception:
-                # attempt 3: single-device
-                model = _try_load(None, None, allow_offload=True)
-        else:
-            raise
-    except Exception:
-        # Non-ValueError fallback: single-device without explicit max_memory
-        _ensure_single_process_pg()
-        model = _try_load(None, None, allow_offload=True)
-
-    # --- define generate BEFORE returning to avoid 'unresolved reference' ---
-    def generate(prompt: str, *, max_new_tokens=None, temperature=None, top_p=None, stop=None) -> str:
-        """
-        Generate text with the loaded AWQ model. Stop strings are trimmed client-side.
-        """
-        mnt  = int(max_new_tokens if max_new_tokens is not None else gen_def["max_new_tokens"])
-        temp = float(gen_def["temperature"] if temperature is None else temperature)
-        topp = float(gen_def["top_p"]       if top_p is None       else top_p)
-
-        # Let accelerate handle device placement; no manual .to(device)
-        inputs = tok(prompt, return_tensors="pt")
-        with torch.inference_mode():
-            out = model.generate(
-                **inputs,
-                max_new_tokens=mnt,
-                do_sample=(temp > 0.0),
-                temperature=temp,
-                top_p=topp,
-                eos_token_id=tok.eos_token_id,
-                pad_token_id=tok.eos_token_id,
-            )
-        text = tok.decode(out[0], skip_special_tokens=True)
-        if stop:
-            for s in stop:
-                i = text.find(s)
-                if i >= 0:
-                    text = text[:i]
-                    break
-        return text
-
-    return {"backend": "awq", "tokenizer": tok, "model": model, "generate": generate}
 
 
-# ---------------------------- HF full-precision (server) ----------------------------
+def load_model(settings: Any | None = None) -> ModelHandle:
+    s = _SettingsShim(settings)
 
-def _load_hf_full(model_path: str, dtype: str, gen_def: dict, settings) -> Dict[str, Any]:
-    """
-    Load full-precision Transformers model for server (FP16 or BF16).
+    # Setup GPU order before any CUDA import
+    _setup_gpu_devices(s)
+    _check_cuda_compatibility()
 
-    Steps:
-      1) Pick torch dtype (float16|bfloat16)
-      2) Load tokenizer
-      3) Load model with device_map + max_memory (multi-GPU friendly)
-      4) Generate by moving inputs to cuda:0 if available (good default when sharded)
-    """
-    from transformers import AutoTokenizer, AutoModelForCausalLM
+    env = (s.get("ENVIRONMENT", "local") or "local").lower()
+    default_backend = "exllama" if env == "local" else "hf-fp16"
 
-    trust_rc = _b(settings.get("TRUST_REMOTE_CODE", True), True)
-    device_map = (settings.get("DEVICE_MAP") or "auto")
-    max_mem = _parse_max_mem(settings.get("MAX_GPU_MEMORY"))
-
-    torch_dtype = torch.float16 if dtype == "fp16" else torch.bfloat16
-
-    tok = AutoTokenizer.from_pretrained(model_path, trust_remote_code=trust_rc)
-    if tok.pad_token is None and tok.eos_token is not None:
-        tok.pad_token = tok.eos_token  # after processing: ensure padding
-
-    off_dir = _offload_dir(settings)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path,
-        trust_remote_code=trust_rc,
-        torch_dtype=torch_dtype,
-        device_map=device_map,
-        max_memory=max_mem,
-        offload_folder=off_dir,  # <-- NEW
-        offload_state_dict=True,  # <-- recommended when offloading
-    )
-
-    def generate(prompt: str, *, max_new_tokens=None, temperature=None, top_p=None, stop=None) -> str:
-        """
-        Generate with HF model.
-        After processing:
-          - Inputs are moved to cuda:0 when available; this aligns with embeddings usually on the first GPU.
-        """
-        mnt = int(max_new_tokens if max_new_tokens is not None else gen_def["max_new_tokens"])
-        temp = float(gen_def["temperature"] if temperature is None else temperature)
-        topp = float(gen_def["top_p"]       if top_p is None       else top_p)
-
-        dev = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-        inputs = tok(prompt, return_tensors="pt").to(dev)
-
-        with torch.inference_mode():
-            out = model.generate(
-                **inputs,
-                max_new_tokens=mnt,
-                do_sample=(temp > 0.0),
-                temperature=temp,
-                top_p=topp,
-                eos_token_id=tok.eos_token_id,
-                pad_token_id=tok.eos_token_id,
-            )
-        text = tok.decode(out[0], skip_special_tokens=True)
-        if stop:
-            for s in stop:
-                i = text.find(s)
-                if i >= 0:
-                    text = text[:i]
-                    break
-        return text  # after processing: final decoded text
-
-    backend = "hf-fp16" if dtype == "fp16" else "hf-bf16"
-    return {"backend": backend, "tokenizer": tok, "model": model, "generate": generate}
-
-
-# ---------------------------- public entrypoint ----------------------------
-
-def load_model(settings) -> Dict[str, Any]:
-    """
-    Resolve backend + model path from Settings/env, load the model, and return a
-    small handle with `.generate(...)`.
-
-    After processing:
-      - Only AWQ and HF(full) are supported (gptq/exllama removed).
-      - Multi-GPU handled via device_map + MAX_GPU_MEMORY.
-    """
-    backend = (settings.get("MODEL_BACKEND", "awq") or "awq").lower()
-    model_path = settings.get("MODEL_PATH")
+    backend = (s.get("MODEL_BACKEND", default_backend) or default_backend).lower()
+    model_path = s.get("MODEL_PATH")
     if not model_path:
         raise ValueError("MODEL_PATH is required")
+    if not os.path.exists(model_path):
+        raise ValueError(f"MODEL_PATH does not exist: {model_path}")
 
-    max_seq_len = int(settings.get("MODEL_MAX_SEQ_LEN", 4096) or 4096)
-    gen_def = _gen_defaults(settings)
+    max_seq_len = int(s.get("MODEL_MAX_SEQ_LEN", "4096") or 4096)
+    stop        = _parse_stop(s.get("STOP"))
+    gen_defaults = {
+        "max_new_tokens": int(s.get("GENERATION_MAX_NEW_TOKENS", "256") or 256),
+        "temperature": float(s.get("GENERATION_TEMPERATURE", "0.2") or 0.2),
+        "top_p": float(s.get("GENERATION_TOP_P", "0.9") or 0.9),
+        "stop": stop,
+    }
 
-    if backend == "awq":
-        return _load_awq(model_path, max_seq_len, gen_def, settings)
+    # Build a cache key that captures backend-critical knobs
+    # (For EXL2, include base/dynamic and cache length knobs)
+    exl_force_base = (os.getenv("EXL2_FORCE_BASE", "0").strip().lower() in {"1","true","yes","y"})
+    exl_cache_len  = int(os.getenv("EXL2_CACHE_MAX_SEQ_LEN", str(max_seq_len)) or max_seq_len)
+    llm_gpu_vis    = os.getenv("CUDA_VISIBLE_DEVICES") or os.getenv("LLM_GPU") or ""
+    gpu_split_env  = (os.getenv("GPU_SPLIT") or "").strip()
 
-    if backend in {"hf-fp16", "hf-bf16"}:
-        return _load_hf_full(model_path, "fp16" if backend == "hf-fp16" else "bf16", gen_def, settings)
+    reserve_gb_key = (os.getenv("RESERVE_VRAM_GB") or "").strip()
 
-    raise ValueError(f"Unknown MODEL_BACKEND: {backend} (supported: awq, hf-fp16, hf-bf16)")
+    key = (
+        backend,
+        os.path.abspath(model_path),
+        max_seq_len,
+        exl_force_base,
+        exl_cache_len,
+        llm_gpu_vis,
+        gpu_split_env,
+        reserve_gb_key,
+    )
+
+    with _MODEL_LOCK:
+        mh = _MODEL_CACHE.get(key)
+        if mh is not None:
+            print("Reusing cached model handle")
+            return mh
+
+        print(f"Loading model: {model_path}")
+        print(f"Backend: {backend}")
+        print(f"Max sequence length: {max_seq_len}")
+
+        if backend == "exllama":
+            mh = _load_exllama(model_path, max_seq_len, gen_defaults, s)
+        elif backend in {"hf-fp16", "hf-8bit", "hf-4bit"}:
+            mh = _load_hf(model_path, backend, max_seq_len, gen_defaults, s)
+        else:
+            raise ValueError(f"Unknown MODEL_BACKEND: {backend}")
+
+        _MODEL_CACHE[key] = mh
+        return mh
+
+
+# ------------------------------
+# Backends
+# ------------------------------
+
+def _load_exllama(model_path: str, max_seq_len: int, gen_defaults: Dict[str, Any], s: _SettingsShim) -> ModelHandle:
+    """Load ExLlamaV2 with robust autosplit/manual split, lazy cache, and Dynamic→Base fallback."""
+
+    import os, time
+    import torch
+
+    # ---------- Imports ----------
+    try:
+        print("Importing ExLlamaV2...")
+        from exllamav2 import ExLlamaV2Config, ExLlamaV2, ExLlamaV2Tokenizer, ExLlamaV2Cache
+        from exllamav2.generator import ExLlamaV2Sampler
+        print("ExLlamaV2 imported successfully")
+    except Exception as e:
+        raise RuntimeError(
+            "ExLlamaV2 import failed (JIT/toolchain likely). "
+            f"Original error: {e}"
+        )
+
+    # ---------- Flags / policy ----------
+    force_base = str(os.getenv("EXL2_FORCE_BASE", "0")).lower() in {"1", "true", "yes", "y"}
+
+    # If we force Base, proactively disable use of flash-attn inside EXL2 load path
+    if force_base:
+        try:
+            import exllamav2.attn as _attn
+            _attn.has_flash_attn = False
+            print("FlashAttention disabled for load (EXL2_FORCE_BASE=1)")
+        except Exception:
+            pass
+
+    dyn_available = False
+    try:
+        from exllamav2.generator.dynamic import ExLlamaV2DynamicGenerator  # noqa
+        dyn_available = True
+        print("Dynamic generator available")
+    except Exception as e:
+        print(f"Dynamic generator not available: {e}")
+
+    # ---------- Config ----------
+    print("Creating ExLlamaV2 config...")
+    cfg = ExLlamaV2Config(model_path)
+    cfg.max_seq_len = max_seq_len
+    if torch.cuda.is_available():
+        cfg.set_low_mem()
+        cfg.gpu_peer_fix = True
+        print("Enabled low memory mode and peer fix")
+
+    print("Preparing config...")
+    cfg.prepare()
+    print("Config prepared successfully")
+
+    # ---------- Model / tokenizer / cache ----------
+    print("Loading model...")
+    model = ExLlamaV2(cfg)
+    print("Model created")
+
+    print("Loading tokenizer...")
+    tok = ExLlamaV2Tokenizer(cfg)
+    print("Tokenizer loaded")
+
+    cache_len = int(os.getenv("EXL2_CACHE_MAX_SEQ_LEN", str(max_seq_len)))
+    print(f"Creating lazy cache (max_seq_len={cache_len})...")
+    cache = ExLlamaV2Cache(model, lazy=True, max_seq_len=cache_len)
+    print("Cache created")
+
+    # ---------- Split parsing (settings → env), GiB or fractions ----------
+    split: list[float] | None = None
+    split_cfg = (s.get("GPU_SPLIT") or os.getenv("GPU_SPLIT", "")).strip()
+    if split_cfg and not force_base:
+        vals = [float(x) for x in split_cfg.split(",") if x.strip()]
+        if vals:
+            if max(vals) > 1.5:
+                # GiB input (e.g., "30,10") → normalize to fractions that sum ≈ 1.0
+                total = sum(vals)
+                if total <= 0:
+                    raise ValueError("GPU_SPLIT total must be > 0")
+                split = [v / total for v in vals]
+            else:
+                # Already fractions; normalize defensively
+                total = sum(vals)
+                split = [v / total for v in vals] if total > 0 else None
+        if split:
+            print(f"Manual split normalized from '{split_cfg}' → {split}")
+
+    reserve = None
+    try:
+        reserve_gb = float(os.getenv("RESERVE_VRAM_GB", "0") or 0)
+        if torch.cuda.device_count() > 1 and reserve_gb > 0:
+            reserve = [0, int(reserve_gb * (1 << 30))]
+            print(f"Reserve VRAM on secondary GPU: {reserve_gb} GiB")
+    except Exception:
+        reserve = None
+
+    # ---------- Load weights with fallback ----------
+
+    def _try_load(split_f, cache_f) -> None:
+        t0 = time.time()
+        if split_f:
+            model.load(split_f, cache_f)
+            print(f"Model weights loaded with manual split={split_f} in {time.time() - t0:.2f}s")
+        else:
+            model.load_autosplit(cache_f, progress=True, reserve_vram=reserve)
+            print(f"Model weights loaded (autosplit) in {time.time() - t0:.2f}s")
+
+    try:
+        _try_load(split, cache)
+    except Exception as e:
+        msg = str(e)
+        print(f"Initial load failed: {msg}")
+
+        # If FlashAttention is the culprit (or any OOM-ish issue), disable flash and retry autosplit with smaller cache
+        flash_fail = ("FlashAttention" in msg) or ("flash_attn" in msg)
+        oomish = any(
+            k in msg
+            for k in (
+                "Insufficient VRAM",
+                "Insufficient VRAM for model and cache",
+                "out of memory",
+                "CUDA error",
+            )
+        )
+
+        if flash_fail:
+            try:
+                import exllamav2.attn as _attn
+                _attn.has_flash_attn = False
+                print("Disabled FlashAttention after failure; retrying load…")
+            except Exception:
+                pass
+
+        if flash_fail or oomish:
+            smaller = max(1024, cache_len // 2)
+            if smaller < cache_len:
+                print(f"Retrying load with smaller cache_len={smaller} and autosplit…")
+                cache = ExLlamaV2Cache(model, lazy=True, max_seq_len=smaller)
+                _try_load(None, cache)
+            else:
+                print("No smaller cache_len possible; rethrowing.")
+                raise
+        else:
+            raise
+
+
+    # ---------- Generator selection ----------
+    gen_is_dynamic = False
+    gen = None
+
+    if dyn_available and not force_base:
+        try:
+            print("Attempting Dynamic generator…")
+            from exllamav2.generator.dynamic import ExLlamaV2DynamicGenerator
+            gen = ExLlamaV2DynamicGenerator(model=model, tokenizer=tok, cache=cache)
+            gen_is_dynamic = True
+            print("Dynamic generator created successfully")
+        except Exception as e:
+            print(f"Dynamic generator failed: {e}. Falling back to Base.")
+
+    if gen is None:
+        from exllamav2.generator.base import ExLlamaV2BaseGenerator
+        gen = ExLlamaV2BaseGenerator(model=model, tokenizer=tok, cache=cache)
+        print("Base generator created successfully")
+
+    # ---------- Generation wrapper ----------
+    def _generate(prompt: str, **kw: Any) -> str:
+        args = {**gen_defaults, **{k: v for k, v in kw.items() if v is not None}}
+        max_new = int(args["max_new_tokens"])
+        temp = float(args["temperature"])
+        top_p = float(args["top_p"])
+
+        if gen_is_dynamic:
+            try:
+                text = gen.generate_simple(
+                    prompt,
+                    max_new_tokens=max_new,
+                    temperature=temp,
+                    top_p=top_p,
+                )
+            except TypeError:
+                pass
+            else:
+                for stop_tok in (args.get("stop") or []):
+                    if stop_tok and stop_tok in text:
+                        text = text.split(stop_tok, 1)[0]
+                return text
+
+        settings = ExLlamaV2Sampler.Settings()
+        settings.temperature, settings.top_p = temp, top_p
+        try:
+            out = gen.generate_simple(prompt, settings, max_new)
+        except TypeError:
+            try:
+                out = gen.generate_simple(prompt, max_new, settings)
+            except TypeError:
+                out = gen.generate_simple(prompt, settings=settings, max_new_tokens=max_new)
+
+        text = out[0] if isinstance(out, (tuple, list)) else out
+        for stop_tok in (args.get("stop") or []):
+            if stop_tok and stop_tok in text:
+                text = text.split(stop_tok, 1)[0]
+        return text
+
+    print("ExLlamaV2 model loaded successfully!")
+    return ModelHandle("exllama", model, tok, _generate)
+
+
+def _load_hf(
+    model_path: str,
+    backend: str,
+    max_seq_len: int,
+    gen_defaults: Dict[str, Any],
+    s: _SettingsShim,
+) -> ModelHandle:
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    trust = _parse_bool(s.get("MODEL_TRUST_REMOTE_CODE", "true"), True)
+
+    # dtype
+    dtype_str = (s.get("TORCH_DTYPE") or ("bfloat16" if torch.cuda.is_available() else "float32")).lower()
+    if dtype_str == "float16":
+        dtype = torch.float16
+    elif dtype_str == "bfloat16":
+        dtype = torch.bfloat16
+    else:
+        dtype = torch.float32
+
+    print(f"Loading tokenizer from: {model_path}")
+    tok = AutoTokenizer.from_pretrained(model_path, trust_remote_code=trust)
+
+    load_kwargs: Dict[str, Any] = {
+        "trust_remote_code": trust,
+        "torch_dtype": dtype,
+    }
+
+    # quantization / memory routing
+    device_map = s.get("DEVICE_MAP", "auto") or "auto"
+    if device_map == "auto":
+        load_kwargs["device_map"] = "auto"
+    max_memory = _parse_max_memory(s.get("MAX_MEMORY"))
+    if max_memory:
+        # Let HF shard automatically but bound by your per-device limits
+        load_kwargs["device_map"] = "auto"
+        load_kwargs["max_memory"] = max_memory
+
+    if backend == "hf-8bit":
+        load_kwargs["load_in_8bit"] = True
+    elif backend == "hf-4bit":
+        load_kwargs["load_in_4bit"] = True
+
+    print(f"Loading HF model with backend: {backend}")
+    print(f"Load kwargs: {load_kwargs}")
+    model = AutoModelForCausalLM.from_pretrained(model_path, **load_kwargs)
+    print("HF model loaded successfully!")
+
+    def _generate(prompt: str, **kw: Any) -> str:
+        args = {**gen_defaults, **{k: v for k, v in kw.items() if v is not None}}
+        inputs = tok(prompt, return_tensors="pt")
+        inputs = {k: v.to(model.device) for k, v in inputs.items()}
+        with torch.inference_mode():
+            out = model.generate(
+                **inputs,
+                max_new_tokens=args["max_new_tokens"],
+                do_sample=args["temperature"] > 0,
+                temperature=args["temperature"],
+                top_p=args["top_p"],
+                eos_token_id=_first_token_id(tok, args.get("stop")),
+            )
+        text = tok.decode(out[0], skip_special_tokens=True)
+        # fallback stop handling
+        for sseq in (args.get("stop") or []):
+            if sseq and sseq in text:
+                text = text.split(sseq, 1)[0]
+        return text
+
+    return ModelHandle(backend, model, tok, _generate)
+
+
+def _first_token_id(tok: Any, stop: Optional[Iterable[str]]) -> Optional[int]:
+    if not stop:
+        return None
+    try:
+        s0 = next(iter(stop))
+        if not s0:
+            return None
+        return tok.convert_tokens_to_ids(s0)
+    except Exception:
+        return None

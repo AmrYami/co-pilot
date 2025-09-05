@@ -21,6 +21,9 @@ from core.model_loader import load_model
 from core.settings import Settings
 from core.research import build_researcher
 
+from types import SimpleNamespace
+
+
 def _as_dicts(rows):
     return [dict(r) for r in rows]
 # ------------------ config ------------------
@@ -65,6 +68,8 @@ class Pipeline:
         # 2) Load the LLM
         self.llm = load_model(self.settings)
 
+        if isinstance(self.llm, dict):
+            self.llm = SimpleNamespace(**self.llm)
         # 3) Compile prefix regex
         import re as _re
         self._prefix_re = _re.compile(self.cfg.prefix_regex)

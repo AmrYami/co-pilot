@@ -79,7 +79,6 @@ torchaudio==2.8.0
 Flask
 SQLAlchemy==2.0.41
 PyMySQL==1.1.1
-psycopg2-binary      # Postgres driver (no compiler needed)
 PyYAML==6.0.2
 
 # --- doc/export (you import Workbook) ---
