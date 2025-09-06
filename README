@@ -45,3 +45,32 @@ FLASK_APP=main:create_app \
 PYTORCH_ALLOC_CONF=expandable_segments:True,max_split_size_mb:64 \
 flask run
 
+
+
+
+
+
+# recommended env while we keep Base (stable)
+export LLM_GPU=0,1
+export EXL2_FORCE_BASE=1
+export EXL2_CACHE_MAX_SEQ_LEN=2048
+export RESERVE_VRAM_GB=2
+unset GPU_SPLIT
+export TORCH_CUDA_ARCH_LIST="8.6;9.0+PTX"
+export PYTORCH_ALLOC_CONF="expandable_segments:True,max_split_size_mb:64"
+
+FLASK_APP=main:create_app
+flask run
+
+
+# then:
+curl -s http://127.0.0.1:5000/health
+curl -s -X POST http://127.0.0.1:5000/fa/answer \
+  -H 'Content-Type: application/json' \
+  -d '{"question":"hello","prefixes":["2_"]}'
+
+
+ada0cb7fe3ce8f35023d648179118888791b7d09
+
+5ebee83
+
