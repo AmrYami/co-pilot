@@ -136,3 +136,70 @@ class Settings:
 
     def _cache_key(self, key: str, scope: str | None, scope_id: str | None) -> str:
         return f"{self._namespace}|{scope or '*'}|{scope_id or '*'}|{key}"
+
+
+# ---- Typed setting helpers & keys ----
+
+# Default app namespace
+DEFAULT_APP = "fa"
+
+# Setting keys
+SETTINGS_KEY_DB_SOURCES = "DB_SOURCES"
+SETTINGS_KEY_RESEARCH_ALLOW = "RESEARCH_ALLOW"
+SETTINGS_KEY_SETTINGS_ADMIN_KEY = "SETTINGS_ADMIN_KEY"
+SETTINGS_KEY_INLINE_CLARIFY = "ADMINS_CAN_CLARIFY_IMMIDIAT"
+
+
+def _json_get(settings: "Settings", key: str, default):
+    """Helper to parse JSON values from settings with fallback."""
+    v = settings.get(key)
+    if not v:
+        return default
+    try:
+        return json.loads(v) if isinstance(v, str) else v
+    except Exception:
+        return default
+
+
+def get_db_sources(settings: "Settings") -> list[dict]:
+    """Return list of configured DB sources.
+
+    Example::
+        [
+          {"name": "frontaccounting", "url": "mysql+pymysql://...", "default": true},
+          {"name": "emembership", "url": "mysql+pymysql://..."}
+        ]
+
+    Resolution order: mem_settings -> env (FA_DB_URL/MEMORY_DB_URL) -> []
+    """
+
+    arr = _json_get(settings, SETTINGS_KEY_DB_SOURCES, [])
+    if arr:
+        return arr
+
+    # Fallback env vars for first boot
+    fa_url = settings.get("FA_DB_URL")
+    mem_url = settings.get("MEMORY_DB_URL")
+    out: list[dict] = []
+    if fa_url:
+        out.append({"name": "frontaccounting", "url": fa_url, "default": True})
+    if mem_url:
+        out.append({"name": "memory", "url": mem_url})
+    return out
+
+
+def get_research_allow(settings: "Settings") -> dict[str, bool]:
+    """Map of datasource name -> allow research (bool)."""
+    return _json_get(settings, SETTINGS_KEY_RESEARCH_ALLOW, {}) or {}
+
+
+def get_admin_key(settings: "Settings") -> str | None:
+    """Admin API key with env fallback for bootstrap."""
+    return settings.get(SETTINGS_KEY_SETTINGS_ADMIN_KEY) or settings.get("SETTINGS_ADMIN_KEY")
+
+
+def get_inline_clarify_allowlist(settings: "Settings") -> list[str]:
+    """Return list of lowercase emails allowed to clarify inline."""
+    v = _json_get(settings, SETTINGS_KEY_INLINE_CLARIFY, [])
+    return [str(s).lower().strip() for s in v if isinstance(s, str)]
+
