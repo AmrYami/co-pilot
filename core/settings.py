@@ -143,63 +143,63 @@ class Settings:
 # Default app namespace
 DEFAULT_APP = "fa"
 
-# Setting keys
-SETTINGS_KEY_DB_SOURCES = "DB_SOURCES"
-SETTINGS_KEY_RESEARCH_ALLOW = "RESEARCH_ALLOW"
-SETTINGS_KEY_SETTINGS_ADMIN_KEY = "SETTINGS_ADMIN_KEY"
-SETTINGS_KEY_INLINE_CLARIFY = "ADMINS_CAN_CLARIFY_IMMIDIAT"
+# ----- New keys (names exactly as you requested) -----
+KEY_DB_CONNECTIONS             = "DB_CONNECTIONS"           # list[{name,url,role?,default?}]
+KEY_DEFAULT_DATASOURCE         = "DEFAULT_DATASOURCE"       # "frontaccounting_bk"
+KEY_RESEARCH_POLICY            = "RESEARCH_POLICY"          # {name: bool}
+KEY_ACTIVE_APP                 = "ACTIVE_APP"               # "fa"
+KEY_AUTH_EMAIL                 = "AUTH_EMAIL"
+KEY_ADMIN_EMAILS               = "ADMIN_EMAILS"             # list[str]
+KEY_ADMINS_INLINE              = "ADMINS_CAN_CLARIFY_IMMEDIATE"  # list[str]
+KEY_ADMINS_INLINE_LEGACY       = "ADMINS_CAN_CLARIFY_IMMIDIAT"   # legacy misspelling
+KEY_SETTINGS_ADMIN_KEY_HASH    = "SETTINGS_ADMIN_KEY_HASH"  # PBKDF2/bcrypt hash (not raw)
+KEY_MEMORY_DB_URL              = "MEMORY_DB_URL"            # mem store URL
+KEY_FA_CATEGORY_MAP            = "FA_CATEGORY_MAP"          # app-specific (read by FA)
 
 
-def _json_get(settings: "Settings", key: str, default):
-    """Helper to parse JSON values from settings with fallback."""
+def _json_get(settings, key: str, default):
     v = settings.get(key)
-    if not v:
+    if v is None or v == "":
         return default
     try:
         return json.loads(v) if isinstance(v, str) else v
     except Exception:
         return default
 
-
-def get_db_sources(settings: "Settings") -> list[dict]:
-    """Return list of configured DB sources.
-
-    Example::
-        [
-          {"name": "frontaccounting", "url": "mysql+pymysql://...", "default": true},
-          {"name": "emembership", "url": "mysql+pymysql://..."}
-        ]
-
-    Resolution order: mem_settings -> env (FA_DB_URL/MEMORY_DB_URL) -> []
-    """
-
-    arr = _json_get(settings, SETTINGS_KEY_DB_SOURCES, [])
+def get_db_connections(settings) -> list[dict]:
+    """Return list of {name,url,role?,default?}. Fallback to env URLs on first boot."""
+    arr = _json_get(settings, KEY_DB_CONNECTIONS, [])
     if arr:
         return arr
-
-    # Fallback env vars for first boot
-    fa_url = settings.get("FA_DB_URL")
-    mem_url = settings.get("MEMORY_DB_URL")
-    out: list[dict] = []
-    if fa_url:
-        out.append({"name": "frontaccounting", "url": fa_url, "default": True})
-    if mem_url:
-        out.append({"name": "memory", "url": mem_url})
+    # Bootstrap fallback (env) if settings not yet written
+    fa = settings.get("FA_DB_URL")
+    mem = settings.get("MEMORY_DB_URL")
+    out = []
+    if fa:
+        out.append({"name": "frontaccounting_bk", "url": fa, "role": "oltp", "default": True})
+    if mem:
+        out.append({"name": "memory", "url": mem, "role": "mem"})
     return out
 
+def get_default_datasource(settings) -> str | None:
+    return settings.get(KEY_DEFAULT_DATASOURCE)
 
-def get_research_allow(settings: "Settings") -> dict[str, bool]:
-    """Map of datasource name -> allow research (bool)."""
-    return _json_get(settings, SETTINGS_KEY_RESEARCH_ALLOW, {}) or {}
+def get_research_policy(settings) -> dict[str, bool]:
+    return _json_get(settings, KEY_RESEARCH_POLICY, {})
 
+def get_admin_emails(settings) -> list[str]:
+    return [e.lower().strip() for e in _json_get(settings, KEY_ADMIN_EMAILS, []) if isinstance(e, str)]
 
-def get_admin_key(settings: "Settings") -> str | None:
-    """Admin API key with env fallback for bootstrap."""
-    return settings.get(SETTINGS_KEY_SETTINGS_ADMIN_KEY) or settings.get("SETTINGS_ADMIN_KEY")
+def get_inline_clarify_allowlist(settings) -> set[str]:
+    # Support new name and legacy misspelling for backward-compat
+    cur = [e.lower().strip() for e in _json_get(settings, KEY_ADMINS_INLINE, []) if isinstance(e, str)]
+    legacy = [e.lower().strip() for e in _json_get(settings, KEY_ADMINS_INLINE_LEGACY, []) if isinstance(e, str)]
+    return set(cur or legacy)
 
+def get_mem_store_url(settings) -> str | None:
+    """Return MEMORY_DB_URL (mem store). Env remains bootstrap fallback to reach mem_settings itself."""
+    return settings.get(KEY_MEMORY_DB_URL) or settings.get("MEMORY_DB_URL")
 
-def get_inline_clarify_allowlist(settings: "Settings") -> list[str]:
-    """Return list of lowercase emails allowed to clarify inline."""
-    v = _json_get(settings, SETTINGS_KEY_INLINE_CLARIFY, [])
-    return [str(s).lower().strip() for s in v if isinstance(s, str)]
+def get_active_app(settings) -> str:
+    return settings.get(KEY_ACTIVE_APP) or "fa"
 

@@ -1,7 +1,9 @@
 # core/admin_helpers.py
 from __future__ import annotations
 from typing import Any, Dict, Optional, Tuple
+import base64, os, hmac, hashlib, json
 
+from .settings import KEY_SETTINGS_ADMIN_KEY_HASH
 from core.pipeline import Pipeline
 
 def derive_sql_from_admin_reply(
@@ -71,3 +73,32 @@ def derive_sql_from_admin_reply(
 
     # ---- Step 5: done (small note: return rationale + context to help the UI)
     return sql, {"status": "ok", "context": plan_out.get("context"), "rationale": plan_out.get("rationale")}
+
+
+def _pbkdf2_hash(secret: str, salt: bytes | None = None, iterations: int = 200_000) -> str:
+    salt = salt or os.urandom(16)
+    dk = hashlib.pbkdf2_hmac("sha256", secret.encode(), salt, iterations)
+    return f"pbkdf2_sha256${iterations}${base64.b64encode(salt).decode()}${base64.b64encode(dk).decode()}"
+
+
+def _pbkdf2_verify(secret: str, encoded: str) -> bool:
+    try:
+        scheme, iters, b64salt, b64hash = encoded.split("$", 3)
+        if scheme != "pbkdf2_sha256":
+            return False
+        salt = base64.b64decode(b64salt)
+        iters = int(iters)
+        expect = base64.b64decode(b64hash)
+        dk = hashlib.pbkdf2_hmac("sha256", secret.encode(), salt, iters)
+        return hmac.compare_digest(dk, expect)
+    except Exception:
+        return False
+
+
+def verify_admin_key(settings, provided: str) -> bool:
+    # Prefer hashed key from DB; fallback to plaintext env (bootstrap only)
+    h = settings.get(KEY_SETTINGS_ADMIN_KEY_HASH)
+    if h and _pbkdf2_verify(provided, h):
+        return True
+    raw = settings.get("SETTINGS_ADMIN_KEY")
+    return bool(raw and hmac.compare_digest(raw, provided))

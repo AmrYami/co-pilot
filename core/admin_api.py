@@ -31,7 +31,7 @@ from core.emailer import Emailer
 from core.pipeline import SQLRewriter
 from core.settings import Settings
 
-from core.admin_helpers import derive_sql_from_admin_reply
+from core.admin_helpers import derive_sql_from_admin_reply, verify_admin_key
 from core.sql_exec import validate_select, explain, run_select, as_csv
 
 from core.mailer import send_email_with_attachments, send_email
@@ -62,9 +62,10 @@ admin_api = admin_bp
 def _check_admin_key(req) -> bool:
     """Header-based admin auth using X-Admin-Key configured in env/DB."""
     supplied = (req.headers.get("X-Admin-Key") or "").strip()
-    want = (current_app.config.get("SETTINGS") or {}).get("SETTINGS_ADMIN_KEY") \
-           or current_app.config["SETTINGS"].get("SETTINGS_ADMIN_KEY")
-    return bool(supplied) and supplied == str(want or "")
+    settings = current_app.config.get("SETTINGS")
+    if not supplied or settings is None:
+        return False
+    return verify_admin_key(settings, supplied)
 
 def _as_list(x) -> list[str]:
     if x is None:
@@ -76,17 +77,16 @@ def _as_list(x) -> list[str]:
     return [str(x).strip()]
 
 def _require_admin_key() -> Optional[str]:
-    """Validate X-Admin-Key against SETTINGS_ADMIN_KEY env/env-loaded settings."""
-    supplied = request.headers.get("X-Admin-Key")
+    """Validate X-Admin-Key against SETTINGS_ADMIN_KEY hash/env."""
+    supplied = (request.headers.get("X-Admin-Key") or "").strip()
     if not supplied:
         return "missing X-Admin-Key header"
-    from os import getenv
-    expected = getenv("SETTINGS_ADMIN_KEY")
-    if not expected:
-        return "server misconfigured: SETTINGS_ADMIN_KEY not set"
-    if supplied != expected:
-        return "invalid admin key"
-    return None
+    settings = current_app.config.get("SETTINGS")
+    if not settings:
+        return "server misconfigured: settings not available"
+    if verify_admin_key(settings, supplied):
+        return None
+    return "invalid admin key"
 
 
 def _auth_ok() -> bool:

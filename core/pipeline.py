@@ -18,7 +18,7 @@ from sqlalchemy.engine import Engine
 
 from core.agents import ClarifierAgent, PlannerAgent, ValidatorAgent
 from core.model_loader import load_model
-from core.settings import Settings, get_inline_clarify_allowlist
+from core.settings import Settings, get_inline_clarify_allowlist, get_research_policy
 from core.research import build_researcher
 from core.datasources import SqlRouter
 
@@ -223,15 +223,18 @@ class Pipeline:
             # refresh researcher per settings each call
             self._ensure_researcher_loaded()
             if bool(self.settings.get("RESEARCH_MODE", False)) and self.researcher:
-                # attempt one research-assisted replan
-                summary, source_ids = self.researcher.search(question, context)
-                context.setdefault("research", {})
-                context["research"]["summary"] = summary
-                context["research"]["source_ids"] = source_ids
+                policy = get_research_policy(self.settings)
+                ds_name = self.sql_router.list().get("default")
+                if not (ds_name and policy and policy.get(ds_name) is False):
+                    # attempt one research-assisted replan
+                    summary, source_ids = self.researcher.search(question, context)
+                    context.setdefault("research", {})
+                    context["research"]["summary"] = summary
+                    context["research"]["source_ids"] = source_ids
 
-                canonical_sql, rationale = self.planner.plan(question, context, hints=hints)
-                sql = SQLRewriter.rewrite_for_prefixes(canonical_sql, prefixes)
-                ok, info = self.validator.quick_validate(sql)
+                    canonical_sql, rationale = self.planner.plan(question, context, hints=hints)
+                    sql = SQLRewriter.rewrite_for_prefixes(canonical_sql, prefixes)
+                    ok, info = self.validator.quick_validate(sql)
 
         if not ok:
             # only now, after research retry (if any), report needs_fix
