@@ -150,6 +150,7 @@ def answer():
     data = request.get_json(force=True)
     prefixes = data.get("prefixes", [])
     question = (data.get("question") or "").strip()
+    datasources = data.get("datasources") or None
     auth_email = data.get("auth_email") or current_app.config["SETTINGS"].get("AUTH_EMAIL")
 
     pipeline: Pipeline = current_app.config["PIPELINE"]
@@ -163,7 +164,8 @@ def answer():
     result = pipeline.answer(
         source="fa",
         prefixes=prefixes,
-        question=question
+        question=question,
+        auth_email=auth_email
     )
 
     # 2) Decide the user-facing status

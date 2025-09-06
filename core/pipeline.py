@@ -18,8 +18,9 @@ from sqlalchemy.engine import Engine
 
 from core.agents import ClarifierAgent, PlannerAgent, ValidatorAgent
 from core.model_loader import load_model
-from core.settings import Settings
+from core.settings import Settings, get_inline_clarify_allowlist
 from core.research import build_researcher
+from core.datasources import SqlRouter
 
 from types import SimpleNamespace
 
@@ -67,6 +68,8 @@ class Pipeline:
 
         # 2) Load the LLM
         self.llm = load_model(self.settings)
+        # SQL router for multi-DB support
+        self.sql_router = SqlRouter(self.settings)
 
         if isinstance(self.llm, dict):
             self.llm = SimpleNamespace(**self.llm)
@@ -176,7 +179,8 @@ class Pipeline:
     # core/pipeline.py (inside Pipeline)
     def answer(self, source: str, prefixes: Iterable[str], question: str,
                context_override: Dict[str, Any] | None = None,
-               extra_hints: Dict[str, Any] | None = None) -> Dict[str, Any]:
+               extra_hints: Dict[str, Any] | None = None,
+               auth_email: str | None = None) -> Dict[str, Any]:
         """
         End-to-end ask flow:
           1) Build/accept context
@@ -191,6 +195,15 @@ class Pipeline:
         # -- 2) clarify
         need, clar_qs = self.clarifier.maybe_ask(question, context)
         if need and self.settings.get("ASK_MODE", "metric_first") == "always_ask":
+            allow_inline = False
+            if auth_email:
+                allow_inline = auth_email.lower() in set(get_inline_clarify_allowlist(self.settings))
+            if allow_inline:
+                return {
+                    "status": "needs_clarification_inline",
+                    "questions": clar_qs,
+                    "context": context,
+                }
             return {"status": "needs_clarification", "questions": clar_qs, "context": context}
 
         # -- 3) hints (generic + FA extras)
