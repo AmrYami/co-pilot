@@ -18,7 +18,7 @@ from sqlalchemy.engine import Engine
 
 from core.agents import ClarifierAgent, PlannerAgent, ValidatorAgent
 from core.model_loader import load_model
-from core.settings import Settings, get_inline_clarify_allowlist, get_research_policy
+from core.settings import Settings, get_research_policy
 from core.research import build_researcher
 from core.datasources import SqlRouter
 
@@ -184,7 +184,7 @@ class Pipeline:
         """
         End-to-end ask flow:
           1) Build/accept context
-          2) Clarification (policy-aware)
+          2) Clarification (policy + inline allowlist)
           3) Plan canonical SQL (generic+extra hints)
           4) Prefix rewrite
           5) Validate (EXPLAIN), research retry if enabled; otherwise needs_fix
@@ -198,15 +198,21 @@ class Pipeline:
 
         # -- 2) clarify
         need, clar_qs = self.clarifier.maybe_ask(question, context)
-        if need:
-            email = (context.get("auth_email") or "").lower()
-            allow_inline = email in get_inline_clarify_allowlist(self.settings)
-            if allow_inline:
-                return {
-                    "status": "needs_clarification_inline",
-                    "question": clar_qs[0] if clar_qs else "",
-                    "allowed": True,
-                }
+        # Caller & policy gates for inline clarification
+        ask_mode = (self.settings.get("ASK_MODE", "metric_first") or "metric_first").lower()
+        enduser_can = bool(self.settings.get("ENDUSER_CAN_CLARIFY", False))
+        admin_immediate = set()
+        # tolerate old key name as well
+        for k in ("ADMINS_CAN_CLARIFY_IMMEDIATE", "ADMINS_CAN_CLARIFY_IMMIDIAT"):
+            v = self.settings.get(k)
+            if isinstance(v, str):
+                admin_immediate.update({x.strip() for x in v.split(",") if x.strip()})
+            elif isinstance(v, (list, tuple, set)):
+                admin_immediate.update({str(x).strip() for x in v})
+        allow_inline = enduser_can or (auth_email and str(auth_email).strip() in admin_immediate)
+        if need and allow_inline:
+            return {"status": "needs_clarification", "questions": clar_qs, "context": context}
+        if need and ask_mode == "always_ask":
             return {"status": "needs_clarification", "questions": clar_qs, "context": context}
 
         # -- 3) hints (generic + FA extras)
