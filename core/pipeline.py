@@ -180,11 +180,11 @@ class Pipeline:
     def answer(self, source: str, prefixes: Iterable[str], question: str,
                context_override: Dict[str, Any] | None = None,
                extra_hints: Dict[str, Any] | None = None,
-               auth_email: str | None = None) -> Dict[str, Any]:
+               *, force_clarify: bool = False) -> Dict[str, Any]:
         """
         End-to-end ask flow:
           1) Build/accept context
-          2) Clarification (policy + inline allowlist)
+          2) Clarification (policy + optional forced inline)
           3) Plan canonical SQL (generic+extra hints)
           4) Prefix rewrite
           5) Validate (EXPLAIN), research retry if enabled; otherwise needs_fix
@@ -193,26 +193,10 @@ class Pipeline:
         context = self.build_context_pack(source, prefixes, question)
         if context_override:
             context.update({k: v for k, v in context_override.items() if v is not None})
-        if auth_email:
-            context.setdefault("auth_email", auth_email)
 
         # -- 2) clarify
         need, clar_qs = self.clarifier.maybe_ask(question, context)
-        # Caller & policy gates for inline clarification
-        ask_mode = (self.settings.get("ASK_MODE", "metric_first") or "metric_first").lower()
-        enduser_can = bool(self.settings.get("ENDUSER_CAN_CLARIFY", False))
-        admin_immediate = set()
-        # tolerate old key name as well
-        for k in ("ADMINS_CAN_CLARIFY_IMMEDIATE", "ADMINS_CAN_CLARIFY_IMMIDIAT"):
-            v = self.settings.get(k)
-            if isinstance(v, str):
-                admin_immediate.update({x.strip() for x in v.split(",") if x.strip()})
-            elif isinstance(v, (list, tuple, set)):
-                admin_immediate.update({str(x).strip() for x in v})
-        allow_inline = enduser_can or (auth_email and str(auth_email).strip() in admin_immediate)
-        if need and allow_inline:
-            return {"status": "needs_clarification", "questions": clar_qs, "context": context}
-        if need and ask_mode == "always_ask":
+        if need and (force_clarify or self.settings.get("ASK_MODE", "metric_first") == "always_ask"):
             return {"status": "needs_clarification", "questions": clar_qs, "context": context}
 
         # -- 3) hints (generic + FA extras)
