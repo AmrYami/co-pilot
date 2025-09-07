@@ -190,11 +190,29 @@ def get_research_policy(settings) -> dict[str, bool]:
 def get_admin_emails(settings) -> list[str]:
     return [e.lower().strip() for e in _json_get(settings, KEY_ADMIN_EMAILS, []) if isinstance(e, str)]
 
+def _as_list(val) -> list[str]:
+    """Accept JSON list, Python list, or comma-separated string."""
+    if val is None:
+        return []
+    if isinstance(val, list):
+        return [str(x) for x in val]
+    if isinstance(val, str):
+        s = val.strip()
+        if not s:
+            return []
+        try:
+            j = json.loads(s)
+            if isinstance(j, list):
+                return [str(x) for x in j]
+        except Exception:
+            pass
+        return [p.strip() for p in s.split(",") if p.strip()]
+    return []
+
 def get_inline_clarify_allowlist(settings) -> set[str]:
-    # Support new name and legacy misspelling for backward-compat
-    cur = [e.lower().strip() for e in _json_get(settings, KEY_ADMINS_INLINE, []) if isinstance(e, str)]
-    legacy = [e.lower().strip() for e in _json_get(settings, KEY_ADMINS_INLINE_LEGACY, []) if isinstance(e, str)]
-    return set(cur or legacy)
+    """Lowercased email allowlist for inline clarifications."""
+    raw = settings.get(KEY_ADMINS_INLINE) or settings.get(KEY_ADMINS_INLINE_LEGACY)
+    return {e.lower() for e in _as_list(raw)}
 
 def get_mem_store_url(settings) -> str | None:
     """Return MEMORY_DB_URL (mem store). Env remains bootstrap fallback to reach mem_settings itself."""

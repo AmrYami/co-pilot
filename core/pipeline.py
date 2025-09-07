@@ -190,19 +190,22 @@ class Pipeline:
           5) Validate (EXPLAIN), research retry if enabled; otherwise needs_fix
         """
         # -- 1) context
-        context = context_override or self.build_context_pack(source, prefixes, question)
+        context = self.build_context_pack(source, prefixes, question)
+        if context_override:
+            context.update({k: v for k, v in context_override.items() if v is not None})
+        if auth_email:
+            context.setdefault("auth_email", auth_email)
 
         # -- 2) clarify
         need, clar_qs = self.clarifier.maybe_ask(question, context)
-        if need and self.settings.get("ASK_MODE", "metric_first") == "always_ask":
-            allow_inline = False
-            if auth_email:
-                allow_inline = auth_email.lower() in set(get_inline_clarify_allowlist(self.settings))
+        if need:
+            email = (context.get("auth_email") or "").lower()
+            allow_inline = email in get_inline_clarify_allowlist(self.settings)
             if allow_inline:
                 return {
                     "status": "needs_clarification_inline",
-                    "questions": clar_qs,
-                    "context": context,
+                    "question": clar_qs[0] if clar_qs else "",
+                    "allowed": True,
                 }
             return {"status": "needs_clarification", "questions": clar_qs, "context": context}
 
