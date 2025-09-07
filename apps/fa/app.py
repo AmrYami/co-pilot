@@ -162,24 +162,45 @@ def answer():
 
     ctx_override = {"datasources": datasources}
 
-    # 1) Try to answer
+    # Decide inline clarification policy
+    def _as_list(x):
+        if x is None:
+            return []
+        if isinstance(x, list):
+            return [str(v).strip().lower() for v in x if str(v).strip()]
+        if isinstance(x, str):
+            return [v.strip().lower() for v in x.split(",") if v.strip()]
+        return [str(x).strip().lower()]
+
+    inline_admins = _as_list(s.get("ADMINS_CAN_CLARIFY_IMMEDIATE") or [])
+    enduser_can = bool(s.get("ENDUSER_CAN_CLARIFY", False))
+    allow_inline = enduser_can or (auth_email and auth_email.strip().lower() in inline_admins)
+
+    # 1) Try to answer (force inline questions when allowed)
     result = pipeline.answer(
         source="fa",
         prefixes=prefixes,
         question=question,
         context_override=ctx_override,
-        auth_email=auth_email,
+        extra_hints=None,
+        force_clarify=allow_inline,
     )
 
-    # 2) Decide the user-facing status
-    if result.get("status") == "ok":
-        status = "answered"
-    elif result.get("status") == "needs_clarification":
-        status = "needs_clarification"
+    # 2) Compute effective status we will persist
+    rstat = result.get("status")
+    if rstat == "ok":
+        effective_status = "answered"
+    elif rstat == "needs_clarification" and allow_inline:
+        effective_status = "needs_clarification"
     else:
-        status = "awaiting_admin"
+        effective_status = "awaiting_admin"
 
-    # 3) Create inquiry row
+    # Extract any research info the pipeline might have attached
+    rctx = (result.get("context") or {}).get("research") or {}
+    research_summary = rctx.get("summary")
+    source_ids = rctx.get("source_ids")
+
+    # 3) Create/record inquiry row
     try:
         inquiry_id = create_or_update_inquiry(
             current_app.config["MEM_ENGINE"],
@@ -189,25 +210,16 @@ def answer():
             auth_email=auth_email,
             run_id=None,
             research_enabled=bool(s.get("RESEARCH_MODE", False)),
-            status=status,
-            research_summary=None,
-            source_ids=None
+            status=effective_status,
+            research_summary=research_summary,
+            source_ids=source_ids,
         )
     except Exception as e:
-        # don't fail user response if audit insert fails
         inquiry_id = None
         result.setdefault("warnings", []).append(f"inquiry_log_failed: {e}")
 
-    # 4) Inline clarify path: return questions to caller (no email escalation)
-    if result.get("status") == "needs_clarification":
-        return jsonify({
-            "status": "needs_clarification",
-            "questions": result.get("questions", []),
-            "inquiry_id": inquiry_id
-        })
-
-    # 5) If we failed to produce final SQL AND no inline clarify, escalate to admins
-    if result.get("status") != "ok":
+    # 4) Only escalate to admins if we’re awaiting_admin
+    if effective_status == "awaiting_admin":
         try:
             admin_list = s.get("ALERTS_EMAILS") or s.get("ADMIN_EMAILS") or []
             if isinstance(admin_list, str):
@@ -222,7 +234,7 @@ def answer():
                     "answered_by": "admin@example.com",
                     "admin_reply": "Describe the measure, correct date column, joins & filters in words.",
                     "sql": "SELECT ...",  # optional; canonical or already-prefixed (SELECT/CTE only)
-                    "persist": { "rules": [], "mappings": [], "glossary": [] }
+                    "persist": {"rules": [], "mappings": [], "glossary": []},
                 }
 
                 subject = f"[Copilot] Clarification needed — {ns} — Inquiry #{inquiry_id or 'N/A'}"
@@ -242,29 +254,43 @@ def answer():
                 notify_admins_via_email(
                     subject=subject,
                     body_text=body,
-                    to_emails=admin_list
+                    to_emails=admin_list,
                 )
             else:
-                result.setdefault("warnings", []).append("ALERTS_EMAILS/ADMIN_EMAILS is empty; no admin email sent")
+                result.setdefault("warnings", []).append(
+                    "ALERTS_EMAILS/ADMIN_EMAILS is empty; no admin email sent"
+                )
         except Exception as e:
             result.setdefault("warnings", []).append(f"admin_email_failed: {e}")
 
-    # 6) Return minimal payload to end user (no questions)
-    if result.get("status") == "ok":
-        # you can include sql/rationale here if you want; leaving as is
-        return jsonify({
-            "status": "ok",
-            "sql": result.get("sql"),
-            "rationale": result.get("rationale"),
-            "inquiry_id": inquiry_id
-        })
+    # 5) Return to end user
+    if effective_status == "answered":
+        return jsonify(
+            {
+                "status": "ok",
+                "sql": result.get("sql"),
+                "rationale": result.get("rationale"),
+                "inquiry_id": inquiry_id,
+            }
+        )
 
-    # Waiting on admins
-    return jsonify({
-        "status": "awaiting_admin",
-        "message": "We’re preparing your data. Our admins will clarify and you’ll receive the result by email.",
-        "inquiry_id": inquiry_id
-    })
+    if effective_status == "needs_clarification":
+        return jsonify(
+            {
+                "status": "needs_clarification",
+                "questions": result.get("questions", []),
+                "inquiry_id": inquiry_id,
+            }
+        )
+
+    # (fallback) waiting on admins
+    return jsonify(
+        {
+            "status": "awaiting_admin",
+            "message": "We’re preparing your data. Our admins will clarify and you’ll receive the result by email.",
+            "inquiry_id": inquiry_id,
+        }
+    )
 
 @fa_bp.get("/metrics")
 def list_metrics():
