@@ -201,6 +201,7 @@ def answer():
     source_ids = rctx.get("source_ids")
 
     # 3) Create/record inquiry row
+    warnings = result.setdefault("warnings", [])
     try:
         inquiry_id = create_or_update_inquiry(
             current_app.config["MEM_ENGINE"],
@@ -216,7 +217,8 @@ def answer():
         )
     except Exception as e:
         inquiry_id = None
-        result.setdefault("warnings", []).append(f"inquiry_log_failed: {e}")
+        current_app.logger.exception("mem_inquiries insert failed")
+        warnings.append(f"inquiry_log_failed: {e!s}")
 
     # 4) Only escalate to admins if we’re awaiting_admin
     if effective_status == "awaiting_admin":
@@ -257,40 +259,37 @@ def answer():
                     to_emails=admin_list,
                 )
             else:
-                result.setdefault("warnings", []).append(
+                warnings.append(
                     "ALERTS_EMAILS/ADMIN_EMAILS is empty; no admin email sent"
                 )
         except Exception as e:
-            result.setdefault("warnings", []).append(f"admin_email_failed: {e}")
+            warnings.append(f"admin_email_failed: {e}")
 
     # 5) Return to end user
     if effective_status == "answered":
-        return jsonify(
-            {
-                "status": "ok",
-                "sql": result.get("sql"),
-                "rationale": result.get("rationale"),
-                "inquiry_id": inquiry_id,
-            }
-        )
+        return jsonify({
+            "status": "ok",
+            "sql": result.get("sql"),
+            "rationale": result.get("rationale"),
+            "inquiry_id": inquiry_id,
+            **({"warnings": warnings} if warnings else {})
+        })
 
     if effective_status == "needs_clarification":
-        return jsonify(
-            {
-                "status": "needs_clarification",
-                "questions": result.get("questions", []),
-                "inquiry_id": inquiry_id,
-            }
-        )
+        return jsonify({
+            "status": "needs_clarification",
+            "questions": result.get("questions", []),
+            "inquiry_id": inquiry_id,
+            **({"warnings": warnings} if warnings else {})
+        })
 
     # (fallback) waiting on admins
-    return jsonify(
-        {
-            "status": "awaiting_admin",
-            "message": "We’re preparing your data. Our admins will clarify and you’ll receive the result by email.",
-            "inquiry_id": inquiry_id,
-        }
-    )
+    return jsonify({
+        "status": "awaiting_admin",
+        "message": "We’re preparing your data. Our admins will clarify and you’ll receive the result by email.",
+        "inquiry_id": inquiry_id,
+        **({"warnings": warnings} if warnings else {})
+    })
 
 @fa_bp.get("/metrics")
 def list_metrics():
