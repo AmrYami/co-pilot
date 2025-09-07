@@ -160,7 +160,7 @@ def answer():
     if isinstance(pipeline.settings, Settings) and prefixes:
         pipeline.settings.set_namespace(f"fa::{prefixes[0]}")
 
-    ctx_override = {"datasources": datasources, "auth_email": auth_email}
+    ctx_override = {"datasources": datasources}
 
     # 1) Try to answer
     result = pipeline.answer(
@@ -168,14 +168,16 @@ def answer():
         prefixes=prefixes,
         question=question,
         context_override=ctx_override,
-        auth_email=auth_email
+        auth_email=auth_email,
     )
 
-    if result.get("status") == "needs_clarification_inline":
-        return jsonify(result)
-
     # 2) Decide the user-facing status
-    status = "answered" if result.get("status") == "ok" else "awaiting_admin"
+    if result.get("status") == "ok":
+        status = "answered"
+    elif result.get("status") == "needs_clarification":
+        status = "needs_clarification"
+    else:
+        status = "awaiting_admin"
 
     # 3) Create inquiry row
     try:
@@ -187,7 +189,7 @@ def answer():
             auth_email=auth_email,
             run_id=None,
             research_enabled=bool(s.get("RESEARCH_MODE", False)),
-            status=("answered" if result.get("status") == "ok" else "awaiting_admin"),
+            status=status,
             research_summary=None,
             source_ids=None
         )
@@ -196,7 +198,15 @@ def answer():
         inquiry_id = None
         result.setdefault("warnings", []).append(f"inquiry_log_failed: {e}")
 
-    # 4) If we failed to produce final SQL, escalate to admins immediately
+    # 4) Inline clarify path: return questions to caller (no email escalation)
+    if result.get("status") == "needs_clarification":
+        return jsonify({
+            "status": "needs_clarification",
+            "questions": result.get("questions", []),
+            "inquiry_id": inquiry_id
+        })
+
+    # 5) If we failed to produce final SQL AND no inline clarify, escalate to admins
     if result.get("status") != "ok":
         try:
             admin_list = s.get("ALERTS_EMAILS") or s.get("ADMIN_EMAILS") or []
@@ -239,7 +249,7 @@ def answer():
         except Exception as e:
             result.setdefault("warnings", []).append(f"admin_email_failed: {e}")
 
-    # 5) Return minimal payload to end user (no questions)
+    # 6) Return minimal payload to end user (no questions)
     if result.get("status") == "ok":
         # you can include sql/rationale here if you want; leaving as is
         return jsonify({
