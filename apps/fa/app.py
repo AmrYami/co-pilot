@@ -147,7 +147,7 @@ from apps.fa.hints import make_fa_hints
 
 @fa_bp.post("/answer")
 def answer():
-    data = request.get_json(force=True)
+    data = request.get_json(force=True) or {}
     prefixes = data.get("prefixes", [])
     question = (data.get("question") or "").strip()
     datasources = data.get("datasources") or None
@@ -160,13 +160,19 @@ def answer():
     if isinstance(pipeline.settings, Settings) and prefixes:
         pipeline.settings.set_namespace(f"fa::{prefixes[0]}")
 
+    ctx_override = {"datasources": datasources, "auth_email": auth_email}
+
     # 1) Try to answer
     result = pipeline.answer(
         source="fa",
         prefixes=prefixes,
         question=question,
+        context_override=ctx_override,
         auth_email=auth_email
     )
+
+    if result.get("status") == "needs_clarification_inline":
+        return jsonify(result)
 
     # 2) Decide the user-facing status
     status = "answered" if result.get("status") == "ok" else "awaiting_admin"
