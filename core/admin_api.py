@@ -296,9 +296,9 @@ def admin_reply_inquiry(inq_id: int):
 
     mem = current_app.config["MEM_ENGINE"]
     pipeline = current_app.config["PIPELINE"]
-    fa_engine = pipeline.fa_engine
-    if not fa_engine:
-        return jsonify({"error": "FA DB not configured"}), 500
+    app_engine = pipeline.app_engine
+    if not app_engine:
+        return jsonify({"error": "APP DB not configured"}), 500
 
     # Load inquiry
     with mem.connect() as con:
@@ -332,7 +332,7 @@ def admin_reply_inquiry(inq_id: int):
 
     # Validate with EXPLAIN
     try:
-        with fa_engine.connect() as c:
+        with app_engine.connect() as c:
             c.execute(text(f"EXPLAIN {sql_strip}"))
     except Exception as e:
         # Keep awaiting_admin and notify admins why it failed
@@ -342,7 +342,7 @@ def admin_reply_inquiry(inq_id: int):
 
     # Execute and build CSV (no LIMIT here; add one if you want to cap size)
     try:
-        with fa_engine.connect() as c:
+        with app_engine.connect() as c:
             rs = c.execute(text(sql_strip))
             cols = list(rs.keys())
             sio = StringIO()

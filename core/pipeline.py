@@ -16,12 +16,13 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple, Callable
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
+import importlib
 from core.agents import ClarifierAgent, PlannerAgent, ValidatorAgent
 from core.model_loader import load_model, load_clarifier_model
 from core.intent import IntentRouter
-from core.settings import Settings, get_research_policy
+from core.settings import Settings
 from core.research import build_researcher
-from core.datasources import SqlRouter
+from core.sql_exec import get_app_engine
 
 from types import SimpleNamespace
 
@@ -62,17 +63,12 @@ class Pipeline:
         except Exception:
             pass
 
-        self.fa_engine: Optional[Engine] = (
-            self._make_engine(self.cfg.fa_db_url, pool_name="fa")
-            if self.cfg.fa_db_url else None
-        )
+        self.app_engine = get_app_engine(self.settings, namespace=namespace)
 
         # 2) Load the LLM
         self.llm = load_model(self.settings)
         self.clarifier_llm = load_clarifier_model(self.settings)
         self.intent_router = IntentRouter(self.clarifier_llm)
-        # SQL router for multi-DB support
-        self.sql_router = SqlRouter(self.settings)
 
         if isinstance(self.llm, dict):
             self.llm = SimpleNamespace(**self.llm)
@@ -80,17 +76,18 @@ class Pipeline:
         import re as _re
         self._prefix_re = _re.compile(self.cfg.prefix_regex)
 
-        # 4) Agents: try FA, else fall back to core
-        try:
-            from apps.fa.agents import ClarifierAgentFA, PlannerAgentFA, ValidatorAgentFA
-            self.clarifier = ClarifierAgentFA(self.llm, self.settings)
-            self.planner = PlannerAgentFA(self.llm, self.settings)
-            self.validator = ValidatorAgentFA(self.fa_engine, self.settings)  # <— pass settings
-        except Exception:
-            from core.agents import ClarifierAgent, PlannerAgent, ValidatorAgent
-            self.clarifier = ClarifierAgent(self.llm)
-            self.planner = PlannerAgent(self.llm)
-            self.validator = ValidatorAgent(self.fa_engine, self.settings)
+        # 4) Dynamic app adapter (default: 'fa')
+        active_app = (self.settings.get("ACTIVE_APP", namespace=namespace) or "fa").strip()
+        modname = f"apps.{active_app}.agents"
+        mod = importlib.import_module(modname)
+        if hasattr(mod, "get_planner"):
+            self.planner = mod.get_planner(self.llm, self.settings)
+        else:
+            self.planner = getattr(mod, "FAPlanner")(self.llm, self.settings)
+        ClarifierCls = getattr(mod, "ClarifierAgentFA", ClarifierAgent)
+        ValidatorCls = getattr(mod, "ValidatorAgentFA", ValidatorAgent)
+        self.clarifier = ClarifierCls(self.llm, self.settings)
+        self.validator = ValidatorCls(self.app_engine, self.settings)
 
         # 5) Researcher: load after engines & settings are ready
         self._ensure_researcher_loaded()
@@ -142,14 +139,14 @@ class Pipeline:
         """
         if source != "fa":
             raise ValueError("Unknown source; only 'fa' is supported right now")
-        if not self.fa_engine:
-            raise RuntimeError("FA DB URL not configured")
+        if not self.app_engine:
+            raise RuntimeError("APP_DB_URL not configured")
 
         # local import keeps core reusable
         from apps.fa.ingestor import FASchemaIngestor
 
         ing = FASchemaIngestor(
-            fa_engine=self.fa_engine,
+            fa_engine=self.app_engine,
             mem_engine=self.mem_engine,
             prefix_regex=self.cfg.prefix_regex,
             sample_rows_per_table=self.cfg.sample_rows_per_table,
@@ -186,15 +183,12 @@ class Pipeline:
 
     # -- end-to-end answer
     # core/pipeline.py (inside Pipeline)
-    def answer(self, source: str, prefixes: Iterable[str], question: str,
-               context_override: Dict[str, Any] | None = None,
-               extra_hints: Dict[str, Any] | None = None,
-               *, force_clarify: bool = False) -> Dict[str, Any]:
+    def answer(self, question: str, context: Dict[str, Any], hints: Dict[str, Any] | None = None) -> Dict[str, Any]:
         """
         End-to-end ask flow:
           1) Intent classification
-          2) Build/accept context
-          3) Clarification (policy + optional forced inline)
+          2) Build context for provided prefixes
+          3) Clarification per policy
           4) Plan canonical SQL (generic+extra hints)
           5) Prefix rewrite
           6) Validate (EXPLAIN), research retry if enabled; otherwise needs_fix
@@ -205,7 +199,7 @@ class Pipeline:
             return {
                 "status": "ok",
                 "intent": intent.kind,
-                "message": self._render_help(None),
+                "message": self._render_help(context),
                 "is_sql": False,
             }
         if intent.kind == "admin_task":
@@ -216,23 +210,25 @@ class Pipeline:
                 "is_sql": False,
             }
 
+        prefixes = context.get("prefixes") or []
+
         # -- 1) context
-        context = self.build_context_pack(source, prefixes, question)
-        if context_override:
-            context.update({k: v for k, v in context_override.items() if v is not None})
+        ctx = self.build_context_pack("fa", prefixes, question)
+        if context:
+            ctx.update({k: v for k, v in context.items() if v is not None})
 
         # -- 2) clarify
-        need, clar_qs = self.clarifier.maybe_ask(question, context)
-        if need and (force_clarify or self.settings.get("ASK_MODE", "metric_first") == "always_ask"):
-            return {"status": "needs_clarification", "questions": clar_qs, "context": context, "intent": intent.kind, "is_sql": True}
+        need, clar_qs = self.clarifier.maybe_ask(question, ctx)
+        if need and self.settings.get("ASK_MODE", "metric_first") == "always_ask":
+            return {"status": "needs_clarification", "questions": clar_qs, "context": ctx, "intent": intent.kind, "is_sql": True}
 
-        # -- 3) hints (generic + FA extras)
+        # -- 3) hints (generic + extras)
         from core.hints import make_hints as _gen_hints
-        hints = _gen_hints(question) or {}
-        if extra_hints:
-            hints.update(extra_hints)
+        gh = _gen_hints(question) or {}
+        if hints:
+            gh.update(hints)
 
-        canonical_sql, rationale = self.planner.plan(question, context, hints=hints)
+        canonical_sql, rationale = self.planner.plan(question, ctx, hints=gh)
 
         # -- 4) rewrite
         sql = SQLRewriter.rewrite_for_prefixes(canonical_sql, prefixes)
@@ -242,18 +238,15 @@ class Pipeline:
         if not ok:
             # refresh researcher per settings each call
             self._ensure_researcher_loaded()
-            if bool(self.settings.get("RESEARCH_MODE", False)) and self.researcher:
-                policy = get_research_policy(self.settings)
-                ds_name = self.sql_router.list().get("default")
-                if not (ds_name and policy and policy.get(ds_name) is False):
-                    summary, source_ids = self.researcher.search(question, context)
-                    context.setdefault("research", {})
-                    context["research"]["summary"] = summary
-                    context["research"]["source_ids"] = source_ids
+            if self.settings.research_enabled(self.namespace) and self.researcher:
+                summary, source_ids = self.researcher.search(question, ctx)
+                ctx.setdefault("research", {})
+                ctx["research"]["summary"] = summary
+                ctx["research"]["source_ids"] = source_ids
 
-                    canonical_sql, rationale = self.planner.plan(question, context, hints=hints)
-                    sql = SQLRewriter.rewrite_for_prefixes(canonical_sql, prefixes)
-                    ok, info = self.validator.quick_validate(sql)
+                canonical_sql, rationale = self.planner.plan(question, ctx, hints=gh)
+                sql = SQLRewriter.rewrite_for_prefixes(canonical_sql, prefixes)
+                ok, info = self.validator.quick_validate(sql)
 
         if not ok:
             return {
@@ -261,12 +254,12 @@ class Pipeline:
                 "sql": sql,
                 "rationale": rationale,
                 "validation": info,
-                "context": context,
+                "context": ctx,
                 "intent": intent.kind,
                 "is_sql": True,
             }
 
-        return {"status": "ok", "sql": sql, "rationale": rationale, "context": context, "intent": intent.kind, "is_sql": True}
+        return {"status": "ok", "sql": sql, "rationale": rationale, "context": ctx, "intent": intent.kind, "is_sql": True}
 
     # ------------------ internals ------------------
     def _load_cfg(self, s: Any | None) -> PipelineConfig:

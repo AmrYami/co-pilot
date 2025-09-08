@@ -1,12 +1,26 @@
 # core/sql_exec.py
 from __future__ import annotations
 from typing import Any, Dict, Optional, Tuple
-from sqlalchemy import text
+from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 import re, csv
 from io import StringIO
 
 SAFE_SQL_RE = re.compile(r"(?is)^\s*(with|select)\b")
+
+_ENGINES: Dict[str, Engine] = {}
+
+
+def get_app_engine(settings, namespace: str) -> Engine:
+    url = settings.get_app_db_url(namespace=namespace)
+    if not url:
+        raise RuntimeError("APP_DB_URL not configured")
+    key = f"{namespace}::{url}"
+    if key in _ENGINES:
+        return _ENGINES[key]
+    eng = create_engine(url, pool_pre_ping=True, pool_recycle=3600)
+    _ENGINES[key] = eng
+    return eng
 
 def validate_select(sql: str) -> Tuple[bool, str]:
     s = sql.strip().lstrip("(")

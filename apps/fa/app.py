@@ -78,7 +78,7 @@ def run_query():
         pipeline.settings.set_namespace(f"fa::{prefixes[0]}")
 
     if not sql_in:
-        plan = pipeline.answer(source="fa", prefixes=prefixes, question=question)
+        plan = pipeline.answer(question=question, context={"prefixes": prefixes, "auth_email": auth_email}, hints=None)
         if plan.get("status") != "ok":
             return jsonify({"error": "planning_failed", "detail": plan}), 400
         sql_in = plan["sql"]
@@ -90,13 +90,13 @@ def run_query():
     if not ok:
         return jsonify({"error": msg}), 400
 
-    fa_engine = pipeline.fa_engine
-    if not fa_engine:
-        return jsonify({"error": "FA DB not configured"}), 500
+    app_engine = pipeline.app_engine
+    if not app_engine:
+        return jsonify({"error": "APP DB not configured"}), 500
 
     try:
-        explain(fa_engine, sql_exec)
-        result = run_select(fa_engine, sql_exec, limit=limit)
+        explain(app_engine, sql_exec)
+        result = run_select(app_engine, sql_exec, limit=limit)
     except Exception as e:
         return jsonify({"error": str(e)}), 400
 
@@ -150,7 +150,7 @@ def answer():
     data = request.get_json(force=True) or {}
     prefixes = data.get("prefixes", [])
     question = (data.get("question") or "").strip()
-    datasources = data.get("datasources") or None
+    datasources = data.get("datasources") or None  # legacy; ignored
     auth_email = data.get("auth_email") or current_app.config["SETTINGS"].get("AUTH_EMAIL")
 
     pipeline: Pipeline = current_app.config["PIPELINE"]
@@ -160,44 +160,21 @@ def answer():
     if isinstance(pipeline.settings, Settings) and prefixes:
         pipeline.settings.set_namespace(f"fa::{prefixes[0]}")
 
-    ctx_override = {"datasources": datasources}
+    hints = make_fa_hints(data)
+    result = pipeline.answer(question=question, context={"prefixes": prefixes, "auth_email": auth_email}, hints=hints)
 
-    # Decide inline clarification policy
-    def _as_list(x):
-        if x is None:
-            return []
-        if isinstance(x, list):
-            return [str(v).strip().lower() for v in x if str(v).strip()]
-        if isinstance(x, str):
-            return [v.strip().lower() for v in x.split(",") if v.strip()]
-        return [str(x).strip().lower()]
-
-    inline_admins = _as_list(s.get("ADMINS_CAN_CLARIFY_IMMEDIATE") or [])
-    enduser_can = bool(s.get("ENDUSER_CAN_CLARIFY", False))
-    allow_inline = enduser_can or (auth_email and auth_email.strip().lower() in inline_admins)
-
-    # 1) Try to answer (force inline questions when allowed)
-    result = pipeline.answer(
-        source="fa",
-        prefixes=prefixes,
-        question=question,
-        context_override=ctx_override,
-        extra_hints=None,
-        force_clarify=allow_inline,
-    )
-
-    if result.get("is_sql") is False and result.get("status") == "ok":
+    if result.get("is_sql") is False and result.get("status") == "ok" and result.get("message"):
         return jsonify({
             "status": "ok",
-            "intent": result.get("intent"),
-            "message": result.get("message"),
+            "intent": result.get("intent", "smalltalk"),
+            "message": result["message"],
         })
 
     # 2) Compute effective status we will persist
     rstat = result.get("status")
     if rstat == "ok":
         effective_status = "answered"
-    elif rstat == "needs_clarification" and allow_inline:
+    elif rstat == "needs_clarification":
         effective_status = "needs_clarification"
     else:
         effective_status = "awaiting_admin"
