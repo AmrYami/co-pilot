@@ -186,6 +186,13 @@ def answer():
         force_clarify=allow_inline,
     )
 
+    if result.get("is_sql") is False and result.get("status") == "ok":
+        return jsonify({
+            "status": "ok",
+            "intent": result.get("intent"),
+            "message": result.get("message"),
+        })
+
     # 2) Compute effective status we will persist
     rstat = result.get("status")
     if rstat == "ok":
