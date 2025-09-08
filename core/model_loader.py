@@ -531,3 +531,29 @@ def _first_token_id(tok: Any, stop: Optional[Iterable[str]]) -> Optional[int]:
         return tok.convert_tokens_to_ids(s0)
     except Exception:
         return None
+
+
+def load_clarifier_model(settings: Any | None = None) -> "ModelHandle | None":
+    """
+    Optional small assistant model (e.g., Meta-Llama-3.1-8B-Instruct) for
+    fast intent classification / short clarifications. If not configured,
+    returns None and the system will use rules only.
+    """
+    s = _SettingsShim(settings)
+    path = s.get("CLARIFIER_MODEL_PATH")
+    if not path:
+        return None
+    backend = (s.get("CLARIFIER_MODEL_BACKEND", "hf-4bit") or "hf-4bit").lower()
+    os.environ.setdefault("GENERATION_MAX_NEW_TOKENS", "32")
+    try:
+        if backend in {"hf-fp16", "hf-8bit", "hf-4bit"}:
+            return _load_hf(path, backend, int(s.get("MODEL_MAX_SEQ_LEN", "4096") or 4096), {
+                "max_new_tokens": 32, "temperature": 0.0, "top_p": 1.0, "stop": ['\n']
+            }, s)
+        if backend == "exllama":
+            return _load_exllama(path, int(s.get("MODEL_MAX_SEQ_LEN", "4096") or 4096), {
+                "max_new_tokens": 32, "temperature": 0.0, "top_p": 1.0, "stop": ['\n']
+            }, s)
+    except Exception as e:
+        print(f"[clarifier] failed to load {backend} at {path}: {e}")
+    return None

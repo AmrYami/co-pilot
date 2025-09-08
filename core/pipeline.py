@@ -17,7 +17,8 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
 from core.agents import ClarifierAgent, PlannerAgent, ValidatorAgent
-from core.model_loader import load_model
+from core.model_loader import load_model, load_clarifier_model
+from core.intent import IntentRouter
 from core.settings import Settings, get_research_policy
 from core.research import build_researcher
 from core.datasources import SqlRouter
@@ -68,6 +69,8 @@ class Pipeline:
 
         # 2) Load the LLM
         self.llm = load_model(self.settings)
+        self.clarifier_llm = load_clarifier_model(self.settings)
+        self.intent_router = IntentRouter(self.clarifier_llm)
         # SQL router for multi-DB support
         self.sql_router = SqlRouter(self.settings)
 
@@ -126,6 +129,12 @@ class Pipeline:
         except Exception:
             return None
 
+    def _render_help(self, context: Dict[str, Any] | None = None) -> str:
+        return (
+            "\ud83d\udc4b Hi! I can help answer data questions. "
+            "Try asking: 'top 10 customers by sales last month' or 'إجمالي المبيعات في يناير'."
+        )
+
     # ------------------ public API ------------------
     def ensure_ingested(self, source: str, prefixes: Iterable[str], fa_version: Optional[str] = None) -> Dict[str, int]:
         """Ensure metadata for given prefixes exists/updated. Returns {prefix: snapshot_id}.
@@ -183,12 +192,30 @@ class Pipeline:
                *, force_clarify: bool = False) -> Dict[str, Any]:
         """
         End-to-end ask flow:
-          1) Build/accept context
-          2) Clarification (policy + optional forced inline)
-          3) Plan canonical SQL (generic+extra hints)
-          4) Prefix rewrite
-          5) Validate (EXPLAIN), research retry if enabled; otherwise needs_fix
+          1) Intent classification
+          2) Build/accept context
+          3) Clarification (policy + optional forced inline)
+          4) Plan canonical SQL (generic+extra hints)
+          5) Prefix rewrite
+          6) Validate (EXPLAIN), research retry if enabled; otherwise needs_fix
         """
+        # -- 0) intent classification
+        intent = self.intent_router.classify(question or "")
+        if intent.kind in {"smalltalk", "help"}:
+            return {
+                "status": "ok",
+                "intent": intent.kind,
+                "message": self._render_help(None),
+                "is_sql": False,
+            }
+        if intent.kind == "admin_task":
+            return {
+                "status": "ok",
+                "intent": "admin_task",
+                "message": "This looks like an admin request. Try /admin endpoints or specify the action.",
+                "is_sql": False,
+            }
+
         # -- 1) context
         context = self.build_context_pack(source, prefixes, question)
         if context_override:
@@ -197,7 +224,7 @@ class Pipeline:
         # -- 2) clarify
         need, clar_qs = self.clarifier.maybe_ask(question, context)
         if need and (force_clarify or self.settings.get("ASK_MODE", "metric_first") == "always_ask"):
-            return {"status": "needs_clarification", "questions": clar_qs, "context": context}
+            return {"status": "needs_clarification", "questions": clar_qs, "context": context, "intent": intent.kind, "is_sql": True}
 
         # -- 3) hints (generic + FA extras)
         from core.hints import make_hints as _gen_hints
@@ -219,7 +246,6 @@ class Pipeline:
                 policy = get_research_policy(self.settings)
                 ds_name = self.sql_router.list().get("default")
                 if not (ds_name and policy and policy.get(ds_name) is False):
-                    # attempt one research-assisted replan
                     summary, source_ids = self.researcher.search(question, context)
                     context.setdefault("research", {})
                     context["research"]["summary"] = summary
@@ -230,16 +256,17 @@ class Pipeline:
                     ok, info = self.validator.quick_validate(sql)
 
         if not ok:
-            # only now, after research retry (if any), report needs_fix
             return {
                 "status": "needs_fix",
                 "sql": sql,
                 "rationale": rationale,
                 "validation": info,
-                "context": context
+                "context": context,
+                "intent": intent.kind,
+                "is_sql": True,
             }
 
-        return {"status": "ok", "sql": sql, "rationale": rationale, "context": context}
+        return {"status": "ok", "sql": sql, "rationale": rationale, "context": context, "intent": intent.kind, "is_sql": True}
 
     # ------------------ internals ------------------
     def _load_cfg(self, s: Any | None) -> PipelineConfig:
