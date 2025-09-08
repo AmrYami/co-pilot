@@ -24,17 +24,21 @@ Env keys (examples):
   LLM_GPU=0,1                             # GPU devices to use (comma separated)
   CUDA_VISIBLE_DEVICES=0,1                # Alternative GPU specification
 """
+
 from __future__ import annotations
 import os, time
 import torch
 from typing import Any, Callable, Dict, Iterable, Optional
 
 import threading
+
 _MODEL_CACHE: dict[tuple, "ModelHandle"] = {}
 _MODEL_LOCK = threading.Lock()
 
+
 class _SettingsShim:
     """Optional shim so we can read from a settings service; falls back to os.environ."""
+
     def __init__(self, settings: Any | None = None):
         self.settings = settings
 
@@ -105,8 +109,14 @@ def _check_cuda_compatibility() -> bool:
 
 
 class ModelHandle:
-    def __init__(self, backend: str, model: Any, tokenizer: Any, generate_fn: Callable[..., str],
-                 meta: Optional[Dict[str, Any]] = None):
+    def __init__(
+        self,
+        backend: str,
+        model: Any,
+        tokenizer: Any,
+        generate_fn: Callable[..., str],
+        meta: Optional[Dict[str, Any]] = None,
+    ):
         self.meta = meta or {}
         self.backend = backend
         self.model = model
@@ -148,7 +158,7 @@ def load_model(settings: Any | None = None) -> ModelHandle:
         raise ValueError(f"MODEL_PATH does not exist: {model_path}")
 
     max_seq_len = int(s.get("MODEL_MAX_SEQ_LEN", "4096") or 4096)
-    stop        = _parse_stop(s.get("STOP"))
+    stop = _parse_stop(s.get("STOP"))
     gen_defaults = {
         "max_new_tokens": int(s.get("GENERATION_MAX_NEW_TOKENS", "256") or 256),
         "temperature": float(s.get("GENERATION_TEMPERATURE", "0.2") or 0.2),
@@ -158,10 +168,17 @@ def load_model(settings: Any | None = None) -> ModelHandle:
 
     # Build a cache key that captures backend-critical knobs
     # (For EXL2, include base/dynamic and cache length knobs)
-    exl_force_base = (os.getenv("EXL2_FORCE_BASE", "0").strip().lower() in {"1","true","yes","y"})
-    exl_cache_len  = int(os.getenv("EXL2_CACHE_MAX_SEQ_LEN", str(max_seq_len)) or max_seq_len)
-    llm_gpu_vis    = os.getenv("CUDA_VISIBLE_DEVICES") or os.getenv("LLM_GPU") or ""
-    gpu_split_env  = (os.getenv("GPU_SPLIT") or "").strip()
+    exl_force_base = os.getenv("EXL2_FORCE_BASE", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "y",
+    }
+    exl_cache_len = int(
+        os.getenv("EXL2_CACHE_MAX_SEQ_LEN", str(max_seq_len)) or max_seq_len
+    )
+    llm_gpu_vis = os.getenv("CUDA_VISIBLE_DEVICES") or os.getenv("LLM_GPU") or ""
+    gpu_split_env = (os.getenv("GPU_SPLIT") or "").strip()
 
     reserve_gb_key = (os.getenv("RESERVE_VRAM_GB") or "").strip()
 
@@ -198,10 +215,56 @@ def load_model(settings: Any | None = None) -> ModelHandle:
 
 
 # ------------------------------
+# Clarifier model loader
+# ------------------------------
+
+
+def load_clarifier_model(settings: Any | None = None) -> ModelHandle:
+    """ENV-only loader for a small clarifier/chat model.
+    Falls back to the primary LLM if CLARIFIER_* envs are missing."""
+    s = _SettingsShim(settings)
+    be = (os.getenv("CLARIFIER_MODEL_BACKEND") or "").strip().lower()
+    mp = (os.getenv("CLARIFIER_MODEL_PATH") or "").strip()
+    if not be or not mp:
+        return load_model(settings)
+
+    key = (
+        "clarifier",
+        be,
+        os.path.abspath(mp),
+        os.getenv("CUDA_VISIBLE_DEVICES") or "",
+    )
+    with _MODEL_LOCK:
+        mh = _MODEL_CACHE.get(key)
+        if mh is not None:
+            return mh
+
+        max_seq_len = int(s.get("MODEL_MAX_SEQ_LEN", "4096") or 4096)
+        gen_defaults = {
+            "max_new_tokens": 64,
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "stop": None,
+        }
+        if be == "exllama":
+            mh = _load_exllama(mp, max_seq_len, gen_defaults, s)
+        elif be in {"hf-fp16", "hf-8bit", "hf-4bit"}:
+            mh = _load_hf(mp, be, max_seq_len, gen_defaults, s)
+        else:
+            mh = load_model(settings)
+
+        _MODEL_CACHE[key] = mh
+        return mh
+
+
+# ------------------------------
 # Backends
 # ------------------------------
 
-def _load_exllama(model_path: str, max_seq_len: int, gen_defaults: Dict[str, Any], s: _SettingsShim) -> ModelHandle:
+
+def _load_exllama(
+    model_path: str, max_seq_len: int, gen_defaults: Dict[str, Any], s: _SettingsShim
+) -> ModelHandle:
     """Load ExLlamaV2 with robust autosplit/manual split, lazy cache, and Dynamic→Base fallback."""
 
     import os, time
@@ -210,22 +273,33 @@ def _load_exllama(model_path: str, max_seq_len: int, gen_defaults: Dict[str, Any
     # ---------- Imports ----------
     try:
         print("Importing ExLlamaV2...")
-        from exllamav2 import ExLlamaV2Config, ExLlamaV2, ExLlamaV2Tokenizer, ExLlamaV2Cache
+        from exllamav2 import (
+            ExLlamaV2Config,
+            ExLlamaV2,
+            ExLlamaV2Tokenizer,
+            ExLlamaV2Cache,
+        )
         from exllamav2.generator import ExLlamaV2Sampler
+
         print("ExLlamaV2 imported successfully")
     except Exception as e:
         raise RuntimeError(
-            "ExLlamaV2 import failed (JIT/toolchain likely). "
-            f"Original error: {e}"
+            "ExLlamaV2 import failed (JIT/toolchain likely). " f"Original error: {e}"
         )
 
     # ---------- Flags / policy ----------
-    force_base = str(os.getenv("EXL2_FORCE_BASE", "0")).lower() in {"1", "true", "yes", "y"}
+    force_base = str(os.getenv("EXL2_FORCE_BASE", "0")).lower() in {
+        "1",
+        "true",
+        "yes",
+        "y",
+    }
 
     # If we force Base, proactively disable use of flash-attn inside EXL2 load path
     if force_base:
         try:
             import exllamav2.attn as _attn
+
             _attn.has_flash_attn = False
             print("FlashAttention disabled for load (EXL2_FORCE_BASE=1)")
         except Exception:
@@ -235,6 +309,7 @@ def _load_exllama(model_path: str, max_seq_len: int, gen_defaults: Dict[str, Any
     if not force_base:
         try:
             from exllamav2.generator.dynamic import ExLlamaV2DynamicGenerator  # noqa
+
             dyn_available = True
             print("Dynamic generator available")
         except Exception as e:
@@ -301,7 +376,9 @@ def _load_exllama(model_path: str, max_seq_len: int, gen_defaults: Dict[str, Any
         t0 = time.time()
         if split_f:
             model.load(split_f, cache_f)
-            print(f"Model weights loaded with manual split={split_f} in {time.time() - t0:.2f}s")
+            print(
+                f"Model weights loaded with manual split={split_f} in {time.time() - t0:.2f}s"
+            )
         else:
             model.load_autosplit(cache_f, progress=True, reserve_vram=reserve)
             print(f"Model weights loaded (autosplit) in {time.time() - t0:.2f}s")
@@ -328,6 +405,7 @@ def _load_exllama(model_path: str, max_seq_len: int, gen_defaults: Dict[str, Any
         if flash_fail:
             try:
                 import exllamav2.attn as _attn
+
                 _attn.has_flash_attn = False
                 print("Disabled FlashAttention after failure; retrying load…")
             except Exception:
@@ -345,7 +423,6 @@ def _load_exllama(model_path: str, max_seq_len: int, gen_defaults: Dict[str, Any
         else:
             raise
 
-
     # ---------- Generator selection ----------
     gen_is_dynamic = False
     gen = None
@@ -354,6 +431,7 @@ def _load_exllama(model_path: str, max_seq_len: int, gen_defaults: Dict[str, Any
         try:
             print("Attempting Dynamic generator…")
             from exllamav2.generator.dynamic import ExLlamaV2DynamicGenerator
+
             gen = ExLlamaV2DynamicGenerator(model=model, tokenizer=tok, cache=cache)
             gen_is_dynamic = True
             print("Dynamic generator created successfully")
@@ -362,6 +440,7 @@ def _load_exllama(model_path: str, max_seq_len: int, gen_defaults: Dict[str, Any
 
     if gen is None:
         from exllamav2.generator.base import ExLlamaV2BaseGenerator
+
         gen = ExLlamaV2BaseGenerator(model=model, tokenizer=tok, cache=cache)
         print("Base generator created successfully")
 
@@ -383,7 +462,7 @@ def _load_exllama(model_path: str, max_seq_len: int, gen_defaults: Dict[str, Any
             except TypeError:
                 pass
             else:
-                for stop_tok in (args.get("stop") or []):
+                for stop_tok in args.get("stop") or []:
                     if stop_tok and stop_tok in text:
                         text = text.split(stop_tok, 1)[0]
                 return text
@@ -396,10 +475,12 @@ def _load_exllama(model_path: str, max_seq_len: int, gen_defaults: Dict[str, Any
             try:
                 out = gen.generate_simple(prompt, max_new, settings)
             except TypeError:
-                out = gen.generate_simple(prompt, settings=settings, max_new_tokens=max_new)
+                out = gen.generate_simple(
+                    prompt, settings=settings, max_new_tokens=max_new
+                )
 
         text = out[0] if isinstance(out, (tuple, list)) else out
-        for stop_tok in (args.get("stop") or []):
+        for stop_tok in args.get("stop") or []:
             if stop_tok and stop_tok in text:
                 text = text.split(stop_tok, 1)[0]
         return text
@@ -407,8 +488,10 @@ def _load_exllama(model_path: str, max_seq_len: int, gen_defaults: Dict[str, Any
     print("ExLlamaV2 model loaded successfully!")
     try:
         import exllamav2 as _exl
+
         exl_version = getattr(_exl, "__version__", "unknown")
         from exllamav2 import attn as _exl_attn
+
         flash_enabled = bool(getattr(_exl_attn, "has_flash_attn", False))
     except Exception:
         exl_version, flash_enabled = "unknown", False
@@ -418,7 +501,13 @@ def _load_exllama(model_path: str, max_seq_len: int, gen_defaults: Dict[str, Any
     if torch.cuda.is_available():
         for i in range(torch.cuda.device_count()):
             p = torch.cuda.get_device_properties(i)
-            gpu_info.append({"index": i, "name": p.name, "total_gib": round(p.total_memory / (1 << 30), 2)})
+            gpu_info.append(
+                {
+                    "index": i,
+                    "name": p.name,
+                    "total_gib": round(p.total_memory / (1 << 30), 2),
+                }
+            )
 
     meta = {
         "backend": "exllama",
@@ -454,7 +543,9 @@ def _load_hf(
     trust = _parse_bool(s.get("MODEL_TRUST_REMOTE_CODE", "true"), True)
 
     # dtype
-    dtype_str = (s.get("TORCH_DTYPE") or ("bfloat16" if torch.cuda.is_available() else "float32")).lower()
+    dtype_str = (
+        s.get("TORCH_DTYPE") or ("bfloat16" if torch.cuda.is_available() else "float32")
+    ).lower()
     if dtype_str == "float16":
         dtype = torch.float16
     elif dtype_str == "bfloat16":
@@ -504,7 +595,7 @@ def _load_hf(
             )
         text = tok.decode(out[0], skip_special_tokens=True)
         # fallback stop handling
-        for sseq in (args.get("stop") or []):
+        for sseq in args.get("stop") or []:
             if sseq and sseq in text:
                 text = text.split(sseq, 1)[0]
         return text
@@ -547,13 +638,30 @@ def load_clarifier_model(settings: Any | None = None) -> "ModelHandle | None":
     os.environ.setdefault("GENERATION_MAX_NEW_TOKENS", "32")
     try:
         if backend in {"hf-fp16", "hf-8bit", "hf-4bit"}:
-            return _load_hf(path, backend, int(s.get("MODEL_MAX_SEQ_LEN", "4096") or 4096), {
-                "max_new_tokens": 32, "temperature": 0.0, "top_p": 1.0, "stop": ['\n']
-            }, s)
+            return _load_hf(
+                path,
+                backend,
+                int(s.get("MODEL_MAX_SEQ_LEN", "4096") or 4096),
+                {
+                    "max_new_tokens": 32,
+                    "temperature": 0.0,
+                    "top_p": 1.0,
+                    "stop": ["\n"],
+                },
+                s,
+            )
         if backend == "exllama":
-            return _load_exllama(path, int(s.get("MODEL_MAX_SEQ_LEN", "4096") or 4096), {
-                "max_new_tokens": 32, "temperature": 0.0, "top_p": 1.0, "stop": ['\n']
-            }, s)
+            return _load_exllama(
+                path,
+                int(s.get("MODEL_MAX_SEQ_LEN", "4096") or 4096),
+                {
+                    "max_new_tokens": 32,
+                    "temperature": 0.0,
+                    "top_p": 1.0,
+                    "stop": ["\n"],
+                },
+                s,
+            )
     except Exception as e:
         print(f"[clarifier] failed to load {backend} at {path}: {e}")
     return None

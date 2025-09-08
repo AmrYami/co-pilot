@@ -19,6 +19,7 @@ Usage:
 Thread-safety: Settings is lightweight; instantiate per request or
 store one per process and call `set_namespace(...)` before use.
 """
+
 from __future__ import annotations
 
 import json, threading
@@ -26,10 +27,14 @@ from typing import Any, Dict, Optional
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 from dotenv import load_dotenv
+
 load_dotenv()
 
+
 class Settings:
-    def __init__(self, namespace: str = "default", mem_engine: Engine | None = None) -> None:
+    def __init__(
+        self, namespace: str = "default", mem_engine: Engine | None = None
+    ) -> None:
         self._namespace = namespace
         self._mem_engine = mem_engine
         self._runtime_overrides: Dict[str, Any] = {}
@@ -82,6 +87,7 @@ class Settings:
 
             # env
             from os import getenv
+
             env_val = getenv(key)
             if env_val is not None:
                 return env_val
@@ -143,15 +149,27 @@ class Settings:
             raw = raw.decode("utf-8", "ignore")
         try:
             # value is JSONB in DB; convert to python
-            parsed = raw if isinstance(raw, (dict, list, int, float, bool)) else json.loads(raw)
+            parsed = (
+                raw
+                if isinstance(raw, (dict, list, int, float, bool))
+                else json.loads(raw)
+            )
         except Exception:
             parsed = raw
 
-        entry = {"value": parsed, "value_type": r["value_type"], "is_secret": r["is_secret"], "scope": r["scope"], "scope_id": r["scope_id"]}
+        entry = {
+            "value": parsed,
+            "value_type": r["value_type"],
+            "is_secret": r["is_secret"],
+            "scope": r["scope"],
+            "scope_id": r["scope_id"],
+        }
         self._cache[cache_key] = entry
         return entry["value"]
 
-    def _cache_key(self, namespace: str, key: str, scope: str | None, scope_id: str | None) -> str:
+    def _cache_key(
+        self, namespace: str, key: str, scope: str | None, scope_id: str | None
+    ) -> str:
         return f"{namespace}|{scope or '*'}|{scope_id or '*'}|{key}"
 
     # Convenience: canonical single-DB accessor with safe fallbacks
@@ -166,6 +184,7 @@ class Settings:
                 return v
         # As a last resort, environment variables:
         import os
+
         return os.getenv("APP_DB_URL") or os.getenv("FA_DB_URL")
 
     def research_enabled(self, namespace: str | None = None) -> bool:
@@ -177,6 +196,24 @@ class Settings:
             return v
         return str(v).strip().lower() in {"1", "true", "yes", "y"}
 
+    def get_admin_emails(self) -> list[str]:
+        vals = (
+            self.get("ADMINS_CAN_CLARIFY_IMMEDIATE")
+            or self.get("ADMIN_EMAILS")
+            or self.get("ALERTS_EMAILS")
+        )
+        if isinstance(vals, list):
+            return vals
+        return []
+
+    def smtp_sanity(self) -> None:
+        sec = (self.get("SMTP_SECURITY") or "").lower().strip()
+        port = int(self.get("SMTP_PORT") or 0)
+        if sec == "ssl" and port == 587:
+            print(
+                "WARNING: SMTP_SECURITY=ssl usually uses port 465; 587 is typically starttls."
+            )
+
 
 # ---- Typed setting helpers & keys ----
 
@@ -184,17 +221,17 @@ class Settings:
 DEFAULT_APP = "fa"
 
 # ----- New keys (names exactly as you requested) -----
-KEY_DB_CONNECTIONS             = "DB_CONNECTIONS"           # list[{name,url,role?,default?}]
-KEY_DEFAULT_DATASOURCE         = "DEFAULT_DATASOURCE"       # "frontaccounting_bk"
-KEY_RESEARCH_POLICY            = "RESEARCH_POLICY"          # {name: bool}
-KEY_ACTIVE_APP                 = "ACTIVE_APP"               # "fa"
-KEY_AUTH_EMAIL                 = "AUTH_EMAIL"
-KEY_ADMIN_EMAILS               = "ADMIN_EMAILS"             # list[str]
-KEY_ADMINS_INLINE              = "ADMINS_CAN_CLARIFY_IMMEDIATE"  # list[str]
-KEY_ADMINS_INLINE_LEGACY       = "ADMINS_CAN_CLARIFY_IMMIDIAT"   # legacy misspelling
-KEY_SETTINGS_ADMIN_KEY_HASH    = "SETTINGS_ADMIN_KEY_HASH"  # PBKDF2/bcrypt hash (not raw)
-KEY_MEMORY_DB_URL              = "MEMORY_DB_URL"            # mem store URL
-KEY_FA_CATEGORY_MAP            = "FA_CATEGORY_MAP"          # app-specific (read by FA)
+KEY_DB_CONNECTIONS = "DB_CONNECTIONS"  # list[{name,url,role?,default?}]
+KEY_DEFAULT_DATASOURCE = "DEFAULT_DATASOURCE"  # "frontaccounting_bk"
+KEY_RESEARCH_POLICY = "RESEARCH_POLICY"  # {name: bool}
+KEY_ACTIVE_APP = "ACTIVE_APP"  # "fa"
+KEY_AUTH_EMAIL = "AUTH_EMAIL"
+KEY_ADMIN_EMAILS = "ADMIN_EMAILS"  # list[str]
+KEY_ADMINS_INLINE = "ADMINS_CAN_CLARIFY_IMMEDIATE"  # list[str]
+KEY_ADMINS_INLINE_LEGACY = "ADMINS_CAN_CLARIFY_IMMIDIAT"  # legacy misspelling
+KEY_SETTINGS_ADMIN_KEY_HASH = "SETTINGS_ADMIN_KEY_HASH"  # PBKDF2/bcrypt hash (not raw)
+KEY_MEMORY_DB_URL = "MEMORY_DB_URL"  # mem store URL
+KEY_FA_CATEGORY_MAP = "FA_CATEGORY_MAP"  # app-specific (read by FA)
 
 
 def _json_get(settings, key: str, default):
@@ -206,6 +243,7 @@ def _json_get(settings, key: str, default):
     except Exception:
         return default
 
+
 def get_db_connections(settings) -> list[dict]:
     """Return list of {name,url,role?,default?}. Fallback to env URLs on first boot."""
     arr = _json_get(settings, KEY_DB_CONNECTIONS, [])
@@ -216,19 +254,29 @@ def get_db_connections(settings) -> list[dict]:
     mem = settings.get("MEMORY_DB_URL")
     out = []
     if fa:
-        out.append({"name": "frontaccounting_bk", "url": fa, "role": "oltp", "default": True})
+        out.append(
+            {"name": "frontaccounting_bk", "url": fa, "role": "oltp", "default": True}
+        )
     if mem:
         out.append({"name": "memory", "url": mem, "role": "mem"})
     return out
 
+
 def get_default_datasource(settings) -> str | None:
     return settings.get(KEY_DEFAULT_DATASOURCE)
+
 
 def get_research_policy(settings) -> dict[str, bool]:
     return _json_get(settings, KEY_RESEARCH_POLICY, {})
 
+
 def get_admin_emails(settings) -> list[str]:
-    return [e.lower().strip() for e in _json_get(settings, KEY_ADMIN_EMAILS, []) if isinstance(e, str)]
+    return [
+        e.lower().strip()
+        for e in _json_get(settings, KEY_ADMIN_EMAILS, [])
+        if isinstance(e, str)
+    ]
+
 
 def _as_list(val) -> list[str]:
     """Accept JSON list, Python list, or comma-separated string."""
@@ -249,15 +297,17 @@ def _as_list(val) -> list[str]:
         return [p.strip() for p in s.split(",") if p.strip()]
     return []
 
+
 def get_inline_clarify_allowlist(settings) -> set[str]:
     """Lowercased email allowlist for inline clarifications."""
     raw = settings.get(KEY_ADMINS_INLINE) or settings.get(KEY_ADMINS_INLINE_LEGACY)
     return {e.lower() for e in _as_list(raw)}
 
+
 def get_mem_store_url(settings) -> str | None:
     """Return MEMORY_DB_URL (mem store). Env remains bootstrap fallback to reach mem_settings itself."""
     return settings.get(KEY_MEMORY_DB_URL) or settings.get("MEMORY_DB_URL")
 
+
 def get_active_app(settings) -> str:
     return settings.get(KEY_ACTIVE_APP) or "fa"
-
