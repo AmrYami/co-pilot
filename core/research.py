@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Tuple, Optional
 import importlib
 
-from .settings import Settings, get_research_policy
+from .settings import Settings
 
 class Researcher:
     def search(self, question: str, context: Dict[str, Any]) -> Tuple[str, List[int]]:
@@ -18,7 +18,7 @@ def _load_class(path: str):
 
 def build_researcher(settings) -> Optional[Any]:
     try:
-        if not bool(settings.get("RESEARCH_MODE", False)):
+        if not settings.research_enabled():
             return None
     except Exception:
         return None
@@ -42,15 +42,10 @@ def build_researcher(settings) -> Optional[Any]:
     return NullResearcher()
 
 
-def maybe_research(settings: Settings, question: str, datasource_name: str | None = None) -> str | None:
-    if not settings.get("RESEARCH_MODE"):
+def maybe_research(settings: Settings, question: str, namespace: str | None = None) -> str | None:
+    if not settings.research_enabled(namespace):
         return None
-    policy = get_research_policy(settings)
-    if datasource_name and policy:
-        if not policy.get(datasource_name, False):
-            return None
-    # load researcher class if provided
-    cls_path = settings.get("RESEARCHER_CLASS")
+    cls_path = settings.get("RESEARCHER_CLASS", namespace=namespace)
     if not cls_path:
         return None
     mod, _, cls = cls_path.rpartition(".")

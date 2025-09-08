@@ -176,3 +176,7 @@ class ValidatorAgentFA(CoreValidator):
 
 def expand_sql_for_prefixes(canonical_sql: str, prefixes: Iterable[str]) -> str:
     return union_for_prefixes(canonical_sql, prefixes)
+
+
+def get_planner(llm, settings):
+    return PlannerAgentFA(llm, settings)

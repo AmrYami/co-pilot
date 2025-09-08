@@ -56,17 +56,27 @@ class Settings:
         with self._lock:
             self._runtime_overrides.clear()
 
-    def get(self, key: str, default: Any | None = None, *, scope: str | None = None, scope_id: str | None = None) -> Any:
+    def get(
+        self,
+        key: str,
+        default: Any | None = None,
+        *,
+        scope: str | None = None,
+        scope_id: str | None = None,
+        namespace: str | None = None,
+    ) -> Any:
         """Get a setting by key with precedence runtime→DB→env→default.
         `scope` can be 'user' with a `scope_id` to fetch user-specific overrides.
+        `namespace` optionally overrides the active namespace for this lookup.
         """
         with self._lock:
+            ns = namespace or self._namespace
             # runtime
             if key in self._runtime_overrides:
                 return self._runtime_overrides[key]
 
             # DB
-            val = self._get_from_db(key, scope=scope, scope_id=scope_id)
+            val = self._get_from_db(key, scope=scope, scope_id=scope_id, namespace=ns)
             if val is not None:
                 return val
 
@@ -89,10 +99,17 @@ class Settings:
         return snap
 
     # ---------------- Internals ----------------
-    def _get_from_db(self, key: str, *, scope: str | None, scope_id: str | None) -> Any | None:
+    def _get_from_db(
+        self,
+        key: str,
+        *,
+        scope: str | None,
+        scope_id: str | None,
+        namespace: str,
+    ) -> Any | None:
         if not self._mem_engine:
             return None
-        cache_key = self._cache_key(key, scope, scope_id)
+        cache_key = self._cache_key(namespace, key, scope, scope_id)
         if cache_key in self._cache:
             entry = self._cache[cache_key]
             return entry["value"] if isinstance(entry, dict) else entry
@@ -111,7 +128,7 @@ class Settings:
             LIMIT 1
             """
         )
-        params = {"key": key, "ns": self._namespace, "scope_id": scope_id}
+        params = {"key": key, "ns": namespace, "scope_id": scope_id}
         try:
             with self._mem_engine.connect() as c:  # type: ignore[union-attr]
                 r = c.execute(sql, params).mappings().first()
@@ -134,8 +151,31 @@ class Settings:
         self._cache[cache_key] = entry
         return entry["value"]
 
-    def _cache_key(self, key: str, scope: str | None, scope_id: str | None) -> str:
-        return f"{self._namespace}|{scope or '*'}|{scope_id or '*'}|{key}"
+    def _cache_key(self, namespace: str, key: str, scope: str | None, scope_id: str | None) -> str:
+        return f"{namespace}|{scope or '*'}|{scope_id or '*'}|{key}"
+
+    # Convenience: canonical single-DB accessor with safe fallbacks
+    def get_app_db_url(self, namespace: str | None = None) -> str | None:
+        # Prefer DB-backed settings (mem_settings), else env. Canonical key:
+        #   APP_DB_URL  (namespace scope)
+        # Back-compat fallbacks:
+        #   FA_DB_URL   (namespace/global)
+        for key in ("APP_DB_URL", "FA_DB_URL"):
+            v = self.get(key, namespace=namespace)
+            if v:
+                return v
+        # As a last resort, environment variables:
+        import os
+        return os.getenv("APP_DB_URL") or os.getenv("FA_DB_URL")
+
+    def research_enabled(self, namespace: str | None = None) -> bool:
+        # Single boolean toggle, default False in prod, True in dev.
+        v = self.get("RESEARCH_MODE", namespace=namespace)
+        if v is None:
+            return False
+        if isinstance(v, bool):
+            return v
+        return str(v).strip().lower() in {"1", "true", "yes", "y"}
 
 
 # ---- Typed setting helpers & keys ----

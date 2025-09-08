@@ -51,7 +51,7 @@ def derive_sql_from_admin_reply(
     augmented_q = f"{question}\n\nADMIN HINTS: {admin_reply}".strip()
 
     # ---- Step 2: plan via pipeline (small note: returns canonical SQL + rationale)
-    plan_out = pipeline.answer(source=source, prefixes=prefixes, question=augmented_q)
+    plan_out = pipeline.answer(question=augmented_q, context={"prefixes": prefixes, "source": source}, hints=None)
 
     # If planner still needs clarification or failed, bubble that up unchanged
     if plan_out.get("status") != "ok":
