@@ -6,6 +6,7 @@ Core pipeline orchestration
 - Provides a light ContextPack builder
 - Scaffolds Clarifier / Planner / Validator agents (FA-specific if available)
 """
+
 from __future__ import annotations
 
 import json
@@ -29,6 +30,8 @@ from types import SimpleNamespace
 
 def _as_dicts(rows):
     return [dict(r) for r in rows]
+
+
 # ------------------ config ------------------
 @dataclass
 class PipelineConfig:
@@ -47,7 +50,11 @@ class Pipeline:
     def __init__(self, settings: Any | None = None, namespace: str = "default") -> None:
         # 0) fields used by other steps
         self._cache: Dict[str, Dict[str, Any]] = {}
-        self.settings = settings if isinstance(settings, Settings) else Settings(namespace=namespace)
+        self.settings = (
+            settings
+            if isinstance(settings, Settings)
+            else Settings(namespace=namespace)
+        )
         self.researcher = build_researcher(self.settings)
         self._researcher_class_path: str | None = None
         self._researcher_fingerprint = None
@@ -74,10 +81,13 @@ class Pipeline:
             self.llm = SimpleNamespace(**self.llm)
         # 3) Compile prefix regex
         import re as _re
+
         self._prefix_re = _re.compile(self.cfg.prefix_regex)
 
         # 4) Dynamic app adapter (default: 'fa')
-        active_app = (self.settings.get("ACTIVE_APP", namespace=namespace) or "fa").strip()
+        active_app = (
+            self.settings.get("ACTIVE_APP", namespace=namespace) or "fa"
+        ).strip()
         modname = f"apps.{active_app}.agents"
         mod = importlib.import_module(modname)
         if hasattr(mod, "get_planner"):
@@ -111,6 +121,7 @@ class Pipeline:
 
         # build via research factory (handles class/provider/mode)
         from core.research import build_researcher
+
         self.researcher = build_researcher(self.settings)
         self._researcher_fingerprint = desired_key
 
@@ -119,6 +130,7 @@ class Pipeline:
             return None
         try:
             import importlib
+
             mod_name, _, cls_name = class_path.rpartition(".")
             mod = importlib.import_module(mod_name)
             cls = getattr(mod, cls_name)
@@ -133,7 +145,9 @@ class Pipeline:
         )
 
     # ------------------ public API ------------------
-    def ensure_ingested(self, source: str, prefixes: Iterable[str], fa_version: Optional[str] = None) -> Dict[str, int]:
+    def ensure_ingested(
+        self, source: str, prefixes: Iterable[str], fa_version: Optional[str] = None
+    ) -> Dict[str, int]:
         """Ensure metadata for given prefixes exists/updated. Returns {prefix: snapshot_id}.
         For source=="fa", uses apps.fa.ingestor.FASchemaIngestor.
         """
@@ -156,7 +170,9 @@ class Pipeline:
         out: Dict[str, int] = {}
         for p in prefixes:
             if not self._prefix_re.match(p):
-                raise ValueError(f"Invalid prefix '{p}' per regex {self.cfg.prefix_regex}")
+                raise ValueError(
+                    f"Invalid prefix '{p}' per regex {self.cfg.prefix_regex}"
+                )
             out[p] = ing.ingest_prefix(p, fa_version=fa_version)
             # drop cache for this namespace so next context build reloads
             self._cache.pop(f"fa::{p}", None)
@@ -167,23 +183,29 @@ class Pipeline:
         source: str,
         prefixes: Iterable[str],
         query: str,
-        keyword_expander: Optional[Callable[[List[str]], List[str]]] = None
+        keyword_expander: Optional[Callable[[List[str]], List[str]]] = None,
     ) -> Dict[str, Any]:
         if source != "fa":
             raise ValueError("Unknown source; only 'fa' is supported right now")
         namespaces = [f"fa::{p}" for p in prefixes]
         ctx = ContextBuilder(
-            self.mem_engine, namespaces,
+            self.mem_engine,
+            namespaces,
             topk_tables=self.cfg.context_topk_tables,
             topk_columns=self.cfg.context_topk_columns,
             cache=self._cache,
-            keyword_expander=keyword_expander
+            keyword_expander=keyword_expander,
         )
         return ctx.build(query)
 
     # -- end-to-end answer
     # core/pipeline.py (inside Pipeline)
-    def answer(self, question: str, context: Dict[str, Any], hints: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    def answer(
+        self,
+        question: str,
+        context: Dict[str, Any],
+        hints: Dict[str, Any] | None = None,
+    ) -> Dict[str, Any]:
         """
         End-to-end ask flow:
           1) Intent classification
@@ -194,19 +216,16 @@ class Pipeline:
           6) Validate (EXPLAIN), research retry if enabled; otherwise needs_fix
         """
         # -- 0) intent classification
-        intent = self.intent_router.classify(question or "")
-        if intent.kind in {"smalltalk", "help"}:
+        it = self.intent_router.classify(question or "")
+        if it.kind in {"smalltalk", "help"}:
             return {
                 "status": "ok",
-                "intent": intent.kind,
-                "message": self._render_help(context),
-                "is_sql": False,
-            }
-        if intent.kind == "admin_task":
-            return {
-                "status": "ok",
-                "intent": "admin_task",
-                "message": "This looks like an admin request. Try /admin endpoints or specify the action.",
+                "intent": it.kind,
+                "message": (
+                    self._render_help(context)
+                    if it.kind == "help"
+                    else "👋 Hi! Ask me about your data (e.g. “top 10 customers by sales last month”)."
+                ),
                 "is_sql": False,
             }
 
@@ -220,10 +239,17 @@ class Pipeline:
         # -- 2) clarify
         need, clar_qs = self.clarifier.maybe_ask(question, ctx)
         if need and self.settings.get("ASK_MODE", "metric_first") == "always_ask":
-            return {"status": "needs_clarification", "questions": clar_qs, "context": ctx, "intent": intent.kind, "is_sql": True}
+            return {
+                "status": "needs_clarification",
+                "questions": clar_qs,
+                "context": ctx,
+                "intent": it.kind,
+                "is_sql": True,
+            }
 
         # -- 3) hints (generic + extras)
         from core.hints import make_hints as _gen_hints
+
         gh = _gen_hints(question) or {}
         if hints:
             gh.update(hints)
@@ -255,11 +281,18 @@ class Pipeline:
                 "rationale": rationale,
                 "validation": info,
                 "context": ctx,
-                "intent": intent.kind,
+                "intent": it.kind,
                 "is_sql": True,
             }
 
-        return {"status": "ok", "sql": sql, "rationale": rationale, "context": ctx, "intent": intent.kind, "is_sql": True}
+        return {
+            "status": "ok",
+            "sql": sql,
+            "rationale": rationale,
+            "context": ctx,
+            "intent": it.kind,
+            "is_sql": True,
+        }
 
     # ------------------ internals ------------------
     def _load_cfg(self, s: Any | None) -> PipelineConfig:
@@ -270,15 +303,18 @@ class Pipeline:
                 except Exception:
                     pass
             from os import getenv
+
             return getenv(key, default)
 
         return PipelineConfig(
-            memory_db_url=g("MEMORY_DB_URL") or "postgresql+psycopg2://copilot:pass@localhost/copilot_mem_dev",
+            memory_db_url=g("MEMORY_DB_URL")
+            or "postgresql+psycopg2://copilot:pass@localhost/copilot_mem_dev",
             fa_db_url=g("FA_DB_URL"),
             environment=(g("ENVIRONMENT", "local") or "local").lower(),
             prefix_regex=g("FA_PREFIX_REGEX", r"^[0-9]+_$") or r"^[0-9]+_$",
             sample_rows_per_table=int(g("FA_SAMPLE_ROWS_PER_TABLE", "5") or 5),
-            profile_stats=(g("FA_PROFILE_STATS", "false") or "false").lower() in {"1", "true", "t", "yes", "y"},
+            profile_stats=(g("FA_PROFILE_STATS", "false") or "false").lower()
+            in {"1", "true", "t", "yes", "y"},
             context_topk_tables=int(g("CONTEXT_TOPK_TABLES", "5") or 5),
             context_topk_columns=int(g("CONTEXT_TOPK_COLUMNS", "20") or 20),
         )
@@ -298,7 +334,7 @@ class ContextBuilder:
         topk_tables: int,
         topk_columns: int,
         cache: Dict[str, Dict[str, Any]],
-        keyword_expander: Optional[Callable[[List[str]], List[str]]] = None
+        keyword_expander: Optional[Callable[[List[str]], List[str]]] = None,
     ):
         self.db = mem_engine
         self.namespaces = namespaces
@@ -309,7 +345,9 @@ class ContextBuilder:
 
     def build(self, user_text: str) -> Dict[str, Any]:
         base = self._keywords(user_text)  # generic split only
-        keywords = list(set(self.keyword_expander(base))) if self.keyword_expander else base  # NEW
+        keywords = (
+            list(set(self.keyword_expander(base))) if self.keyword_expander else base
+        )  # NEW
         tables: List[Dict[str, Any]] = []
         columns: List[Dict[str, Any]] = []
         glossary: List[Dict[str, Any]] = []
@@ -321,15 +359,23 @@ class ContextBuilder:
                 ns_cache = self._load_ns(ns)
                 self.cache[ns] = ns_cache
             tables += self._match_tables(ns_cache["tables"], keywords, self.topk_tables)
-            columns += self._match_columns(ns_cache["columns"], keywords, self.topk_columns)
+            columns += self._match_columns(
+                ns_cache["columns"], keywords, self.topk_columns
+            )
             glossary += ns_cache.get("glossary_top", [])
             rules += ns_cache.get("rules_top", [])
             # NEW: accumulate join hints from each namespace (dedupe later)
             join_hints = ns_cache.get("preferred_joins", [])
             if join_hints:
                 # stash into a temp list on the builder
-                columns.append({"table_name": "__JOIN_HINTS__", "column_name": "\n".join(join_hints), "data_type": "",
-                                "schema_name": ""})
+                columns.append(
+                    {
+                        "table_name": "__JOIN_HINTS__",
+                        "column_name": "\n".join(join_hints),
+                        "data_type": "",
+                        "schema_name": "",
+                    }
+                )
 
         # NEW: extract join_hints back out (kept separate from real columns)
         join_hints_out = []
@@ -347,28 +393,40 @@ class ContextBuilder:
             "columns": real_columns[: self.topk_columns],  # <-- use real_columns
             "glossary": glossary,
             "rules": rules,
-            "join_hints": join_hints_out  # <-- optional: helpful to planner/ERD
+            "join_hints": join_hints_out,  # <-- optional: helpful to planner/ERD
         }
 
     def _load_ns(self, namespace: str) -> Dict[str, Any]:
         with self.db.connect() as c:
-            tables_rows = c.execute(
-                text("""
+            tables_rows = (
+                c.execute(
+                    text(
+                        """
                     SELECT id, table_name, schema_name, table_comment, primary_key, date_columns
                     FROM mem_tables WHERE namespace=:ns
-                """),
-                {"ns": namespace},
-            ).mappings().all()
+                """
+                    ),
+                    {"ns": namespace},
+                )
+                .mappings()
+                .all()
+            )
             tables = _as_dicts(tables_rows)
 
-            cols_rows = c.execute(
-                text("""
+            cols_rows = (
+                c.execute(
+                    text(
+                        """
                     SELECT c.table_id, c.column_name, c.data_type, c.is_nullable
                     FROM mem_columns c
                     JOIN mem_tables t ON t.id=c.table_id AND t.namespace=:ns
-                """),
-                {"ns": namespace},
-            ).mappings().all()
+                """
+                    ),
+                    {"ns": namespace},
+                )
+                .mappings()
+                .all()
+            )
             cols = _as_dicts(cols_rows)
 
         # group by table_id
@@ -380,26 +438,44 @@ class ContextBuilder:
         flat_cols: List[Dict[str, Any]] = []
         for t in tables:
             for c in cols_by_table.get(t["id"], []):
-                flat_cols.append({
-                    "table_name": t["table_name"],
-                    "schema_name": t["schema_name"],
-                    "column_name": c["column_name"],
-                    "data_type": c["data_type"],
-                })
+                flat_cols.append(
+                    {
+                        "table_name": t["table_name"],
+                        "schema_name": t["schema_name"],
+                        "column_name": c["column_name"],
+                        "data_type": c["data_type"],
+                    }
+                )
 
         # glossary / rules → dicts too
         with self.db.connect() as c:
-            glossary = _as_dicts(c.execute(
-                text("SELECT term, definition FROM mem_glossary WHERE namespace=:ns LIMIT 20"),
-                {"ns": namespace},
-            ).mappings().all())
-            rules = _as_dicts(c.execute(
-                text("SELECT rule_name, rule_type, scope FROM mem_rules WHERE namespace=:ns LIMIT 20"),
-                {"ns": namespace},
-            ).mappings().all())
+            glossary = _as_dicts(
+                c.execute(
+                    text(
+                        "SELECT term, definition FROM mem_glossary WHERE namespace=:ns LIMIT 20"
+                    ),
+                    {"ns": namespace},
+                )
+                .mappings()
+                .all()
+            )
+            rules = _as_dicts(
+                c.execute(
+                    text(
+                        "SELECT rule_name, rule_type, scope FROM mem_rules WHERE namespace=:ns LIMIT 20"
+                    ),
+                    {"ns": namespace},
+                )
+                .mappings()
+                .all()
+            )
 
-        return {"tables": tables, "columns": flat_cols, "glossary_top": glossary, "rules_top": rules}
-
+        return {
+            "tables": tables,
+            "columns": flat_cols,
+            "glossary_top": glossary,
+            "rules_top": rules,
+        }
 
     def _keywords(self, s: str) -> List[str]:
         base = [w.lower() for w in re.findall(r"[A-Za-z0-9_]+", s)]
@@ -412,7 +488,9 @@ class ContextBuilder:
                 pass
         return base
 
-    def _match_tables(self, tables: List[Dict[str, Any]], keywords: List[str], k: int) -> List[Dict[str, Any]]:
+    def _match_tables(
+        self, tables: List[Dict[str, Any]], keywords: List[str], k: int
+    ) -> List[Dict[str, Any]]:
         scored: List[Tuple[int, Dict[str, Any]]] = []
         for t in tables:
             # ensure dict (in case anything slips through)
@@ -425,10 +503,12 @@ class ContextBuilder:
         scored.sort(key=lambda x: x[0], reverse=True)
         return [t for _, t in scored[:k]]
 
-    def _match_columns(self, columns: List[Dict[str, Any]], keywords: List[str], k: int) -> List[Dict[str, Any]]:
+    def _match_columns(
+        self, columns: List[Dict[str, Any]], keywords: List[str], k: int
+    ) -> List[Dict[str, Any]]:
         scored: List[Tuple[int, Dict[str, Any]]] = []
         for c in columns:
-            tname_raw = (c['table_name'] or "").lower()
+            tname_raw = (c["table_name"] or "").lower()
             tname = re.sub(r"^\d+_", "", tname_raw)
             name = f"{tname}.{c['column_name'].lower()}"
             score = sum(1 for kw in keywords if kw in name)
@@ -459,5 +539,7 @@ class SQLRewriter:
                 return m.group(0)
             return f"{kw} `{prefix}{name}`"  # backtick quoting for MySQL
 
-        pattern = re.compile(r"\b(FROM|JOIN)\s+([A-Za-z_][A-Za-z0-9_]*)\b", re.IGNORECASE)
+        pattern = re.compile(
+            r"\b(FROM|JOIN)\s+([A-Za-z_][A-Za-z0-9_]*)\b", re.IGNORECASE
+        )
         return pattern.sub(repl, sql)

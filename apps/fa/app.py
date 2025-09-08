@@ -14,6 +14,7 @@ POST /fa/answer
 All routes expect prefixes to match ^[0-9]+_$. We do not pre-approve prefixes; any
 well-formed prefix is accepted.
 """
+
 from __future__ import annotations
 
 import json
@@ -51,6 +52,7 @@ def _validate_prefixes(prefixes: Iterable[str]) -> List[str]:
             raise ValueError(f"Invalid prefix: {p}")
     return ps
 
+
 @fa_bp.post("/run")
 def run_query():
     """
@@ -71,20 +73,29 @@ def run_query():
     question = (data.get("question") or "").strip()
     limit = int(data.get("limit") or 500)
     do_email = bool(data.get("email", False))
-    auth_email = data.get("auth_email") or current_app.config["SETTINGS"].get("AUTH_EMAIL")
+    auth_email = data.get("auth_email") or current_app.config["SETTINGS"].get(
+        "AUTH_EMAIL"
+    )
 
     pipeline: Pipeline = current_app.config["PIPELINE"]
     if isinstance(pipeline.settings, Settings) and prefixes:
         pipeline.settings.set_namespace(f"fa::{prefixes[0]}")
 
     if not sql_in:
-        plan = pipeline.answer(question=question, context={"prefixes": prefixes, "auth_email": auth_email}, hints=None)
+        plan = pipeline.answer(
+            question=question,
+            context={"prefixes": prefixes, "auth_email": auth_email},
+            hints=None,
+        )
         if plan.get("status") != "ok":
             return jsonify({"error": "planning_failed", "detail": plan}), 400
         sql_in = plan["sql"]
 
     from core.pipeline import SQLRewriter
-    sql_exec = SQLRewriter.rewrite_for_prefixes(sql_in, prefixes) if prefixes else sql_in
+
+    sql_exec = (
+        SQLRewriter.rewrite_for_prefixes(sql_in, prefixes) if prefixes else sql_in
+    )
 
     ok, msg = validate_select(sql_exec)
     if not ok:
@@ -112,13 +123,16 @@ def run_query():
                 to=[auth_email] if auth_email else [],
                 subject="[Copilot] Your data export",
                 body_text="Your CSV export is attached.",
-                attachments=[("result.csv", as_csv(result), "text/csv")]
+                attachments=[("result.csv", as_csv(result), "text/csv")],
             )
-            return jsonify({"ok": True, "emailed_to": auth_email, "rowcount": result["rowcount"]})
+            return jsonify(
+                {"ok": True, "emailed_to": auth_email, "rowcount": result["rowcount"]}
+            )
         except Exception as e:
             return jsonify({"error": f"email failed: {e}", "result": result}), 200
 
     return jsonify({"ok": True, "result": result})
+
 
 @fa_bp.post("/ingest")
 def ingest_prefixes():  # type: ignore[no-redef]
@@ -143,7 +157,9 @@ def ingest_prefixes():  # type: ignore[no-redef]
     except Exception as e:
         return jsonify({"error": str(e)}), 400
 
+
 from apps.fa.hints import make_fa_hints
+
 
 @fa_bp.post("/answer")
 def answer():
@@ -151,7 +167,9 @@ def answer():
     prefixes = data.get("prefixes", [])
     question = (data.get("question") or "").strip()
     datasources = data.get("datasources") or None  # legacy; ignored
-    auth_email = data.get("auth_email") or current_app.config["SETTINGS"].get("AUTH_EMAIL")
+    auth_email = data.get("auth_email") or current_app.config["SETTINGS"].get(
+        "AUTH_EMAIL"
+    )
 
     pipeline: Pipeline = current_app.config["PIPELINE"]
     s = current_app.config["SETTINGS"]
@@ -161,14 +179,25 @@ def answer():
         pipeline.settings.set_namespace(f"fa::{prefixes[0]}")
 
     hints = make_fa_hints(data)
-    result = pipeline.answer(question=question, context={"prefixes": prefixes, "auth_email": auth_email}, hints=hints)
+    result = pipeline.answer(
+        question=question,
+        context={"prefixes": prefixes, "auth_email": auth_email},
+        hints=hints,
+    )
 
-    if result.get("is_sql") is False and result.get("status") == "ok" and result.get("message"):
-        return jsonify({
-            "status": "ok",
-            "intent": result.get("intent", "smalltalk"),
-            "message": result["message"],
-        })
+    if (
+        result.get("is_sql") is False
+        and result.get("status") == "ok"
+        and result.get("message")
+    ):
+        # early return — no inquiry row is written
+        return jsonify(
+            {
+                "status": "ok",
+                "intent": result.get("intent", "smalltalk"),
+                "message": result["message"],
+            }
+        )
 
     # 2) Compute effective status we will persist
     rstat = result.get("status")
@@ -213,8 +242,14 @@ def answer():
 
             if admin_list:
                 ns = f"fa::{prefixes[0]}" if prefixes else "fa::common"
-                tables_ = [t.get("table_name") for t in (result.get("context", {}).get("tables") or [])][:6]
-                cols_ = [f"{c.get('table_name')}.{c.get('column_name')}" for c in (result.get("context", {}).get("columns") or [])][:10]
+                tables_ = [
+                    t.get("table_name")
+                    for t in (result.get("context", {}).get("tables") or [])
+                ][:6]
+                cols_ = [
+                    f"{c.get('table_name')}.{c.get('column_name')}"
+                    for c in (result.get("context", {}).get("columns") or [])
+                ][:10]
 
                 reply_template = {
                     "answered_by": "admin@example.com",
@@ -231,7 +266,11 @@ def answer():
                     f"Matched tables: {', '.join(tables_) if tables_ else '(none)'}\n"
                     f"Matched columns: {', '.join(cols_) if cols_ else '(none)'}\n\n"
                     f"Copilot follow-ups (for admin):\n"
-                    + ("\n".join([f"- {q}" for q in (result.get('questions') or [])]) or "(none)") + "\n\n"
+                    + (
+                        "\n".join([f"- {q}" for q in (result.get("questions") or [])])
+                        or "(none)"
+                    )
+                    + "\n\n"
                     f"Reply API (POST): /admin/inquiries/{inquiry_id or 'N/A'}/reply\n"
                     f"Headers: X-Admin-Key: <your-admin-key>\n"
                     f"JSON body template:\n{json.dumps(reply_template, indent=2)}\n"
@@ -251,29 +290,36 @@ def answer():
 
     # 5) Return to end user
     if effective_status == "answered":
-        return jsonify({
-            "status": "ok",
-            "sql": result.get("sql"),
-            "rationale": result.get("rationale"),
-            "inquiry_id": inquiry_id,
-            **({"warnings": warnings} if warnings else {})
-        })
+        return jsonify(
+            {
+                "status": "ok",
+                "sql": result.get("sql"),
+                "rationale": result.get("rationale"),
+                "inquiry_id": inquiry_id,
+                **({"warnings": warnings} if warnings else {}),
+            }
+        )
 
     if effective_status == "needs_clarification":
-        return jsonify({
-            "status": "needs_clarification",
-            "questions": result.get("questions", []),
-            "inquiry_id": inquiry_id,
-            **({"warnings": warnings} if warnings else {})
-        })
+        return jsonify(
+            {
+                "status": "needs_clarification",
+                "questions": result.get("questions", []),
+                "inquiry_id": inquiry_id,
+                **({"warnings": warnings} if warnings else {}),
+            }
+        )
 
     # (fallback) waiting on admins
-    return jsonify({
-        "status": "awaiting_admin",
-        "message": "We’re preparing your data. Our admins will clarify and you’ll receive the result by email.",
-        "inquiry_id": inquiry_id,
-        **({"warnings": warnings} if warnings else {})
-    })
+    return jsonify(
+        {
+            "status": "awaiting_admin",
+            "message": "We’re preparing your data. Our admins will clarify and you’ll receive the result by email.",
+            "inquiry_id": inquiry_id,
+            **({"warnings": warnings} if warnings else {}),
+        }
+    )
+
 
 @fa_bp.get("/metrics")
 def list_metrics():
