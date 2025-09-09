@@ -27,18 +27,44 @@ def admin_reply(inquiry_id: int):
         return jsonify({"error": "admin_reply is required"}), 400
 
     mem = current_app.config["MEM_ENGINE"]
-    pipeline = current_app.config["PIPELINE"]
-
-    note_info = append_admin_note(mem, inquiry_id, by=answered_by, text_note=admin_reply)
-
     try:
-        out = pipeline.replan_from_admin_notes(inquiry_id, answered_by=answered_by)
-        return jsonify(out), 200
+        append_admin_note(mem, inquiry_id, by=answered_by, text_note=admin_reply)
     except Exception as e:
-        current_app.logger.exception("replan_from_admin_notes failed")
-        return jsonify({
-            "inquiry_id": inquiry_id,
-            "status": "needs_clarification",
-            "message": "Note saved; add one more hint or confirm tables.",
-        }), 200
+        return (
+            jsonify({"error": f"append_failed: {e.__class__.__name__}: {e}"}),
+            400,
+        )
+
+    pipeline = current_app.config["PIPELINE"]
+    out = pipeline.process_admin_reply(inquiry_id)
+    return jsonify(out), 200
+
+
+@admin_bp.post("/inquiries/reply")
+def admin_reply_body():
+    if not _check_admin_key():
+        return jsonify({"error": "unauthorized"}), 401
+
+    data = request.get_json(force=True) or {}
+    inquiry_id = int(data.get("inquiry_id") or 0)
+    answered_by = (data.get("auth_email") or "").strip()
+    admin_reply = (data.get("answer") or "").strip()
+    if not (inquiry_id and answered_by and admin_reply):
+        return (
+            jsonify({"error": "inquiry_id, auth_email, answer are required"}),
+            400,
+        )
+
+    mem = current_app.config["MEM_ENGINE"]
+    try:
+        append_admin_note(mem, inquiry_id, by=answered_by, text_note=admin_reply)
+    except Exception as e:
+        return (
+            jsonify({"error": f"append_failed: {e.__class__.__name__}: {e}"}),
+            400,
+        )
+
+    pipeline = current_app.config["PIPELINE"]
+    out = pipeline.process_admin_reply(inquiry_id)
+    return jsonify(out), 200
 

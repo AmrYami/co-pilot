@@ -173,6 +173,18 @@ class Pipeline:
 
         return None
 
+    def _coerce_sql_or_retry(self, raw_out: str, question: str) -> str:
+        sql = self._force_sql_only(raw_out, question)
+        if not sql:
+            raise RuntimeError("no_sql")
+        return sql
+
+    def _coerce_sql_or_none(self, raw_out: str) -> str | None:
+        try:
+            return self._coerce_sql_or_retry(raw_out, "")
+        except Exception:
+            return None
+
     def _log_inquiry(
         self,
         namespace: str,
@@ -563,6 +575,86 @@ class Pipeline:
         from core.hints import make_hints as _gen_hints
         blob = " ".join([n.get("text","") for n in notes] + [question])
         return _gen_hints(blob) or {}
+
+    def process_admin_reply(self, inquiry_id: int) -> dict:
+        """After we append an admin note, try again using the accumulated notes."""
+        with self.mem_engine.begin() as cx:
+            row = cx.execute(
+                text(
+                    """
+                SELECT id, namespace, question, prefixes, admin_notes,
+                       COALESCE(clarification_rounds,0) AS rounds
+                FROM mem_inquiries WHERE id = :id
+                """
+                ),
+                {"id": inquiry_id},
+            ).mappings().first()
+
+        if not row:
+            return {"inquiry_id": inquiry_id, "status": "not_found"}
+
+        prefixes = row["prefixes"] or []
+        if isinstance(prefixes, str):
+            try:
+                prefixes = json.loads(prefixes)
+            except Exception:
+                prefixes = []
+        question = row["question"] or ""
+        notes = row.get("admin_notes") or []
+
+        notes_txt = "\n".join(
+            f"- {n.get('note')}" for n in notes if isinstance(n, dict) and n.get("note")
+        ).strip()
+
+        from apps.fa.hints import make_fa_hints, parse_admin_answer
+
+        overrides = parse_admin_answer(notes_txt) if notes_txt else None
+        fa_hints = make_fa_hints(self.mem_engine, prefixes, question, None, overrides)
+
+        context = self.build_context_pack("fa", prefixes, question)
+        raw_out = self.planner.plan(question, context, hints=fa_hints)
+
+        sql_or_none = self._coerce_sql_or_none(raw_out)
+
+        if not sql_or_none:
+            max_rounds = int(self.settings.get("MAX_CLARIFICATION_ROUNDS", "3") or 3)
+            status = "needs_clarification"
+            msg = (
+                "I couldn't derive a clean SQL from the admin notes. Add one more hint or confirm the tables."
+            )
+            if row["rounds"] + 1 >= max_rounds:
+                status = "failed"
+                msg = "I could not derive a valid SQL after multiple clarifications."
+            with self.mem_engine.begin() as cx:
+                cx.execute(
+                    text(
+                        """UPDATE mem_inquiries SET status = :st, updated_at = NOW() WHERE id = :id"""
+                    ),
+                    {"id": inquiry_id, "st": status},
+                )
+            return {"inquiry_id": inquiry_id, "status": status, "message": msg}
+
+        canonical_sql = sql_or_none
+        from core.pipeline import SQLRewriter
+
+        sql_exec = SQLRewriter.rewrite_for_prefixes(canonical_sql, prefixes)
+        result = self.validate_and_execute(
+            sql_exec, list(prefixes), auth_email=None, inquiry_id=inquiry_id
+        )
+
+        with self.mem_engine.begin() as cx:
+            cx.execute(
+                text(
+                    """
+                UPDATE mem_inquiries
+                SET status='answered', answered_by = :by, answered_at = NOW(),
+                    updated_at = NOW()
+                WHERE id = :id
+                """
+                ),
+                {"id": inquiry_id, "by": "admin"},
+            )
+        return {"inquiry_id": inquiry_id, "status": "answered", "result": result}
 
     def replan_from_admin_notes(self, inquiry_id: int, answered_by: str = "") -> dict:
         # Fetch original question, prefixes, and all notes for this inquiry
