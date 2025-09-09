@@ -6,18 +6,29 @@ from core.pipeline import Pipeline
 from apps.fa.app import fa_bp
 from core.admin_api import admin_bp
 
+
 def create_app() -> Flask:
     app = Flask(__name__)
 
-    settings = Settings()  # namespace set later per-request by FA routes
+    settings = Settings()
     pipeline = Pipeline(settings=settings, namespace="fa::common")
 
+    app.extensions = getattr(app, "extensions", {})
+    app.extensions["pipeline"] = pipeline
     app.config["PIPELINE"] = pipeline
     app.config["MEM_ENGINE"] = pipeline.mem_engine
-    app.config["SETTINGS"]  = pipeline.settings
+    app.config["SETTINGS"] = pipeline.settings
 
-    app.register_blueprint(admin_bp)
+    # Force the /admin prefix here even if someone removes it in the blueprint
+    app.register_blueprint(admin_bp, url_prefix="/admin")
+
     app.register_blueprint(fa_bp, url_prefix="/fa")
+
+    @app.get("/__routes")
+    def _routes():
+        return {
+            "routes": sorted([str(r.rule) for r in app.url_map.iter_rules()])
+        }
 
     @app.get("/health")
     def health():
