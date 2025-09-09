@@ -23,7 +23,7 @@ from core.model_loader import load_model, load_clarifier_model
 from core.intent import IntentRouter
 from core.settings import Settings
 from core.research import build_researcher
-from core.sql_exec import get_app_engine
+from core.sql_exec import get_app_engine, run_select
 
 from types import SimpleNamespace
 
@@ -216,6 +216,117 @@ class Pipeline:
           5) Prefix rewrite
           6) Validate (EXPLAIN), research retry if enabled; otherwise needs_fix
         """
+        ns = context.get("namespace") or self.namespace
+        prefixes = context.get("prefixes") or []
+        auth_email = context.get("auth_email")
+        inquiry_id = context.get("inquiry_id")
+        admin_reply = context.get("admin_reply")
+        clarifications = context.get("clarifications") or {}
+
+        if inquiry_id and (admin_reply or clarifications):
+            try:
+                with self.mem_engine.begin() as con:
+                    con.execute(
+                        text(
+                            """UPDATE mem_inquiries
+                                SET admin_reply = COALESCE(:rep, admin_reply),
+                                    status = 'open',
+                                    updated_at = NOW()
+                              WHERE id = :iid"""
+                        ),
+                        {"rep": admin_reply, "iid": inquiry_id},
+                    )
+            except Exception:
+                pass
+
+            enriched_q = question
+            if admin_reply:
+                enriched_q += f"\n\nClarifications: {admin_reply}"
+
+            ctx = self.build_context_pack("fa", prefixes, enriched_q)
+            if context:
+                ctx.update({k: v for k, v in context.items() if v is not None})
+
+            from core.hints import make_hints as _gen_hints
+            gh = _gen_hints(enriched_q) or {}
+            if hints:
+                gh.update(hints)
+
+            canonical_sql, rationale = self.planner.plan(enriched_q, ctx, hints=gh)
+            sql = SQLRewriter.rewrite_for_prefixes(canonical_sql, prefixes)
+            exec_ok, info = self.validator.quick_validate(sql)
+            rows = None
+            err = None
+            if exec_ok:
+                try:
+                    res = run_select(self.app_engine, sql, limit=50)
+                    rows = res.get("rows")
+                except Exception as e:
+                    exec_ok = False
+                    err = str(e)
+            else:
+                err = info.get("error") if isinstance(info, dict) else None
+
+            run_id = None
+            try:
+                with self.mem_engine.begin() as con:
+                    res = con.execute(
+                        text(
+                            """INSERT INTO mem_runs
+                                  (namespace, user_id, input_query, interpreted_intent,
+                                   sql_generated, sql_final, status, rows_returned, created_at)
+                                VALUES
+                                  (:ns, :uid, :inq, :intent, :sqlg, :sqlf, :st, :rows, NOW())
+                                RETURNING id"""
+                        ),
+                        {
+                            "ns": ns,
+                            "uid": auth_email or "unknown",
+                            "inq": question,
+                            "intent": "clarified",
+                            "sqlg": canonical_sql,
+                            "sqlf": sql,
+                            "st": "complete" if exec_ok else "failed",
+                            "rows": len(rows or []) if rows is not None else None,
+                        },
+                    )
+                    run_id = res.scalar()
+                    con.execute(
+                        text(
+                            """UPDATE mem_inquiries
+                                  SET status = :st,
+                                      run_id = :rid,
+                                      answered_by = :by,
+                                      answered_at = NOW(),
+                                      updated_at = NOW()
+                                WHERE id = :iid"""
+                        ),
+                        {
+                            "st": "answered" if exec_ok else "failed",
+                            "rid": run_id,
+                            "by": auth_email,
+                            "iid": inquiry_id,
+                        },
+                    )
+            except Exception:
+                pass
+
+            if exec_ok:
+                return {
+                    "status": "complete",
+                    "inquiry_id": inquiry_id,
+                    "sql": sql,
+                    "rows": rows[:50] if rows else [],
+                    "rationale": rationale,
+                    "doc": info,
+                }
+            else:
+                return {
+                    "status": "failed",
+                    "inquiry_id": inquiry_id,
+                    "error": err or (info.get("error") if isinstance(info, dict) else None),
+                }
+
         # -- 0) intent classification
         it = self.intent_router.classify(question or "")
         if it.kind in {"smalltalk", "help"}:
@@ -229,8 +340,6 @@ class Pipeline:
                 ),
                 "is_sql": False,
             }
-
-        prefixes = context.get("prefixes") or []
 
         # -- 1) context
         ctx = self.build_context_pack("fa", prefixes, question)

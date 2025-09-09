@@ -171,6 +171,12 @@ def answer():
         or current_app.config["SETTINGS"].get("AUTH_EMAIL")
         or ""
     ).strip()
+    inquiry_id = data.get("inquiry_id")
+    clarifications = data.get("clarifications")
+    admin_reply_text = (
+        data.get("answer") or data.get("admin_reply") or ""
+    ).strip() or None
+    followup = bool(inquiry_id and (clarifications or admin_reply_text))
 
     # 0) Friendly intent gate
     it = detect_intent(question)
@@ -203,6 +209,7 @@ def answer():
         "mem_engine": mem_engine,
         "prefixes": prefixes,
         "question": question,
+        "clarifications": clarifications,
     })
 
     # 2) Call the pipeline with hints
@@ -224,9 +231,15 @@ def answer():
             "prefixes": prefixes,
             "auth_email": auth_email,
             "inline_clarify": bool(can_inline),
+            "inquiry_id": inquiry_id,
+            "clarifications": clarifications,
+            "admin_reply": admin_reply_text,
         },
         hints=hints,
     )
+
+    if followup:
+        return jsonify(result)
 
     if (
         result.get("is_sql") is False
