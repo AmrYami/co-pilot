@@ -23,7 +23,8 @@ from core.model_loader import load_model, load_clarifier_model
 from core.intent import IntentRouter
 from core.settings import Settings
 from core.research import build_researcher
-from core.sql_exec import get_app_engine, run_select
+from core.sql_exec import get_app_engine, run_select, as_csv
+from core.emailer import Emailer
 
 from types import SimpleNamespace
 
@@ -649,6 +650,46 @@ class ContextBuilder:
                 scored.append((score, c))
         scored.sort(key=lambda x: x[0], reverse=True)
         return [c for _, c in scored[:k]]
+
+    def validate_and_execute(
+        self,
+        sql: str,
+        prefixes: list[str],
+        auth_email: str | None,
+        inquiry_id: int,
+        notes: dict | None = None,
+    ) -> dict:
+        """
+        Validate the SQL via validator, execute it, optionally email preview.
+        Returns dict with keys {sql_final, rows, preview}.
+        """
+        ok, info = self.validator.quick_validate(sql)
+        if not ok:
+            err = info.get("error") if isinstance(info, dict) else str(info)
+            raise RuntimeError(err or "validation failed")
+
+        res = run_select(self.app_engine, sql, limit=50)
+
+        notify = str(self.settings.get("AUTO_NOTIFY_ON_SUCCESS", "false")).lower()
+        if auth_email and notify in ("1", "true", "yes", "on"):
+            try:
+                mailer = Emailer(self.settings)
+                csv_bytes = as_csv(res)
+                body_html = "<p>Query executed successfully.</p>"
+                mailer.send(
+                    to=[auth_email],
+                    subject=f"Inquiry #{inquiry_id} results",
+                    html=body_html,
+                    attachments=[("result.csv", csv_bytes, "text/csv")],
+                )
+            except Exception:
+                pass
+
+        return {
+            "sql_final": sql,
+            "rows": res.get("rowcount"),
+            "preview": res.get("rows"),
+        }
 
 
 # ------------------ simple SQL rewriter ------------------

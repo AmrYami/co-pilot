@@ -31,7 +31,8 @@ from core.emailer import Emailer
 from core.pipeline import SQLRewriter
 from core.settings import Settings
 
-from core.admin_helpers import derive_sql_from_admin_reply, verify_admin_key
+from core.admin_helpers import verify_admin_key
+from core.derive import derive_sql_from_admin_reply, DerivationError
 from core.sql_exec import validate_select, explain, run_select, as_csv
 
 from core.mailer import send_email_with_attachments, send_email
@@ -103,6 +104,126 @@ def _infer_type(val: Any) -> str:
 
 def _pip():
     return current_app.config["PIPELINE"]
+
+
+@admin_bp.post("/inquiry/reply")
+def admin_reply():
+    """
+    Body:
+    {
+      "inquiry_id": 76,
+      "question": "top 10 customers by sales last month",
+      "answer": "Use invoice (tran_date), last month.",
+      "prefixes": ["579_"],
+      "auth_email": "amr.yami1@gmail.com",
+      // optional:
+      // "answer_sql": "SELECT ... ;"
+    }
+    """
+    data: Dict[str, Any] = request.get_json(force=True) or {}
+    inquiry_id: int = int(data.get("inquiry_id"))
+    question: str = (data.get("question") or "").strip()
+    answer: str = (data.get("answer") or "").strip()
+    answer_sql: Optional[str] = (data.get("answer_sql") or None)
+    prefixes = data.get("prefixes") or []
+    auth_email = data.get("auth_email")
+
+    pipeline = current_app.config["PIPELINE"]
+    mem = current_app.config["MEM_ENGINE"]
+
+    # Store admin_reply and move inquiry back to 'open' while processing
+    try:
+        with mem.begin() as conn:
+            conn.execute(
+                """
+                UPDATE mem_inquiries
+                SET admin_reply = %(r)s, status = 'open', updated_at = NOW()
+                WHERE id = %(id)s
+                """,
+                {"r": answer or answer_sql or "", "id": inquiry_id},
+            )
+    except Exception as e:
+        return (
+            jsonify({"error": f"failed to update inquiry: {e}", "inquiry_id": inquiry_id, "status": "failed"}),
+            500,
+        )
+
+    try:
+        # 1) get SQL (either direct or derived from admin clarification)
+        if answer_sql and answer_sql.strip().lower().startswith(("select", "with")):
+            sql = answer_sql.strip()
+        else:
+            sql = derive_sql_from_admin_reply(
+                pipeline=pipeline,
+                inquiry_id=inquiry_id,
+                question=question,
+                admin_answer=answer or "",
+                prefixes=prefixes,
+                auth_email=auth_email,
+            )
+
+        # 2) validate + auto-fix + execute (pipeline provides these)
+        v = pipeline.validate_and_execute(
+            sql=sql,
+            prefixes=prefixes,
+            auth_email=auth_email,
+            inquiry_id=inquiry_id,
+            notes={"admin_reply": answer},
+        )
+
+        # 3) mark answered and return
+        with mem.begin() as conn:
+            conn.execute(
+                """
+                UPDATE mem_inquiries
+                   SET status = 'answered',
+                       answered_by = %(who)s,
+                       answered_at = NOW(),
+                       updated_at  = NOW()
+                 WHERE id = %(id)s
+                """,
+                {"who": auth_email or "admin", "id": inquiry_id},
+            )
+
+        return jsonify({
+            "inquiry_id": inquiry_id,
+            "status": "answered",
+            "sql": v.get("sql_final") or sql,
+            "rows": v.get("rows", 0),
+            "preview": v.get("preview"),
+        })
+
+    except DerivationError as e:
+        with mem.begin() as conn:
+            conn.execute(
+                """
+                UPDATE mem_inquiries
+                   SET status = 'needs_clarification',
+                       updated_at = NOW()
+                 WHERE id = %(id)s
+                """,
+                {"id": inquiry_id},
+            )
+        return (
+            jsonify({"error": str(e), "inquiry_id": inquiry_id, "status": "needs_clarification"}),
+            400,
+        )
+
+    except Exception as e:
+        with mem.begin() as conn:
+            conn.execute(
+                """
+                UPDATE mem_inquiries
+                   SET status = 'failed',
+                       updated_at = NOW()
+                 WHERE id = %(id)s
+                """,
+                {"id": inquiry_id},
+            )
+        return (
+            jsonify({"error": f"{e}", "inquiry_id": inquiry_id, "status": "failed"}),
+            500,
+        )
 
 @admin_bp.post("/settings/bulk")
 def settings_bulk():
