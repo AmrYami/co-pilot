@@ -1,11 +1,9 @@
 from __future__ import annotations
-from typing import Any, Dict
-from flask import Blueprint, current_app, jsonify, request
-from sqlalchemy.engine import Engine
+from flask import Blueprint, current_app, request, jsonify
 
-from core.inquiries import append_admin_note, get_inquiry, set_inquiry_status
+from core.inquiries import append_admin_note
 
-admin_bp = Blueprint("admin", __name__)
+admin_bp = Blueprint("admin", __name__, url_prefix="/admin")
 
 
 def _check_admin_key() -> bool:
@@ -16,45 +14,31 @@ def _check_admin_key() -> bool:
     return bool(expect and key_hdr and key_hdr == expect)
 
 
-@admin_bp.post("/admin/inquiries/<int:inquiry_id>/reply")
+@admin_bp.post("/inquiries/<int:inquiry_id>/reply")
 def admin_reply(inquiry_id: int):
     if not _check_admin_key():
         return jsonify({"error": "unauthorized"}), 401
 
-    data: Dict[str, Any] = request.get_json(force=True) or {}
-    admin_reply = (data.get("admin_reply") or "").strip()
-    answered_by = (data.get("answered_by") or "admin@example.com").strip()
+    data = request.get_json(force=True) or {}
+    answered_by = (data.get("answered_by") or data.get("by") or "").strip() or "admin"
+    admin_reply = (data.get("admin_reply") or data.get("reply") or data.get("answer") or "").strip()
 
     if not admin_reply:
-        return jsonify({"error": "admin_reply required"}), 400
+        return jsonify({"error": "admin_reply is required"}), 400
 
+    mem = current_app.config["MEM_ENGINE"]
     pipeline = current_app.config["PIPELINE"]
-    mem: Engine = current_app.config["MEM_ENGINE"]
 
-    inq = get_inquiry(mem, inquiry_id)
-    if not inq:
-        return jsonify({"error": "inquiry_not_found"}), 404
+    note_info = append_admin_note(mem, inquiry_id, by=answered_by, text_note=admin_reply)
 
-    # Persist the note
-    append_admin_note(mem, inquiry_id, by=answered_by, text_note=admin_reply)
-
-    # Try to derive/plan again with ALL notes so far
     try:
-        result = pipeline.retry_from_admin(
-            inquiry_id=inquiry_id,
-            source="fa",
-            prefixes=inq.get("prefixes") or [],
-            question=inq.get("question") or "",
-            answered_by=answered_by
-        )
+        out = pipeline.replan_from_admin_notes(inquiry_id, answered_by=answered_by)
+        return jsonify(out), 200
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-    # Update status
-    if result.get("status") == "ok":
-        set_inquiry_status(mem, inquiry_id, status="answered", answered_by=answered_by)
-    else:
-        set_inquiry_status(mem, inquiry_id, status="needs_clarification", answered_by=answered_by)
-
-    return jsonify({"inquiry_id": inquiry_id, **result})
+        current_app.logger.exception("replan_from_admin_notes failed")
+        return jsonify({
+            "inquiry_id": inquiry_id,
+            "status": "needs_clarification",
+            "message": "Note saved; add one more hint or confirm tables.",
+        }), 200
 

@@ -564,6 +564,94 @@ class Pipeline:
         blob = " ".join([n.get("text","") for n in notes] + [question])
         return _gen_hints(blob) or {}
 
+    def replan_from_admin_notes(self, inquiry_id: int, answered_by: str = "") -> dict:
+        # Fetch original question, prefixes, and all notes for this inquiry
+        with self.mem_engine.begin() as c:
+            r = c.execute(text(
+                """
+                SELECT namespace, prefixes, question,
+                       COALESCE(admin_notes, '[]'::jsonb) AS notes
+                  FROM mem_inquiries
+                 WHERE id = :id
+                """
+            ), {"id": inquiry_id}).mappings().first()
+
+        if not r:
+            return {"inquiry_id": inquiry_id, "status": "failed", "error": "inquiry not found"}
+
+        namespace = r["namespace"]
+        prefixes = r["prefixes"]
+        if isinstance(prefixes, str):
+            try:
+                prefixes = json.loads(prefixes)
+            except Exception:
+                prefixes = []
+        question = r["question"] or ""
+        notes = r["notes"] or []
+        hint_text = " ; ".join([n.get("text", "") for n in notes if n and isinstance(n, dict)])
+
+        context = self.build_context_pack(namespace, prefixes, question)
+        hints = {"admin_notes": notes, "free_text": hint_text}
+
+        canonical_sql, rationale = self.planner.plan(question, context, hints=hints)
+        canonical_sql = extract_sql(canonical_sql) or self._force_sql_only(canonical_sql, question)
+
+        if not canonical_sql:
+            followups = self._ask_one_more(question, context)
+            with self.mem_engine.begin() as c:
+                c.execute(text(
+                    """
+                    UPDATE mem_inquiries
+                       SET status     = 'needs_clarification',
+                           updated_at = NOW()
+                     WHERE id = :id
+                    """
+                ), {"id": inquiry_id})
+            return {"inquiry_id": inquiry_id, "status": "needs_clarification", "questions": followups}
+
+        from core.pipeline import SQLRewriter
+        sql_exec = SQLRewriter.rewrite_for_prefixes(canonical_sql, prefixes)
+
+        try:
+            result = self.validate_and_execute(sql_exec, list(prefixes), auth_email=None, inquiry_id=inquiry_id)
+        except Exception:
+            followups = self._ask_one_more(question, context)
+            with self.mem_engine.begin() as c:
+                c.execute(text(
+                    """
+                    UPDATE mem_inquiries
+                       SET status     = 'needs_clarification',
+                           updated_at = NOW()
+                     WHERE id = :id
+                    """
+                ), {"id": inquiry_id})
+            return {"inquiry_id": inquiry_id, "status": "needs_clarification", "questions": followups}
+
+        with self.mem_engine.begin() as c:
+            c.execute(text(
+                """
+                UPDATE mem_inquiries
+                   SET status      = 'answered',
+                       run_id      = :run_id,
+                       answered_by = :by,
+                       answered_at = NOW(),
+                       updated_at  = NOW()
+                 WHERE id = :id
+                """
+            ), {"id": inquiry_id, "run_id": result.get("run_id"), "by": answered_by or ""})
+
+        return {"inquiry_id": inquiry_id, "status": "answered", **result}
+
+    def _ask_one_more(self, question: str, context: dict) -> list[str]:
+        try:
+            if self.clarifier:
+                need, qs = self.clarifier.maybe_ask(question, context)
+                if qs:
+                    return qs[:1]
+        except Exception:
+            pass
+        return ["Can you confirm the tables/metrics?"]
+
     def retry_from_admin(self, *, inquiry_id: int, source: str, prefixes: Iterable[str],
                          question: str, answered_by: str) -> Dict[str, Any]:
         """

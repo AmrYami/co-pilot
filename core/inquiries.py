@@ -8,7 +8,7 @@ These helpers are project-agnostic (no FA-specific code).
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from sqlalchemy.engine import Engine
 from sqlalchemy import text, bindparam
@@ -31,19 +31,34 @@ def mark_admin_note(mem_engine, *, inquiry_id: int, admin_reply: str, answered_b
         """), {"reply": admin_reply, "by": answered_by, "id": inquiry_id})
 
 
-def append_admin_note(db: Engine, inquiry_id: int, *, by: str, text_note: str) -> None:
-    """Append a {by, ts, text} object into mem_inquiries.admin_notes and bump clarification_rounds."""
-    note = {"by": by, "ts": datetime.utcnow().isoformat() + "Z", "text": text_note}
+def append_admin_note(mem_engine, inquiry_id: int, by: str, text_note: str) -> dict:
+    """
+    Append a single admin note (JSON object) to mem_inquiries.admin_notes array,
+    increment clarification_rounds, and return the new array + count.
+    """
+
+    note = {
+        "by": (by or "").strip() or "admin",
+        "text": (text_note or "").strip(),
+        "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+
     sql = """
         UPDATE mem_inquiries
-        SET admin_notes = COALESCE(admin_notes, '[]'::jsonb) || to_jsonb(:note::json),
-            clarification_rounds = COALESCE(clarification_rounds, 0) + 1,
-            updated_at = NOW()
-        WHERE id = :id
+           SET admin_notes = COALESCE(admin_notes, '[]'::jsonb)
+                              || jsonb_build_array(CAST(:note AS jsonb)),
+               clarification_rounds = COALESCE(clarification_rounds, 0) + 1,
+               updated_at = NOW()
+         WHERE id = :id
+     RETURNING id, admin_notes, clarification_rounds
     """
-    with db.begin() as c:
-        c.execute(text(sql), {"id": inquiry_id, "note": note})
 
+    params = {"id": inquiry_id, "note": json.dumps(note)}
+
+    with mem_engine.begin() as c:
+        row = c.execute(text(sql), params).mappings().first()
+
+    return dict(row) if row else {}
 
 def get_inquiry(db: Engine, inquiry_id: int) -> Optional[Dict[str, Any]]:
     with db.connect() as c:
