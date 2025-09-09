@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Callable
 
 from sqlalchemy import create_engine, text
+from sqlalchemy import text as _sqltext
 from sqlalchemy.engine import Engine
 
 import importlib
@@ -540,6 +541,100 @@ class Pipeline:
         if not url:
             raise RuntimeError(f"Missing DB URL for {pool_name}")
         return create_engine(url, pool_pre_ping=True, pool_recycle=1800)
+
+    def _load_inquiry_notes(self, inquiry_id: int) -> list[dict]:
+        with self.mem_engine.connect() as c:
+            row = c.execute(_sqltext("SELECT admin_notes FROM mem_inquiries WHERE id=:id"),
+                            {"id": inquiry_id}).mappings().first()
+            if not row:
+                return []
+            notes = row["admin_notes"] or []
+        # normalize: each item is {"text": "...", "by": "...", "ts": "..."}
+        out = []
+        for n in notes:
+            try:
+                out.append({"text": n.get("text",""), "by": n.get("by",""), "ts": n.get("ts","")})
+            except Exception:
+                out.append({"text": str(n), "by": "", "ts": ""})
+        return out
+
+    def _hints_from_notes(self, notes: list[dict], question: str) -> dict:
+        # Concatenate notes + question, then reuse core.hints to extract date ranges & simple filters
+        from core.hints import make_hints as _gen_hints
+        blob = " ".join([n.get("text","") for n in notes] + [question])
+        return _gen_hints(blob) or {}
+
+    def retry_from_admin(self, *, inquiry_id: int, source: str, prefixes: Iterable[str],
+                         question: str, answered_by: str) -> Dict[str, Any]:
+        """
+        Use accumulated admin notes for this inquiry to try again.
+        1) Build context
+        2) Convert notes → hints
+        3) Try direct derivation from admin notes (derive.py)
+        4) Otherwise re-plan with hints
+        5) Validate; on failure, ask for the next minimal clarification
+        """
+        context = self.build_context_pack(source, prefixes, question)
+
+        notes = self._load_inquiry_notes(inquiry_id)
+        extra_hints = self._hints_from_notes(notes, question)
+
+        # 3) First attempt: direct derivation from admin notes (if any)
+        try:
+            from derive import derive_sql_from_admin_reply
+            tables = [t["table_name"] for t in context.get("tables", [])]
+            cols = [f"{c['table_name']}.{c['column_name']}" for c in context.get("columns", [])]
+            admin_blob = "\n".join([n.get("text","") for n in notes])
+            if admin_blob.strip():
+                sql0, why0 = derive_sql_from_admin_reply(
+                    self.llm,
+                    question=question,
+                    admin_reply=admin_blob,
+                    tables=tables,
+                    columns=cols,
+                    metrics=(context.get("metrics") or {}).keys(),
+                )
+            else:
+                sql0, why0 = None, None
+        except Exception:
+            sql0, why0 = None, None
+
+        # canonical → prefixed
+        if sql0:
+            from core.pipeline import SQLRewriter
+            sql_exec = SQLRewriter.rewrite_for_prefixes(sql0, prefixes)
+            ok, info = self.validator.quick_validate(sql_exec)
+            if ok:
+                return {"status": "ok", "sql": sql_exec, "rationale": why0 or "Derived from admin notes", "context": context}
+            # fallthrough to LLM plan with hints
+
+        # 4) LLM plan with hints
+        canonical_sql, rationale = self.planner.plan(question, context, hints=extra_hints)
+        from core.pipeline import SQLRewriter
+        sql_exec = SQLRewriter.rewrite_for_prefixes(canonical_sql, prefixes)
+
+        # 5) Validate; if still not ok, ask next best question and keep the loop alive
+        ok, info = self.validator.quick_validate(sql_exec)
+        if ok:
+            return {"status": "ok", "sql": sql_exec, "rationale": rationale, "context": context}
+
+        # Next clarifying question (short & actionable)
+        need, clar_qs = self.clarifier.maybe_ask(question, context)
+        next_qs = clar_qs or ["I couldn't derive a clean SQL from the admin notes. Add one more hint or confirm the tables."]
+
+        # Respect MAX_CLARIFICATION_ROUNDS but do not hard-stop; caller holds the loop
+        try:
+            cap = int(self.settings.get("MAX_CLARIFICATION_ROUNDS", "5") or 5)
+        except Exception:
+            cap = 5
+        with self.mem_engine.begin() as c:
+            c.execute(_sqltext("""
+                UPDATE mem_inquiries
+                SET status = 'needs_clarification',
+                    updated_at = NOW()
+                WHERE id = :id
+            """), {"id": inquiry_id})
+        return {"status": "needs_clarification", "questions": next_qs, "context": context}
 
 
 # ------------------ context builder ------------------
