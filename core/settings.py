@@ -187,6 +187,52 @@ class Settings:
 
         return os.getenv("APP_DB_URL") or os.getenv("FA_DB_URL")
 
+    def db_connections(self, namespace: str | None = None) -> list[dict]:
+        ns = namespace or self._namespace
+        v = self.get("DB_CONNECTIONS", namespace=ns)
+        if isinstance(v, list):
+            return v
+        return []
+
+    def default_datasource(self, namespace: str | None = None) -> str | None:
+        ns = namespace or self._namespace
+        v = self.get("DEFAULT_DATASOURCE", namespace=ns)
+        return v if isinstance(v, str) and v else None
+
+    def research_allowed(self, datasource: str, namespace: str | None = None) -> bool:
+        ns = namespace or self._namespace
+        policy = self.get("RESEARCH_POLICY", namespace=ns) or {}
+        if isinstance(policy, str):
+            try:
+                import json
+
+                policy = json.loads(policy)
+            except Exception:
+                policy = {}
+        if isinstance(policy, dict) and datasource in policy:
+            return bool(policy[datasource])
+        return bool(
+            self.get("RESEARCH_MODE", namespace=ns)
+            or self.get("RESEARCH_MODE")
+        )
+
+    def memory_db_url(self) -> str:
+        v = self.get("MEMORY_DB_URL")
+        if isinstance(v, str) and v:
+            return v
+        import os
+
+        return os.getenv(
+            "MEMORY_DB_URL",
+            "postgresql+psycopg2://postgres@localhost/copilot_mem_dev",
+        )
+
+    def admins_can_clarify_immediate(self, namespace: str | None = None) -> set[str]:
+        ns = namespace or self._namespace
+        v = self.get("ADMINS_CAN_CLARIFY_IMMEDIATE", namespace=ns) \
+            or self.get("ADMINS_CAN_CLARIFY_IMMIDIAT", namespace=ns)
+        return set(v) if isinstance(v, list) else set()
+
     def admin_can_clarify_immediate(
         self, email: str | None, namespace: str | None = None
     ) -> bool:

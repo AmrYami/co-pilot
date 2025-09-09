@@ -203,20 +203,24 @@ def answer():
             200,
         )
 
-    # 1) Build FA-aware hints correctly
+    # 1) Settings / namespace
     mem_engine = current_app.config["MEM_ENGINE"]
+    s = current_app.config["SETTINGS"]
+    ns = f"fa::{prefixes[0]}" if prefixes else "fa::common"
+
+    # 2) Build FA-aware hints correctly
     hints = make_fa_hints({
         "mem_engine": mem_engine,
         "prefixes": prefixes,
         "question": question,
         "clarifications": clarifications,
     })
+    ds_name = s.default_datasource(namespace=ns)
+    if ds_name and isinstance(hints, dict):
+        hints.setdefault("datasource", ds_name)
 
-    # 2) Call the pipeline with hints
+    # 3) Call the pipeline with hints
     pipeline: Pipeline = current_app.config["PIPELINE"]
-    s = current_app.config["SETTINGS"]
-
-    ns = f"fa::{prefixes[0]}" if prefixes else "fa::common"
     if isinstance(pipeline.settings, Settings):
         pipeline.settings.set_namespace(ns)
 
@@ -269,25 +273,27 @@ def answer():
     research_summary = rctx.get("summary")
     source_ids = rctx.get("source_ids")
 
-    # 3) Create/record inquiry row
+    # 3) Create/record inquiry row only when further action required
     warnings = result.setdefault("warnings", [])
-    try:
-        inquiry_id = create_or_update_inquiry(
-            current_app.config["MEM_ENGINE"],
-            namespace=f"fa::{prefixes[0]}" if prefixes else "fa::common",
-            prefixes=prefixes,
-            question=question,
-            auth_email=auth_email,
-            run_id=None,
-            research_enabled=bool(s.get("RESEARCH_MODE", False)),
-            status=effective_status,
-            research_summary=research_summary,
-            source_ids=source_ids,
-        )
-    except Exception as e:
-        inquiry_id = None
-        current_app.logger.exception("mem_inquiries insert failed")
-        warnings.append(f"inquiry_log_failed: {e!s}")
+    inquiry_id = None
+    if effective_status in {"needs_clarification", "awaiting_admin"}:
+        try:
+            inquiry_id = create_or_update_inquiry(
+                current_app.config["MEM_ENGINE"],
+                namespace=f"fa::{prefixes[0]}" if prefixes else "fa::common",
+                prefixes=prefixes,
+                question=question,
+                auth_email=auth_email,
+                run_id=None,
+                research_enabled=bool(s.get("RESEARCH_MODE", False)),
+                status=effective_status,
+                research_summary=research_summary,
+                source_ids=source_ids,
+            )
+        except Exception as e:
+            inquiry_id = None
+            current_app.logger.exception("mem_inquiries insert failed")
+            warnings.append(f"inquiry_log_failed: {e!s}")
 
     # 4) Only escalate to admins if we’re awaiting_admin
     if effective_status == "awaiting_admin":
@@ -351,7 +357,6 @@ def answer():
                 "status": "ok",
                 "sql": result.get("sql"),
                 "rationale": result.get("rationale"),
-                "inquiry_id": inquiry_id,
                 **({"warnings": warnings} if warnings else {}),
             }
         )

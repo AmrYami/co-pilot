@@ -223,6 +223,11 @@ class Pipeline:
         admin_reply = context.get("admin_reply")
         clarifications = context.get("clarifications") or {}
 
+        ds_name = hints.get("datasource") if hints else None
+        if not ds_name:
+            ds_name = self.settings.default_datasource(ns)
+        context["datasource"] = ds_name
+
         if inquiry_id and (admin_reply or clarifications):
             try:
                 with self.mem_engine.begin() as con:
@@ -273,14 +278,15 @@ class Pipeline:
                     res = con.execute(
                         text(
                             """INSERT INTO mem_runs
-                                  (namespace, user_id, input_query, interpreted_intent,
+                                  (namespace, datasource, user_id, input_query, interpreted_intent,
                                    sql_generated, sql_final, status, rows_returned, created_at)
                                 VALUES
-                                  (:ns, :uid, :inq, :intent, :sqlg, :sqlf, :st, :rows, NOW())
+                                  (:ns, :ds, :uid, :inq, :intent, :sqlg, :sqlf, :st, :rows, NOW())
                                 RETURNING id"""
                         ),
                         {
                             "ns": ns,
+                            "ds": ds_name,
                             "uid": auth_email or "unknown",
                             "inq": question,
                             "intent": "clarified",
@@ -391,7 +397,7 @@ class Pipeline:
             ns_for_settings = (
                 f"fa::{prefixes[0]}" if prefixes else getattr(self, "namespace", "fa::common")
             )
-            if self.settings.research_enabled(ns_for_settings) and self.researcher:
+            if ds_name and self.settings.research_allowed(ds_name, ns_for_settings) and self.researcher:
                 summary, source_ids = self.researcher.search(question, ctx)
                 ctx.setdefault("research", {})
                 ctx["research"]["summary"] = summary
