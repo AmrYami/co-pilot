@@ -1,42 +1,67 @@
 from __future__ import annotations
-from typing import Any, Dict, Iterable, Tuple
+import re
+from typing import Optional, Dict, Any
+
+
+class DerivationError(RuntimeError):
+    pass
+
+
+_SQL_TAG = re.compile(r"(?is)<sql>\s*(.*?)\s*</sql>")
+_SQL_FALLBACK = re.compile(r"(?is)\b(with\b.*?;|\bselect\b.*?;)\s*$")
+
+
+def _extract_sql(text: str) -> Optional[str]:
+    if not text:
+        return None
+    m = _SQL_TAG.search(text)
+    if m:
+        return m.group(1).strip()
+    m = _SQL_FALLBACK.search(text)
+    if m:
+        return m.group(1).strip()
+    return None
+
 
 def derive_sql_from_admin_reply(
-    llm: Any,
-    *,
+    pipeline,
+    inquiry_id: int,
     question: str,
-    admin_reply: str,
-    tables: Iterable[str],
-    columns: Iterable[str],
-    metrics: Iterable[str] | None = None,
-) -> Tuple[str | None, str | None]:
+    admin_answer: str,
+    prefixes: list[str] | None = None,
+    auth_email: str | None = None,
+    extra_hints: Dict[str, Any] | None = None,
+) -> str:
     """
-    Try to convert admin natural-language reply into canonical SQL (no prefixes).
-    Returns (sql, rationale) or (None, None) if not confident.
+    Turn admin natural-language reply into a concrete SQL query.
+    We re-run the planner with the admin clarification injected and force SQL-only output.
     """
-    tbls = ", ".join(sorted(set(tables)))
-    cols = ", ".join(sorted(set(columns)))
-    mets = ", ".join(sorted(set(metrics or []))) or "(none)"
-    prompt = (
-        "You are an expert SQL planner. Convert the admin guidance into canonical SQL.\n"
-        "Use only these tables/columns.\n"
-        f"Tables: {tbls}\n"
-        f"Columns: {cols}\n"
-        f"Metrics: {mets}\n"
-        f"Original Question: {question}\n"
-        f"Admin Guidance: {admin_reply}\n"
-        "Return as:\nSQL:\n<sql>\nRationale:\n<why>\n"
-        "If you cannot produce safe SELECT/CTE SQL, return literally: SQL:\n<none>\nRationale:\n<why>\n"
+
+    prefixes = prefixes or []
+    hints = dict(extra_hints or {})
+    hints["admin_clarification"] = admin_answer
+    hints["force_sql_only"] = True
+
+    sys_rules = (
+        "You are a SQL generator for MySQL/MariaDB.\n"
+        "Return ONLY a valid SQL query that answers the question.\n"
+        "Do not include explanations. Output between <sql> and </sql> tags."
     )
-    out = llm.generate(prompt, max_new_tokens=256, temperature=0.1, top_p=0.9)
-    lower = out.lower()
-    if "sql:" in lower:
-        i = lower.find("sql:")
-        rest = out[i+4:]
-        j = rest.lower().find("rationale:")
-        sql = rest[:j].strip() if j >= 0 else rest.strip()
-        why = rest[j+10:].strip() if j >= 0 else ""
-        if "<none>" in sql.lower():
-            return None, why
-        return sql, why
-    return None, None
+    prompt = (
+        f"{sys_rules}\n\n"
+        f"Question:\n{question}\n\n"
+        f"Admin clarification:\n{admin_answer}\n\n"
+        f"Context: user prefixes={prefixes}\n"
+        f"Return SQL only.\n"
+        f"<sql>"
+    )
+
+    out = pipeline.llm.generate(prompt, max_new_tokens=256, temperature=0.2, top_p=0.9)
+    if "</sql>" not in out:
+        out = out + "\n</sql>"
+
+    sql = _extract_sql(out)
+    if not sql:
+        raise DerivationError("planner returned non-SQL text")
+
+    return sql
