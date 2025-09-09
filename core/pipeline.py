@@ -49,6 +49,7 @@ class PipelineConfig:
 class Pipeline:
     def __init__(self, settings: Any | None = None, namespace: str = "default") -> None:
         # 0) fields used by other steps
+        self.namespace: str = namespace
         self._cache: Dict[str, Dict[str, Any]] = {}
         self.settings = (
             settings
@@ -264,7 +265,11 @@ class Pipeline:
         if not ok:
             # refresh researcher per settings each call
             self._ensure_researcher_loaded()
-            if self.settings.research_enabled(self.namespace) and self.researcher:
+            prefixes = context.get("prefixes") or []
+            ns_for_settings = (
+                f"fa::{prefixes[0]}" if prefixes else getattr(self, "namespace", "fa::common")
+            )
+            if self.settings.research_enabled(ns_for_settings) and self.researcher:
                 summary, source_ids = self.researcher.search(question, ctx)
                 ctx.setdefault("research", {})
                 ctx["research"]["summary"] = summary
