@@ -1,60 +1,90 @@
 from __future__ import annotations
-
 from dataclasses import dataclass
+from typing import Optional
 import re
 
-
-@dataclass
+@dataclass(frozen=True)
 class Intent:
-    kind: str  # 'smalltalk' | 'help' | 'raw_sql' | 'sql' | 'ambiguous'
+    # allowed kinds consumed by Pipeline.answer:
+    # 'smalltalk' | 'help' | 'admin_task' | 'raw_sql' | 'sql' | 'ambiguous'
+    kind: str
     reason: str
 
-
-_GREETING = re.compile(r"^\s*(hi|hello|hey|السلام عليكم|مرحبا|أهلًا|اهلا|ازيك)\b", re.I)
+# --- Patterns (EN + AR) ---
+_GREETING = re.compile(
+    r'^\s*(hi|hello|hey|salam|salām|السلام\s*عليكم|مرحبا|أهلًا|اهلا|ازيك|صباح الخير|مساء الخير)\b',
+    re.I | re.U
+)
 _HELP = re.compile(
-    r"\b(help|what can you do|how (?:do|can) you help|ممكن تساعدني|تقدر تعمل ايه|ايه اللي بتعمله)\b",
-    re.I,
+    r'\b(help|what\s+can\s+you\s+do|how\s+(?:do|can)\s+you\s+help|how\s+to\s+use|'
+    r'مساعدة|ممكن\s*تساعدني|تقدر\s*تعمل\s*ايه|ازاي\s*تستخدم)\b',
+    re.I | re.U
+)
+_ADMIN = re.compile(
+    r'\b(restart\s+copilot|reload\s+settings|ingest|bundle|export|config|health|/admin)\b',
+    re.I
 )
 _SQL_TOKENS = re.compile(
-    r"\b(select|from|where|group\s+by|order\s+by|join|limit)\b", re.I
+    r'\b(select|from|where|group\s+by|order\s+by|join|limit|having|union|with)\b',
+    re.I
 )
 _DOMAIN = re.compile(
-    r"\b(customer|customers|invoice|invoices|sales|receipt|supplier|gl|aging|dimension|bank|payment|voucher|stock|item|inventory)\b",
-    re.I,
+    r'\b(customer|customers|client|invoice|invoices|sales|receipt|supplier|gl|aging|'
+    r'dimension|bank|payment|voucher|stock|item|inventory)\b',
+    re.I
 )
 
-_CLF_PROMPT = """You are a strict classifier. Output one of:
-smalltalk | help | raw_sql | sql | ambiguous
-Text: {q}
-Answer:"""
-
-
 class IntentRouter:
-    def __init__(self, clarifier_llm):
-        self.clarifier_llm = clarifier_llm
+    """
+    Lightweight intent classifier with strong fallbacks; optionally uses a small LLM
+    (clarifier) when available for borderline domain questions.
+    """
+    def __init__(self, llm: Optional[object] = None):
+        # llm must expose .generate(prompt, max_new_tokens=..., temperature=..., top_p=...)
+        self.llm = llm
 
     def classify(self, text: str) -> Intent:
         t = (text or "").strip()
         if not t:
             return Intent("smalltalk", "empty")
+
         if _GREETING.search(t):
-            if not _DOMAIN.search(t) and len(t.split()) <= 3:
-                return Intent("smalltalk", "greeting")
+            return Intent("smalltalk", "greeting")
         if _HELP.search(t):
-            return Intent("help", "help")
+            return Intent("help", "help_keyword")
+        if _ADMIN.search(t):
+            return Intent("admin_task", "admin_keyword")
         if _SQL_TOKENS.search(t):
             return Intent("raw_sql", "sql_tokens")
-        try:
-            out = self.clarifier_llm.generate(
-                _CLF_PROMPT.format(q=t), max_new_tokens=4, temperature=0.0, top_p=1.0
-            )
-            ans = (out or "").strip().split()[0].lower()
-            if ans in {"smalltalk", "help", "raw_sql", "sql", "ambiguous"}:
-                return Intent(ans, "clarifier")
-        except Exception:
-            pass
-        if _DOMAIN.search(t):
-            return Intent("sql", "domain_words")
-        if len(t.split()) <= 3:
+
+        # One or two words, no domain word → treat as smalltalk.
+        if len(t.split()) <= 3 and not _DOMAIN.search(t):
             return Intent("smalltalk", "very_short")
+
+        # Domain words present → likely SQL. If we have a clarifier LLM, try it once.
+        if _DOMAIN.search(t):
+            if self.llm is not None:
+                try:
+                    prompt = (
+                        "Decide if the message is SQL-related (data question), SMALLTALK, HELP, or ADMIN.\n"
+                        "Respond with a single word: SQL, SMALLTALK, HELP, or ADMIN.\n"
+                        f"Message: {t!r}\n"
+                    )
+                    out = self.llm.generate(
+                        prompt, max_new_tokens=1, temperature=0.0, top_p=1.0
+                    ).strip().upper()
+                    if out.startswith("SMALL"):
+                        return Intent("smalltalk", "clarifier_smalltalk")
+                    if out.startswith("HELP"):
+                        return Intent("help", "clarifier_help")
+                    if out.startswith("ADMIN"):
+                        return Intent("admin_task", "clarifier_admin")
+                    # default SQL on any other output
+                    return Intent("sql", "clarifier_sql")
+                except Exception:
+                    # fall through to heuristic
+                    pass
+            return Intent("sql", "domain_words")
+
+        # Last resort
         return Intent("ambiguous", "default")
