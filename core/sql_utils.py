@@ -4,41 +4,41 @@ Keep generic; FA specifics stay in apps/fa.
 """
 from __future__ import annotations
 import re
-from typing import Optional, Tuple
 
 _WHERE_RE = re.compile(r"(?is)\bwhere\b")
 
-_SQL_START = re.compile(r"(?is)\b(SELECT|WITH|INSERT|UPDATE|DELETE)\b")
+# Fenced code block: ```sql ... ```
+_SQL_FENCE = re.compile(r"```(?:sql)?\s*(.*?)```", re.I | re.S)
+# First SQL-ish token
+_SQL_START = re.compile(r"(?is)\b(SELECT|WITH|EXPLAIN|SHOW)\b")
 
 
-def extract_sql(text: str) -> Tuple[Optional[str], str]:
-    """
-    Try hard to pull a single SQL statement from LLM output.
-    Returns (sql or None, how_extracted).
-    """
+def extract_sql(text: str) -> str | None:
+    """Pull a single SQL statement out of model output (markdown fences, chatter, etc.)."""
     if not text:
-        return None, "empty"
-
-    # ```sql ... ```
-    m = re.search(r"```sql\s*(.*?)```", text, re.DOTALL | re.IGNORECASE)
+        return None
+    body = text.strip()
+    m = _SQL_FENCE.search(body)
     if m:
         body = m.group(1).strip()
-        m2 = _SQL_START.search(body)
-        if m2:
-            sql = body[m2.start():].strip()
-            return sql, "fenced"
+    # drop leading 'sql:' labels etc.
+    body = re.sub(r"^\s*sql\s*:\s*", "", body, flags=re.I).strip()
+    m2 = _SQL_START.search(body)
+    if not m2:
+        return None
+    sql = body[m2.start():]
+    # stop at a trailing fence if present
+    sql = sql.split("```", 1)[0].strip()
+    # keep up to the last semicolon if multiple statements
+    if ";" in sql:
+        sql = sql[: sql.rfind(";") + 1]
+    # strip stray backticks
+    sql = sql.replace("`", "").strip()
+    return sql or None
 
-    # Inline SQL (first SELECT/WITH/… onward)
-    m = _SQL_START.search(text)
-    if m:
-        body = text[m.start():].strip()
-        # cut to last ';' if present
-        last_semicolon = body.rfind(";")
-        if last_semicolon != -1:
-            body = body[: last_semicolon + 1]
-        return body.strip(), "inline"
 
-    return None, "not_found"
+def looks_like_sql(text: str) -> bool:
+    return bool(_SQL_START.search((text or "").strip()))
 
 def _strip_semicolon(sql: str) -> str:
     return sql.rstrip().rstrip(";").rstrip()

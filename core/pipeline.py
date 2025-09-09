@@ -24,7 +24,8 @@ from core.intent import IntentRouter
 from core.settings import Settings
 from core.research import build_researcher
 from core.sql_exec import get_app_engine, run_select, as_csv
-from core.sql_utils import extract_sql
+from core.sql_utils import extract_sql, looks_like_sql
+from core.inquiries import create_or_update_inquiry
 from core.emailer import Emailer
 
 from types import SimpleNamespace
@@ -147,37 +148,54 @@ class Pipeline:
             "Try asking: 'top 10 customers by sales last month' or 'إجمالي المبيعات في يناير'."
         )
 
-    def _coerce_sql_or_retry(self, raw_text: str, question: str) -> str:
-        """
-        Try to extract SQL from planner output.
-        If missing, re-prompt the planner with a strict 'SQL-only' instruction.
-        """
-        sql, _ = extract_sql(raw_text)
-        if sql:
-            return sql
-
-        strict_prompt = (
-            "Return ONLY the final SQL query for the following request. "
-            "No prose, no backticks, no comments.\n\n"
-            f"Request: {question}\n"
-            "SQL:"
-        )
-        forced = self.llm.generate(
-            strict_prompt, max_new_tokens=512, temperature=0.0, top_p=1.0
-        )
-        sql, _ = extract_sql(forced)
+    def _force_sql_only(self, raw: str, question: str) -> str | None:
+        """Try to coerce any model output into SQL; optionally use the clarifier to reformat."""
+        sql = extract_sql(raw)
         if sql:
             return sql
 
         if getattr(self, "clarifier_llm", None):
-            forced2 = self.clarifier_llm.generate(
-                strict_prompt, max_new_tokens=512, temperature=0.0, top_p=1.0
-            )
-            sql, _ = extract_sql(forced2)
-            if sql:
-                return sql
+            cleaned = self.clarifier_llm.generate(
+                (
+                    "Convert the following assistant output into a single valid SQL query only. "
+                    "Do NOT include any commentary or markdown. "
+                    "If no SQL is possible, output exactly NO_SQL.\n\n"
+                    f"Question:\n{question}\n\nAssistant output:\n{raw}\n"
+                ),
+                max_new_tokens=256,
+                temperature=0.0,
+                top_p=1.0,
+            ).strip()
+            if cleaned.upper().startswith("NO_SQL"):
+                return None
+            return extract_sql(cleaned) or (cleaned if looks_like_sql(cleaned) else None)
 
-        raise ValueError("planner returned non-SQL text")
+        return None
+
+    def _log_inquiry(
+        self,
+        namespace: str,
+        prefixes: Iterable[str],
+        question: str,
+        auth_email: str | None,
+        *,
+        status: str,
+    ) -> int | None:
+        try:
+            return create_or_update_inquiry(
+                self.mem_engine,
+                namespace=namespace,
+                prefixes=list(prefixes),
+                question=question,
+                auth_email=auth_email,
+                run_id=None,
+                research_enabled=bool(self.settings.get("RESEARCH_MODE", False)),
+                status=status,
+                research_summary=None,
+                source_ids=None,
+            )
+        except Exception:
+            return None
 
     # ------------------ public API ------------------
     def ensure_ingested(
@@ -291,8 +309,19 @@ class Pipeline:
             if hints:
                 gh.update(hints)
 
-            raw_out, rationale = self.planner.plan(enriched_q, ctx, hints=gh)
-            canonical_sql = self._coerce_sql_or_retry(raw_out, enriched_q)
+            canonical_sql, rationale = self.planner.plan(enriched_q, ctx, hints=gh)
+            canonical_sql = extract_sql(canonical_sql) or self._force_sql_only(canonical_sql, question)
+            if not canonical_sql:
+                inquiry_id = self._log_inquiry(
+                    ns, prefixes, question, auth_email, status="needs_clarification"
+                )
+                return {
+                    "status": "needs_clarification",
+                    "inquiry_id": inquiry_id,
+                    "questions": [
+                        "I couldn't derive a clean SQL from the admin notes. Add one more hint or confirm the tables."
+                    ],
+                }
             sql = SQLRewriter.rewrite_for_prefixes(canonical_sql, prefixes)
             exec_ok, info = self.validator.quick_validate(sql)
             rows = None
@@ -399,8 +428,22 @@ class Pipeline:
         if hints:
             gh.update(hints)
 
-        raw_out, rationale = self.planner.plan(question, ctx, hints=gh)
-        canonical_sql = self._coerce_sql_or_retry(raw_out, question)
+        canonical_sql, rationale = self.planner.plan(question, ctx, hints=gh)
+        canonical_sql = extract_sql(canonical_sql) or self._force_sql_only(canonical_sql, question)
+        if not canonical_sql:
+            inquiry_id = self._log_inquiry(
+                ns, prefixes, question, auth_email, status="needs_clarification"
+            )
+            return {
+                "status": "needs_clarification",
+                "inquiry_id": inquiry_id,
+                "questions": [
+                    "I couldn't derive a clean SQL. Can you clarify the tables or metrics?"
+                ],
+                "context": ctx,
+                "intent": it.kind,
+                "is_sql": True,
+            }
 
         if needs_clarification and it.kind in {"sql", "ambiguous"}:
             inline_ok = bool(context.get("inline_clarify"))
@@ -439,10 +482,14 @@ class Pipeline:
                 ctx["research"]["summary"] = summary
                 ctx["research"]["source_ids"] = source_ids
 
-                raw_out, rationale = self.planner.plan(question, ctx, hints=gh)
-                canonical_sql = self._coerce_sql_or_retry(raw_out, question)
-                sql = SQLRewriter.rewrite_for_prefixes(canonical_sql, prefixes)
-                ok, info = self.validator.quick_validate(sql)
+                canonical_sql, rationale = self.planner.plan(question, ctx, hints=gh)
+                canonical_sql = extract_sql(canonical_sql) or self._force_sql_only(canonical_sql, question)
+                if canonical_sql:
+                    sql = SQLRewriter.rewrite_for_prefixes(canonical_sql, prefixes)
+                    ok, info = self.validator.quick_validate(sql)
+                else:
+                    ok = False
+                    info = {"error": "no_sql_after_research"}
 
         if not ok:
             return {
