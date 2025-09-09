@@ -88,3 +88,13 @@ class IntentRouter:
 
         # Last resort
         return Intent("ambiguous", "default")
+
+
+# Convenience global router for simple intent checks
+_DEFAULT_ROUTER = IntentRouter()
+
+
+def detect_intent(text: str) -> Intent:
+    """Classify *text* into a lightweight Intent instance."""
+    return _DEFAULT_ROUTER.classify(text)
+

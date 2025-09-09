@@ -24,6 +24,7 @@ from typing import Any, Iterable, List
 from flask import Blueprint, current_app, jsonify, request
 from core.inquiries import create_or_update_inquiry
 from core.pipeline import Pipeline
+from core.intent import detect_intent
 
 from core.settings import Settings
 from apps.fa.adapters import expand_keywords
@@ -33,6 +34,7 @@ from core.alerts import queue_alert, notify_admins_via_email
 from core.sql_exec import validate_select, explain, run_select, as_csv
 from core.mailer import send_email_with_attachments
 from core.agents import ValidatorAgent
+from apps.fa.hints import make_fa_hints
 
 fa_bp = Blueprint("fa", __name__)
 PREFIX_RE = re.compile(r"^[0-9]+_$")
@@ -51,6 +53,16 @@ def _validate_prefixes(prefixes: Iterable[str]) -> List[str]:
         if not PREFIX_RE.match(p):
             raise ValueError(f"Invalid prefix: {p}")
     return ps
+
+
+def _fa_make_hints(mem_engine, prefixes, question):
+    """Call make_fa_hints with either the new or legacy signature."""
+    try:
+        return make_fa_hints(mem_engine, prefixes, question)
+    except TypeError:
+        return make_fa_hints(
+            {"mem_engine": mem_engine, "prefixes": prefixes, "question": question}
+        )
 
 
 @fa_bp.post("/run")
@@ -158,19 +170,48 @@ def ingest_prefixes():  # type: ignore[no-redef]
         return jsonify({"error": str(e)}), 400
 
 
-from apps.fa.hints import make_fa_hints
-
-
 @fa_bp.post("/answer")
 def answer():
     data = request.get_json(force=True) or {}
-    prefixes = data.get("prefixes", [])
+    prefixes = list(data.get("prefixes") or [])
     question = (data.get("question") or "").strip()
     datasources = data.get("datasources") or None  # legacy; ignored
-    auth_email = data.get("auth_email") or current_app.config["SETTINGS"].get(
-        "AUTH_EMAIL"
-    )
+    auth_email = (
+        data.get("auth_email")
+        or current_app.config["SETTINGS"].get("AUTH_EMAIL")
+        or ""
+    ).strip()
 
+    # 0) Friendly intent gate
+    it = detect_intent(question)
+    if it.kind in {"greeting", "help"}:
+        return (
+            jsonify(
+                {
+                    "status": "assist",
+                    "message": (
+                        "Hi! I can analyze your FrontAccounting data and other connected databases.\n"
+                        "Try for example:\n"
+                        "• top 10 customers by sales last month\n"
+                        "• expenses invoice last month for dimension3=Retail\n"
+                        "• receipts by date for prefix 579_ in August\n"
+                        "You can also ask in Arabic."
+                    ),
+                    "examples": [
+                        "top 10 customers by sales last month",
+                        "sales by item category for last 7 days",
+                        "supplier payments last month",
+                    ],
+                }
+            ),
+            200,
+        )
+
+    # 1) Build FA-aware hints correctly
+    mem_engine = current_app.config["MEM_ENGINE"]
+    hints = _fa_make_hints(mem_engine, prefixes, question)
+
+    # 2) Call the pipeline with hints
     pipeline: Pipeline = current_app.config["PIPELINE"]
     s = current_app.config["SETTINGS"]
 
@@ -178,7 +219,6 @@ def answer():
     if isinstance(pipeline.settings, Settings) and prefixes:
         pipeline.settings.set_namespace(f"fa::{prefixes[0]}")
 
-    hints = make_fa_hints(data)
     result = pipeline.answer(
         question=question,
         context={"prefixes": prefixes, "auth_email": auth_email},
