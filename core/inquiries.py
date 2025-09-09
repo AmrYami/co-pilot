@@ -31,34 +31,39 @@ def mark_admin_note(mem_engine, *, inquiry_id: int, admin_reply: str, answered_b
         """), {"reply": admin_reply, "by": answered_by, "id": inquiry_id})
 
 
-def append_admin_note(mem_engine, inquiry_id: int, by: str, text_note: str) -> dict:
+def append_admin_note(
+    mem_engine,
+    inquiry_id: int,
+    by: str,
+    text_note: str | None = None,
+    structured: dict | None = None,
+) -> None:
     """
-    Append a single admin note (JSON object) to mem_inquiries.admin_notes array,
-    increment clarification_rounds, and return the new array + count.
+    Append a single admin note to mem_inquiries.admin_notes (JSONB[]),
+    increment clarification_rounds, and touch updated_at.
     """
 
     note = {
-        "by": (by or "").strip() or "admin",
-        "text": (text_note or "").strip(),
-        "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "by": by,
+        "ts": datetime.now(timezone.utc).isoformat(),
     }
+    if text_note:
+        note["note"] = text_note
+    if structured:
+        note["structured"] = structured
 
-    sql = """
+    sql = text(
+        """
         UPDATE mem_inquiries
-           SET admin_notes = COALESCE(admin_notes, '[]'::jsonb)
-                              || jsonb_build_array(CAST(:note AS jsonb)),
-               clarification_rounds = COALESCE(clarification_rounds, 0) + 1,
-               updated_at = NOW()
-         WHERE id = :id
-     RETURNING id, admin_notes, clarification_rounds
-    """
+        SET admin_notes = COALESCE(admin_notes, '[]'::jsonb) || jsonb_build_array(:note),
+            clarification_rounds = COALESCE(clarification_rounds, 0) + 1,
+            updated_at = NOW()
+        WHERE id = :id
+        """
+    ).bindparams(bindparam("note", type_=JSONB))
 
-    params = {"id": inquiry_id, "note": json.dumps(note)}
-
-    with mem_engine.begin() as c:
-        row = c.execute(text(sql), params).mappings().first()
-
-    return dict(row) if row else {}
+    with mem_engine.begin() as cx:
+        cx.execute(sql, {"id": inquiry_id, "note": note})
 
 def get_inquiry(db: Engine, inquiry_id: int) -> Optional[Dict[str, Any]]:
     with db.connect() as c:
