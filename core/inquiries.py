@@ -8,6 +8,7 @@ These helpers are project-agnostic (no FA-specific code).
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 from sqlalchemy.engine import Engine
 from sqlalchemy import text, bindparam
@@ -28,6 +29,39 @@ def mark_admin_note(mem_engine, *, inquiry_id: int, admin_reply: str, answered_b
                    updated_at = NOW()
              WHERE id = :id
         """), {"reply": admin_reply, "by": answered_by, "id": inquiry_id})
+
+
+def append_admin_note(db: Engine, inquiry_id: int, *, by: str, text_note: str) -> None:
+    """Append a {by, ts, text} object into mem_inquiries.admin_notes and bump clarification_rounds."""
+    note = {"by": by, "ts": datetime.utcnow().isoformat() + "Z", "text": text_note}
+    sql = """
+        UPDATE mem_inquiries
+        SET admin_notes = COALESCE(admin_notes, '[]'::jsonb) || to_jsonb(:note::json),
+            clarification_rounds = COALESCE(clarification_rounds, 0) + 1,
+            updated_at = NOW()
+        WHERE id = :id
+    """
+    with db.begin() as c:
+        c.execute(text(sql), {"id": inquiry_id, "note": note})
+
+
+def get_inquiry(db: Engine, inquiry_id: int) -> Optional[Dict[str, Any]]:
+    with db.connect() as c:
+        row = c.execute(text("SELECT * FROM mem_inquiries WHERE id = :id"), {"id": inquiry_id}).mappings().first()
+        return dict(row) if row else None
+
+
+def set_inquiry_status(db: Engine, inquiry_id: int, *, status: str, answered_by: Optional[str] = None) -> None:
+    sql = """
+        UPDATE mem_inquiries
+        SET status = :st,
+            answered_by = COALESCE(:by, answered_by),
+            answered_at = CASE WHEN :st = 'answered' THEN NOW() ELSE answered_at END,
+            updated_at = NOW()
+        WHERE id = :id
+    """
+    with db.begin() as c:
+        c.execute(text(sql), {"id": inquiry_id, "st": status, "by": answered_by, "id": inquiry_id})
 
 
 def create_or_update_inquiry(
