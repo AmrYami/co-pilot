@@ -39,6 +39,7 @@ from core.mailer import send_email_with_attachments, send_email
 from core.alerts import notify_admins_via_email
 from core.pipeline import Pipeline
 from core.agents import ValidatorAgent
+from apps.fa.hints import parse_admin_answer, make_fa_hints
 
 admin_bp = Blueprint("admin", __name__, url_prefix="/admin")
 
@@ -222,6 +223,72 @@ def admin_reply():
             )
         return (
             jsonify({"error": f"{e}", "inquiry_id": inquiry_id, "status": "failed"}),
+            500,
+        )
+
+
+@admin_bp.post("/inquiries/derive")
+def derive_inquiry():
+    data = request.get_json(force=True) or {}
+    inquiry_id = data.get("inquiry_id")
+    answer = data.get("answer", "") or ""
+    question = data.get("question")
+    prefixes = data.get("prefixes") or []
+    auth_email = data.get("auth_email")
+
+    with current_app.config["MEM_ENGINE"].begin() as conn:
+        row = conn.execute(
+            text(
+                """
+            SELECT id, namespace, question AS q_db, prefixes, auth_email
+              FROM mem_inquiries WHERE id = :iid
+            """
+            ),
+            {"iid": inquiry_id},
+        ).mappings().first()
+        if not row:
+            return jsonify({"error": "inquiry_not_found", "inquiry_id": inquiry_id}), 404
+
+        namespace = row["namespace"]
+        question = question or row["q_db"]
+        if not prefixes:
+            prefixes = row["prefixes"] if isinstance(row["prefixes"], list) else []
+        auth_email = auth_email or row["auth_email"]
+
+        conn.execute(
+            text(
+                """
+                UPDATE mem_inquiries
+                   SET admin_reply = :ar, status = 'open', updated_at = NOW()
+                 WHERE id = :iid
+                """
+            ),
+            {"ar": answer, "iid": inquiry_id},
+        )
+
+    admin_overrides = parse_admin_answer(answer)
+    mem_engine = current_app.config["MEM_ENGINE"]
+    hints = make_fa_hints(mem_engine, prefixes, question, admin_overrides=admin_overrides)
+
+    pipeline: Pipeline = current_app.config["PIPELINE"]
+    pipeline.namespace = namespace
+
+    try:
+        result = pipeline.answer(
+            question,
+            {
+                "namespace": namespace,
+                "prefixes": prefixes,
+                "auth_email": auth_email,
+                "inquiry_id": inquiry_id,
+                "admin_reply": answer,
+            },
+            hints=hints,
+        )
+        return jsonify({"inquiry_id": inquiry_id, "status": "answered", **result})
+    except Exception as e:
+        return (
+            jsonify({"inquiry_id": inquiry_id, "status": "failed", "error": str(e)}),
             500,
         )
 

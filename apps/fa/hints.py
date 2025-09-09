@@ -1,6 +1,46 @@
 # apps/fa/hints.py
+"""FA-specific hint helpers."""
+
 from __future__ import annotations
+from datetime import date, timedelta
 from typing import Any, Dict, List, Optional
+
+
+def _last_month_bounds() -> tuple[str, str]:
+    today = date.today()
+    first_this = today.replace(day=1)
+    last_day_prev = first_this - timedelta(days=1)
+    first_day_prev = last_day_prev.replace(day=1)
+    return first_day_prev.isoformat(), last_day_prev.isoformat()
+
+
+def parse_admin_answer(answer: str) -> Dict[str, Any]:
+    """
+    Minimal heuristics:
+      - if mentions 'invoice' or 'tran_date' -> prefer debtor_trans.tran_date
+      - 'last month' -> concrete YYYY-MM-DD range
+    Returns a dict that make_fa_hints can merge into its output.
+    """
+    a = (answer or "").lower()
+    out: Dict[str, Any] = {}
+
+    if "tran_date" in a or "invoice" in a:
+        out["date_column"] = "debtor_trans.tran_date"
+
+    if "last month" in a:
+        start, end = _last_month_bounds()
+        out["date_filter"] = {
+            "column": out.get("date_column", "tran_date"),
+            "op": "between",
+            "start": start,
+            "end": end,
+        }
+        out["time_grain"] = "month"
+
+    if "top 10" in a:
+        out["limit"] = 10
+
+    return out
 
 
 def _build(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -11,6 +51,7 @@ def _build(payload: Dict[str, Any]) -> Dict[str, Any]:
     q = (payload.get("question") or "").strip()
     prefixes = list(payload.get("prefixes") or [])
     clarifications: Optional[Dict[str, Any]] = payload.get("clarifications") or None
+    admin_overrides: Optional[Dict[str, Any]] = payload.get("admin_overrides") or None
 
     # App-agnostic, lightweight hints (date range, simple eq filters)
     base = core_make_hints(q)
@@ -35,6 +76,10 @@ def _build(payload: Dict[str, Any]) -> Dict[str, Any]:
     # Always pass-through prefixes to downstream planner
     base["prefixes"] = prefixes
 
+    # Apply admin overrides last
+    if admin_overrides:
+        base.update(admin_overrides)
+
     # You can add more FA-specific nudges here later (dimensions, ST codes, etc.)
     return base
 
@@ -50,11 +95,13 @@ def make_fa_hints(*args, **kwargs) -> Dict[str, Any]:
     if len(args) >= 3:
         mem_engine, prefixes, question = args[:3]
         clar = args[3] if len(args) > 3 else None
+        admin_overrides = args[4] if len(args) > 4 else None
         return _build({
             "mem_engine": mem_engine,
             "prefixes": prefixes,
             "question": question,
             "clarifications": clar,
+            "admin_overrides": admin_overrides,
         })
 
     # Named kwargs (accept either shape)
@@ -66,5 +113,6 @@ def make_fa_hints(*args, **kwargs) -> Dict[str, Any]:
         "prefixes": kwargs.get("prefixes") or [],
         "question": kwargs.get("question") or "",
         "clarifications": kwargs.get("clarifications"),
+        "admin_overrides": kwargs.get("admin_overrides"),
     })
 
