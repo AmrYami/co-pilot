@@ -4,9 +4,41 @@ Keep generic; FA specifics stay in apps/fa.
 """
 from __future__ import annotations
 import re
-from typing import Optional
+from typing import Optional, Tuple
 
 _WHERE_RE = re.compile(r"(?is)\bwhere\b")
+
+_SQL_START = re.compile(r"(?is)\b(SELECT|WITH|INSERT|UPDATE|DELETE)\b")
+
+
+def extract_sql(text: str) -> Tuple[Optional[str], str]:
+    """
+    Try hard to pull a single SQL statement from LLM output.
+    Returns (sql or None, how_extracted).
+    """
+    if not text:
+        return None, "empty"
+
+    # ```sql ... ```
+    m = re.search(r"```sql\s*(.*?)```", text, re.DOTALL | re.IGNORECASE)
+    if m:
+        body = m.group(1).strip()
+        m2 = _SQL_START.search(body)
+        if m2:
+            sql = body[m2.start():].strip()
+            return sql, "fenced"
+
+    # Inline SQL (first SELECT/WITH/… onward)
+    m = _SQL_START.search(text)
+    if m:
+        body = text[m.start():].strip()
+        # cut to last ';' if present
+        last_semicolon = body.rfind(";")
+        if last_semicolon != -1:
+            body = body[: last_semicolon + 1]
+        return body.strip(), "inline"
+
+    return None, "not_found"
 
 def _strip_semicolon(sql: str) -> str:
     return sql.rstrip().rstrip(";").rstrip()

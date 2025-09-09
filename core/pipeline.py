@@ -24,6 +24,7 @@ from core.intent import IntentRouter
 from core.settings import Settings
 from core.research import build_researcher
 from core.sql_exec import get_app_engine, run_select, as_csv
+from core.sql_utils import extract_sql
 from core.emailer import Emailer
 
 from types import SimpleNamespace
@@ -146,6 +147,38 @@ class Pipeline:
             "Try asking: 'top 10 customers by sales last month' or 'إجمالي المبيعات في يناير'."
         )
 
+    def _coerce_sql_or_retry(self, raw_text: str, question: str) -> str:
+        """
+        Try to extract SQL from planner output.
+        If missing, re-prompt the planner with a strict 'SQL-only' instruction.
+        """
+        sql, _ = extract_sql(raw_text)
+        if sql:
+            return sql
+
+        strict_prompt = (
+            "Return ONLY the final SQL query for the following request. "
+            "No prose, no backticks, no comments.\n\n"
+            f"Request: {question}\n"
+            "SQL:"
+        )
+        forced = self.llm.generate(
+            strict_prompt, max_new_tokens=512, temperature=0.0, top_p=1.0
+        )
+        sql, _ = extract_sql(forced)
+        if sql:
+            return sql
+
+        if getattr(self, "clarifier_llm", None):
+            forced2 = self.clarifier_llm.generate(
+                strict_prompt, max_new_tokens=512, temperature=0.0, top_p=1.0
+            )
+            sql, _ = extract_sql(forced2)
+            if sql:
+                return sql
+
+        raise ValueError("planner returned non-SQL text")
+
     # ------------------ public API ------------------
     def ensure_ingested(
         self, source: str, prefixes: Iterable[str], fa_version: Optional[str] = None
@@ -258,7 +291,8 @@ class Pipeline:
             if hints:
                 gh.update(hints)
 
-            canonical_sql, rationale = self.planner.plan(enriched_q, ctx, hints=gh)
+            raw_out, rationale = self.planner.plan(enriched_q, ctx, hints=gh)
+            canonical_sql = self._coerce_sql_or_retry(raw_out, enriched_q)
             sql = SQLRewriter.rewrite_for_prefixes(canonical_sql, prefixes)
             exec_ok, info = self.validator.quick_validate(sql)
             rows = None
@@ -365,7 +399,8 @@ class Pipeline:
         if hints:
             gh.update(hints)
 
-        canonical_sql, rationale = self.planner.plan(question, ctx, hints=gh)
+        raw_out, rationale = self.planner.plan(question, ctx, hints=gh)
+        canonical_sql = self._coerce_sql_or_retry(raw_out, question)
 
         if needs_clarification and it.kind in {"sql", "ambiguous"}:
             inline_ok = bool(context.get("inline_clarify"))
@@ -404,7 +439,8 @@ class Pipeline:
                 ctx["research"]["summary"] = summary
                 ctx["research"]["source_ids"] = source_ids
 
-                canonical_sql, rationale = self.planner.plan(question, ctx, hints=gh)
+                raw_out, rationale = self.planner.plan(question, ctx, hints=gh)
+                canonical_sql = self._coerce_sql_or_retry(raw_out, question)
                 sql = SQLRewriter.rewrite_for_prefixes(canonical_sql, prefixes)
                 ok, info = self.validator.quick_validate(sql)
 
