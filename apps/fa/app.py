@@ -55,16 +55,6 @@ def _validate_prefixes(prefixes: Iterable[str]) -> List[str]:
     return ps
 
 
-def _fa_make_hints(mem_engine, prefixes, question):
-    """Call make_fa_hints with either the new or legacy signature."""
-    try:
-        return make_fa_hints(mem_engine, prefixes, question)
-    except TypeError:
-        return make_fa_hints(
-            {"mem_engine": mem_engine, "prefixes": prefixes, "question": question}
-        )
-
-
 @fa_bp.post("/run")
 def run_query():
     """
@@ -209,7 +199,11 @@ def answer():
 
     # 1) Build FA-aware hints correctly
     mem_engine = current_app.config["MEM_ENGINE"]
-    hints = _fa_make_hints(mem_engine, prefixes, question)
+    hints = make_fa_hints({
+        "mem_engine": mem_engine,
+        "prefixes": prefixes,
+        "question": question,
+    })
 
     # 2) Call the pipeline with hints
     pipeline: Pipeline = current_app.config["PIPELINE"]
