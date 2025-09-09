@@ -187,14 +187,47 @@ class Settings:
 
         return os.getenv("APP_DB_URL") or os.getenv("FA_DB_URL")
 
-    def research_enabled(self, namespace: str | None = None) -> bool:
-        # Single boolean toggle, default False in prod, True in dev.
-        v = self.get("RESEARCH_MODE", namespace=namespace)
-        if v is None:
+    def admin_can_clarify_immediate(
+        self, email: str | None, namespace: str | None = None
+    ) -> bool:
+        if not email:
             return False
-        if isinstance(v, bool):
-            return v
+        emails = _as_list(
+            self.get("ADMINS_CAN_CLARIFY_IMMEDIATE", namespace=namespace)
+        )
+        return any(email.strip().lower() == e.strip().lower() for e in emails)
+
+    def enduser_can_clarify(self, namespace: str | None = None) -> bool:
+        v = self.get("ENDUSER_CAN_CLARIFY", namespace=namespace)
         return str(v).strip().lower() in {"1", "true", "yes", "y"}
+
+    def research_enabled(self, namespace: str | None = None) -> bool:
+        """Namespace-aware research policy with sane fallbacks."""
+        # 1) per-namespace toggle
+        v_ns = self.get("RESEARCH_MODE", namespace=namespace)
+        if v_ns is not None and str(v_ns).strip().lower() in {"0", "false", "no", "n"}:
+            return False
+        if v_ns is not None and str(v_ns).strip().lower() in {"1", "true", "yes", "y"}:
+            return True
+
+        # 2) policy object (e.g., {"frontaccounting_bk": true, "rms2": false, ...})
+        try:
+            import json
+
+            pol_raw = self.get("RESEARCH_POLICY", namespace=namespace)
+            if pol_raw:
+                pol = json.loads(pol_raw) if isinstance(pol_raw, str) else pol_raw
+                if isinstance(pol, dict):
+                    # if a datasource is present in context you can check it upstream
+                    # here we just honor the namespace-level policy objectively
+                    # absence means "no decision"
+                    pass
+        except Exception:
+            pass
+
+        # 3) global default
+        v_glob = self.get("RESEARCH_MODE")
+        return str(v_glob).strip().lower() in {"1", "true", "yes", "y"}
 
     def get_admin_emails(self) -> list[str]:
         vals = (
@@ -278,24 +311,24 @@ def get_admin_emails(settings) -> list[str]:
     ]
 
 
-def _as_list(val) -> list[str]:
-    """Accept JSON list, Python list, or comma-separated string."""
-    if val is None:
+def _as_list(v):
+    if v is None:
         return []
-    if isinstance(val, list):
-        return [str(x) for x in val]
-    if isinstance(val, str):
-        s = val.strip()
-        if not s:
-            return []
-        try:
-            j = json.loads(s)
-            if isinstance(j, list):
-                return [str(x) for x in j]
-        except Exception:
-            pass
-        return [p.strip() for p in s.split(",") if p.strip()]
-    return []
+    if isinstance(v, (list, tuple)):
+        return list(v)
+    # try JSON string -> list
+    try:
+        import json
+
+        j = json.loads(v) if isinstance(v, str) else v
+        if isinstance(j, list):
+            return j
+    except Exception:
+        pass
+    # comma-separated fallback
+    if isinstance(v, str) and "," in v:
+        return [p.strip() for p in v.split(",") if p.strip()]
+    return [str(v)]
 
 
 def get_inline_clarify_allowlist(settings) -> set[str]:

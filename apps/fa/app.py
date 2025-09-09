@@ -209,13 +209,22 @@ def answer():
     pipeline: Pipeline = current_app.config["PIPELINE"]
     s = current_app.config["SETTINGS"]
 
-    # ensure namespace for settings resolution
-    if isinstance(pipeline.settings, Settings) and prefixes:
-        pipeline.settings.set_namespace(f"fa::{prefixes[0]}")
+    ns = f"fa::{prefixes[0]}" if prefixes else "fa::common"
+    if isinstance(pipeline.settings, Settings):
+        pipeline.settings.set_namespace(ns)
+
+    # Inline clarify policy: admin list OR enduser_can_clarify true
+    can_inline = s.admin_can_clarify_immediate(auth_email, namespace=ns) or \
+                 s.enduser_can_clarify(namespace=ns)
 
     result = pipeline.answer(
         question=question,
-        context={"prefixes": prefixes, "auth_email": auth_email},
+        context={
+            "namespace": ns,
+            "prefixes": prefixes,
+            "auth_email": auth_email,
+            "inline_clarify": bool(can_inline),
+        },
         hints=hints,
     )
 

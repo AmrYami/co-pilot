@@ -238,15 +238,9 @@ class Pipeline:
             ctx.update({k: v for k, v in context.items() if v is not None})
 
         # -- 2) clarify
-        need, clar_qs = self.clarifier.maybe_ask(question, ctx)
-        if need and self.settings.get("ASK_MODE", "metric_first") == "always_ask":
-            return {
-                "status": "needs_clarification",
-                "questions": clar_qs,
-                "context": ctx,
-                "intent": it.kind,
-                "is_sql": True,
-            }
+        needs_clarification, clarification_questions = self.clarifier.maybe_ask(
+            question, ctx
+        )
 
         # -- 3) hints (generic + extras)
         from core.hints import make_hints as _gen_hints
@@ -256,6 +250,25 @@ class Pipeline:
             gh.update(hints)
 
         canonical_sql, rationale = self.planner.plan(question, ctx, hints=gh)
+
+        if needs_clarification and it.kind in {"sql", "ambiguous"}:
+            inline_ok = bool(context.get("inline_clarify"))
+            if inline_ok:
+                return {
+                    "status": "needs_clarification",
+                    "questions": clarification_questions,
+                    "context": ctx,
+                    "intent": it.kind,
+                    "is_sql": True,
+                }
+            else:
+                return {
+                    "status": "awaiting_admin",
+                    "questions": clarification_questions,
+                    "context": ctx,
+                    "intent": it.kind,
+                    "is_sql": True,
+                }
 
         # -- 4) rewrite
         sql = SQLRewriter.rewrite_for_prefixes(canonical_sql, prefixes)
