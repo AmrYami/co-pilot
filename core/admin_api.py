@@ -277,129 +277,60 @@ def admin_list_inquiries():
 
 @admin_bp.post("/inquiries/<int:inq_id>/reply")
 def admin_reply_inquiry(inq_id: int):
-    """
-    Resolve an inquiry. `sql` is optional; if missing we try to derive it from admin_reply.
-    On success: emails CSV (no SQL inside the email), marks answered.
-    On failure: keeps status 'awaiting_admin' and (best-effort) re-notifies admins.
-    """
-    if not _check_admin_key(request):
-        return jsonify({"error": "forbidden"}), 403
+    """Handle admin reply by passing it through the pipeline."""
+    err = _require_admin_key()
+    if err:
+        return jsonify({"error": err}), 401
 
     data = request.get_json(force=True) or {}
+    admin_reply = (data.get("reply") or data.get("admin_reply") or "").strip()
     answered_by = (data.get("answered_by") or "").strip()
-    admin_reply = (data.get("admin_reply") or "").strip()
-    sql_in = (data.get("sql") or "").strip()
-    if not answered_by:
-        return jsonify({"error": "answered_by is required"}), 400
-    if not admin_reply and not sql_in:
-        return jsonify({"error": "Provide either sql or admin_reply"}), 400
+    clarifications = data.get("clarifications")
 
     mem = current_app.config["MEM_ENGINE"]
-    pipeline = current_app.config["PIPELINE"]
-    app_engine = pipeline.app_engine
-    if not app_engine:
-        return jsonify({"error": "APP DB not configured"}), 500
-
-    # Load inquiry
     with mem.connect() as con:
-        inq = con.execute(text("SELECT * FROM mem_inquiries WHERE id=:id"), {"id": inq_id}).mappings().first()
+        inq = (
+            con.execute(text("SELECT * FROM mem_inquiries WHERE id=:id"), {"id": inq_id})
+            .mappings()
+            .first()
+        )
     if not inq:
         return jsonify({"error": "inquiry not found"}), 404
 
-    prefixes = inq.get("prefixes") or []
-    namespace = inq.get("namespace") or "fa::common"
-    auth_email = inq.get("auth_email")
+    pipeline = current_app.config["PIPELINE"]
+    res = pipeline.answer(
+        question=inq.get("question") or "",
+        context={
+            "namespace": inq.get("namespace"),
+            "prefixes": inq.get("prefixes") or [],
+            "auth_email": inq.get("auth_email"),
+            "inline_clarify": True,
+            "inquiry_id": inq_id,
+            "admin_reply": admin_reply,
+            "clarifications": clarifications,
+        },
+        hints=None,
+    )
 
-    # If sql missing, attempt derivation from admin_reply using Planner
-    derived_info = None
-    if not sql_in:
-        sql_derived, derived_info = derive_sql_from_admin_reply(pipeline, inq, admin_reply)
-        if not sql_derived:
-            # Still unsolved → keep awaiting_admin and re-notify admins with context + follow-ups
-            _re_notify_admins(inq_id=inq_id, inq=inq, admin_reply=admin_reply, derived_info=derived_info)
-            return jsonify({
-                "ok": False,
-                "status": "awaiting_admin",
-                "reason": "Could not derive a valid query from admin_reply",
-                "derived_info": derived_info or {}
-            }), 200
-        sql_in = sql_derived  # proceed with the derived SQL
-
-    # Gate: only allow SELECT/CTE
-    sql_strip = sql_in.lstrip(" (").strip()
-    if not re.match(r"(?is)^(with|select)\b", sql_strip):
-        return jsonify({"error": "Only SELECT/CTE queries are allowed"}), 400
-
-    # Validate with EXPLAIN
-    try:
-        with app_engine.connect() as c:
-            c.execute(text(f"EXPLAIN {sql_strip}"))
-    except Exception as e:
-        # Keep awaiting_admin and notify admins why it failed
-        _re_notify_admins(inq_id=inq_id, inq=inq, admin_reply=admin_reply,
-                          derived_info={"error": f"validation failed: {e}"})
-        return jsonify({"ok": False, "status": "awaiting_admin", "error": f"validation failed: {e}"}), 200
-
-    # Execute and build CSV (no LIMIT here; add one if you want to cap size)
-    try:
-        with app_engine.connect() as c:
-            rs = c.execute(text(sql_strip))
-            cols = list(rs.keys())
-            sio = StringIO()
-            w = csv.writer(sio)
-            w.writerow(cols)
-            for row in rs:
-                w.writerow([row[c] for c in cols])
-            csv_bytes = sio.getvalue().encode("utf-8")
-    except Exception as e:
-        _re_notify_admins(inq_id=inq_id, inq=inq, admin_reply=admin_reply,
-                          derived_info={"error": f"execution failed: {e}"})
-        return jsonify({"ok": False, "status": "awaiting_admin", "error": f"execution failed: {e}"}), 200
-
-    # Email CSV to requester (no SQL in email)
-    s = current_app.config["SETTINGS"]
-    email_warning = None
-    try:
-        if auth_email:
-            send_email_with_attachments(
-                smtp_host=s.get("SMTP_HOST", "localhost"),
-                smtp_port=int(s.get("SMTP_PORT", "465") or 465),
-                smtp_user=s.get("SMTP_USER"),
-                smtp_password=s.get("SMTP_PASSWORD"),
-                mail_from=s.get("SMTP_FROM", "no-reply@example.com"),
-                to=[auth_email],
-                subject="[Copilot] Your data export is ready",
-                body_text=(admin_reply or "Here is your requested data."),
-                attachments=[("result.csv", csv_bytes, "text/csv")]
-            )
-    except Exception as e:
-        email_warning = str(e)
-
-    # Mark answered
-    from core.inquiries import mark_answered
-    mark_answered(mem, inquiry_id=inq_id, answered_by=answered_by, admin_reply=admin_reply)
-
-    # (Optional) store snippet for later reuse — left as-is
+    status = "answered" if res.get("status") == "complete" else "awaiting_admin"
     try:
         with mem.begin() as con:
-            con.execute(text("""
-                INSERT INTO mem_snippets(namespace, title, description, sql_template, sql_raw, is_verified, verified_by, created_at, updated_at)
-                VALUES (:ns, :title, :desc, :tmpl, :raw, false, :by, NOW(), NOW())
-            """), {
-                "ns": namespace,
-                "title": "Admin reply export",
-                "desc": admin_reply or "Admin-provided query",
-                "tmpl": sql_in,   # canonical (if admin provided), or derived canonical
-                "raw": sql_strip, # executed SQL (prefixed already via planner)
-                "by": answered_by
-            })
+            con.execute(
+                text(
+                    """UPDATE mem_inquiries
+                            SET admin_reply = COALESCE(:rep, admin_reply),
+                                answered_by = :by,
+                                status = :st,
+                                answered_at = CASE WHEN :st='answered' THEN NOW() ELSE answered_at END,
+                                updated_at = NOW()
+                          WHERE id = :iid"""
+                ),
+                {"rep": admin_reply or None, "by": answered_by, "st": status, "iid": inq_id},
+            )
     except Exception:
         pass
 
-    resp = {"ok": True, "inquiry_id": inq_id, "emailed_to": auth_email}
-    if email_warning:
-        resp["email_warning"] = email_warning
-    return jsonify(resp), 200
+    return jsonify(res)
 
 def _re_notify_admins(*, inq_id: int, inq, admin_reply: str, derived_info: dict | None):
     """
