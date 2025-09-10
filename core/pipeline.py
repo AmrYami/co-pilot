@@ -193,6 +193,52 @@ class Pipeline:
         )
         return result
 
+    def apply_admin_notes(self, inquiry_id: int) -> dict:
+        """Re-derive an answer for an existing inquiry using all accumulated admin notes."""
+        with self.mem_engine.connect() as c:
+            row = c.execute(
+                text(
+                    """SELECT id, namespace, prefixes, question, auth_email, admin_notes
+                           FROM mem_inquiries WHERE id = :id"""
+                ),
+                {"id": inquiry_id},
+            ).mappings().first()
+
+        if not row:
+            return {"applied": False, "error": "inquiry_not_found"}
+
+        ns = row["namespace"]
+        prefixes = row["prefixes"] or []
+        if isinstance(prefixes, str):
+            try:
+                prefixes = json.loads(prefixes) or []
+            except Exception:
+                prefixes = []
+        question = row["question"] or ""
+        auth_email = row["auth_email"]
+        notes_arr = row["admin_notes"] or []
+
+        notes_lines: list[str] = []
+        for n in notes_arr[-5:]:
+            t = n.get("text") if isinstance(n, dict) else str(n)
+            if t and t.strip():
+                notes_lines.append(t.strip())
+
+        hints = None
+        if notes_lines:
+            hints_text = "ADMIN_HINTS:\n" + "\n".join(f"- {ln}" for ln in notes_lines)
+            hints = {"admin_notes": hints_text}
+
+        result = self.answer(
+            question=question,
+            context={"prefixes": prefixes, "auth_email": auth_email, "namespace": ns},
+            hints=hints,
+            existing_inquiry_id=inquiry_id,
+        )
+        if isinstance(result, dict):
+            result["applied"] = True
+        return result
+
 
     def _force_sql_only(self, raw: str, question: str) -> str | None:
         """Try to coerce any model output into SQL; optionally use the clarifier to reformat."""
@@ -319,6 +365,7 @@ class Pipeline:
         inquiry_id: int | None = None,
         extra_hints: Dict[str, Any] | None = None,
         allow_new_inquiry: bool = True,
+        existing_inquiry_id: int | None = None,
     ) -> Dict[str, Any]:
         """
         End-to-end ask flow:
@@ -335,10 +382,15 @@ class Pipeline:
         if extra_hints:
             hints = {**(hints or {}), **extra_hints}
 
+        if existing_inquiry_id is not None:
+            inquiry_id = existing_inquiry_id
+            allow_new_inquiry = False
+        else:
+            inquiry_id = context.get("inquiry_id")
+
         ns = context.get("namespace") or self.namespace
         prefixes = context.get("prefixes") or []
         auth_email = context.get("auth_email")
-        inquiry_id = context.get("inquiry_id")
         admin_reply = context.get("admin_reply")
         clarifications = context.get("clarifications") or {}
 
@@ -379,9 +431,11 @@ class Pipeline:
             canonical_sql, rationale = self.planner.plan(enriched_q, ctx, hints=gh)
             canonical_sql = extract_sql(canonical_sql) or self._force_sql_only(canonical_sql, question)
             if not canonical_sql:
-                inquiry_id = self._log_inquiry(
-                    ns, prefixes, question, auth_email, status="needs_clarification"
-                )
+                if allow_new_inquiry:
+                    inquiry_id = self._log_inquiry(
+                        ns, prefixes, question, auth_email, status="needs_clarification"
+                    )
+                # otherwise keep existing inquiry_id
                 return {
                     "status": "needs_clarification",
                     "inquiry_id": inquiry_id,
@@ -498,9 +552,11 @@ class Pipeline:
         canonical_sql, rationale = self.planner.plan(question, ctx, hints=gh)
         canonical_sql = extract_sql(canonical_sql) or self._force_sql_only(canonical_sql, question)
         if not canonical_sql:
-            inquiry_id = self._log_inquiry(
-                ns, prefixes, question, auth_email, status="needs_clarification"
-            )
+            if allow_new_inquiry:
+                inquiry_id = self._log_inquiry(
+                    ns, prefixes, question, auth_email, status="needs_clarification"
+                )
+            # otherwise keep existing inquiry_id
             return {
                 "status": "needs_clarification",
                 "inquiry_id": inquiry_id,
