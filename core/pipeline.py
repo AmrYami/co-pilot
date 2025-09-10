@@ -171,13 +171,14 @@ class Pipeline:
             return {"status": "needs_clarification", "inquiry_id": inquiry_id, "questions": questions}
         row = fetch_inquiry(self.mem_engine, inquiry_id)
         rounds = row.get("clarification_rounds") if row else 0
-        max_rounds = int(self.settings.get("MAX_CLARIFICATION_ROUNDS", namespace=ns) or 3)
-        if rounds >= max_rounds:
+        limit = int(self.settings.get("MAX_CLARIFICATION_ROUNDS", namespace=ns) or 3)
+        unlimited = limit == -1
+        if (not unlimited) and rounds >= limit:
             update_inquiry_status_run(self.mem_engine, inquiry_id, status="failed")
             return {
                 "status": "failed",
                 "inquiry_id": inquiry_id,
-                "message": f"Max clarification rounds reached ({max_rounds}).",
+                "message": f"Max clarification rounds reached ({limit}).",
             }
         update_inquiry_status_run(self.mem_engine, inquiry_id, status="needs_clarification")
         return {"status": "needs_clarification", "inquiry_id": inquiry_id, "questions": questions}
@@ -199,7 +200,8 @@ class Pipeline:
         auth_email = row.get("auth_email")
         notes = get_admin_notes(row)
         rounds = row.get("clarification_rounds") or 0
-        max_rounds = int(self.settings.get("MAX_CLARIFICATION_ROUNDS", namespace=ns) or 3)
+        limit = int(self.settings.get("MAX_CLARIFICATION_ROUNDS", namespace=ns) or 3)
+        unlimited = limit == -1
 
         hints = ""
         if notes:
@@ -215,13 +217,13 @@ class Pipeline:
             canonical_sql, rationale = self.planner.plan(question, context, hints=hints)
         except Exception:
             q = self.planner.fallback_clarifying_question(question, context)
-            if rounds >= max_rounds:
+            if (not unlimited) and rounds >= limit:
                 update_inquiry_status_run(self.mem_engine, inquiry_id, status="failed")
                 return {
                     "ok": True,
                     "inquiry_id": inquiry_id,
                     "status": "failed",
-                    "message": f"Max clarification rounds reached ({max_rounds}).",
+                    "message": f"Max clarification rounds reached ({limit}).",
                 }
             update_inquiry_status_run(self.mem_engine, inquiry_id, status="needs_clarification")
             return {
@@ -238,13 +240,13 @@ class Pipeline:
         )
         if not ok:
             q = self.validator.clarify_question(validation_or_error, question)
-            if rounds >= max_rounds:
+            if (not unlimited) and rounds >= limit:
                 update_inquiry_status_run(self.mem_engine, inquiry_id, status="failed")
                 return {
                     "ok": True,
                     "inquiry_id": inquiry_id,
                     "status": "failed",
-                    "message": f"Max clarification rounds reached ({max_rounds}).",
+                    "message": f"Max clarification rounds reached ({limit}).",
                 }
             update_inquiry_status_run(self.mem_engine, inquiry_id, status="needs_clarification")
             return {
@@ -288,6 +290,28 @@ class Pipeline:
             "We’re running this in the background. You’ll receive the result by email."
         )
         return payload
+
+
+    def retry_from_inquiry(self, inq_id: int) -> dict:
+        row = fetch_inquiry(self.mem_engine, inq_id)
+        if not row:
+            return {"status": "not_found", "inquiry_id": inq_id}
+        prefixes = row.get("prefixes") or []
+        question = row.get("question") or ""
+        auth_email = row.get("auth_email")
+        ns = row.get("namespace") or self.namespace
+        from apps.fa.hints import make_fa_hints
+        hints = make_fa_hints(self.mem_engine, prefixes, question)
+        context = {"namespace": ns, "prefixes": prefixes, "auth_email": auth_email}
+        out = self.answer(
+            question,
+            context,
+            hints=hints,
+            existing_inquiry_id=inq_id,
+            allow_new_inquiry=False,
+        )
+        out["inquiry_id"] = inq_id
+        return out
 
 
     def _force_sql_only(self, raw: str, question: str) -> str | None:
@@ -766,12 +790,13 @@ class Pipeline:
         sql_or_none = self._coerce_sql_or_none(raw_out)
 
         if not sql_or_none:
-            max_rounds = int(self.settings.get("MAX_CLARIFICATION_ROUNDS", "3") or 3)
+            limit = int(self.settings.get("MAX_CLARIFICATION_ROUNDS", "3") or 3)
+            unlimited = limit == -1
             status = "needs_clarification"
             msg = (
                 "I couldn't derive a clean SQL from the admin notes. Add one more hint or confirm the tables."
             )
-            if row["rounds"] + 1 >= max_rounds:
+            if (not unlimited) and row["rounds"] + 1 >= limit:
                 status = "failed"
                 msg = "I could not derive a valid SQL after multiple clarifications."
             with self.mem_engine.begin() as cx:

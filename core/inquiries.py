@@ -16,15 +16,22 @@ from sqlalchemy.dialects.postgresql import JSONB
 
 
 def fetch_inquiry(mem_engine, inquiry_id: int) -> Optional[Dict[str, Any]]:
+    sql = text(
+        """
+        SELECT
+            i.id, i.namespace, i.prefixes, i.question, i.auth_email,
+            i.status, i.clarification_rounds, i.admin_notes, i.run_id,
+            COALESCE(i.last_error, r.error_message) AS last_error,
+            COALESCE(i.last_sql,   r.sql_final)     AS last_sql,
+            i.created_at, i.updated_at
+        FROM mem_inquiries i
+        LEFT JOIN mem_runs r
+          ON r.id = i.run_id
+        WHERE i.id = :id
+        """
+    )
     with mem_engine.begin() as c:
-        row = c.execute(text(
-            """
-            SELECT id, namespace, prefixes, question, auth_email,
-                   status, clarification_rounds, admin_notes, run_id,
-                   last_error, last_sql, created_at, updated_at
-              FROM mem_inquiries
-             WHERE id = :id
-        """), {"id": inquiry_id}).mappings().first()
+        row = c.execute(sql, {"id": inquiry_id}).mappings().first()
         return dict(row) if row else None
 
 
