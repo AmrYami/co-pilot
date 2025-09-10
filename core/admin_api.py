@@ -5,7 +5,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from core.sql_exec import get_mem_engine
 from core.inquiries import append_admin_note, fetch_inquiry
 
-admin_bp = Blueprint("admin", __name__)
+admin_bp = Blueprint("admin_bp", __name__, url_prefix="/admin")
 
 
 def _conn():
@@ -117,30 +117,36 @@ def settings_get():
 
 # ----- Admin reply (append note safely & drive the pipeline) -----
 
-@admin_bp.get("/admin/inquiries/<int:inq_id>")
+@admin_bp.get("/inquiries/<int:inq_id>")
 def get_inquiry(inq_id: int):
-    app = current_app
-    mem = app.config["MEM_ENGINE"]
+    mem = current_app.config["MEM_ENGINE"]
     row = fetch_inquiry(mem, inq_id)
     if not row:
-        return jsonify({"ok": False, "error": "not_found"}), 404
-    return jsonify({"ok": True, **row})
+        return jsonify({"error": "not_found"}), 404
+    return jsonify(row)
 
 
-@admin_bp.post("/admin/inquiries/<int:inq_id>/reply")
+@admin_bp.post("/inquiries/<int:inq_id>/reply")
 def admin_reply(inq_id: int):
-    app = current_app
-    pipeline = app.config["PIPELINE"]
-
-    data = request.get_json(force=True) or {}
+    data = request.get_json(force=True, silent=True) or {}
     answered_by = (data.get("answered_by") or "").strip()
     admin_reply = (data.get("admin_reply") or "").strip()
     if not answered_by or not admin_reply:
-        return jsonify({"ok": False, "error": "answered_by and admin_reply are required"}), 400
+        return jsonify({"ok": False, "error": "missing answered_by or admin_reply"}), 400
 
-    appended = append_admin_note(pipeline.mem_engine, inq_id, by=answered_by, text_note=admin_reply)
-    if not appended:
-        return jsonify({"ok": False, "error": "append_failed"}), 500
+    mem = current_app.config["MEM_ENGINE"]
+    pipeline = current_app.config["PIPELINE"]
 
-    resp = pipeline.retry_from_inquiry(inq_id)
+    try:
+        append_admin_note(mem, inq_id, by=answered_by, text_note=admin_reply)
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"append_failed: {e}"}), 500
+
+    try:
+        apply_result = pipeline.apply_admin_and_retry(inq_id)
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"apply_failed: {e}", "inquiry_id": inq_id}), 500
+
+    resp = {"ok": True, "inquiry_id": inq_id, "applied": True}
+    resp.update(apply_result)
     return jsonify(resp)
