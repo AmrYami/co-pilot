@@ -3,7 +3,8 @@ from flask import Blueprint, request, jsonify, current_app
 from sqlalchemy import text, bindparam
 from sqlalchemy.dialects.postgresql import JSONB
 from core.sql_exec import get_mem_engine
-from core.inquiries import append_admin_note, get_inquiry_details
+from core.inquiries import append_admin_note, fetch_inquiry
+from core.settings import Settings
 
 admin_bp = Blueprint("admin", __name__)
 
@@ -115,46 +116,41 @@ def settings_get():
     return jsonify({"ok": True, "items": rows})
 
 
-# ----- Admin reply (append note safely & drive the pipeline later) -----
+# ----- Admin reply (append note safely & drive the pipeline) -----
 
-@admin_bp.get("/inquiries/<int:inq_id>")
-def inquiry_get(inq_id: int):
-    pipeline = current_app.config["PIPELINE"]
-    mem = pipeline.mem_engine
-    details = get_inquiry_details(mem, inq_id)
-    return jsonify(details), (200 if details.get("ok") else 404)
+@admin_bp.get("/admin/inquiries/<int:inq_id>")
+def get_inquiry(inq_id: int):
+    app = current_app
+    mem = app.config["MEM_ENGINE"]
+    row = fetch_inquiry(mem, inq_id)
+    if not row:
+        return jsonify({"ok": False, "error": "not_found"}), 404
+    return jsonify({"ok": True, **row})
 
 
-@admin_bp.post("/inquiries/<int:inq_id>/reply")
+@admin_bp.post("/admin/inquiries/<int:inq_id>/reply")
 def admin_reply(inq_id: int):
+    app = current_app
+    pipeline = app.config["PIPELINE"]
+    settings: Settings = app.config["SETTINGS"]
+
     data = request.get_json(force=True) or {}
-    answered_by = data.get("answered_by") or data.get("by") or "admin"
-    admin_text = (data.get("admin_reply") or data.get("reply") or "").strip()
-    if not admin_text:
-        return jsonify({"ok": False, "error": "empty_reply"}), 400
+    answered_by = (data.get("answered_by") or "").strip()
+    admin_reply = (data.get("admin_reply") or "").strip()
+    if not answered_by or not admin_reply:
+        return jsonify({"ok": False, "error": "answered_by and admin_reply are required"}), 400
 
-    pipeline = current_app.config["PIPELINE"]
-    mem = pipeline.mem_engine
-
-    res = append_admin_note(mem, inq_id, by=answered_by, text_note=admin_text)
-    if not res.get("ok"):
+    appended = append_admin_note(pipeline.mem_engine, inq_id, by=answered_by, text_note=admin_reply)
+    if not appended:
         return jsonify({"ok": False, "error": "append_failed"}), 500
 
-    applied = pipeline.continue_inquiry(inq_id)
+    ns = f"fa::common"
+    inline = settings.is_inline_clarifier(ns, answered_by)
 
-    out = {
-        "ok": True,
-        "appended": True,
-        "applied": True,
-        "inquiry_id": inq_id,
-    }
-    if isinstance(applied, dict):
-        out.update({k: v for k, v in applied.items() if k in ("status", "run_id", "questions", "message")})
+    out = pipeline.continue_inquiry(inq_id, answered_by=answered_by, inline=inline)
 
-    return jsonify(out), 200
-
-
-@admin_bp.post("/inquiries/<int:inq_id>/process")
-def admin_process(inq_id: int):
-    out = current_app.config["PIPELINE"].resume_inquiry(inq_id)
+    out["ok"] = True
+    out["inquiry_id"] = inq_id
+    out["appended"] = True
+    out["applied"] = True
     return jsonify(out)

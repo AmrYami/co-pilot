@@ -199,6 +199,17 @@ class Settings:
         v = self.get("DEFAULT_DATASOURCE", namespace=ns)
         return v if isinstance(v, str) and v else None
 
+    def is_inline_clarifier(self, namespace: str, email: str) -> bool:
+        allowed = set(self.get("ADMINS_CAN_CLARIFY_IMMEDIATE", namespace=namespace) or [])
+        return (email or "").lower() in {e.lower() for e in allowed}
+
+    def snapshot(self, namespace: str) -> Dict[str, Any]:
+        prev = self._namespace
+        self.set_namespace(namespace)
+        snap = self.summary(mask_secrets=False)
+        self.set_namespace(prev)
+        return snap
+
     def research_allowed(self, datasource: str, namespace: str | None = None) -> bool:
         ns = namespace or self._namespace
         policy = self.get("RESEARCH_POLICY", namespace=ns) or {}
