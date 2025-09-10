@@ -13,6 +13,7 @@ import json
 import re
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Callable
+from datetime import datetime
 
 from sqlalchemy import create_engine, text
 from sqlalchemy import text as _sqltext
@@ -27,7 +28,12 @@ from core.settings import Settings
 from core.research import build_researcher
 from core.sql_exec import get_app_engine, run_select, as_csv
 from core.sql_utils import extract_sql, looks_like_sql
-from core.inquiries import create_or_update_inquiry
+from core.inquiries import (
+    create_or_update_inquiry,
+    fetch_inquiry,
+    update_inquiry_status_run,
+    get_admin_notes,
+)
 from core.emailer import Emailer
 
 from types import SimpleNamespace
@@ -158,182 +164,130 @@ class Pipeline:
                 parts.append(f"- {t}" + (f" (by: {by})" if by else ""))
         return "\n".join(parts)
 
-    def continue_inquiry(self, inquiry_id: int) -> dict:
-        """
-        Re-run planning/execution for an existing inquiry using accumulated
-        admin_notes as hints. Updates mem_inquiries.status to either 'answered'
-        or stays/returns 'needs_clarification'. Respects MAX_CLARIFICATION_ROUNDS
-        (mem_settings).
-        """
-        mem = self.mem_engine
-        with mem.begin() as c:
-            row = c.execute(text("SELECT * FROM mem_inquiries WHERE id = :id"), {"id": inquiry_id}).fetchone()
-        if not row:
-            return {"ok": False, "error": "not_found", "inquiry_id": inquiry_id}
-
-        ns = row.namespace
-        question = row.question
-        prefixes = row.prefixes or []
-        auth_email = getattr(row, "auth_email", None)
-        rounds = int(getattr(row, "clarification_rounds", 0) or 0)
-        notes = list(getattr(row, "admin_notes", []) or [])
-
-        max_rounds = int(self.settings.get("MAX_CLARIFICATION_ROUNDS", "3") or 3)
+    def _needs_clarification(
+        self, inquiry_id: Optional[int], ns: str, questions: List[str]
+    ) -> Dict[str, Any]:
+        if not inquiry_id:
+            return {"status": "needs_clarification", "inquiry_id": inquiry_id, "questions": questions}
+        row = fetch_inquiry(self.mem_engine, inquiry_id)
+        rounds = row.get("clarification_rounds") if row else 0
+        max_rounds = int(self.settings.get("MAX_CLARIFICATION_ROUNDS", namespace=ns) or 3)
         if rounds >= max_rounds:
-            with mem.begin() as c:
-                c.execute(
-                    text(
-                        """
-                    UPDATE mem_inquiries
-                       SET status = 'failed', updated_at = NOW()
-                     WHERE id = :id
-                    """
-                    ),
-                    {"id": inquiry_id},
-                )
+            update_inquiry_status_run(self.mem_engine, inquiry_id, status="failed")
             return {
-                "ok": True,
                 "status": "failed",
                 "inquiry_id": inquiry_id,
                 "message": f"Max clarification rounds reached ({max_rounds}).",
             }
+        update_inquiry_status_run(self.mem_engine, inquiry_id, status="needs_clarification")
+        return {"status": "needs_clarification", "inquiry_id": inquiry_id, "questions": questions}
 
-        admin_hint = ""
+    def continue_inquiry(
+        self, inquiry_id: int, answered_by: Optional[str] = None, inline: bool = False
+    ) -> Dict[str, Any]:
+        """
+        Use existing inquiry + all admin_notes as hints to re-plan/execute.
+        Returns a response payload for the API.
+        """
+        row = fetch_inquiry(self.mem_engine, inquiry_id)
+        if not row:
+            return {"ok": False, "error": f"inquiry {inquiry_id} not found"}
+
+        ns = row["namespace"]
+        prefixes = row.get("prefixes") or []
+        question = row["question"]
+        auth_email = row.get("auth_email")
+        notes = get_admin_notes(row)
+        rounds = row.get("clarification_rounds") or 0
+        max_rounds = int(self.settings.get("MAX_CLARIFICATION_ROUNDS", namespace=ns) or 3)
+
+        hints = ""
         if notes:
-            admin_hint = " | ".join(n.get("note", "") for n in notes if isinstance(n, dict))[-2000:]
+            hints = "ADMIN_NOTES:\n" + "\n---\n".join(notes)
+
+        context = {
+            "namespace": ns,
+            "prefixes": prefixes,
+            "settings": self.settings.snapshot(ns),
+        }
 
         try:
-            from apps.fa.hints import make_fa_hints
-
-            app_hints = make_fa_hints(self.mem_engine, prefixes, question)
+            canonical_sql, rationale = self.planner.plan(question, context, hints=hints)
         except Exception:
-            app_hints = {}
-
-        app_hints = dict(app_hints or {})
-        if admin_hint:
-            app_hints["admin_hint"] = admin_hint
-
-        try:
-            context = self._build_context(ns, prefixes)
-            canonical_sql, rationale = self.planner.plan(question, context, hints=app_hints)
-            run_info = self._validate_and_execute(ns, canonical_sql, prefixes, question, auth_email=auth_email)
-            run_id = run_info.get("run_id")
-
-            with mem.begin() as c:
-                c.execute(
-                    text(
-                        """
-                    UPDATE mem_inquiries
-                       SET status = 'answered',
-                           run_id = :rid,
-                           answered_by = COALESCE(answered_by, :by),
-                           answered_at = COALESCE(answered_at, NOW()),
-                           updated_at = NOW()
-                     WHERE id = :id
-                    """
-                    ),
-                    {"id": inquiry_id, "rid": run_id, "by": auth_email or "system"},
-                )
-            return {"ok": True, "status": "answered", "inquiry_id": inquiry_id, "run_id": run_id}
-
-        except Exception as e:
-            followup_q = "I couldn't derive a clean SQL. Can you clarify the tables or metrics?"
-            try:
-                followup_q = self.planner.followup_question or followup_q
-            except Exception:
-                pass
-
-            with mem.begin() as c:
-                c.execute(
-                    text(
-                        """
-                    UPDATE mem_inquiries
-                       SET status = 'needs_clarification',
-                           updated_at = NOW()
-                     WHERE id = :id
-                    """
-                    ),
-                    {"id": inquiry_id},
-                )
+            q = self.planner.fallback_clarifying_question(question, context)
+            if rounds >= max_rounds:
+                update_inquiry_status_run(self.mem_engine, inquiry_id, status="failed")
+                return {
+                    "ok": True,
+                    "inquiry_id": inquiry_id,
+                    "status": "failed",
+                    "message": f"Max clarification rounds reached ({max_rounds}).",
+                }
+            update_inquiry_status_run(self.mem_engine, inquiry_id, status="needs_clarification")
             return {
                 "ok": True,
-                "status": "needs_clarification",
                 "inquiry_id": inquiry_id,
-                "questions": [followup_q],
+                "status": "needs_clarification",
+                "questions": [
+                    q or "I couldn't derive a clean SQL. Can you clarify the tables or metrics?"
+                ],
             }
 
-    def resume_inquiry(self, inquiry_id: int) -> dict:
-        with self.mem_engine.begin() as c:
-            row = c.execute(
-                text("SELECT id, namespace, prefixes, question, auth_email, admin_notes, clarification_rounds, status FROM mem_inquiries WHERE id=:id"),
-                {"id": inquiry_id},
-            ).mappings().first()
-        if not row:
-            return {"ok": False, "error": "inquiry_not_found", "inquiry_id": inquiry_id}
+        ok, validation_or_error, sql_final = self.validator.validate_and_fix(
+            canonical_sql, prefixes, self.settings
+        )
+        if not ok:
+            q = self.validator.clarify_question(validation_or_error, question)
+            if rounds >= max_rounds:
+                update_inquiry_status_run(self.mem_engine, inquiry_id, status="failed")
+                return {
+                    "ok": True,
+                    "inquiry_id": inquiry_id,
+                    "status": "failed",
+                    "message": f"Max clarification rounds reached ({max_rounds}).",
+                }
+            update_inquiry_status_run(self.mem_engine, inquiry_id, status="needs_clarification")
+            return {
+                "ok": True,
+                "inquiry_id": inquiry_id,
+                "status": "needs_clarification",
+                "questions": [q or "What date range should we use?"],
+            }
 
-        ns = row["namespace"]
-        question = row["question"]
-        auth_email = row["auth_email"]
-        prefixes = row["prefixes"] or []
-        if isinstance(prefixes, str):
+        run = self.executor.execute(sql_final, ns, prefixes, self.settings)
+        update_inquiry_status_run(
+            self.mem_engine,
+            inquiry_id,
+            status="answered",
+            run_id=run.id,
+            answered_by=answered_by,
+            answered_at=datetime.utcnow(),
+        )
+
+        payload = {
+            "ok": True,
+            "inquiry_id": inquiry_id,
+            "status": "answered",
+            "sql": sql_final,
+            "rationale": rationale,
+            "sample": run.sample,
+            "rows": run.rows_returned,
+        }
+
+        if inline:
+            return payload
+
+        if self.notifier and auth_email:
             try:
-                prefixes = json.loads(prefixes) or []
-            except Exception:
-                prefixes = []
+                self.notifier.email_result(ns, inquiry_id, auth_email, payload)
+            except Exception as e:
+                payload["email_error"] = str(e)
 
-        from apps.fa.hints import make_fa_hints
-        hints = make_fa_hints(self.mem_engine, prefixes, question)
-        admin_text = self._notes_to_text(row["admin_notes"] or [])
-        if admin_text:
-            hints["admin_notes"] = admin_text
-
-        result = self.answer(
-            question=question,
-            context={"prefixes": prefixes, "auth_email": auth_email},
-            hints=hints,
-            inquiry_id=inquiry_id,
-            allow_new_inquiry=False,
+        payload["status"] = "queued"
+        payload["message"] = (
+            "We’re running this in the background. You’ll receive the result by email."
         )
-        return result
-
-
-    def apply_admin_notes(self, inquiry_id: int, max_rounds: int = 3) -> dict:
-        """
-        Try to re-derive SQL using the accumulated admin_notes.
-        Returns a small dict and is safe to call repeatedly.
-        """
-        with self.mem_engine.begin() as c:
-            row = c.execute(
-                sa.text(
-                    "SELECT id, namespace, prefixes, question, auth_email, admin_notes "
-                    "FROM mem_inquiries WHERE id = :id"
-                ),
-                {"id": inquiry_id},
-            ).mappings().first()
-        if not row:
-            raise ValueError(f"inquiry {inquiry_id} not found")
-
-        ns = row["namespace"]
-        prefixes = row["prefixes"] if isinstance(row["prefixes"], list) else []
-        question = row.get("question") or ""
-        auth_email = row.get("auth_email")
-        notes = row.get("admin_notes") or []
-
-        lines = [n.get("text") for n in notes if isinstance(n, dict) and n.get("text")]
-        admin_context = ""
-        if lines:
-            recent = lines[-max_rounds:]
-            admin_context = "Admin notes:\n" + "\n".join(f"- {t}" for t in recent)
-
-        hints = {"admin_notes": admin_context} if admin_context else None
-        result = self.answer(
-            question=question,
-            context={"prefixes": prefixes, "auth_email": auth_email, "namespace": ns},
-            hints=hints,
-            inquiry_id=inquiry_id,
-            allow_new_inquiry=False,
-        )
-        return result
+        return payload
 
 
     def _force_sql_only(self, raw: str, question: str) -> str | None:
@@ -531,14 +485,11 @@ class Pipeline:
                     inquiry_id = self._log_inquiry(
                         ns, prefixes, question, auth_email, status="needs_clarification"
                     )
-                # otherwise keep existing inquiry_id
-                return {
-                    "status": "needs_clarification",
-                    "inquiry_id": inquiry_id,
-                    "questions": [
-                        "I couldn't derive a clean SQL from the admin notes. Add one more hint or confirm the tables."
-                    ],
-                }
+                return self._needs_clarification(
+                    inquiry_id,
+                    ns,
+                    ["I couldn't derive a clean SQL from the admin notes. Add one more hint or confirm the tables."],
+                )
             sql = SQLRewriter.rewrite_for_prefixes(canonical_sql, prefixes)
             exec_ok, info = self.validator.quick_validate(sql)
             rows = None
@@ -653,27 +604,19 @@ class Pipeline:
                     ns, prefixes, question, auth_email, status="needs_clarification"
                 )
             # otherwise keep existing inquiry_id
-            return {
-                "status": "needs_clarification",
-                "inquiry_id": inquiry_id,
-                "questions": [
-                    "I couldn't derive a clean SQL. Can you clarify the tables or metrics?"
-                ],
-                "context": ctx,
-                "intent": it.kind,
-                "is_sql": True,
-            }
-
+            resp = self._needs_clarification(
+                inquiry_id,
+                ns,
+                ["I couldn't derive a clean SQL. Can you clarify the tables or metrics?"],
+            )
+            resp.update({"context": ctx, "intent": it.kind, "is_sql": True})
+            return resp
         if needs_clarification and it.kind in {"sql", "ambiguous"}:
             inline_ok = bool(context.get("inline_clarify"))
             if inline_ok:
-                return {
-                    "status": "needs_clarification",
-                    "questions": clarification_questions,
-                    "context": ctx,
-                    "intent": it.kind,
-                    "is_sql": True,
-                }
+                resp = self._needs_clarification(None, ns, clarification_questions)
+                resp.update({"context": ctx, "intent": it.kind, "is_sql": True})
+                return resp
             else:
                 return {
                     "status": "awaiting_admin",
