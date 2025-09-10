@@ -12,6 +12,11 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 from sqlalchemy.engine import Engine
 from sqlalchemy import text, bindparam
+import sqlalchemy as sa
+
+
+def _utc_iso() -> str:
+    return datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
 try:
     # Optional: only present on Postgres
@@ -31,29 +36,25 @@ def mark_admin_note(mem_engine, *, inquiry_id: int, admin_reply: str, answered_b
         """), {"reply": admin_reply, "by": answered_by, "id": inquiry_id})
 
 
-def json_dumps(obj) -> str:
-    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
-
-
 def append_admin_note(mem_engine, inquiry_id: int, by: str, text_note: str) -> None:
-    note = {
-        "by": by,
-        "text": text_note,
-        "at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
-    }
+    """
+    Append a JSON note {by, text, ts} to mem_inquiries.admin_notes (JSONB[]),
+    and increment clarification_rounds.
+    """
+    note = {"by": by, "text": text_note, "ts": _utc_iso()}
+    sql = text(
+        """
+        UPDATE mem_inquiries
+           SET admin_notes = COALESCE(admin_notes, '[]'::jsonb)
+                              || jsonb_build_array(to_jsonb(:note)),
+               clarification_rounds = COALESCE(clarification_rounds, 0) + 1,
+               updated_at = NOW()
+         WHERE id = :id
+    """
+    ).bindparams(bindparam("note", type_=sa.JSON()))
+
     with mem_engine.begin() as c:
-        c.execute(
-            text(
-                """
-                UPDATE mem_inquiries
-                   SET admin_notes = COALESCE(admin_notes, '[]'::jsonb) || to_jsonb(:note::json),
-                       clarification_rounds = COALESCE(clarification_rounds, 0) + 1,
-                       updated_at = NOW()
-                 WHERE id = :id
-                """
-            ),
-            {"id": inquiry_id, "note": json_dumps(note)},
-        )
+        c.execute(sql, {"id": inquiry_id, "note": note})
 
 def get_inquiry(conn, inquiry_id: int) -> dict | None:
     row = conn.execute(

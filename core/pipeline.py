@@ -17,6 +17,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple, Callable
 from sqlalchemy import create_engine, text
 from sqlalchemy import text as _sqltext
 from sqlalchemy.engine import Engine
+import sqlalchemy as sa
 
 import importlib
 from core.agents import ClarifierAgent, PlannerAgent, ValidatorAgent
@@ -191,50 +192,43 @@ class Pipeline:
         )
         return result
 
-    def apply_admin_notes(self, inquiry_id: int) -> dict:
-        """Re-derive an answer for an existing inquiry using all accumulated admin notes."""
-        with self.mem_engine.connect() as c:
+
+    def apply_admin_notes(self, inquiry_id: int, max_rounds: int = 3) -> dict:
+        """
+        Try to re-derive SQL using the accumulated admin_notes.
+        Returns a small dict and is safe to call repeatedly.
+        """
+        with self.mem_engine.begin() as c:
             row = c.execute(
-                text(
-                    """SELECT id, namespace, prefixes, question, auth_email, admin_notes
-                           FROM mem_inquiries WHERE id = :id"""
+                sa.text(
+                    "SELECT id, namespace, prefixes, question, auth_email, admin_notes "
+                    "FROM mem_inquiries WHERE id = :id"
                 ),
                 {"id": inquiry_id},
             ).mappings().first()
-
         if not row:
-            return {"applied": False, "error": "inquiry_not_found"}
+            raise ValueError(f"inquiry {inquiry_id} not found")
 
         ns = row["namespace"]
-        prefixes = row["prefixes"] or []
-        if isinstance(prefixes, str):
-            try:
-                prefixes = json.loads(prefixes) or []
-            except Exception:
-                prefixes = []
-        question = row["question"] or ""
-        auth_email = row["auth_email"]
-        notes_arr = row["admin_notes"] or []
+        prefixes = row["prefixes"] if isinstance(row["prefixes"], list) else []
+        question = row.get("question") or ""
+        auth_email = row.get("auth_email")
+        notes = row.get("admin_notes") or []
 
-        notes_lines: list[str] = []
-        for n in notes_arr[-5:]:
-            t = n.get("text") if isinstance(n, dict) else str(n)
-            if t and t.strip():
-                notes_lines.append(t.strip())
+        lines = [n.get("text") for n in notes if isinstance(n, dict) and n.get("text")]
+        admin_context = ""
+        if lines:
+            recent = lines[-max_rounds:]
+            admin_context = "Admin notes:\n" + "\n".join(f"- {t}" for t in recent)
 
-        hints = None
-        if notes_lines:
-            hints_text = "ADMIN_HINTS:\n" + "\n".join(f"- {ln}" for ln in notes_lines)
-            hints = {"admin_notes": hints_text}
-
+        hints = {"admin_notes": admin_context} if admin_context else None
         result = self.answer(
             question=question,
             context={"prefixes": prefixes, "auth_email": auth_email, "namespace": ns},
             hints=hints,
-            existing_inquiry_id=inquiry_id,
+            inquiry_id=inquiry_id,
+            allow_new_inquiry=False,
         )
-        if isinstance(result, dict):
-            result["applied"] = True
         return result
 
 

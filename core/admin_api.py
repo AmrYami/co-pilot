@@ -123,44 +123,41 @@ def admin_reply(inq_id: int):
     Append an admin note and, by default, immediately try to apply it.
     Opt-out with ?apply=0 (or 'false'/'no').
     """
-    data = request.get_json(silent=True) or {}
-    answered_by = data.get("answered_by") or "admin"
-    text_note = data.get("admin_reply") or data.get("answer") or ""
-    if not text_note.strip():
-        return jsonify({"ok": False, "error": "admin_reply (text) is required"}), 400
+    data = request.get_json(force=True) or {}
+    answered_by = (data.get("answered_by") or data.get("by") or "").strip()
+    admin_reply = (data.get("admin_reply") or data.get("note") or "").strip()
+    if not answered_by or not admin_reply:
+        return {"ok": False, "error": "answered_by and admin_reply are required"}, 400
 
     mem = current_app.config["MEM_ENGINE"]
     try:
-        append_admin_note(mem, inquiry_id=inq_id, by=answered_by, text_note=text_note)
+        append_admin_note(mem, inq_id, by=answered_by, text_note=admin_reply)
     except Exception as e:
-        return jsonify({"ok": False, "error": f"append_failed: {e}"}), 500
+        return {"ok": False, "inquiry_id": inq_id, "error": f"append_failed: {e}"}, 500
 
-    apply_qs = (request.args.get("apply") or "").strip().lower()
-    auto_apply = not (apply_qs in {"0", "false", "no"})
+    # NEW: apply defaults to ON. You can still skip with ?apply=0 if you want.
+    qs = request.args.get("apply")
+    do_apply = True if qs is None else (qs.lower() not in {"0", "false", "no"})
 
-    if not auto_apply:
-        return jsonify({
-            "ok": True,
-            "inquiry_id": inq_id,
-            "appended": True,
-            "applied": False,
-        }), 200
+    applied = None
+    if do_apply:
+        pipeline = current_app.config["PIPELINE"]
+        settings = current_app.config["SETTINGS"]
+        try:
+            max_rounds = int(settings.get("MAX_CLARIFICATION_ROUNDS", "3") or 3)
+            applied = pipeline.apply_admin_notes(inq_id, max_rounds=max_rounds)
+        except Exception as e:
+            return {
+                "ok": False, "inquiry_id": inq_id, "appended": True,
+                "applied": False, "error": f"apply_failed: {e}"
+            }, 200
 
-    pipeline = current_app.extensions["pipeline"]
-    try:
-        result = pipeline.apply_admin_notes(inquiry_id=inq_id)
-        out = {"ok": True, "inquiry_id": inq_id, "appended": True, "applied": True}
-        if isinstance(result, dict):
-            out.update(result)
-        return jsonify(out), 200
-    except Exception as e:
-        return jsonify({
-            "ok": False,
-            "inquiry_id": inq_id,
-            "appended": True,
-            "applied": False,
-            "error": f"apply_failed: {e}",
-        }), 500
+    return {
+        "ok": True,
+        "inquiry_id": inq_id,
+        "appended": True,
+        "applied": bool(applied)
+    }, 200
 
 
 @admin_bp.post("/inquiries/<int:inq_id>/process")
