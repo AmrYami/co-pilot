@@ -1,8 +1,8 @@
 from __future__ import annotations
-from flask import Blueprint, current_app, request, jsonify
-from sqlalchemy import text
-import json
-from typing import Any, Dict, List
+from flask import Blueprint, request, jsonify, current_app
+from sqlalchemy import text, bindparam
+from sqlalchemy.dialects.postgresql import JSONB
+from core.sql_exec import get_mem_engine
 
 # Make sure the blueprint has this prefix so routes live under /admin...
 admin_bp = Blueprint("admin", __name__, url_prefix="/admin")
@@ -16,29 +16,39 @@ def _conn():
     return mem_engine.connect()
 
 
+def _infer_value_type(val, explicit: str | None) -> str:
+    if explicit:
+        return explicit
+    if isinstance(val, bool):
+        return "bool"
+    if isinstance(val, int) and not isinstance(val, bool):
+        return "int"
+    if isinstance(val, (dict, list)):
+        return "json"
+    return "string"
+
+
 @admin_bp.post("/settings/bulk")
 def settings_bulk():
-    # expects:
-    # {
-    #   "namespace": "...",
-    #   "updated_by": "...",
-    #   "settings": [{ "key": "...", "value": <any>, "scope"?: "namespace"|"global"|"user", "value_type"?: "string"|"int"|"bool"|"json", "is_secret"?: bool }, ...]
-    # }
-    data = request.get_json(force=True) or {}
-    ns = data.get("namespace") or "default"
-    updated_by = data.get("updated_by") or "api"
-    items: List[Dict[str, Any]] = data.get("settings") or []
-    if not items or not isinstance(items, list):
-        return jsonify({"ok": False, "error": "settings must be a non-empty array"}), 400
+    payload = request.get_json(force=True) or {}
+    ns = payload.get("namespace") or "fa::common"
+    who = payload.get("updated_by") or "api"
+    items = payload.get("settings") or []
+    if not isinstance(items, list) or not items:
+        return jsonify({"ok": False, "error": "settings list required"}), 400
+
+    mem = get_mem_engine(current_app.config.get("MEM_ENGINE"))
 
     upsert_sql = text("""
         INSERT INTO mem_settings(
             namespace, key, value, value_type, scope, scope_id,
-            category, description, overridable, updated_by, created_at, updated_at, is_secret
+            category, description, overridable, updated_by,
+            created_at, updated_at, is_secret
         )
         VALUES (
-            :ns, :key, :val::jsonb, :vtype, :scope, :scope_id,
-            :cat, :desc, COALESCE(:ovr, true), :upd, NOW(), NOW(), COALESCE(:sec, false)
+            :ns, :key, :val, :vtype, :scope, :scope_id,
+            :cat, :desc, COALESCE(:ovr, true), :upd,
+            NOW(), NOW(), COALESCE(:sec, false)
         )
         ON CONFLICT (namespace, key, scope, COALESCE(scope_id, ''))
         DO UPDATE SET
@@ -47,55 +57,46 @@ def settings_bulk():
             updated_by = EXCLUDED.updated_by,
             updated_at = NOW(),
             is_secret = EXCLUDED.is_secret
-    """)
+    """).bindparams(bindparam("val", type_=JSONB))
 
-    def infer_value_type(v: Any) -> str:
-        if isinstance(v, bool):
-            return "bool"
-        if isinstance(v, int):
-            return "int"
-        if isinstance(v, (dict, list)):
-            return "json"
-        return "string"
-
-    out = {"updated": 0, "namespace": ns}
-    with _conn() as c:
-        for item in items:
-            key = item.get("key")
+    results = []
+    with mem.begin() as c:
+        for it in items:
+            key = it.get("key")
             if not key:
+                results.append({"key": None, "ok": False, "error": "missing key"})
                 continue
-            val = item.get("value")
-            vtype = item.get("value_type") or infer_value_type(val)
+
+            value = it.get("value")
+            vtype = _infer_value_type(value, it.get("value_type"))
+            scope = it.get("scope") or "namespace"
+            scope_id = it.get("scope_id")
+            is_secret = bool(it.get("is_secret", False))
+            overr = it.get("overridable")
+            cat = it.get("category")
+            desc = it.get("description")
+
+            params = {
+                "ns": ns,
+                "key": key,
+                "val": value,
+                "vtype": vtype,
+                "scope": scope,
+                "scope_id": scope_id,
+                "cat": cat,
+                "desc": desc,
+                "ovr": overr,
+                "upd": who,
+                "sec": is_secret,
+            }
+
             try:
-                val_json = json.dumps(val)
-            except Exception:
-                val_json = json.dumps(str(val))
+                c.execute(upsert_sql, params)
+                results.append({"key": key, "ok": True})
+            except Exception as e:
+                results.append({"key": key, "ok": False, "error": str(e)})
 
-            scope = item.get("scope") or "namespace"
-            scope_id = item.get("scope_id")
-            cat = item.get("category")
-            desc = item.get("description")
-            ovr = item.get("overridable")
-            sec = bool(item.get("is_secret", False))
-            c.execute(
-                upsert_sql,
-                {
-                    "ns": ns,
-                    "key": key,
-                    "val": val_json,
-                    "vtype": vtype,
-                    "scope": scope,
-                    "scope_id": scope_id,
-                    "cat": cat,
-                    "desc": desc,
-                    "ovr": ovr,
-                    "upd": updated_by,
-                    "sec": sec,
-                },
-            )
-            out["updated"] += 1
-
-    return jsonify({"ok": True, **out})
+    return jsonify({"ok": True, "namespace": ns, "updated_by": who, "results": results})
 
 
 @admin_bp.get("/settings/get")

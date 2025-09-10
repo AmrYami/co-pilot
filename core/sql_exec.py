@@ -22,6 +22,20 @@ def get_app_engine(settings, namespace: str) -> Engine:
     _ENGINES[key] = eng
     return eng
 
+
+def get_mem_engine(mem) -> Engine:
+    """Return a cached Engine for the given mem database."""
+    if isinstance(mem, Engine):
+        return mem
+    if isinstance(mem, str):
+        key = f"mem::{mem}"
+        if key in _ENGINES:
+            return _ENGINES[key]
+        eng = create_engine(mem, pool_pre_ping=True, pool_recycle=3600)
+        _ENGINES[key] = eng
+        return eng
+    raise RuntimeError("MEM_ENGINE not configured")
+
 def validate_select(sql: str) -> Tuple[bool, str]:
     s = sql.strip().lstrip("(")
     if not SAFE_SQL_RE.match(s):
