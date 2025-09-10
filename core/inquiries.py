@@ -31,57 +31,73 @@ def mark_admin_note(mem_engine, *, inquiry_id: int, admin_reply: str, answered_b
         """), {"reply": admin_reply, "by": answered_by, "id": inquiry_id})
 
 
-def append_admin_note(
-    mem_engine,
-    inquiry_id: int,
-    by: str,
-    text_note: str | None = None,
-    structured: dict | None = None,
-) -> None:
-    """
-    Append a single admin note to mem_inquiries.admin_notes (JSONB[]),
-    increment clarification_rounds, and touch updated_at.
-    """
-
+def append_admin_note(mem_engine, inquiry_id: int, by: str, text_note: str) -> None:
     note = {
         "by": by,
+        "text": text_note,
         "ts": datetime.now(timezone.utc).isoformat(),
     }
-    if text_note:
-        note["note"] = text_note
-    if structured:
-        note["structured"] = structured
+    with mem_engine.begin() as c:
+        r = (
+            c.execute(
+                text("SELECT admin_notes FROM mem_inquiries WHERE id=:id FOR UPDATE"),
+                {"id": inquiry_id},
+            )
+            .mappings()
+            .first()
+        )
+        notes = r["admin_notes"] or []
+        if isinstance(notes, str):
+            try:
+                notes = json.loads(notes) or []
+            except Exception:
+                notes = []
+        if not isinstance(notes, list):
+            notes = []
+        notes.append(note)
+        c.execute(
+            text(
+                """UPDATE mem_inquiries
+                    SET admin_notes=:notes,
+                        clarification_rounds = COALESCE(clarification_rounds,0) + 1,
+                        updated_at = NOW()
+                    WHERE id=:id"""
+            ),
+            {"id": inquiry_id, "notes": json.dumps(notes)},
+        )
 
-    sql = text(
-        """
-        UPDATE mem_inquiries
-        SET admin_notes = COALESCE(admin_notes, '[]'::jsonb) || :note,
-            clarification_rounds = COALESCE(clarification_rounds, 0) + 1,
-            updated_at = NOW()
-        WHERE id = :id
-        """
-    ).bindparams(bindparam("note", type_=JSONB))
-
-    with mem_engine.begin() as cx:
-        cx.execute(sql, {"id": inquiry_id, "note": [note]})
-
-def get_inquiry(db: Engine, inquiry_id: int) -> Optional[Dict[str, Any]]:
-    with db.connect() as c:
-        row = c.execute(text("SELECT * FROM mem_inquiries WHERE id = :id"), {"id": inquiry_id}).mappings().first()
-        return dict(row) if row else None
+def get_inquiry(conn, inquiry_id: int) -> dict | None:
+    row = conn.execute(
+        text(
+            """SELECT id, namespace, prefixes, question, auth_email,
+                       status, admin_notes, clarification_rounds, last_question
+                FROM mem_inquiries
+                WHERE id = :id"""
+        ),
+        {"id": inquiry_id},
+    ).mappings().first()
+    return dict(row) if row else None
 
 
-def set_inquiry_status(db: Engine, inquiry_id: int, *, status: str, answered_by: Optional[str] = None) -> None:
-    sql = """
-        UPDATE mem_inquiries
-        SET status = :st,
-            answered_by = COALESCE(:by, answered_by),
-            answered_at = CASE WHEN :st = 'answered' THEN NOW() ELSE answered_at END,
-            updated_at = NOW()
-        WHERE id = :id
-    """
-    with db.begin() as c:
-        c.execute(text(sql), {"id": inquiry_id, "st": status, "by": answered_by, "id": inquiry_id})
+def set_inquiry_status(
+    mem_engine,
+    inquiry_id: int,
+    status: str,
+    last_question: str | None = None,
+    answered_by: str | None = None,
+) -> None:
+    with mem_engine.begin() as c:
+        c.execute(
+            text(
+                """UPDATE mem_inquiries
+                    SET status=:st,
+                        last_question = :lq,
+                        answered_by = COALESCE(:by, answered_by),
+                        updated_at = NOW()
+                    WHERE id=:id"""
+            ),
+            {"id": inquiry_id, "st": status, "lq": last_question, "by": answered_by},
+        )
 
 
 def create_or_update_inquiry(

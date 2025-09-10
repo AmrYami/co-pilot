@@ -148,6 +148,51 @@ class Pipeline:
             "\ud83d\udc4b Hi! I can help answer data questions. "
             "Try asking: 'top 10 customers by sales last month' or 'إجمالي المبيعات في يناير'."
         )
+    def _notes_to_text(self, notes: list[dict]) -> str:
+        parts = []
+        for n in notes or []:
+            t = n.get("text") if isinstance(n, dict) else str(n)
+            by = n.get("by") if isinstance(n, dict) else None
+            if t:
+                parts.append(f"- {t}" + (f" (by: {by})" if by else ""))
+        return "\n".join(parts)
+
+    def resume_inquiry(self, inquiry_id: int) -> dict:
+        with self.mem_engine.begin() as c:
+            row = c.execute(
+                text("SELECT id, namespace, prefixes, question, auth_email,
+                               admin_notes, clarification_rounds, status
+                        FROM mem_inquiries WHERE id=:id"),
+                {"id": inquiry_id},
+            ).mappings().first()
+        if not row:
+            return {"ok": False, "error": "inquiry_not_found", "inquiry_id": inquiry_id}
+
+        ns = row["namespace"]
+        question = row["question"]
+        auth_email = row["auth_email"]
+        prefixes = row["prefixes"] or []
+        if isinstance(prefixes, str):
+            try:
+                prefixes = json.loads(prefixes) or []
+            except Exception:
+                prefixes = []
+
+        from apps.fa.hints import make_fa_hints
+        hints = make_fa_hints(self.mem_engine, prefixes, question)
+        admin_text = self._notes_to_text(row["admin_notes"] or [])
+        if admin_text:
+            hints["admin_notes"] = admin_text
+
+        result = self.answer(
+            question=question,
+            context={"prefixes": prefixes, "auth_email": auth_email},
+            hints=hints,
+            inquiry_id=inquiry_id,
+            allow_new_inquiry=False,
+        )
+        return result
+
 
     def _force_sql_only(self, raw: str, question: str) -> str | None:
         """Try to coerce any model output into SQL; optionally use the clarifier to reformat."""
@@ -271,6 +316,9 @@ class Pipeline:
         question: str,
         context: Dict[str, Any],
         hints: Dict[str, Any] | None = None,
+        inquiry_id: int | None = None,
+        extra_hints: Dict[str, Any] | None = None,
+        allow_new_inquiry: bool = True,
     ) -> Dict[str, Any]:
         """
         End-to-end ask flow:
@@ -281,6 +329,12 @@ class Pipeline:
           5) Prefix rewrite
           6) Validate (EXPLAIN), research retry if enabled; otherwise needs_fix
         """
+        if inquiry_id is not None:
+            context = dict(context)
+            context["inquiry_id"] = inquiry_id
+        if extra_hints:
+            hints = {**(hints or {}), **extra_hints}
+
         ns = context.get("namespace") or self.namespace
         prefixes = context.get("prefixes") or []
         auth_email = context.get("auth_email")
