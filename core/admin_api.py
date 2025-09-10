@@ -3,7 +3,7 @@ from flask import Blueprint, request, jsonify, current_app
 from sqlalchemy import text, bindparam
 from sqlalchemy.dialects.postgresql import JSONB
 from core.sql_exec import get_mem_engine
-from core.inquiries import append_admin_note
+from core.inquiries import append_admin_note, get_inquiry_details
 
 admin_bp = Blueprint("admin", __name__)
 
@@ -117,47 +117,41 @@ def settings_get():
 
 # ----- Admin reply (append note safely & drive the pipeline later) -----
 
+@admin_bp.get("/inquiries/<int:inq_id>")
+def inquiry_get(inq_id: int):
+    pipeline = current_app.config["PIPELINE"]
+    mem = pipeline.mem_engine
+    details = get_inquiry_details(mem, inq_id)
+    return jsonify(details), (200 if details.get("ok") else 404)
+
+
 @admin_bp.post("/inquiries/<int:inq_id>/reply")
 def admin_reply(inq_id: int):
-    """
-    Append an admin note and, by default, immediately try to apply it.
-    Opt-out with ?apply=0 (or 'false'/'no').
-    """
     data = request.get_json(force=True) or {}
-    answered_by = (data.get("answered_by") or data.get("by") or "").strip()
-    admin_reply = (data.get("admin_reply") or data.get("note") or "").strip()
-    if not answered_by or not admin_reply:
-        return {"ok": False, "error": "answered_by and admin_reply are required"}, 400
+    answered_by = data.get("answered_by") or data.get("by") or "admin"
+    admin_text = (data.get("admin_reply") or data.get("reply") or "").strip()
+    if not admin_text:
+        return jsonify({"ok": False, "error": "empty_reply"}), 400
 
-    mem = current_app.config["MEM_ENGINE"]
-    try:
-        append_admin_note(mem, inq_id, by=answered_by, text_note=admin_reply)
-    except Exception as e:
-        return {"ok": False, "inquiry_id": inq_id, "error": f"append_failed: {e}"}, 500
+    pipeline = current_app.config["PIPELINE"]
+    mem = pipeline.mem_engine
 
-    # NEW: apply defaults to ON. You can still skip with ?apply=0 if you want.
-    qs = request.args.get("apply")
-    do_apply = True if qs is None else (qs.lower() not in {"0", "false", "no"})
+    res = append_admin_note(mem, inq_id, by=answered_by, text_note=admin_text)
+    if not res.get("ok"):
+        return jsonify({"ok": False, "error": "append_failed"}), 500
 
-    applied = None
-    if do_apply:
-        pipeline = current_app.config["PIPELINE"]
-        settings = current_app.config["SETTINGS"]
-        try:
-            max_rounds = int(settings.get("MAX_CLARIFICATION_ROUNDS", "3") or 3)
-            applied = pipeline.apply_admin_notes(inq_id, max_rounds=max_rounds)
-        except Exception as e:
-            return {
-                "ok": False, "inquiry_id": inq_id, "appended": True,
-                "applied": False, "error": f"apply_failed: {e}"
-            }, 200
+    applied = pipeline.continue_inquiry(inq_id)
 
-    return {
+    out = {
         "ok": True,
-        "inquiry_id": inq_id,
         "appended": True,
-        "applied": bool(applied)
-    }, 200
+        "applied": True,
+        "inquiry_id": inq_id,
+    }
+    if isinstance(applied, dict):
+        out.update({k: v for k, v in applied.items() if k in ("status", "run_id", "questions", "message")})
+
+    return jsonify(out), 200
 
 
 @admin_bp.post("/inquiries/<int:inq_id>/process")
