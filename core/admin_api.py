@@ -4,7 +4,6 @@ from sqlalchemy import text, bindparam
 from sqlalchemy.dialects.postgresql import JSONB
 from core.sql_exec import get_mem_engine
 from core.inquiries import append_admin_note, fetch_inquiry
-from core.settings import Settings
 
 admin_bp = Blueprint("admin", __name__)
 
@@ -132,7 +131,6 @@ def get_inquiry(inq_id: int):
 def admin_reply(inq_id: int):
     app = current_app
     pipeline = app.config["PIPELINE"]
-    settings: Settings = app.config["SETTINGS"]
 
     data = request.get_json(force=True) or {}
     answered_by = (data.get("answered_by") or "").strip()
@@ -144,13 +142,5 @@ def admin_reply(inq_id: int):
     if not appended:
         return jsonify({"ok": False, "error": "append_failed"}), 500
 
-    ns = f"fa::common"
-    inline = settings.is_inline_clarifier(ns, answered_by)
-
-    out = pipeline.continue_inquiry(inq_id, answered_by=answered_by, inline=inline)
-
-    out["ok"] = True
-    out["inquiry_id"] = inq_id
-    out["appended"] = True
-    out["applied"] = True
-    return jsonify(out)
+    resp = pipeline.retry_from_inquiry(inq_id)
+    return jsonify(resp)
