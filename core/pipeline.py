@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import json
 import re
+import io
+import csv
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Callable
 from datetime import datetime
@@ -290,6 +292,41 @@ class Pipeline:
             "We’re running this in the background. You’ll receive the result by email."
         )
         return payload
+
+    def _email_result_if_needed(self, namespace: str, to_mail: str | None, question: str, rows: list[dict]):
+        if not to_mail or not rows:
+            return
+        buf = io.StringIO()
+        w = csv.DictWriter(buf, fieldnames=list(rows[0].keys()))
+        w.writeheader()
+        w.writerows(rows)
+        try:
+            mailer = Emailer(self.settings)
+            mailer.send(
+                to=[to_mail],
+                subject="Your data is ready",
+                body=f"Result for: {question}\nAttached CSV.",
+                attachments=[("result.csv", buf.getvalue(), "text/csv")],
+            )
+        except Exception:
+            pass
+
+    def apply_admin_and_retry(self, inquiry_id: int) -> dict:
+        row = fetch_inquiry(self.mem_engine, inquiry_id)
+        if not row:
+            return {"status": "not_found"}
+
+        ns = row.get("namespace") or self.namespace
+        auth_email = row.get("auth_email")
+
+        result = self.continue_inquiry(inquiry_id, inline=True)
+        if result.get("status") == "answered":
+            try:
+                sample_rows = result.get("sample") or []
+                self._email_result_if_needed(ns, auth_email, row.get("question"), sample_rows)
+            except Exception:
+                pass
+        return result
 
 
     def retry_from_inquiry(self, inq_id: int) -> dict:

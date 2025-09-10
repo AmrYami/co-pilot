@@ -8,7 +8,7 @@ These helpers are project-agnostic (no FA-specific code).
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from sqlalchemy.engine import Engine, Row
 from sqlalchemy import text, bindparam, Integer
@@ -16,22 +16,19 @@ from sqlalchemy.dialects.postgresql import JSONB
 
 
 def fetch_inquiry(mem_engine, inquiry_id: int) -> Optional[Dict[str, Any]]:
-    sql = text(
-        """
-        SELECT
-            i.id, i.namespace, i.prefixes, i.question, i.auth_email,
-            i.status, i.clarification_rounds, i.admin_notes, i.run_id,
-            COALESCE(i.last_error, r.error_message) AS last_error,
-            COALESCE(i.last_sql,   r.sql_final)     AS last_sql,
-            i.created_at, i.updated_at
-        FROM mem_inquiries i
-        LEFT JOIN mem_runs r
-          ON r.id = i.run_id
-        WHERE i.id = :id
-        """
-    )
     with mem_engine.begin() as c:
-        row = c.execute(sql, {"id": inquiry_id}).mappings().first()
+        row = c.execute(
+            text(
+                """
+            SELECT id, namespace, prefixes, question, auth_email,
+                   status, clarification_rounds, admin_notes, run_id,
+                   last_sql, last_error, result_sample, created_at, updated_at
+              FROM mem_inquiries
+             WHERE id = :id
+            """
+            ),
+            {"id": inquiry_id},
+        ).mappings().first()
         return dict(row) if row else None
 
 
@@ -45,23 +42,21 @@ def get_admin_notes(inquiry_row: Dict[str, Any]) -> List[str]:
     return out
 
 
-def append_admin_note(mem_engine, inquiry_id: int, by: str, text_note: str) -> bool:
-    note = {"by": by, "text": text_note}
+def append_admin_note(mem_engine, inquiry_id: int, by: str, text_note: str) -> None:
+    note = {"by": by, "text": text_note, "ts": datetime.now(timezone.utc).isoformat()}
     with mem_engine.begin() as c:
-        stmt = text(
-            """
+        c.execute(
+            text(
+                """
             UPDATE mem_inquiries
-               SET admin_notes = COALESCE(admin_notes, '[]'::jsonb) || to_jsonb(:note),
+               SET admin_notes = COALESCE(admin_notes, '[]'::jsonb) || to_jsonb(:note::json),
                    clarification_rounds = COALESCE(clarification_rounds, 0) + 1,
                    updated_at = NOW()
              WHERE id = :id
             """
-        ).bindparams(
-            bindparam("note", type_=JSONB),
-            bindparam("id", type_=Integer),
+            ),
+            {"id": inquiry_id, "note": json.dumps(note)},
         )
-        c.execute(stmt, {"id": inquiry_id, "note": note})
-    return True
 
 
 def update_inquiry_status_run(mem_engine, inquiry_id: int, *,

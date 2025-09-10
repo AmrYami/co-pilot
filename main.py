@@ -19,8 +19,8 @@ def create_app() -> Flask:
     app.config["MEM_ENGINE"] = pipeline.mem_engine
     app.config["SETTINGS"] = pipeline.settings
 
-    # Force the /admin prefix here even if someone removes it in the blueprint
-    app.register_blueprint(admin_bp, url_prefix="/admin")
+    # admin_bp already has url_prefix="/admin"
+    app.register_blueprint(admin_bp)
 
     app.register_blueprint(fa_bp, url_prefix="/fa")
 
