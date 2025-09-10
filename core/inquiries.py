@@ -52,18 +52,20 @@ def append_admin_note(
     if structured:
         note["structured"] = structured
 
+    # Bind a JSON string and cast once on the server. Use :named binds consistently.
     sql = text(
         """
         UPDATE mem_inquiries
-        SET admin_notes = COALESCE(admin_notes, '[]'::jsonb) || jsonb_build_array(:note),
+        SET admin_notes = COALESCE(admin_notes, '[]'::jsonb) || (:note)::jsonb,
             clarification_rounds = COALESCE(clarification_rounds, 0) + 1,
             updated_at = NOW()
         WHERE id = :id
         """
-    ).bindparams(bindparam("note", type_=JSONB))
+    )
 
+    note_json = json.dumps(note, ensure_ascii=False)
     with mem_engine.begin() as cx:
-        cx.execute(sql, {"id": inquiry_id, "note": note})
+        cx.execute(sql, {"id": inquiry_id, "note": note_json})
 
 def get_inquiry(db: Engine, inquiry_id: int) -> Optional[Dict[str, Any]]:
     with db.connect() as c:

@@ -18,32 +18,28 @@ def _conn():
 
 @admin_bp.post("/settings/bulk")
 def settings_bulk():
-    """
-    Upsert a batch of settings:
-    {
-      "namespace": "fa::common",
-      "updated_by": "amr",
-      "settings": [
-        {"key": "RESEARCH_MODE", "value": true, "scope": "namespace"},
-        {"key": "MAX_CLARIFICATION_ROUNDS", "value": 3, "value_type":"int", "scope": "namespace"}
-      ]
-    }
-    """
-    payload = request.get_json(force=True, silent=False) or {}
-    namespace = payload.get("namespace") or "default"
-    updated_by = payload.get("updated_by") or "system"
-    settings: List[Dict[str, Any]] = payload.get("settings") or []
+    # expects:
+    # {
+    #   "namespace": "...",
+    #   "updated_by": "...",
+    #   "settings": [{ "key": "...", "value": <any>, "scope"?: "namespace"|"global"|"user", "value_type"?: "string"|"int"|"bool"|"json", "is_secret"?: bool }, ...]
+    # }
+    data = request.get_json(force=True) or {}
+    ns = data.get("namespace") or "default"
+    updated_by = data.get("updated_by") or "api"
+    items: List[Dict[str, Any]] = data.get("settings") or []
+    if not items or not isinstance(items, list):
+        return jsonify({"ok": False, "error": "settings must be a non-empty array"}), 400
 
-    if not isinstance(settings, list):
-        return jsonify({"error": "settings must be a list"}), 400
-
-    # NOTE: we keep one canonical unique index:
-    #   (namespace, key, scope, COALESCE(scope_id, ''))
     upsert_sql = text("""
-        INSERT INTO mem_settings(namespace, key, value, value_type, scope, scope_id,
-                                 category, description, overridable, updated_by, created_at, updated_at, is_secret)
-        VALUES (:ns, :key, :val::jsonb, :vtype, :scope, :scope_id,
-                :cat, :desc, COALESCE(:ovr, true), :upd, NOW(), NOW(), COALESCE(:sec, false))
+        INSERT INTO mem_settings(
+            namespace, key, value, value_type, scope, scope_id,
+            category, description, overridable, updated_by, created_at, updated_at, is_secret
+        )
+        VALUES (
+            :ns, :key, :val::jsonb, :vtype, :scope, :scope_id,
+            :cat, :desc, COALESCE(:ovr, true), :upd, NOW(), NOW(), COALESCE(:sec, false)
+        )
         ON CONFLICT (namespace, key, scope, COALESCE(scope_id, ''))
         DO UPDATE SET
             value = EXCLUDED.value,
@@ -51,52 +47,52 @@ def settings_bulk():
             updated_by = EXCLUDED.updated_by,
             updated_at = NOW(),
             is_secret = EXCLUDED.is_secret
-        ;
     """)
 
-    # Normalize values into json text for val::jsonb
-    def _to_json(v: Any) -> str:
-        # Already JSON text? keep; else dump
-        if isinstance(v, str):
-            # If it looks like JSON (starts with { or [ or is a JSON literal), try to validate
-            s = v.strip()
-            if s.startswith("{") or s.startswith("[") or s in ("true","false","null") or s.replace(".","",1).isdigit():
-                try:
-                    json.loads(s)
-                    return s
-                except Exception:
-                    return json.dumps(v)
-            return json.dumps(v)
-        return json.dumps(v)
+    def infer_value_type(v: Any) -> str:
+        if isinstance(v, bool):
+            return "bool"
+        if isinstance(v, int):
+            return "int"
+        if isinstance(v, (dict, list)):
+            return "json"
+        return "string"
 
-    out = {"updated": 0, "namespace": namespace}
+    out = {"updated": 0, "namespace": ns}
     with _conn() as c:
-        for item in settings:
+        for item in items:
             key = item.get("key")
             if not key:
                 continue
+            val = item.get("value")
+            vtype = item.get("value_type") or infer_value_type(val)
+            try:
+                val_json = json.dumps(val)
+            except Exception:
+                val_json = json.dumps(str(val))
+
             scope = item.get("scope") or "namespace"
             scope_id = item.get("scope_id")
-            vtype = item.get("value_type") or None
             cat = item.get("category")
             desc = item.get("description")
             ovr = item.get("overridable")
             sec = bool(item.get("is_secret", False))
-            val_json_text = _to_json(item.get("value"))
-
-            c.execute(upsert_sql, {
-                "ns": namespace,
-                "key": key,
-                "val": val_json_text,
-                "vtype": vtype,
-                "scope": scope,
-                "scope_id": scope_id,
-                "cat": cat,
-                "desc": desc,
-                "ovr": ovr,
-                "upd": updated_by,
-                "sec": sec,
-            })
+            c.execute(
+                upsert_sql,
+                {
+                    "ns": ns,
+                    "key": key,
+                    "val": val_json,
+                    "vtype": vtype,
+                    "scope": scope,
+                    "scope_id": scope_id,
+                    "cat": cat,
+                    "desc": desc,
+                    "ovr": ovr,
+                    "upd": updated_by,
+                    "sec": sec,
+                },
+            )
             out["updated"] += 1
 
     return jsonify({"ok": True, **out})
