@@ -3,6 +3,7 @@ from flask import Blueprint, request, jsonify, current_app
 from sqlalchemy import text, bindparam
 from sqlalchemy.dialects.postgresql import JSONB
 from core.sql_exec import get_mem_engine
+from core.inquiries import append_admin_note, get_inquiry
 
 # Make sure the blueprint has this prefix so routes live under /admin...
 admin_bp = Blueprint("admin", __name__, url_prefix="/admin")
@@ -119,33 +120,42 @@ def settings_get():
 
 @admin_bp.post("/inquiries/<int:inq_id>/reply")
 def admin_reply(inq_id: int):
-    """
-    Body:
-    {
-      "answered_by": "admin@example.com",
-      "admin_reply": "Use invoices (debtor_trans), date column tran_date, period last month, sum net of credit notes."
-    }
-    """
+    mem = current_app.config["MEM_ENGINE"]
+    pipeline = current_app.config["PIPELINE"]
     data = request.get_json(force=True) or {}
-    by  = (data.get("answered_by") or "").strip() or "admin"
-    txt = (data.get("admin_reply") or "").strip()
-    if not txt:
-        return jsonify({"error": "admin_reply required"}), 400
+    answered_by = data.get("answered_by") or data.get("auth_email") or "admin"
+    admin_reply = (data.get("admin_reply") or "").strip()
+    if not admin_reply:
+        return jsonify({"ok": False, "error": "admin_reply_required"}), 400
 
-    # Append to JSONB array WITHOUT casting bound params (use jsonb_build_array/object)
-    sql = text("""
-        UPDATE mem_inquiries
-        SET admin_notes = COALESCE(admin_notes, '[]'::jsonb)
-                          || jsonb_build_array(jsonb_build_object('ts', NOW(), 'by', :by, 'text', :txt)),
-            clarification_rounds = COALESCE(clarification_rounds, 0) + 1,
-            updated_at = NOW()
-        WHERE id = :id
-        RETURNING id;
-    """)
-    with _conn() as c:
-        r = c.execute(sql, {"id": inq_id, "by": by, "txt": txt}).fetchone()
-        if not r:
-            return jsonify({"error": "inquiry not found", "inquiry_id": inq_id}), 404
+    append_admin_note(mem, inq_id, by=answered_by, text_note=admin_reply)
 
-    # You already have core/admin_helpers.py or pipeline hooks – keep those.
-    return jsonify({"ok": True, "inquiry_id": inq_id, "appended": True})
+    apply_now = request.args.get("apply", "1") not in {"0", "false", "no"}
+    if not apply_now:
+        return jsonify({"ok": True, "appended": True, "inquiry_id": inq_id})
+
+    out = pipeline.resume_inquiry(inq_id)
+
+    if out.get("status") == "ok" and "sql" in out:
+        return jsonify({
+            "ok": True,
+            "inquiry_id": inq_id,
+            "status": "answered",
+            "sql": out["sql"],
+            "rows": out.get("rows", 0)
+        })
+    elif out.get("status") == "needs_clarification":
+        return jsonify({
+            "ok": True,
+            "inquiry_id": inq_id,
+            "status": "needs_clarification",
+            "questions": out.get("questions", ["Add one more hint"])
+        })
+    else:
+        return jsonify({"ok": False, "inquiry_id": inq_id, "error": out.get("error", "replan_failed")}), 500
+
+
+@admin_bp.post("/inquiries/<int:inq_id>/process")
+def admin_process(inq_id: int):
+    out = current_app.config["PIPELINE"].resume_inquiry(inq_id)
+    return jsonify(out)

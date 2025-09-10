@@ -137,6 +137,14 @@ class PlannerAgentFA(CorePlanner):
             f"Hints:\n{hint_txt}\n"
             "Return as:\nSQL:\n<sql>\nRationale:\n<why>\n"
         )
+
+        if hints and hints.get("admin_notes"):
+            prompt += (
+                "\n\n# Admin clarifications (authoritative):\n"
+                + hints["admin_notes"]
+                + "\n# Use these clarifications to finalize the SQL. Return **SQL only**."
+            )
+
         out = self.llm.generate(prompt, max_new_tokens=256, temperature=0.2, top_p=0.9)
         return self._split(out)
 
