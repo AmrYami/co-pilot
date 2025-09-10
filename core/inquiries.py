@@ -8,7 +8,7 @@ These helpers are project-agnostic (no FA-specific code).
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 from sqlalchemy.engine import Engine
 from sqlalchemy import text, bindparam
@@ -31,39 +31,28 @@ def mark_admin_note(mem_engine, *, inquiry_id: int, admin_reply: str, answered_b
         """), {"reply": admin_reply, "by": answered_by, "id": inquiry_id})
 
 
+def json_dumps(obj) -> str:
+    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+
+
 def append_admin_note(mem_engine, inquiry_id: int, by: str, text_note: str) -> None:
     note = {
         "by": by,
         "text": text_note,
-        "ts": datetime.now(timezone.utc).isoformat(),
+        "at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
     }
     with mem_engine.begin() as c:
-        r = (
-            c.execute(
-                text("SELECT admin_notes FROM mem_inquiries WHERE id=:id FOR UPDATE"),
-                {"id": inquiry_id},
-            )
-            .mappings()
-            .first()
-        )
-        notes = r["admin_notes"] or []
-        if isinstance(notes, str):
-            try:
-                notes = json.loads(notes) or []
-            except Exception:
-                notes = []
-        if not isinstance(notes, list):
-            notes = []
-        notes.append(note)
         c.execute(
             text(
-                """UPDATE mem_inquiries
-                    SET admin_notes=:notes,
-                        clarification_rounds = COALESCE(clarification_rounds,0) + 1,
-                        updated_at = NOW()
-                    WHERE id=:id"""
+                """
+                UPDATE mem_inquiries
+                   SET admin_notes = COALESCE(admin_notes, '[]'::jsonb) || to_jsonb(:note::json),
+                       clarification_rounds = COALESCE(clarification_rounds, 0) + 1,
+                       updated_at = NOW()
+                 WHERE id = :id
+                """
             ),
-            {"id": inquiry_id, "notes": json.dumps(notes)},
+            {"id": inquiry_id, "note": json_dumps(note)},
         )
 
 def get_inquiry(conn, inquiry_id: int) -> dict | None:

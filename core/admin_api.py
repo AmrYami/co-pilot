@@ -3,10 +3,9 @@ from flask import Blueprint, request, jsonify, current_app
 from sqlalchemy import text, bindparam
 from sqlalchemy.dialects.postgresql import JSONB
 from core.sql_exec import get_mem_engine
-from core.inquiries import append_admin_note, get_inquiry
+from core.inquiries import append_admin_note
 
-# Make sure the blueprint has this prefix so routes live under /admin...
-admin_bp = Blueprint("admin", __name__, url_prefix="/admin")
+admin_bp = Blueprint("admin", __name__)
 
 
 def _conn():
@@ -120,39 +119,48 @@ def settings_get():
 
 @admin_bp.post("/inquiries/<int:inq_id>/reply")
 def admin_reply(inq_id: int):
+    """
+    Append an admin note and, by default, immediately try to apply it.
+    Opt-out with ?apply=0 (or 'false'/'no').
+    """
+    data = request.get_json(silent=True) or {}
+    answered_by = data.get("answered_by") or "admin"
+    text_note = data.get("admin_reply") or data.get("answer") or ""
+    if not text_note.strip():
+        return jsonify({"ok": False, "error": "admin_reply (text) is required"}), 400
+
     mem = current_app.config["MEM_ENGINE"]
-    pipeline = current_app.config["PIPELINE"]
-    data = request.get_json(force=True) or {}
-    answered_by = data.get("answered_by") or data.get("auth_email") or "admin"
-    admin_reply = (data.get("admin_reply") or "").strip()
-    if not admin_reply:
-        return jsonify({"ok": False, "error": "admin_reply_required"}), 400
+    try:
+        append_admin_note(mem, inquiry_id=inq_id, by=answered_by, text_note=text_note)
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"append_failed: {e}"}), 500
 
-    append_admin_note(mem, inq_id, by=answered_by, text_note=admin_reply)
+    apply_qs = (request.args.get("apply") or "").strip().lower()
+    auto_apply = not (apply_qs in {"0", "false", "no"})
 
-    apply_now = request.args.get("apply", "1") not in {"0", "false", "no"}
-    if not apply_now:
-        return jsonify({"ok": True, "appended": True, "inquiry_id": inq_id})
-
-    out = pipeline.resume_inquiry(inq_id)
-
-    if out.get("status") == "ok" and "sql" in out:
+    if not auto_apply:
         return jsonify({
             "ok": True,
             "inquiry_id": inq_id,
-            "status": "answered",
-            "sql": out["sql"],
-            "rows": out.get("rows", 0)
-        })
-    elif out.get("status") == "needs_clarification":
+            "appended": True,
+            "applied": False,
+        }), 200
+
+    pipeline = current_app.extensions["pipeline"]
+    try:
+        result = pipeline.apply_admin_notes(inquiry_id=inq_id)
+        out = {"ok": True, "inquiry_id": inq_id, "appended": True, "applied": True}
+        if isinstance(result, dict):
+            out.update(result)
+        return jsonify(out), 200
+    except Exception as e:
         return jsonify({
-            "ok": True,
+            "ok": False,
             "inquiry_id": inq_id,
-            "status": "needs_clarification",
-            "questions": out.get("questions", ["Add one more hint"])
-        })
-    else:
-        return jsonify({"ok": False, "inquiry_id": inq_id, "error": out.get("error", "replan_failed")}), 500
+            "appended": True,
+            "applied": False,
+            "error": f"apply_failed: {e}",
+        }), 500
 
 
 @admin_bp.post("/inquiries/<int:inq_id>/process")
