@@ -158,6 +158,110 @@ class Pipeline:
                 parts.append(f"- {t}" + (f" (by: {by})" if by else ""))
         return "\n".join(parts)
 
+    def continue_inquiry(self, inquiry_id: int) -> dict:
+        """
+        Re-run planning/execution for an existing inquiry using accumulated
+        admin_notes as hints. Updates mem_inquiries.status to either 'answered'
+        or stays/returns 'needs_clarification'. Respects MAX_CLARIFICATION_ROUNDS
+        (mem_settings).
+        """
+        mem = self.mem_engine
+        with mem.begin() as c:
+            row = c.execute(text("SELECT * FROM mem_inquiries WHERE id = :id"), {"id": inquiry_id}).fetchone()
+        if not row:
+            return {"ok": False, "error": "not_found", "inquiry_id": inquiry_id}
+
+        ns = row.namespace
+        question = row.question
+        prefixes = row.prefixes or []
+        auth_email = getattr(row, "auth_email", None)
+        rounds = int(getattr(row, "clarification_rounds", 0) or 0)
+        notes = list(getattr(row, "admin_notes", []) or [])
+
+        max_rounds = int(self.settings.get("MAX_CLARIFICATION_ROUNDS", "3") or 3)
+        if rounds >= max_rounds:
+            with mem.begin() as c:
+                c.execute(
+                    text(
+                        """
+                    UPDATE mem_inquiries
+                       SET status = 'failed', updated_at = NOW()
+                     WHERE id = :id
+                    """
+                    ),
+                    {"id": inquiry_id},
+                )
+            return {
+                "ok": True,
+                "status": "failed",
+                "inquiry_id": inquiry_id,
+                "message": f"Max clarification rounds reached ({max_rounds}).",
+            }
+
+        admin_hint = ""
+        if notes:
+            admin_hint = " | ".join(n.get("note", "") for n in notes if isinstance(n, dict))[-2000:]
+
+        try:
+            from apps.fa.hints import make_fa_hints
+
+            app_hints = make_fa_hints(self.mem_engine, prefixes, question)
+        except Exception:
+            app_hints = {}
+
+        app_hints = dict(app_hints or {})
+        if admin_hint:
+            app_hints["admin_hint"] = admin_hint
+
+        try:
+            context = self._build_context(ns, prefixes)
+            canonical_sql, rationale = self.planner.plan(question, context, hints=app_hints)
+            run_info = self._validate_and_execute(ns, canonical_sql, prefixes, question, auth_email=auth_email)
+            run_id = run_info.get("run_id")
+
+            with mem.begin() as c:
+                c.execute(
+                    text(
+                        """
+                    UPDATE mem_inquiries
+                       SET status = 'answered',
+                           run_id = :rid,
+                           answered_by = COALESCE(answered_by, :by),
+                           answered_at = COALESCE(answered_at, NOW()),
+                           updated_at = NOW()
+                     WHERE id = :id
+                    """
+                    ),
+                    {"id": inquiry_id, "rid": run_id, "by": auth_email or "system"},
+                )
+            return {"ok": True, "status": "answered", "inquiry_id": inquiry_id, "run_id": run_id}
+
+        except Exception as e:
+            followup_q = "I couldn't derive a clean SQL. Can you clarify the tables or metrics?"
+            try:
+                followup_q = self.planner.followup_question or followup_q
+            except Exception:
+                pass
+
+            with mem.begin() as c:
+                c.execute(
+                    text(
+                        """
+                    UPDATE mem_inquiries
+                       SET status = 'needs_clarification',
+                           updated_at = NOW()
+                     WHERE id = :id
+                    """
+                    ),
+                    {"id": inquiry_id},
+                )
+            return {
+                "ok": True,
+                "status": "needs_clarification",
+                "inquiry_id": inquiry_id,
+                "questions": [followup_q],
+            }
+
     def resume_inquiry(self, inquiry_id: int) -> dict:
         with self.mem_engine.begin() as c:
             row = c.execute(
