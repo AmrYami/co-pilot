@@ -160,9 +160,7 @@ class Pipeline:
     def resume_inquiry(self, inquiry_id: int) -> dict:
         with self.mem_engine.begin() as c:
             row = c.execute(
-                text("SELECT id, namespace, prefixes, question, auth_email,
-                               admin_notes, clarification_rounds, status
-                        FROM mem_inquiries WHERE id=:id"),
+                text("SELECT id, namespace, prefixes, question, auth_email, admin_notes, clarification_rounds, status FROM mem_inquiries WHERE id=:id"),
                 {"id": inquiry_id},
             ).mappings().first()
         if not row:
