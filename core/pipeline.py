@@ -23,9 +23,9 @@ from sqlalchemy.engine import Engine
 import sqlalchemy as sa
 
 import importlib
-from core.agents import ClarifierAgent, PlannerAgent, ValidatorAgent
+from core.agents import PlannerAgent, ValidatorAgent
 from core.model_loader import load_model, load_clarifier_model
-from core.intent import IntentRouter
+from core.clarifier import ClarifierAgent
 from core.settings import Settings
 from core.research import build_researcher
 from core.sql_exec import get_app_engine, run_select, as_csv
@@ -37,6 +37,7 @@ from core.inquiries import (
     get_admin_notes,
 )
 from core.emailer import Emailer
+from apps.fa.hints import MISSING_FIELD_QUESTIONS, DOMAIN_HINTS
 
 from types import SimpleNamespace
 
@@ -107,7 +108,6 @@ class Pipeline:
         # 2) Load the LLM
         self.llm = load_model(self.settings)
         self.clarifier_llm = load_clarifier_model(self.settings)
-        self.intent_router = IntentRouter(self.clarifier_llm)
 
         if isinstance(self.llm, dict):
             self.llm = SimpleNamespace(**self.llm)
@@ -126,9 +126,7 @@ class Pipeline:
             self.planner = mod.get_planner(self.llm, self.settings)
         else:
             self.planner = getattr(mod, "FAPlanner")(self.llm, self.settings)
-        ClarifierCls = getattr(mod, "ClarifierAgentFA", ClarifierAgent)
         ValidatorCls = getattr(mod, "ValidatorAgentFA", ValidatorAgent)
-        self.clarifier = ClarifierCls(self.llm, self.settings)
         self.validator = ValidatorCls(self.app_engine, self.settings)
 
         # 5) Researcher: load after engines & settings are ready
@@ -644,29 +642,58 @@ class Pipeline:
                     "error": err or (info.get("error") if isinstance(info, dict) else None),
                 }
 
-        # -- 0) intent classification
-        it = self.intent_router.classify(question or "")
-        if it.kind in {"smalltalk", "help"}:
+        clarifier = ClarifierAgent(self.settings)
+        spec = clarifier.classify_and_extract(question, prefixes, DOMAIN_HINTS)
+
+        if spec.intent in {"smalltalk", "help"}:
             return {
                 "status": "ok",
-                "intent": it.kind,
+                "intent": spec.intent,
                 "message": (
                     self._render_help(context)
-                    if it.kind == "help"
+                    if spec.intent == "help"
                     else "👋 Hi! Ask me about your data (e.g. “top 10 customers by sales last month”)."
                 ),
                 "is_sql": False,
             }
 
+        if spec.intent == "raw_sql":
+            ctx = self.build_context_pack("fa", prefixes, question)
+            sql = SQLRewriter.rewrite_for_prefixes(question, prefixes)
+            ok, info = self.validator.quick_validate(sql)
+            if not ok:
+                return {
+                    "status": "needs_fix",
+                    "sql": sql,
+                    "validation": info,
+                    "context": ctx,
+                    "intent": spec.intent,
+                    "is_sql": True,
+                }
+            return {
+                "status": "ok",
+                "sql": sql,
+                "rationale": "raw SQL provided",
+                "context": ctx,
+                "intent": spec.intent,
+                "is_sql": True,
+            }
+
+        missing = spec.missing_fields()
+        if missing:
+            if allow_new_inquiry:
+                inquiry_id = self._log_inquiry(
+                    ns, prefixes, question, auth_email, status="needs_clarification"
+                )
+            questions = [
+                MISSING_FIELD_QUESTIONS.get(m, f"Please clarify: {m}") for m in missing
+            ]
+            return self._needs_clarification(inquiry_id, ns, questions)
+
         # -- 1) context
         ctx = self.build_context_pack("fa", prefixes, question)
         if context:
             ctx.update({k: v for k, v in context.items() if v is not None})
-
-        # -- 2) clarify
-        needs_clarification, clarification_questions = self.clarifier.maybe_ask(
-            question, ctx
-        )
 
         # -- 3) hints (generic + extras)
         from core.hints import make_hints as _gen_hints
@@ -682,28 +709,13 @@ class Pipeline:
                 inquiry_id = self._log_inquiry(
                     ns, prefixes, question, auth_email, status="needs_clarification"
                 )
-            # otherwise keep existing inquiry_id
             resp = self._needs_clarification(
                 inquiry_id,
                 ns,
                 ["I couldn't derive a clean SQL. Can you clarify the tables or metrics?"],
             )
-            resp.update({"context": ctx, "intent": it.kind, "is_sql": True})
+            resp.update({"context": ctx, "intent": spec.intent, "is_sql": True})
             return resp
-        if needs_clarification and it.kind in {"sql", "ambiguous"}:
-            inline_ok = bool(context.get("inline_clarify"))
-            if inline_ok:
-                resp = self._needs_clarification(None, ns, clarification_questions)
-                resp.update({"context": ctx, "intent": it.kind, "is_sql": True})
-                return resp
-            else:
-                return {
-                    "status": "awaiting_admin",
-                    "questions": clarification_questions,
-                    "context": ctx,
-                    "intent": it.kind,
-                    "is_sql": True,
-                }
 
         # -- 4) rewrite
         sql = SQLRewriter.rewrite_for_prefixes(canonical_sql, prefixes)
@@ -739,7 +751,7 @@ class Pipeline:
                 "rationale": rationale,
                 "validation": info,
                 "context": ctx,
-                "intent": it.kind,
+                "intent": spec.intent,
                 "is_sql": True,
             }
 
@@ -748,7 +760,7 @@ class Pipeline:
             "sql": sql,
             "rationale": rationale,
             "context": ctx,
-            "intent": it.kind,
+            "intent": spec.intent,
             "is_sql": True,
         }
 
@@ -964,13 +976,6 @@ class Pipeline:
         return {"inquiry_id": inquiry_id, "status": "answered", **result}
 
     def _ask_one_more(self, question: str, context: dict) -> list[str]:
-        try:
-            if self.clarifier:
-                need, qs = self.clarifier.maybe_ask(question, context)
-                if qs:
-                    return qs[:1]
-        except Exception:
-            pass
         return ["Can you confirm the tables/metrics?"]
 
     def retry_from_admin(self, *, inquiry_id: int, source: str, prefixes: Iterable[str],
@@ -1028,8 +1033,9 @@ class Pipeline:
             return {"status": "ok", "sql": sql_exec, "rationale": rationale, "context": context}
 
         # Next clarifying question (short & actionable)
-        need, clar_qs = self.clarifier.maybe_ask(question, context)
-        next_qs = clar_qs or ["I couldn't derive a clean SQL from the admin notes. Add one more hint or confirm the tables."]
+        next_qs = [
+            "I couldn't derive a clean SQL from the admin notes. Add one more hint or confirm the tables."
+        ]
 
         # Respect MAX_CLARIFICATION_ROUNDS but do not hard-stop; caller holds the loop
         try:
