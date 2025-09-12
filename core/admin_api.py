@@ -3,7 +3,7 @@ from flask import Blueprint, request, jsonify, current_app
 from werkzeug.exceptions import BadRequest
 from sqlalchemy import text, bindparam
 from sqlalchemy.dialects.postgresql import JSONB
-from core.inquiries import append_admin_note, fetch_inquiry, summarize_admin_notes
+from core.inquiries import append_admin_note, fetch_inquiry
 
 admin_bp = Blueprint("admin_bp", __name__, url_prefix="/admin")
 
@@ -117,43 +117,43 @@ def get_inquiry(inq_id: int):
 
 @admin_bp.post("/inquiries/<int:inq_id>/reply")
 def admin_reply(inq_id: int):
+    data = request.get_json(silent=True) or {}
+
+    answered_by = data.get("answered_by") or data.get("by") or "admin"
+    admin_reply_text = data.get("admin_reply") or data.get("reply") or ""
+    process = bool(data.get("process", False))
+
     mem = current_app.config["MEM_ENGINE"]
-    data = request.get_json(force=True) or {}
-
-    by = data.get("answered_by") or data.get("by") or "admin"
-    reply = (data.get("admin_reply") or data.get("reply") or "").strip()
-    do_process = str(data.get("process", "0")).lower() in {"1", "true", "yes", "y"}
-
-    if not reply:
-        return jsonify({"ok": False, "error": "admin_reply is required"}), 400
 
     try:
-        rounds = append_admin_note(mem, inq_id, by=by, text_note=reply)
+        rounds = append_admin_note(
+            mem,
+            inq_id,
+            by=answered_by,
+            text_note=admin_reply_text,
+            reply=admin_reply_text,
+        )
     except Exception as e:
-        return jsonify({"ok": False, "error": f"append_failed: {e}"}), 500
+        return (
+            jsonify({"ok": False, "inquiry_id": inq_id, "error": f"append_failed: {e}"}),
+            500,
+        )
 
-    if not do_process:
-        return jsonify({"ok": True, "inquiry_id": inq_id, "clarification_rounds": rounds})
+    resp = {"ok": True, "inquiry_id": inq_id, "clarification_rounds": rounds}
 
-    pipeline = current_app.config["PIPELINE"]
-    row = fetch_inquiry(mem, inq_id)
-    if not row:
-        return jsonify({"ok": False, "inquiry_id": inq_id, "error": "inquiry_not_found"}), 404
+    if process:
+        try:
+            pipeline = current_app.config["PIPELINE"]
+            out = getattr(pipeline, "process_inquiry", lambda _id: {"status": "skipped"})(
+                inq_id
+            )
+            resp["processed"] = True
+            resp["result"] = out
+        except Exception as e:
+            resp["processed"] = False
+            resp["error"] = f"process_failed: {e}"
 
-    admin_ctx = summarize_admin_notes(row.get("admin_notes"))
-    prefixes = row.get("prefixes") or []
-    out = pipeline.answer(
-        question=row["question"],
-        context={
-            "prefixes": prefixes,
-            "auth_email": row.get("auth_email"),
-            "namespace": row.get("namespace"),
-        },
-        inquiry_id=inq_id,
-        hints=None,
-        admin_context=admin_ctx,
-    )
-    return jsonify(out)
+    return jsonify(resp)
 
 
 @admin_bp.post("/inquiries/<int:inq_id>/process")
