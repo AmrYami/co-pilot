@@ -344,6 +344,69 @@ class Pipeline:
                 pass
         return result
 
+    def process_inquiry(self, inquiry_id: int) -> dict:
+        """
+        Re-plan and try again using the stored inquiry record plus any admin notes.
+        Returns a lightweight status dictionary.
+        """
+        with self.mem_engine.begin() as c:
+            row = c.execute(
+                text(
+                    """
+                SELECT id, namespace, prefixes, question, auth_email,
+                       admin_reply, admin_notes
+                  FROM mem_inquiries
+                 WHERE id = :id
+                """
+                ),
+                {"id": inquiry_id},
+            ).mappings().first()
+
+        if not row:
+            return {"status": "error", "message": "inquiry not found"}
+
+        prefixes = row["prefixes"] or []
+        question = row["question"] or ""
+        ns = row["namespace"] or "default"
+
+        extra_hints: list[str] = []
+        if row["admin_reply"]:
+            extra_hints.append(str(row["admin_reply"]))
+        if row["admin_notes"]:
+            for n in row["admin_notes"]:
+                if isinstance(n, dict) and "text" in n:
+                    extra_hints.append(n["text"])
+                else:
+                    extra_hints.append(str(n))
+
+        try:
+            from apps.fa.hints import make_fa_hints
+
+            hints = make_fa_hints(
+                self.mem_engine, prefixes, question, extra_text=" | ".join(extra_hints)
+            )
+        except Exception:
+            hints = {"admin": " | ".join(extra_hints)}
+
+        result = self.answer(
+            question=question,
+            context={
+                "prefixes": prefixes,
+                "auth_email": row.get("auth_email"),
+                "namespace": ns,
+            },
+            hints=hints,
+            existing_inquiry_id=inquiry_id,
+            allow_new_inquiry=False,
+        )
+
+        return {
+            "status": "ok",
+            "message": "reprocessed",
+            "inquiry_id": inquiry_id,
+            "result": result,
+        }
+
 
     def retry_from_inquiry(self, inq_id: int) -> dict:
         row = fetch_inquiry(self.mem_engine, inq_id)
