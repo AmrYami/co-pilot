@@ -2,7 +2,6 @@ from __future__ import annotations
 from flask import Blueprint, request, jsonify, current_app
 from sqlalchemy import text, bindparam
 from sqlalchemy.dialects.postgresql import JSONB
-from core.sql_exec import get_mem_engine
 from core.inquiries import append_admin_note, fetch_inquiry
 
 admin_bp = Blueprint("admin_bp", __name__, url_prefix="/admin")
@@ -16,93 +15,76 @@ def _conn():
     return mem_engine.connect()
 
 
-def _infer_value_type(val, explicit: str | None) -> str:
-    if explicit:
-        return explicit
-    if isinstance(val, bool):
-        return "bool"
-    if isinstance(val, int) and not isinstance(val, bool):
-        return "int"
-    if isinstance(val, float):
-        return "float"
-    if isinstance(val, (dict, list)):
-        return "json"
-    return "string"
-
-
 @admin_bp.post("/settings/bulk")
 def settings_bulk():
-    data = request.get_json(force=True) or {}
-    ns = data.get("namespace") or "fa::common"
-    updated_by = data.get("updated_by") or "api"
-    items = data.get("settings") or []
-    if not isinstance(items, list) or not items:
-        return jsonify({"ok": False, "error": "settings list required"}), 400
+    mem = current_app.config["MEM_ENGINE"]
+    payload = request.get_json(force=True) or {}
+    ns = payload.get("namespace") or "fa::common"
+    upd = payload.get("updated_by") or "api"
+    items = payload.get("settings") or []
 
-    mem = get_mem_engine(current_app.config.get("MEM_ENGINE"))
+    upsert = (
+        text(
+            """
+            INSERT INTO mem_settings(
+                namespace, key, value, value_type, scope, scope_id,
+                category, description, overridable, updated_by,
+                created_at, updated_at, is_secret
+            )
+            VALUES (
+                :ns, :key, :val, :vtype, :scope, :scope_id,
+                :cat, :desc, COALESCE(:ovr, true), :upd,
+                NOW(), NOW(), COALESCE(:sec, false)
+            )
+            ON CONFLICT (namespace, key, scope, COALESCE(scope_id, ''))
+            DO UPDATE SET
+                value      = EXCLUDED.value,
+                value_type = EXCLUDED.value_type,
+                updated_by = EXCLUDED.updated_by,
+                updated_at = NOW(),
+                is_secret  = EXCLUDED.is_secret
+            """
+        ).bindparams(bindparam("val", type_=JSONB))
+    )
 
-    upsert_sql = text("""
-        INSERT INTO mem_settings(
-            namespace, key, value, value_type, scope, scope_id,
-            category, description, overridable, updated_by,
-            created_at, updated_at, is_secret
-        )
-        VALUES (
-            :ns, :key, :val, :vtype, :scope, :scope_id,
-            :cat, :desc, COALESCE(:ovr, true), :upd,
-            NOW(), NOW(), COALESCE(:sec, false)
-        )
-        ON CONFLICT (namespace, key, scope, COALESCE(scope_id, ''))
-        DO UPDATE SET
-            value       = EXCLUDED.value,
-            value_type  = EXCLUDED.value_type,
-            updated_by  = EXCLUDED.updated_by,
-            updated_at  = NOW(),
-            is_secret   = EXCLUDED.is_secret
-    """).bindparams(bindparam("val", type_=JSONB))
+    def infer_type(v, explicit):
+        if explicit:
+            return explicit
+        if isinstance(v, bool):
+            return "bool"
+        if isinstance(v, int):
+            return "int"
+        if isinstance(v, (dict, list)):
+            return "json"
+        return "string"
 
-    results, errors = [], []
-
+    updated = 0
     with mem.begin() as conn:
-        for it in items:
-            key = it.get("key")
-            if not key:
-                errors.append({"key": None, "error": "missing key"})
-                continue
+        for s in items:
+            key = s["key"]
+            val = s.get("value")
+            vtype = infer_type(val, s.get("value_type"))
+            scope = s.get("scope") or "namespace"
 
-            value = it.get("value")
-            scope = it.get("scope") or "namespace"
-            scope_id = it.get("scope_id")
-            is_secret = bool(it.get("is_secret", False))
-            overridable = it.get("overridable")
-            category = it.get("category")
-            desc = it.get("description")
+            conn.execute(
+                upsert,
+                {
+                    "ns": ns,
+                    "key": key,
+                    "val": val,
+                    "vtype": vtype,
+                    "scope": scope,
+                    "scope_id": s.get("scope_id"),
+                    "cat": s.get("category"),
+                    "desc": s.get("description"),
+                    "ovr": s.get("overridable"),
+                    "upd": upd,
+                    "sec": bool(s.get("is_secret")),
+                },
+            )
+            updated += 1
 
-            vtype = _infer_value_type(value, it.get("value_type"))
-
-            try:
-                conn.execute(
-                    upsert_sql,
-                    {
-                        "ns": ns,
-                        "key": key,
-                        "val": value,
-                        "vtype": vtype,
-                        "scope": scope,
-                        "scope_id": scope_id,
-                        "cat": category,
-                        "desc": desc,
-                        "ovr": overridable,
-                        "upd": updated_by,
-                        "sec": is_secret,
-                    },
-                )
-                results.append({"key": key, "ok": True})
-            except Exception as e:
-                errors.append({"key": key, "error": str(e)})
-
-    status = 200 if not errors else 207
-    return jsonify({"ok": not errors, "updated": results, "errors": errors}), status
+    return {"ok": True, "updated": updated}, 200
 
 
 @admin_bp.get("/settings/get")
@@ -134,25 +116,25 @@ def get_inquiry(inq_id: int):
 
 @admin_bp.post("/inquiries/<int:inq_id>/reply")
 def admin_reply(inq_id: int):
-    payload = request.get_json(force=True, silent=True) or {}
-    answered_by = (payload.get("answered_by") or "").strip()
-    admin_reply = (payload.get("admin_reply") or "").strip()
-    if not answered_by or not admin_reply:
-        return jsonify({"ok": False, "error": "answered_by and admin_reply are required"}), 400
-
     mem = current_app.config["MEM_ENGINE"]
-    pipeline = current_app.config["PIPELINE"]
+    data = request.get_json(force=True) or {}
+
+    by = (data.get("answered_by") or data.get("by") or "").strip()
+    reply = (data.get("admin_reply") or data.get("reply") or "").strip()
+
+    if not reply:
+        return jsonify({"ok": False, "error": "admin_reply is required"}), 400
+    if not by:
+        return jsonify({"ok": False, "error": "answered_by is required"}), 400
 
     try:
-        with mem.begin() as conn:
-            rounds = append_admin_note(conn, inq_id, by=answered_by, text_note=admin_reply)
+        rounds = append_admin_note(mem, inq_id, by=by, text_note=reply)
     except Exception as e:
         return jsonify({"ok": False, "error": f"append_failed: {e}"}), 500
 
-    try:
-        result = pipeline.retry_from_admin_note(inquiry_id=inq_id)
-        return jsonify({"ok": True, "inquiry_id": inq_id, "rounds": rounds, **result}), 200
-    except AttributeError:
-        return jsonify({"ok": True, "inquiry_id": inq_id, "rounds": rounds, "message": "Note appended; will retry on next cycle."}), 200
-    except Exception as e:
-        return jsonify({"ok": True, "inquiry_id": inq_id, "rounds": rounds, "warn": f"append ok, retry failed: {e}"}), 200
+    # (Optional) you can trigger a replan here if you’ve added that method.
+    # pipeline = current_app.extensions.get("pipeline")
+    # if pipeline:
+    #     pipeline.retry_with_admin_notes(inquiry_id=inq_id)
+
+    return jsonify({"ok": True, "inquiry_id": inq_id, "clarification_rounds": rounds}), 200

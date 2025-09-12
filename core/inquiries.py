@@ -11,7 +11,7 @@ import json
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from sqlalchemy.engine import Engine, Row
-from sqlalchemy import text, bindparam, Integer
+from sqlalchemy import text, bindparam
 from sqlalchemy.dialects.postgresql import JSONB
 
 
@@ -44,53 +44,42 @@ def get_admin_notes(inquiry_row: Dict[str, Any]) -> List[str]:
 
 # --- Admin note helpers ----------------------------------------------------
 
-def ensure_inquiry_columns(conn) -> None:
-    """Idempotent: add admin_notes and clarification_rounds if missing."""
-    conn.execute(text(
-        """
-        ALTER TABLE mem_inquiries
-        ADD COLUMN IF NOT EXISTS admin_notes JSONB DEFAULT '[]'::jsonb;
-        """
-    ))
-    conn.execute(text(
-        """
-        ALTER TABLE mem_inquiries
-        ADD COLUMN IF NOT EXISTS clarification_rounds INTEGER DEFAULT 0;
-        """
-    ))
 
-
-def append_admin_note(conn, inquiry_id: int, *, by: str, text_note: str) -> int:
+def append_admin_note(mem_engine, inquiry_id: int, *, by: str, text_note: str) -> int:
     """
-    Append one admin note into mem_inquiries.admin_notes (JSONB array),
-    bump clarification_rounds, update last reply meta; return new rounds.
+    Append a structured admin note into mem_inquiries.admin_notes (JSONB array),
+    set admin_reply/answered_by, and bump clarification_rounds by 1.
+    Returns the new clarification_rounds value.
     """
-    ensure_inquiry_columns(conn)
-
-    note_obj = {
+    note: Dict[str, Any] = {
         "by": by,
         "text": text_note,
         "ts": datetime.now(timezone.utc).isoformat(),
     }
-    note_array = [note_obj]
 
-    sql = text(
-        """
-        UPDATE mem_inquiries
-           SET admin_notes          = COALESCE(admin_notes, '[]'::jsonb) || :note,
-               admin_reply          = :reply,
-               answered_by          = :by,
-               clarification_rounds = COALESCE(clarification_rounds, 0) + 1,
-               updated_at           = NOW()
-         WHERE id = :id
-     RETURNING clarification_rounds
-    """
-    ).bindparams(bindparam("note", type_=JSONB))
-    row = conn.execute(
-        sql,
-        {"id": inquiry_id, "note": note_array, "reply": text_note, "by": by},
-    ).fetchone()
-    return int(row[0]) if row else 0
+    stmt = (
+        text(
+            """
+            UPDATE mem_inquiries
+               SET admin_notes          = COALESCE(admin_notes, '[]'::jsonb)
+                                          || jsonb_build_array(:note),
+                   admin_reply          = :reply,
+                   answered_by          = :by,
+                   clarification_rounds = COALESCE(clarification_rounds, 0) + 1,
+                   updated_at           = NOW()
+             WHERE id = :id
+         RETURNING clarification_rounds
+            """
+        )
+        .bindparams(bindparam("note", type_=JSONB))
+    )
+
+    with mem_engine.begin() as conn:
+        row = conn.execute(
+            stmt,
+            {"id": inquiry_id, "note": note, "reply": text_note, "by": by},
+        ).fetchone()
+        return int(row[0]) if row else 0
 
 
 def update_inquiry_status_run(mem_engine, inquiry_id: int, *,
