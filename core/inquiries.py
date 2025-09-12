@@ -42,21 +42,59 @@ def get_admin_notes(inquiry_row: Dict[str, Any]) -> List[str]:
     return out
 
 
-def append_admin_note(mem_engine, inquiry_id: int, by: str, text_note: str) -> None:
-    note = {"by": by, "text": text_note, "ts": datetime.now(timezone.utc).isoformat()}
-    with mem_engine.begin() as c:
-        c.execute(
-            text(
-                """
-            UPDATE mem_inquiries
-               SET admin_notes = COALESCE(admin_notes, '[]'::jsonb) || to_jsonb(:note::json),
-                   clarification_rounds = COALESCE(clarification_rounds, 0) + 1,
-                   updated_at = NOW()
-             WHERE id = :id
-            """
-            ),
-            {"id": inquiry_id, "note": json.dumps(note)},
-        )
+# --- Admin note helpers ----------------------------------------------------
+
+def ensure_inquiry_columns(conn) -> None:
+    """Idempotent: add admin_notes and clarification_rounds if missing."""
+    conn.execute(text(
+        """
+        ALTER TABLE mem_inquiries
+        ADD COLUMN IF NOT EXISTS admin_notes JSONB DEFAULT '[]'::jsonb;
+        """
+    ))
+    conn.execute(text(
+        """
+        ALTER TABLE mem_inquiries
+        ADD COLUMN IF NOT EXISTS clarification_rounds INTEGER DEFAULT 0;
+        """
+    ))
+
+
+def append_admin_note(conn, inquiry_id: int, *, by: str, text_note: str) -> int:
+    """
+    Append one admin note into mem_inquiries.admin_notes (JSONB array),
+    bump clarification_rounds, update last reply meta; return new rounds.
+    """
+    ensure_inquiry_columns(conn)
+
+    note = {
+        "by": by,
+        "text": text_note,
+        "ts": datetime.now(timezone.utc).isoformat(),
+    }
+
+    # Append a single JSON object as array element:
+    #   admin_notes = admin_notes || jsonb_build_array(to_jsonb(:note))
+    sql = text(
+        """
+        UPDATE mem_inquiries
+           SET admin_notes          = COALESCE(admin_notes, '[]'::jsonb)
+                                      || jsonb_build_array(to_jsonb(:note)),
+               admin_reply          = :reply,
+               answered_by          = :by,
+               clarification_rounds = COALESCE(clarification_rounds, 0) + 1,
+               updated_at           = NOW()
+         WHERE id = :id
+     RETURNING clarification_rounds
+    """
+    )
+    row = conn.execute(sql, {
+        "id": inquiry_id,
+        "note": note,
+        "reply": text_note,
+        "by": by,
+    }).fetchone()
+    return int(row[0]) if row else 0
 
 
 def update_inquiry_status_run(mem_engine, inquiry_id: int, *,
