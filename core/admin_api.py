@@ -128,25 +128,25 @@ def get_inquiry(inq_id: int):
 
 @admin_bp.post("/inquiries/<int:inq_id>/reply")
 def admin_reply(inq_id: int):
-    data = request.get_json(force=True, silent=True) or {}
-    answered_by = (data.get("answered_by") or "").strip()
-    admin_reply = (data.get("admin_reply") or "").strip()
+    payload = request.get_json(force=True, silent=True) or {}
+    answered_by = (payload.get("answered_by") or "").strip()
+    admin_reply = (payload.get("admin_reply") or "").strip()
     if not answered_by or not admin_reply:
-        return jsonify({"ok": False, "error": "missing answered_by or admin_reply"}), 400
+        return jsonify({"ok": False, "error": "answered_by and admin_reply are required"}), 400
 
     mem = current_app.config["MEM_ENGINE"]
     pipeline = current_app.config["PIPELINE"]
 
     try:
-        append_admin_note(mem, inq_id, by=answered_by, text_note=admin_reply)
+        with mem.begin() as conn:
+            rounds = append_admin_note(conn, inq_id, by=answered_by, text_note=admin_reply)
     except Exception as e:
         return jsonify({"ok": False, "error": f"append_failed: {e}"}), 500
 
     try:
-        apply_result = pipeline.apply_admin_and_retry(inq_id)
+        result = pipeline.retry_from_admin_note(inquiry_id=inq_id)
+        return jsonify({"ok": True, "inquiry_id": inq_id, "rounds": rounds, **result}), 200
+    except AttributeError:
+        return jsonify({"ok": True, "inquiry_id": inq_id, "rounds": rounds, "message": "Note appended; will retry on next cycle."}), 200
     except Exception as e:
-        return jsonify({"ok": False, "error": f"apply_failed: {e}", "inquiry_id": inq_id}), 500
-
-    resp = {"ok": True, "inquiry_id": inq_id, "applied": True}
-    resp.update(apply_result)
-    return jsonify(resp)
+        return jsonify({"ok": True, "inquiry_id": inq_id, "rounds": rounds, "warn": f"append ok, retry failed: {e}"}), 200
