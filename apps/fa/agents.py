@@ -5,6 +5,7 @@ This file can evolve independently from the core.
 from __future__ import annotations
 
 from typing import Any, Dict, Iterable, List, Tuple
+import re
 
 
 from core.agents import ClarifierAgent as CoreClarifier, PlannerAgent as CorePlanner, ValidatorAgent as CoreValidator
@@ -147,6 +148,43 @@ class PlannerAgentFA(CorePlanner):
 
         out = self.llm.generate(prompt, max_new_tokens=256, temperature=0.2, top_p=0.9)
         return self._split(out)
+
+    def fallback_clarifying_question(self, question: str, context: dict | None, hints: dict | None):
+        """
+        Return a *small list* of targeted clarifying questions.
+        If you later enable the small clarifier model, you can swap this
+        heuristic with an LLM-based one; the signature can stay the same.
+        """
+        ctx_txt = " ".join(
+            [
+                str((context or {}).get("admin_notes") or ""),
+                str((hints or {}).get("prompt_boosters") or ""),
+                question or "",
+            ]
+        ).lower()
+
+        qs = []
+
+        if not re.search(r"\b(last|this|today|yesterday|month|year|week|between|\d{4}-\d{2}-\d{2})\b", ctx_txt):
+            qs.append(
+                "What date range should we use (e.g., last month, or between 2025-08-01 and 2025-08-31)?"
+            )
+
+        if not re.search(r"\b(sum|count|avg|average|net|gross|revenue|sales|amount|balance|qty|quantity)\b", ctx_txt):
+            qs.append("Which metric should we compute (e.g., net sales sum, count of invoices)?")
+
+        if not re.search(
+            r"\b(debtor[_\s]?trans|debtors[_\s]?master|supp[_\s]?trans|gl[_\s]?trans|bank[_\s]?trans|stock[_\s]?moves|items?)\b",
+            ctx_txt,
+        ):
+            qs.append("Which tables should we use (e.g., debtor_trans, debtors_master, gl_trans)?")
+
+        if not qs:
+            qs.append(
+                "I couldn’t derive a clean SQL. Can you confirm the main tables, date column, and metric?"
+            )
+
+        return qs[:3]
 
     def _rule_based_plan(self, question: str, context: Dict[str, Any]) -> Tuple[str, str]:
         q = question.lower()
