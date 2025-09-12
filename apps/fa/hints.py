@@ -6,6 +6,30 @@ from datetime import date, timedelta
 from typing import Any, Dict, List, Optional
 
 
+# Questions to ask when specific fields are missing from the structured spec
+MISSING_FIELD_QUESTIONS = {
+    "date_range": "What date range should we use (e.g., last month, between 2025-08-01 and 2025-08-31)?",
+    "tables": "Which tables should we use (e.g., debtor_trans, debtors_master, gl_trans)?",
+    "metric": "Which metric should we compute (e.g., sum of net sales, count of invoices)?",
+    "entity": "Top by what entity (customer, supplier, item, account, or a dimension)?",
+}
+
+# Lightweight domain hints handed to the clarifier
+DOMAIN_HINTS = {
+    "entities": ["customer", "supplier", "item", "account", "dimension"],
+    "table_aliases": [
+        "debtor_trans",
+        "debtors_master",
+        "supp_trans",
+        "gl_trans",
+        "bank_trans",
+        "stock_moves",
+        "item_codes",
+    ],
+    "metric_registry": {"net_sales": "sum(quantity * price * (1-discount))"},
+}
+
+
 def _last_month_bounds() -> tuple[str, str]:
     today = date.today()
     first_this = today.replace(day=1)
