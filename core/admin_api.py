@@ -23,6 +23,8 @@ def _infer_value_type(val, explicit: str | None) -> str:
         return "bool"
     if isinstance(val, int) and not isinstance(val, bool):
         return "int"
+    if isinstance(val, float):
+        return "float"
     if isinstance(val, (dict, list)):
         return "json"
     return "string"
@@ -30,10 +32,10 @@ def _infer_value_type(val, explicit: str | None) -> str:
 
 @admin_bp.post("/settings/bulk")
 def settings_bulk():
-    payload = request.get_json(force=True) or {}
-    ns = payload.get("namespace") or "fa::common"
-    who = payload.get("updated_by") or "api"
-    items = payload.get("settings") or []
+    data = request.get_json(force=True) or {}
+    ns = data.get("namespace") or "fa::common"
+    updated_by = data.get("updated_by") or "api"
+    items = data.get("settings") or []
     if not isinstance(items, list) or not items:
         return jsonify({"ok": False, "error": "settings list required"}), 400
 
@@ -52,51 +54,55 @@ def settings_bulk():
         )
         ON CONFLICT (namespace, key, scope, COALESCE(scope_id, ''))
         DO UPDATE SET
-            value = EXCLUDED.value,
-            value_type = EXCLUDED.value_type,
-            updated_by = EXCLUDED.updated_by,
-            updated_at = NOW(),
-            is_secret = EXCLUDED.is_secret
+            value       = EXCLUDED.value,
+            value_type  = EXCLUDED.value_type,
+            updated_by  = EXCLUDED.updated_by,
+            updated_at  = NOW(),
+            is_secret   = EXCLUDED.is_secret
     """).bindparams(bindparam("val", type_=JSONB))
 
-    results = []
-    with mem.begin() as c:
+    results, errors = [], []
+
+    with mem.begin() as conn:
         for it in items:
             key = it.get("key")
             if not key:
-                results.append({"key": None, "ok": False, "error": "missing key"})
+                errors.append({"key": None, "error": "missing key"})
                 continue
 
             value = it.get("value")
-            vtype = _infer_value_type(value, it.get("value_type"))
             scope = it.get("scope") or "namespace"
             scope_id = it.get("scope_id")
             is_secret = bool(it.get("is_secret", False))
-            overr = it.get("overridable")
-            cat = it.get("category")
+            overridable = it.get("overridable")
+            category = it.get("category")
             desc = it.get("description")
 
-            params = {
-                "ns": ns,
-                "key": key,
-                "val": value,
-                "vtype": vtype,
-                "scope": scope,
-                "scope_id": scope_id,
-                "cat": cat,
-                "desc": desc,
-                "ovr": overr,
-                "upd": who,
-                "sec": is_secret,
-            }
+            vtype = _infer_value_type(value, it.get("value_type"))
 
             try:
-                c.execute(upsert_sql, params)
+                conn.execute(
+                    upsert_sql,
+                    {
+                        "ns": ns,
+                        "key": key,
+                        "val": value,
+                        "vtype": vtype,
+                        "scope": scope,
+                        "scope_id": scope_id,
+                        "cat": category,
+                        "desc": desc,
+                        "ovr": overridable,
+                        "upd": updated_by,
+                        "sec": is_secret,
+                    },
+                )
                 results.append({"key": key, "ok": True})
             except Exception as e:
-                results.append({"key": key, "ok": False, "error": str(e)})
+                errors.append({"key": key, "error": str(e)})
 
-    return jsonify({"ok": True, "namespace": ns, "updated_by": who, "results": results})
+    status = 200 if not errors else 207
+    return jsonify({"ok": not errors, "updated": results, "errors": errors}), status
 
 
 @admin_bp.get("/settings/get")
