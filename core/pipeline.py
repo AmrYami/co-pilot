@@ -493,6 +493,7 @@ class Pipeline:
         extra_hints: Dict[str, Any] | None = None,
         allow_new_inquiry: bool = True,
         existing_inquiry_id: int | None = None,
+        admin_context: str | None = None,
     ) -> Dict[str, Any]:
         """
         End-to-end ask flow:
@@ -508,6 +509,8 @@ class Pipeline:
             context["inquiry_id"] = inquiry_id
         if extra_hints:
             hints = {**(hints or {}), **extra_hints}
+        if admin_context:
+            hints = {**(hints or {}), "admin_notes": admin_context}
 
         if existing_inquiry_id is not None:
             inquiry_id = existing_inquiry_id
@@ -562,10 +565,14 @@ class Pipeline:
                     inquiry_id = self._log_inquiry(
                         ns, prefixes, question, auth_email, status="needs_clarification"
                     )
+                try:
+                    qs = self.planner.fallback_clarifying_question(enriched_q, ctx, gh) or []
+                except Exception:
+                    qs = ["I couldn't derive a clean SQL. Can you clarify the tables or metrics?"]
                 return self._needs_clarification(
                     inquiry_id,
                     ns,
-                    ["I couldn't derive a clean SQL from the admin notes. Add one more hint or confirm the tables."],
+                    qs,
                 )
             sql = SQLRewriter.rewrite_for_prefixes(canonical_sql, prefixes)
             exec_ok, info = self.validator.quick_validate(sql)
@@ -709,10 +716,14 @@ class Pipeline:
                 inquiry_id = self._log_inquiry(
                     ns, prefixes, question, auth_email, status="needs_clarification"
                 )
+            try:
+                qs = self.planner.fallback_clarifying_question(question, ctx, gh) or []
+            except Exception:
+                qs = ["I couldn't derive a clean SQL. Can you clarify the tables or metrics?"]
             resp = self._needs_clarification(
                 inquiry_id,
                 ns,
-                ["I couldn't derive a clean SQL. Can you clarify the tables or metrics?"],
+                qs,
             )
             resp.update({"context": ctx, "intent": spec.intent, "is_sql": True})
             return resp
