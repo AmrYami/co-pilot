@@ -1,5 +1,6 @@
 from __future__ import annotations
 from flask import Blueprint, request, jsonify, current_app
+from werkzeug.exceptions import BadRequest
 from sqlalchemy import text, bindparam
 from sqlalchemy.dialects.postgresql import JSONB
 from core.inquiries import append_admin_note, fetch_inquiry
@@ -119,22 +120,39 @@ def admin_reply(inq_id: int):
     mem = current_app.config["MEM_ENGINE"]
     data = request.get_json(force=True) or {}
 
-    by = (data.get("answered_by") or data.get("by") or "").strip()
-    reply = (data.get("admin_reply") or data.get("reply") or "").strip()
+    answered_by = data.get("answered_by") or data.get("by") or "admin"
+    admin_reply = data.get("admin_reply") or data.get("reply")
 
-    if not reply:
+    if not admin_reply:
         return jsonify({"ok": False, "error": "admin_reply is required"}), 400
-    if not by:
-        return jsonify({"ok": False, "error": "answered_by is required"}), 400
 
     try:
-        rounds = append_admin_note(mem, inq_id, by=by, text_note=reply)
+        rounds = append_admin_note(mem, inq_id, by=answered_by, text_note=admin_reply)
     except Exception as e:
         return jsonify({"ok": False, "error": f"append_failed: {e}"}), 500
 
-    # (Optional) you can trigger a replan here if you’ve added that method.
-    # pipeline = current_app.extensions.get("pipeline")
-    # if pipeline:
-    #     pipeline.retry_with_admin_notes(inquiry_id=inq_id)
+    # Optional auto process if client asks
+    if str(data.get("process", "0")).lower() in {"1", "true", "yes", "y"}:
+        pipeline = current_app.config["PIPELINE"]
+        try:
+            # inline=True → don’t send emails or escalate; just return JSON
+            out = pipeline.apply_admin_and_retry(inq_id, inline=True)
+            return jsonify({"ok": True, "inquiry_id": inq_id, **out})
+        except Exception as e:
+            return jsonify({"ok": False, "error": f"process_failed: {e}", "inquiry_id": inq_id}), 500
 
     return jsonify({"ok": True, "inquiry_id": inq_id, "clarification_rounds": rounds}), 200
+
+
+@admin_bp.post("/inquiries/<int:inq_id>/process")
+def admin_process(inq_id: int):
+    """Re-run an inquiry using stored question + admin notes."""
+    pipeline = current_app.config.get("PIPELINE")
+    if pipeline is None:
+        raise BadRequest("Pipeline not available")
+    try:
+        out = pipeline.apply_admin_and_retry(inq_id, inline=True)
+        # Shape is either {"status":"answered", ...} or {"status":"needs_clarification", ...}
+        return jsonify({"ok": True, "inquiry_id": inq_id, **out})
+    except Exception as e:
+        return jsonify({"ok": False, "inquiry_id": inq_id, "error": str(e)}), 500
