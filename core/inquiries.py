@@ -67,19 +67,17 @@ def append_admin_note(conn, inquiry_id: int, *, by: str, text_note: str) -> int:
     """
     ensure_inquiry_columns(conn)
 
-    note = {
+    note_obj = {
         "by": by,
         "text": text_note,
         "ts": datetime.now(timezone.utc).isoformat(),
     }
+    note_array = [note_obj]
 
-    # Append a single JSON object as array element:
-    #   admin_notes = admin_notes || jsonb_build_array(to_jsonb(:note))
     sql = text(
         """
         UPDATE mem_inquiries
-           SET admin_notes          = COALESCE(admin_notes, '[]'::jsonb)
-                                      || jsonb_build_array(to_jsonb(:note)),
+           SET admin_notes          = COALESCE(admin_notes, '[]'::jsonb) || :note,
                admin_reply          = :reply,
                answered_by          = :by,
                clarification_rounds = COALESCE(clarification_rounds, 0) + 1,
@@ -87,13 +85,11 @@ def append_admin_note(conn, inquiry_id: int, *, by: str, text_note: str) -> int:
          WHERE id = :id
      RETURNING clarification_rounds
     """
-    )
-    row = conn.execute(sql, {
-        "id": inquiry_id,
-        "note": note,
-        "reply": text_note,
-        "by": by,
-    }).fetchone()
+    ).bindparams(bindparam("note", type_=JSONB))
+    row = conn.execute(
+        sql,
+        {"id": inquiry_id, "note": note_array, "reply": text_note, "by": by},
+    ).fetchone()
     return int(row[0]) if row else 0
 
 
