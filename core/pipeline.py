@@ -85,6 +85,24 @@ class Pipeline:
             pass
 
         self.app_engine = get_app_engine(self.settings, namespace=namespace)
+        # Backward-compatible execution shim:
+        # Some earlier code expects `self.executor.execute(sql, ns, prefixes, settings)`.
+        # Provide a tiny adapter around core.sql_exec.run_select().
+        if not hasattr(self, "executor") or self.executor is None:
+            from types import SimpleNamespace
+            from core.sql_exec import run_select
+
+            def _exec(sql: str, ns: str, prefixes: list[str], settings):
+                # Try common signatures of run_select; stay lenient.
+                try:
+                    return run_select(self.app_engine, sql, namespace=ns, prefixes=prefixes, settings=self.settings)
+                except TypeError:
+                    try:
+                        return run_select(self.app_engine, sql, ns, prefixes, self.settings)
+                    except TypeError:
+                        return run_select(self.app_engine, sql)
+
+            self.executor = SimpleNamespace(execute=_exec)
 
         # 2) Load the LLM
         self.llm = load_model(self.settings)
@@ -311,7 +329,7 @@ class Pipeline:
         except Exception:
             pass
 
-    def apply_admin_and_retry(self, inquiry_id: int) -> dict:
+    def apply_admin_and_retry(self, inquiry_id: int, inline: bool = False) -> dict:
         row = fetch_inquiry(self.mem_engine, inquiry_id)
         if not row:
             return {"status": "not_found"}
@@ -319,8 +337,8 @@ class Pipeline:
         ns = row.get("namespace") or self.namespace
         auth_email = row.get("auth_email")
 
-        result = self.continue_inquiry(inquiry_id, inline=True)
-        if result.get("status") == "answered":
+        result = self.continue_inquiry(inquiry_id, inline=inline)
+        if result.get("status") == "answered" and not inline:
             try:
                 sample_rows = result.get("sample") or []
                 self._email_result_if_needed(ns, auth_email, row.get("question"), sample_rows)
