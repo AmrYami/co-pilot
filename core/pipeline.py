@@ -1454,28 +1454,47 @@ class ContextBuilder:
             raise RuntimeError("No datasource configured (DEFAULT_DATASOURCE / APP_DB_URL missing).")
         return ds, url
 
-    def validate_and_execute(self, sql: str, namespace: str, preview_rows: int = 100) -> Dict[str, Any]:
+    def validate_and_execute(
+        self,
+        *,
+        sql: str,
+        prefixes: List[str],
+        namespace: str,
+        datasource: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """
-        Validate (EXPLAIN) or execute with a safe LIMIT, and return a standard result dict.
+        Minimal, safe path used by admin 'process': EXPLAIN (optional) then execute with row cap.
+        - picks the app (OLTP) engine; prefix handling stays in app layer (query already prefixed).
+        - returns { status, rows, rowcount, elapsed_ms, validated: bool }
         """
-        validate_only = bool(self.settings.get("VALIDATE_WITH_EXPLAIN_ONLY", False, namespace=namespace))
-        datasource, engine_url = self._pick_datasource(namespace)
-        engine = create_engine(engine_url)
+        explain_only = bool(self.settings.get("VALIDATE_WITH_EXPLAIN_ONLY", False))
+        row_cap = int(self.settings.get("ROW_LIMIT", 1000) or 1000)
 
-        sql_final = sql
-        if not validate_only:
-            sql_final = ensure_limit(sql, preview_rows)
+        engine = self.app_engine
 
-        try:
-            if validate_only:
-                explain_sql = f"EXPLAIN {sql}"
-                rows = run_select(engine, explain_sql).get("rows")
-                return {"status": "validated", "datasource": datasource, "rows": rows, "sql_final": explain_sql}
-            else:
-                rows = run_select(engine, sql_final).get("rows")
-                return {"status": "ok", "datasource": datasource, "rows": rows, "sql_final": sql_final}
-        except Exception as e:
-            return {"status": "error", "error": f"{e}", "sql_final": sql_final, "datasource": datasource}
+        out: Dict[str, Any] = {"validated": False, "rows": []}
+        with engine.begin() as conn:
+            # Optional EXPLAIN
+            if explain_only:
+                try:
+                    conn.execute(text("EXPLAIN " + sql))
+                    out["validated"] = True
+                except Exception as e:
+                    return {"status": "failed", "error": f"EXPLAIN failed: {e}"}
+
+            # Execute (sample)
+            try:
+                res = conn.execute(text(sql))
+                rows = res.fetchmany(row_cap)
+                out.update({
+                    "status": "ok",
+                    "rows": [dict(r._mapping) for r in rows],
+                    "rowcount": len(rows),
+                })
+            except Exception as e:
+                return {"status": "failed", "error": f"exec failed: {e}"}
+
+        return out
 
     def reprocess_inquiry(self, inquiry_id: int) -> Dict[str, Any]:
         """
@@ -1542,8 +1561,8 @@ class ContextBuilder:
             mem.commit()
             return {"ok": False, "inquiry_id": inquiry_id, "error": f"derive_failed: {e}"}
 
-        result = self.validate_and_execute(sql, namespace=namespace, preview_rows=100)
-        if result.get("status") in ("ok", "validated"):
+        result = self.validate_and_execute(sql=sql, prefixes=list(prefixes), namespace=namespace)
+        if result.get("status") == "ok":
             mem.execute(
                 text(
                     """
@@ -1560,9 +1579,9 @@ class ContextBuilder:
             return {
                 "ok": True,
                 "inquiry_id": inquiry_id,
-                "sql": result.get("sql_final", sql),
-                "datasource": result.get("datasource"),
+                "sql": sql,
                 "rows": result.get("rows"),
+                "rowcount": result.get("rowcount"),
                 "status": "answered",
             }
         else:
@@ -1583,7 +1602,7 @@ class ContextBuilder:
                 "inquiry_id": inquiry_id,
                 "status": "failed",
                 "error": f"validation/exec failed: {result.get('error','unknown')}",
-                "sql": result.get("sql_final", sql),
+                "sql": sql,
             }
 
     def _legacy_validate_and_execute(

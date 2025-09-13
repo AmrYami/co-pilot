@@ -13,7 +13,6 @@ from typing import Any, Dict, List, Optional
 from sqlalchemy.engine import Engine, Row
 from sqlalchemy import text, bindparam
 from sqlalchemy.dialects.postgresql import JSONB
-from psycopg2.extras import Json
 
 
 def fetch_inquiry(mem_engine, inquiry_id: int) -> Optional[Dict[str, Any]]:
@@ -58,9 +57,10 @@ def summarize_admin_notes(notes: Optional[List[Dict[str, Any]]]) -> str:
 # --- Admin note helpers ----------------------------------------------------
 
 
-def append_admin_note(conn, inquiry_id: int, by: str, text_note: str) -> int:
+def append_admin_note(mem_engine, inquiry_id: int, *, by: str, text_note: str) -> int:
     """
-    Append a note to mem_inquiries.admin_notes (jsonb[]), update reply/rounds.
+    Append a structured admin note to mem_inquiries.admin_notes (JSONB array)
+    and bump clarification_rounds. No string interpolation; JSONB bind.
     Returns the new clarification_rounds.
     """
 
@@ -70,30 +70,31 @@ def append_admin_note(conn, inquiry_id: int, by: str, text_note: str) -> int:
         "ts": datetime.now(timezone.utc).isoformat(),
     }
 
-    # NOTE: Use psycopg2 param style (%(name)s) and Json(note) for json adaptation.
-    sql = """
+    sql = text(
+        """
         UPDATE mem_inquiries
            SET admin_notes          = COALESCE(admin_notes, '[]'::jsonb)
-                                      || jsonb_build_array(to_jsonb(%(note)s)),
-               admin_reply          = %(reply)s,
-               answered_by          = %(by)s,
+                                      || jsonb_build_array(:note),
+               admin_reply          = :reply,
+               answered_by          = :by,
                clarification_rounds = COALESCE(clarification_rounds, 0) + 1,
                updated_at           = NOW()
-         WHERE id = %(id)s
+         WHERE id = :id
      RETURNING clarification_rounds
     """
+    ).bindparams(bindparam("note", type_=JSONB))
 
-    row = conn.execute(
-        text(sql),
-        {
-            "id": inquiry_id,
-            "note": Json(note),
-            "reply": text_note,
-            "by": by,
-        },
-    ).fetchone()
-
-    return int(row[0]) if row else 0
+    with mem_engine.begin() as c:
+        row = c.execute(
+            sql,
+            {
+                "id": inquiry_id,
+                "note": note,
+                "reply": text_note,
+                "by": by,
+            },
+        ).fetchone()
+        return int(row[0])
 
 
 def update_inquiry_status_run(mem_engine, inquiry_id: int, *,
