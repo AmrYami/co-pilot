@@ -373,7 +373,7 @@ class Pipeline:
         mem_admin_notes = row.get("admin_notes") or []
 
         try:
-            from apps.fa.hints import make_fa_hints, try_build_sql_from_hints
+            from apps.fa.hints import make_fa_hints
 
             hints = make_fa_hints(
                 self.mem_engine, prefixes, question, admin_reply=admin_reply
@@ -381,12 +381,21 @@ class Pipeline:
         except Exception:
             hints = {}
 
+        print("[process_inquiry] Hints for derive:", hints)
+
+        sql_built = None
         try:
-            sql_built = try_build_sql_from_hints(hints, prefixes)
+            from apps.fa.derive import try_build_sql_from_hints as _derive_sql
+            sql_built = _derive_sql(self.mem_engine, prefixes, question, hints)
         except Exception:
-            sql_built = None
+            try:
+                from apps.fa.hints import try_build_sql_from_hints as _derive_sql
+                sql_built = _derive_sql(hints, prefixes)
+            except Exception:
+                sql_built = None
 
         if sql_built:
+            print("[process_inquiry] Derived SQL from hints:\n", sql_built)
             try:
                 result = self.validate_and_execute(
                     sql_built, list(prefixes), auth_email=row.get("auth_email"), inquiry_id=inquiry_id
