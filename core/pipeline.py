@@ -400,21 +400,60 @@ class Pipeline:
                 sql_built = None
 
         if sql_built:
-            print("[process_inquiry] Derived SQL from hints:\n", sql_built)
+            canonical_sql = sql_built
+            print("[process_inquiry] Derived SQL from hints:\n", canonical_sql)
+            # Validate + execute (or EXPLAIN if validate-only)
             try:
                 result = self.validate_and_execute(
-                    sql_built, list(prefixes), auth_email=row.get("auth_email"), inquiry_id=inquiry_id
+                    canonical_sql,
+                    list(prefixes),
+                    auth_email=row.get("auth_email"),
+                    inquiry_id=inquiry_id,
                 )
+            except Exception as e:
+                # Do not fall back to LLM here; show the real problem
+                print(f"[process_inquiry] validate/execute failed: {e}")
                 with self.mem_engine.begin() as cx:
                     cx.execute(
                         text(
-                            """UPDATE mem_inquiries SET status='answered', answered_by=:by, answered_at=NOW(), updated_at=NOW() WHERE id = :id"""
+                            """
+                        UPDATE mem_inquiries
+                           SET status      = 'failed',
+                               updated_at  = NOW()
+                         WHERE id = :id
+                        """
                         ),
-                        {"id": inquiry_id, "by": "admin"},
+                        {"id": inquiry_id},
                     )
-                return {"status": "ok", "inquiry_id": inquiry_id, "rows": len(result.get("preview") or [])}
-            except Exception:
-                pass
+                return {
+                    "status": "failed",
+                    "inquiry_id": inquiry_id,
+                    "error": f"validation/exec failed: {e}",
+                    "sql": canonical_sql,
+                }
+
+            # Success → mark answered and return
+            with self.mem_engine.begin() as cx:
+                cx.execute(
+                    text(
+                        """
+                    UPDATE mem_inquiries
+                       SET status       = 'answered',
+                           answered_by  = :by,
+                           answered_at  = NOW(),
+                           updated_at   = NOW()
+                     WHERE id = :id
+                    """
+                    ),
+                    {"id": inquiry_id, "by": row.get("auth_email") or "admin"},
+                )
+            return {
+                "status": "ok",
+                "inquiry_id": inquiry_id,
+                "sql": result.get("sql_final", canonical_sql),
+                "preview": result.get("preview"),
+                "rows": len(result.get("preview") or []),
+            }
 
         admin_text = admin_reply or ""
         notes_texts = [n.get("text", "") for n in mem_admin_notes if isinstance(n, dict)]
