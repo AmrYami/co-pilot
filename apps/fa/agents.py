@@ -4,12 +4,118 @@ This file can evolve independently from the core.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, List, Tuple
-import re
+from typing import Any, Dict, Iterable, List, Tuple, Optional
+import re, json, textwrap
 
 
 from core.agents import ClarifierAgent as CoreClarifier, PlannerAgent as CorePlanner, ValidatorAgent as CoreValidator
 from apps.fa.adapters import match_metric, parse_date_range, inject_date_filter, union_for_prefixes
+
+
+def normalize_admin_reply(text: str) -> Dict[str, Any]:
+    """
+    Accepts YAML/JSON/compact one-liners or loose natural language and returns a
+    normalized hint dict the planner expects.
+    """
+    t = (text or "").strip()
+
+    # 1) Try YAML/JSON first
+    try:
+        import yaml
+        y = yaml.safe_load(t)
+        if isinstance(y, dict) and ("tables" in y or "metric" in y or "date" in y):
+            return y
+    except Exception:
+        pass
+    try:
+        j = json.loads(t)
+        if isinstance(j, dict) and ("tables" in j or "metric" in j or "date" in j):
+            return j
+    except Exception:
+        pass
+
+    # 2) Compact "key: ...; key: ..." one-liner
+    if ";" in t and ":" in t:
+        out: Dict[str, Any] = {}
+        parts = [p.strip() for p in t.split(";") if p.strip()]
+        for p in parts:
+            if ":" not in p:
+                continue
+            k, v = p.split(":", 1)
+            k = k.strip().lower()
+            v = v.strip()
+            if k == "tables":
+                # dt=debtor_trans, dtd=debtor_trans_details, dm=debtors_master
+                tbls = {}
+                for tok in re.split(r"[,\s]+", v):
+                    if "=" in tok:
+                        alias, name = tok.split("=", 1)
+                        tbls[alias.strip()] = name.strip()
+                if tbls:
+                    out["tables"] = tbls
+            elif k == "joins":
+                out["joins"] = [j.strip() for j in v.split(",") if j.strip()]
+            elif k == "date":
+                # "dt.tran_date last_month"
+                m = re.match(r"(?P<col>[\w\.]+)\s+(?P<period>[\w_]+)", v)
+                if m:
+                    out["date"] = {"column": m.group("col"), "period": m.group("period")}
+            elif k == "filters":
+                out["filters"] = [v]
+            elif k == "metric":
+                # "net_sales = SUM(...)"
+                m = re.match(r"(?P<key>[\w]+)\s*=\s*(?P<expr>.+)$", v, flags=re.I)
+                if m:
+                    out["metric"] = {"key": m.group("key"), "expr": m.group("expr")}
+            elif k == "group_by":
+                out["group_by"] = [x.strip() for x in v.split(",") if x.strip()]
+            elif k == "order_by":
+                out["order_by"] = v
+            elif k == "limit":
+                try:
+                    out["limit"] = int(v)
+                except Exception:
+                    pass
+        if out:
+            return out
+
+    # 3) Heuristic fallback for loose phrases like your original
+    lo = t.lower()
+    hint: Dict[str, Any] = {}
+    # tables
+    if "debtor_trans_details" in lo or "dtd" in lo:
+        hint.setdefault("tables", {})["dtd"] = "debtor_trans_details"
+    if "debtor_trans" in lo or "invoice" in lo or "invoices" in lo:
+        hint.setdefault("tables", {})["dt"] = "debtor_trans"
+    if "customer" in lo or "debtors_master" in lo:
+        hint.setdefault("tables", {})["dm"] = "debtors_master"
+    # joins (standard FA detail joins)
+    if "dtd" in hint.get("tables", {}) and "dt" in hint.get("tables", {}):
+        hint["joins"] = [
+            "dtd.debtor_trans_no = dt.trans_no",
+            "dtd.debtor_trans_type = dt.type",
+        ]
+    if "dm" in hint.get("tables", {}) and "dt" in hint.get("tables", {}):
+        hint.setdefault("joins", []).append("dm.debtor_no = dt.debtor_no")
+    # date
+    if "tran_date" in lo or "date column" in lo or "date" in lo:
+        hint["date"] = {"column": "dt.tran_date", "period": "last_month" if "last month" in lo else "auto"}
+    # filters: net of credit notes => include (1,11)
+    if "net of credit" in lo or "credit note" in lo or "credit notes" in lo:
+        hint["filters"] = ["dt.type IN (1,11)"]
+    # metric
+    if "sum net" in lo or "net of credit" in lo:
+        hint["metric"] = {
+            "key": "net_sales",
+            "expr": "SUM((CASE WHEN dt.type=11 THEN -1 ELSE 1 END) * dtd.unit_price * (1 - dtd.discount_percent) * dtd.quantity)",
+        }
+    # group/order
+    if "top 10 customers" in lo or "top customers" in lo:
+        hint["group_by"] = ["dm.name"]
+        hint["order_by"] = "net_sales DESC"
+        hint["limit"] = 10
+
+    return hint
 
 
 class ClarifierAgentFA(CoreClarifier):
@@ -92,11 +198,33 @@ class PlannerAgentFA(CorePlanner):
          4) Else, fall back to the core planner prompt.
        """
 
-    def plan(self, question: str, context: Dict[str, Any], hints: Dict[str, Any] | None = None) -> Tuple[str, str]:
+    def plan(
+        self,
+        question: str,
+        context: Dict[str, Any],
+        hints: Dict[str, Any] | None = None,
+        admin_hints: Dict[str, Any] | None = None,
+    ) -> Tuple[str, str]:
         """
         Plan canonical (unprefixed) SQL for FA-like schemas using tables/columns in context
         and FA-specific hints (dates, categories, dimensions, items).
         """
+        if admin_hints:
+            try:
+                from apps.fa.hints import try_build_sql_from_hints
+
+                sql0 = try_build_sql_from_hints(admin_hints, context.get("prefixes") or [])
+                if sql0:
+                    return sql0, "constructed from admin hints"
+            except Exception:
+                pass
+            try:
+                admin_txt = textwrap.indent(json.dumps(admin_hints, indent=2), "  ")
+                hints = dict(hints or {})
+                hints["admin_notes"] = admin_txt
+            except Exception:
+                pass
+
         tables = ", ".join(sorted({t['table_name'] for t in context.get('tables', [])}))
         cols = ", ".join(sorted({f"{c['table_name']}.{c['column_name']}" for c in context.get('columns', [])}))
         metrics = context.get("metrics", {}) or {}
