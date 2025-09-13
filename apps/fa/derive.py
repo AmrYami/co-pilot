@@ -2,6 +2,9 @@ from __future__ import annotations
 import re
 from typing import Dict, List, Optional
 
+from core.settings import Settings
+from .agents import _fa_sale_type_codes
+
 # Simple last-month filter that works on MySQL/MariaDB
 def _mysql_last_month(col: str) -> str:
     # e.g. DATE_FORMAT(dt.tran_date, '%Y-%m') = DATE_FORMAT(CURRENT_DATE - INTERVAL 1 MONTH, '%Y-%m')
@@ -24,7 +27,7 @@ def _qt(table: str, pfx: str) -> str:
 
 
 def try_build_sql_from_hints(
-    mem_engine, prefixes: List[str], question: str, hints: Dict
+    mem_engine, prefixes: List[str], question: str, hints: Dict, settings: Settings | None = None
 ) -> Optional[str]:
     """
     Return a best-effort SQL string when admin notes (hints) clearly specify
@@ -35,6 +38,8 @@ def try_build_sql_from_hints(
 
     text = f"{question} {hints.get('free_text','')}".lower()
     pfx = _first_prefix(prefixes)
+    settings_obj = settings or Settings(namespace=f"fa::{pfx}" if pfx else "default", mem_engine=mem_engine)
+    sale_codes = _fa_sale_type_codes(settings_obj)
 
     # Pull structured signals (if present) from hints
     main_table = (hints.get("main_table") or "debtor_trans").strip()
@@ -72,7 +77,7 @@ JOIN {dtd} AS dtd
  AND dtd.debtor_trans_type = dt.type
 JOIN {dm} AS dm
   ON dm.debtor_no = dt.debtor_no
-WHERE dt.type IN (1, 11) -- 1=invoice, 11=credit note
+WHERE dt.type IN ({', '.join(str(c) for c in sale_codes)})
   AND {where_last_month}
 GROUP BY dm.name
 ORDER BY net_sales DESC

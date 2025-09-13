@@ -427,6 +427,42 @@ class Pipeline:
 
         try:
             exec_result = self._validate_and_execute_sql(ns, prefixes, canonical_sql)
+            rows = exec_result.get("rows") if isinstance(exec_result, dict) else None
+            if isinstance(rows, list) and len(rows) == 0:
+                marker = "DATE_FORMAT(dt.tran_date, '%Y-%m') = DATE_FORMAT(DATE_SUB(CURRENT_DATE, INTERVAL 1 MONTH), '%Y-%m')"
+                if marker in canonical_sql:
+                    widened = canonical_sql.replace(
+                        marker,
+                        "dt.tran_date >= DATE_SUB(CURRENT_DATE, INTERVAL 90 DAY)"
+                    )
+                    exec_result2 = self._validate_and_execute_sql(ns, prefixes, widened)
+                    rows2 = exec_result2.get("rows") if isinstance(exec_result2, dict) else None
+                    if isinstance(rows2, list) and len(rows2) > 0:
+                        canonical_sql = widened
+                        exec_result = exec_result2
+                        exec_result["note"] = "No rows last month; expanded to last 90 days."
+                    else:
+                        self._update_inquiry_status(inquiry_id, "needs_clarification")
+                        return {
+                            "ok": True,
+                            "inquiry_id": inquiry_id,
+                            "status": "needs_clarification",
+                            "questions": [
+                                "No rows found for last month. Use a broader date (e.g., last 90 days) or a specific range?"
+                            ],
+                            "sql": canonical_sql,
+                        }
+                else:
+                    self._update_inquiry_status(inquiry_id, "needs_clarification")
+                    return {
+                        "ok": True,
+                        "inquiry_id": inquiry_id,
+                        "status": "needs_clarification",
+                        "questions": [
+                            "No rows found for last month. Use a broader date (e.g., last 90 days) or a specific range?"
+                        ],
+                        "sql": canonical_sql,
+                    }
         except Exception as e:
             self._update_inquiry_status(inquiry_id, "failed")
             return {
@@ -550,6 +586,36 @@ class Pipeline:
             exec_result = self.validate_and_execute(
                 canonical_sql, prefixes, namespace=ns
             )
+            if exec_result.get("ok") and isinstance(exec_result.get("rows"), list) and len(exec_result["rows"]) == 0:
+                marker = "DATE_FORMAT(dt.tran_date, '%Y-%m') = DATE_FORMAT(DATE_SUB(CURRENT_DATE, INTERVAL 1 MONTH), '%Y-%m')"
+                if marker in canonical_sql:
+                    widened = canonical_sql.replace(
+                        marker,
+                        "dt.tran_date >= DATE_SUB(CURRENT_DATE, INTERVAL 90 DAY)"
+                    )
+                    exec_result2 = self.validate_and_execute(widened, prefixes, namespace=ns)
+                    if exec_result2.get("ok") and exec_result2.get("rows"):
+                        canonical_sql = widened
+                        exec_result = exec_result2
+                        exec_result["note"] = "No rows last month; expanded to last 90 days."
+                    else:
+                        return {
+                            "ok": True,
+                            "inquiry_id": inquiry_id,
+                            "status": "needs_clarification",
+                            "questions": [
+                                "No rows found for last month. Use a broader date (e.g., last 90 days) or a specific range?"
+                            ],
+                        }
+                else:
+                    return {
+                        "ok": True,
+                        "inquiry_id": inquiry_id,
+                        "status": "needs_clarification",
+                        "questions": [
+                            "No rows found for last month. Use a broader date (e.g., last 90 days) or a specific range?"
+                        ],
+                    }
             # Mark inquiry answered
             with self.mem_engine.begin() as conn:
                 conn.execute(
@@ -724,7 +790,7 @@ class Pipeline:
         sql_built = None
         try:
             from apps.fa.derive import try_build_sql_from_hints as _derive_sql
-            sql_built = _derive_sql(self.mem_engine, prefixes, question, hints)
+            sql_built = _derive_sql(self.mem_engine, prefixes, question, hints, self.settings)
         except Exception:
             try:
                 from apps.fa.hints import try_build_sql_from_hints as _derive_sql

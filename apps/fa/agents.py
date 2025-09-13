@@ -12,6 +12,15 @@ from core.agents import ClarifierAgent as CoreClarifier, PlannerAgent as CorePla
 from apps.fa.adapters import match_metric, parse_date_range, inject_date_filter, union_for_prefixes
 
 
+def _fa_sale_type_codes(settings) -> List[int]:
+    """Return combined FA type codes for invoices and credit notes."""
+    cmap = settings.get("FA_CATEGORY_MAP") or {}
+    inv = (cmap.get("sales invoice") or {}).get("types") or [10]
+    crn = (cmap.get("credit note") or {}).get("types") or [11]
+    codes = sorted({int(x) for x in (inv + crn)})
+    return codes or [10, 11]
+
+
 def normalize_admin_reply(text: str) -> Dict[str, Any]:
     """
     Accepts YAML/JSON/compact one-liners or loose natural language and returns a
