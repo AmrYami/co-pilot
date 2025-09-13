@@ -13,10 +13,6 @@ from typing import Any, Dict, List, Optional
 from sqlalchemy.engine import Engine, Row
 from sqlalchemy import text, bindparam
 from sqlalchemy.dialects.postgresql import JSONB
-try:
-    from psycopg2.extras import Json as _PgJson
-except Exception:  # pragma: no cover
-    _PgJson = None
 
 
 def fetch_inquiry(mem_engine, inquiry_id: int) -> Optional[Dict[str, Any]]:
@@ -63,32 +59,45 @@ def summarize_admin_notes(notes: Optional[List[Dict[str, Any]]]) -> str:
 
 def append_admin_note(mem_engine, inquiry_id: int, by: str, text_note: str) -> int:
     """
-    Append an admin note to mem_inquiries.admin_notes JSONB array and bump clarification_rounds.
-    Returns new clarification_rounds value.
+    Append a structured admin note to mem_inquiries.admin_notes (jsonb array),
+    increment clarification_rounds, and stamp answered_by / admin_reply optionally elsewhere.
+
+    Returns the updated clarification_rounds.
     """
-    note = {"by": by, "text": text_note, "ts": datetime.now(timezone.utc).isoformat()}
+    note: Dict[str, Any] = {
+        "by": by,
+        "text": text_note,
+        "ts": datetime.now(timezone.utc).isoformat(),
+    }
+
     sql = text(
         """
         UPDATE mem_inquiries
-           SET admin_notes          = COALESCE(admin_notes, '[]'::jsonb)
-                                      || jsonb_build_array(to_jsonb(:note)),
-               admin_reply          = :reply,
-               answered_by          = :by,
+           SET admin_notes          = COALESCE(admin_notes, '[]'::jsonb) || :note_array,
                clarification_rounds = COALESCE(clarification_rounds, 0) + 1,
                updated_at           = NOW()
          WHERE id = :id
      RETURNING clarification_rounds
     """
-    )
-    params = {
-        "id": inquiry_id,
-        "note": _PgJson(note) if _PgJson else note,
-        "reply": text_note,
-        "by": by,
-    }
+    ).bindparams(bindparam("note_array", type_=JSONB))
+
     with mem_engine.begin() as c:
-        rounds = c.execute(sql, params).scalar_one()
-    return int(rounds)
+        row = c.execute(sql, {"id": inquiry_id, "note_array": [note]}).first()
+        return int(row[0]) if row else 0
+
+
+def set_admin_reply(mem_engine, inquiry_id: int, reply: str, answered_by: str | None = None) -> None:
+    sql = text(
+        """
+        UPDATE mem_inquiries
+           SET admin_reply = :reply,
+               answered_by = COALESCE(:by, answered_by),
+               updated_at  = NOW()
+         WHERE id = :id
+    """
+    )
+    with mem_engine.begin() as c:
+        c.execute(sql, {"id": inquiry_id, "reply": reply, "by": answered_by})
 
 
 def update_inquiry_status_run(mem_engine, inquiry_id: int, *,
