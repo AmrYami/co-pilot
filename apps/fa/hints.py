@@ -395,3 +395,52 @@ def try_build_sql_from_hints(hints: Dict[str, Any], prefixes: List[str]) -> Opti
 
     return "\n".join(sql)
 
+
+def parse_admin_reply_freeform(text: str, *, question: str = "") -> Dict[str, Any]:
+    """Very permissive parser for free-text admin replies."""
+    out: Dict[str, Any] = {"raw": text}
+    t = (text or "").lower()
+    if not t:
+        return out
+
+    tables = {}
+    if "debtor_trans_details" in t or "dtd" in t:
+        tables["dtd"] = "debtor_trans_details"
+    if "debtor_trans" in t or " dt" in t or "dt " in t:
+        tables["dt"] = "debtor_trans"
+    if "debtors_master" in t or " dm" in t or "dm " in t:
+        tables["dm"] = "debtors_master"
+    if tables:
+        out["tables"] = tables
+
+    joins: List[str] = []
+    if "debtor_trans_no" in t or "trans_no" in t:
+        joins.append("dtd.debtor_trans_no = dt.trans_no")
+    if "debtor_trans_type" in t or "dt.type" in t:
+        joins.append("dtd.debtor_trans_type = dt.type")
+    if "dm.debtor_no" in t or "debtors_master" in t:
+        joins.append("dm.debtor_no = dt.debtor_no")
+    if joins:
+        out["joins"] = joins
+
+    if "tran_date" in t:
+        out["date"] = {"column": "dt.tran_date"}
+    if "last month" in t or "last_month" in t:
+        out.setdefault("date", {})["period"] = "last_month"
+
+    if "type in (1,11" in t or ("invoice" in t and "credit" in t):
+        out.setdefault("filters", []).append("dt.type IN (1,11)")
+
+    if "net sales" in t or "sum net" in t:
+        out["metric"] = {
+            "key": "net_sales",
+            "expr": "SUM((CASE WHEN dt.type=11 THEN -1 ELSE 1 END) * dtd.unit_price * (1 - COALESCE(dtd.discount_percent,0)) * dtd.quantity)",
+        }
+    if "top 10" in t or "limit 10" in t:
+        out["limit"] = 10
+    if "by customer" in t or "by customer name" in t:
+        out["group_by"] = ["dm.name"]
+        out["order_by"] = ["net_sales DESC"]
+
+    return out
+

@@ -40,8 +40,6 @@ from core.emailer import Emailer
 from apps.fa.hints import (
     MISSING_FIELD_QUESTIONS,
     DOMAIN_HINTS,
-    parse_admin_reply_to_hints,
-    derive_sql_from_hints,
 )
 from apps.fa.agents import normalize_admin_reply
 
@@ -117,6 +115,9 @@ class Pipeline:
                         return run_select(self.app_engine, sql)
 
             self.executor = SimpleNamespace(execute=_exec)
+
+        # cache of (namespace, datasource_url) -> Engine
+        self._ds_engines: Dict[tuple[str, str], Any] = {}
 
         # 2) Load the LLM
         self.llm = load_model(self.settings)
@@ -361,7 +362,7 @@ class Pipeline:
                 pass
         return result
 
-    def process_inquiry(self, inquiry_id: int) -> dict:
+    def _legacy_process_inquiry(self, inquiry_id: int) -> dict:
         """
         Re-plan and try again using the stored inquiry record plus any admin notes.
         Returns a lightweight status dictionary.
@@ -1434,176 +1435,224 @@ class ContextBuilder:
         scored.sort(key=lambda x: x[0], reverse=True)
         return [c for _, c in scored[:k]]
 
-    def _pick_datasource(self, namespace: str) -> Tuple[str, str]:
-        """
-        Returns (datasource_name, engine_url) for the active app/datasource.
-        Prefers DEFAULT_DATASOURCE in this namespace; falls back to APP_DB_URL.
-        """
-        ds = (self.settings.get("DEFAULT_DATASOURCE", None, namespace=namespace) or "").strip()
-        conns = self.settings.get("DB_CONNECTIONS", [], namespace=namespace) or []
-        url = None
-        if ds and conns:
-            for c in conns:
-                if c.get("name") == ds:
-                    url = c.get("url")
-                    break
-        if not url:
-            url = self.settings.get("APP_DB_URL", None, namespace=namespace)
-            ds = "default"
-        if not url:
-            raise RuntimeError("No datasource configured (DEFAULT_DATASOURCE / APP_DB_URL missing).")
-        return ds, url
-
     def validate_and_execute(
         self,
-        *,
         sql: str,
-        prefixes: List[str],
+        *,
+        prefixes: list[str],
         namespace: str,
-        datasource: Optional[str] = None,
-    ) -> Dict[str, Any]:
+        mode: str = "run",
+    ) -> dict:
         """
-        Minimal, safe path used by admin 'process': EXPLAIN (optional) then execute with row cap.
-        - picks the app (OLTP) engine; prefix handling stays in app layer (query already prefixed).
-        - returns { status, rows, rowcount, elapsed_ms, validated: bool }
+        Basic safety checks, optional EXPLAIN-only validation, and execution with LIMIT.
+        Chooses the appropriate datasource based on namespace settings.
         """
-        explain_only = bool(self.settings.get("VALIDATE_WITH_EXPLAIN_ONLY", False))
-        row_cap = int(self.settings.get("ROW_LIMIT", 1000) or 1000)
+        from sqlalchemy import create_engine, text
 
-        engine = self.app_engine
+        s = sql.strip().rstrip(";")
+        if not s.lower().startswith("select"):
+            raise ValueError("Only SELECT queries are allowed")
 
-        out: Dict[str, Any] = {"validated": False, "rows": []}
-        with engine.begin() as conn:
-            # Optional EXPLAIN
-            if explain_only:
-                try:
-                    conn.execute(text("EXPLAIN " + sql))
-                    out["validated"] = True
-                except Exception as e:
-                    return {"status": "failed", "error": f"EXPLAIN failed: {e}"}
+        if mode == "run" and " limit " not in s.lower():
+            s = f"{s}\nLIMIT 100"
 
-            # Execute (sample)
-            try:
-                res = conn.execute(text(sql))
-                rows = res.fetchmany(row_cap)
-                out.update({
-                    "status": "ok",
-                    "rows": [dict(r._mapping) for r in rows],
-                    "rowcount": len(rows),
-                })
-            except Exception as e:
-                return {"status": "failed", "error": f"exec failed: {e}"}
+        dsn = self._resolve_app_dsn(namespace)
+        key = (namespace, dsn)
+        eng = self._ds_engines.get(key)
+        if eng is None:
+            eng = create_engine(dsn, pool_pre_ping=True, future=True)
+            self._ds_engines[key] = eng
 
-        return out
+        with eng.connect() as c:
+            if mode == "explain":
+                q = f"EXPLAIN {s}"
+                rows = [dict(r) for r in c.execute(text(q)).mappings().all()]
+                return {"mode": "explain", "rows": rows}
+            else:
+                rows = [dict(r) for r in c.execute(text(s)).mappings().fetchmany(50)]
+                return {"mode": "run", "rows": rows}
 
-    def reprocess_inquiry(self, inquiry_id: int) -> Dict[str, Any]:
-        """
-        Consume admin notes/reply, derive SQL (FA app), validate/execute,
-        and update mem_inquiries accordingly.
-        """
-        mem = self.mem_engine.connect()
-        row = mem.execute(
-            text(
-                """
-            SELECT id, namespace, prefixes, question, admin_notes, admin_reply,
-                   clarification_rounds
-              FROM mem_inquiries
-             WHERE id = :id
-        """
-            ),
-            {"id": inquiry_id},
-        ).mappings().fetchone()
-        if not row:
-            return {"ok": False, "error": "inquiry_not_found", "inquiry_id": inquiry_id}
+    def reprocess_inquiry(
+        self, inquiry_id: int, answered_by: str | None = None, admin_reply: str | None = None
+    ) -> dict:
+        """Route wrapper: reprocess an inquiry with optional admin reply."""
+        return self.process_inquiry(
+            inquiry_id, answered_by=answered_by, admin_reply=admin_reply
+        )
 
-        namespace = row["namespace"]
-        prefixes = row["prefixes"] or []
-        question = row["question"] or ""
-        admin_reply = row["admin_reply"] or ""
-        admin_notes = row["admin_notes"] or []
+    def process_inquiry(
+        self, inquiry_id: int, *, answered_by: str | None, admin_reply: str | None
+    ) -> dict:
+        """Fetch inquiry, apply admin note, derive SQL, validate/execute, update status."""
+        from sqlalchemy import text
+        from core.inquiries import append_admin_note
+        from apps.fa.hints import (
+            make_fa_hints,
+            parse_admin_reply_freeform,
+            derive_sql_from_hints,
+        )
 
-        reply_text = admin_reply or (admin_notes[-1]["text"] if admin_notes else "")
-        hints = parse_admin_reply_to_hints(reply_text, prefixes=prefixes, question=question)
-
-        if hints.get("__needs", []):
-            msg = " / ".join(hints["__needs"])
-            mem.execute(
+        # 1) Fetch inquiry row
+        with self.mem_engine.begin() as c:
+            row = c.execute(
                 text(
                     """
-                UPDATE mem_inquiries
-                   SET status = 'needs_clarification',
-                       updated_at = NOW()
+                SELECT id, namespace, prefixes, question, auth_email,
+                       COALESCE(clarification_rounds,0) AS rounds
+                  FROM mem_inquiries
                  WHERE id = :id
-            """
+                """
                 ),
                 {"id": inquiry_id},
+            ).mappings().first()
+        if not row:
+            return {"ok": False, "inquiry_id": inquiry_id, "error": "inquiry_not_found"}
+
+        ns = row["namespace"]
+        prefixes = row["prefixes"] or []
+        question = row["question"] or ""
+        auth_email = row.get("auth_email")
+        rounds = int(row["rounds"] or 0)
+
+        # 2) Optional admin note
+        if admin_reply:
+            rounds = append_admin_note(self.mem_engine, inquiry_id, answered_by or "admin", admin_reply)
+
+        max_rounds = int(self.settings.get("MAX_CLARIFICATION_ROUNDS", namespace=ns) or 3)
+        if rounds > max_rounds:
+            self._set_inquiry_failed(
+                inquiry_id, f"Max clarification rounds reached ({max_rounds})."
             )
-            mem.commit()
             return {
                 "ok": True,
                 "inquiry_id": inquiry_id,
-                "result": {"status": "needs_clarification", "questions": [msg]},
+                "message": f"Max clarification rounds reached ({max_rounds}).",
+                "status": "failed",
             }
 
+        # 3) Build hints & parse admin reply
+        base_hints = make_fa_hints(self.mem_engine, prefixes, question)
+        admin_structured = parse_admin_reply_freeform(admin_reply or "", question=question)
+        hints = {**base_hints, "admin_structured": admin_structured}
+
+        # 4) Derive SQL
         try:
             sql = derive_sql_from_hints(hints)
         except Exception as e:
-            mem.execute(
-                text(
-                    """
-                UPDATE mem_inquiries
-                   SET status = 'failed', updated_at = NOW()
-                 WHERE id = :id
-            """
-                ),
-                {"id": inquiry_id},
-            )
-            mem.commit()
-            return {"ok": False, "inquiry_id": inquiry_id, "error": f"derive_failed: {e}"}
-
-        result = self.validate_and_execute(sql=sql, prefixes=list(prefixes), namespace=namespace)
-        if result.get("status") == "ok":
-            mem.execute(
-                text(
-                    """
-                UPDATE mem_inquiries
-                   SET status = 'answered',
-                       answered_at = NOW(),
-                       updated_at = NOW()
-                 WHERE id = :id
-            """
-                ),
-                {"id": inquiry_id},
-            )
-            mem.commit()
-            return {
-                "ok": True,
-                "inquiry_id": inquiry_id,
-                "sql": sql,
-                "rows": result.get("rows"),
-                "rowcount": result.get("rowcount"),
-                "status": "answered",
-            }
-        else:
-            mem.execute(
-                text(
-                    """
-                UPDATE mem_inquiries
-                   SET status = 'failed',
-                       updated_at = NOW()
-                 WHERE id = :id
-            """
-                ),
-                {"id": inquiry_id},
-            )
-            mem.commit()
+            self._set_inquiry_failed(inquiry_id, f"derive_failed: {e}")
             return {
                 "ok": False,
                 "inquiry_id": inquiry_id,
                 "status": "failed",
-                "error": f"validation/exec failed: {result.get('error','unknown')}",
-                "sql": sql,
+                "error": f"derive_failed: {e}",
             }
+
+        if not sql or "select" not in sql.lower():
+            self._set_inquiry_needs_clarification(
+                inquiry_id,
+                [
+                    "I couldn't derive a clean SQL from the admin notes. Add one more hint or confirm the tables."
+                ],
+            )
+            return {
+                "ok": True,
+                "inquiry_id": inquiry_id,
+                "status": "needs_clarification",
+                "questions": [
+                    "I couldn't derive a clean SQL from the admin notes. Add one more hint or confirm the tables."
+                ],
+            }
+
+        # 5) Validate / Execute
+        mode = (
+            "explain"
+            if self.settings.get("VALIDATE_WITH_EXPLAIN_ONLY", namespace=ns)
+            else "run"
+        )
+        try:
+            out = self.validate_and_execute(sql, prefixes=prefixes, namespace=ns, mode=mode)
+        except Exception as e:
+            self._set_inquiry_failed(inquiry_id, f"validation/exec failed: {e}")
+            return {
+                "ok": False,
+                "inquiry_id": inquiry_id,
+                "status": "failed",
+                "sql": sql,
+                "error": f"validation/exec failed: {e}",
+            }
+
+        self._mark_inquiry_answered(inquiry_id, answered_by or "admin")
+        return {
+            "ok": True,
+            "inquiry_id": inquiry_id,
+            "status": "answered",
+            "sql": sql,
+            "result": out,
+        }
+
+    def _resolve_app_dsn(self, namespace: str) -> str:
+        default_ds = self.settings.get("DEFAULT_DATASOURCE", namespace=namespace)
+        conns = self.settings.get("DB_CONNECTIONS", namespace=namespace) or []
+        if default_ds and isinstance(conns, list):
+            for c in conns:
+                if c.get("name") == default_ds and c.get("url"):
+                    return c["url"]
+        app_url = self.settings.get("APP_DB_URL", namespace=namespace)
+        if app_url:
+            return app_url
+        fa_url = self.settings.get("FA_DB_URL", namespace=namespace)
+        if fa_url:
+            return fa_url
+        raise RuntimeError("No datasource URL configured")
+
+    def _set_inquiry_needs_clarification(self, inquiry_id: int, questions: list[str]) -> None:
+        from sqlalchemy import text
+        with self.mem_engine.begin() as c:
+            c.execute(
+                text(
+                    """
+                UPDATE mem_inquiries
+                   SET status = 'needs_clarification',
+                       questions = to_jsonb(:qs),
+                       updated_at = NOW()
+                 WHERE id = :id
+                """
+                ),
+                {"id": inquiry_id, "qs": questions},
+            )
+
+    def _set_inquiry_failed(self, inquiry_id: int, error_msg: str) -> None:
+        from sqlalchemy import text
+        with self.mem_engine.begin() as c:
+            c.execute(
+                text(
+                    """
+                UPDATE mem_inquiries
+                   SET status = 'failed',
+                       error_message = :err,
+                       updated_at = NOW()
+                 WHERE id = :id
+                """
+                ),
+                {"id": inquiry_id, "err": error_msg[:1000]},
+            )
+
+    def _mark_inquiry_answered(self, inquiry_id: int, answered_by: str) -> None:
+        from sqlalchemy import text
+        with self.mem_engine.begin() as c:
+            c.execute(
+                text(
+                    """
+                UPDATE mem_inquiries
+                   SET status = 'answered',
+                       answered_by = :by,
+                       answered_at = NOW(),
+                       updated_at = NOW()
+                 WHERE id = :id
+                """
+                ),
+                {"id": inquiry_id, "by": answered_by},
+            )
 
     def _legacy_validate_and_execute(
         self,

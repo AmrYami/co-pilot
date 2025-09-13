@@ -130,7 +130,7 @@ def admin_reply(inq_id: int):
     mem_engine = pipeline.mem_engine
 
     try:
-        rounds = append_admin_note(mem_engine, inq_id, by=answered_by, text_note=admin_reply)
+        rounds = append_admin_note(mem_engine, inq_id, answered_by, admin_reply)
     except Exception as e:
         return jsonify({"ok": False, "error": f"append_failed: {e}"}), 500
 
@@ -138,7 +138,7 @@ def admin_reply(inq_id: int):
 
     if process:
         try:
-            result = pipeline.reprocess_inquiry(inq_id)
+            result = pipeline.reprocess_inquiry(inq_id, answered_by, admin_reply)
         except Exception as e:
             return jsonify({"ok": False, "inquiry_id": inq_id, "error": f"process_failed: {e}"}), 500
         out["processed"] = True
