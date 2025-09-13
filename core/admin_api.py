@@ -5,7 +5,7 @@ from sqlalchemy import text, bindparam
 from sqlalchemy.dialects.postgresql import JSONB
 from core.inquiries import append_admin_note, fetch_inquiry
 
-admin_bp = Blueprint("admin_bp", __name__, url_prefix="/admin")
+admin_bp = Blueprint("admin", __name__, url_prefix="/admin")
 
 
 def _conn():
@@ -117,43 +117,31 @@ def get_inquiry(inq_id: int):
 
 @admin_bp.post("/inquiries/<int:inq_id>/reply")
 def admin_reply(inq_id: int):
-    data = request.get_json(silent=True) or {}
-
+    data = request.get_json(force=True) or {}
     answered_by = data.get("answered_by") or data.get("by") or "admin"
-    admin_reply_text = data.get("admin_reply") or data.get("reply") or ""
+    admin_reply = data.get("admin_reply") or data.get("reply") or ""
     process = bool(data.get("process", False))
 
-    mem = current_app.config["MEM_ENGINE"]
+    pipeline = current_app.config["PIPELINE"]
+    mem = pipeline.mem_engine.connect()
 
     try:
-        rounds = append_admin_note(
-            mem,
-            inq_id,
-            by=answered_by,
-            text_note=admin_reply_text,
-            reply=admin_reply_text,
-        )
+        rounds = append_admin_note(mem, inq_id, by=answered_by, text_note=admin_reply)
+        mem.commit()
     except Exception as e:
-        return (
-            jsonify({"ok": False, "inquiry_id": inq_id, "error": f"append_failed: {e}"}),
-            500,
-        )
+        mem.rollback()
+        return jsonify({"ok": False, "error": f"append_failed: {e}"}), 500
 
-    resp = {"ok": True, "inquiry_id": inq_id, "clarification_rounds": rounds}
+    out = {"ok": True, "inquiry_id": inq_id, "clarification_rounds": rounds}
 
     if process:
         try:
-            pipeline = current_app.config["PIPELINE"]
-            out = getattr(pipeline, "process_inquiry", lambda _id: {"status": "skipped"})(
-                inq_id
-            )
-            resp["processed"] = True
-            resp["result"] = out
+            result = pipeline.reprocess_inquiry(inq_id)
         except Exception as e:
-            resp["processed"] = False
-            resp["error"] = f"process_failed: {e}"
-
-    return jsonify(resp)
+            return jsonify({"ok": False, "inquiry_id": inq_id, "error": f"process_failed: {e}"}), 500
+        out["processed"] = True
+        out["result"] = result
+    return jsonify(out)
 
 
 @admin_bp.post("/inquiries/<int:inq_id>/process")

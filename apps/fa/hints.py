@@ -148,124 +148,151 @@ def make_fa_hints(*args, **kwargs) -> Dict[str, Any]:
         })
 
     if admin_reply:
-        hints["admin_structured"] = parse_admin_reply_to_hints(admin_reply)
+        hints["admin_structured"] = parse_admin_reply_to_hints(admin_reply, prefixes, q)
 
     return hints
 
 
-def parse_admin_reply_to_hints(text: str) -> Dict[str, Any]:
-    """
-    Parse free-form admin reply into a light structure the planner can use.
-    Accepts simple 'key: value' lines and common patterns like:
-      tables: dt=debtor_trans, dtd=debtor_trans_details, dm=debtors_master
-      joins:
-        - dtd.debtor_trans_no = dt.trans_no
-        - dtd.debtor_trans_type = dt.type
-        - dm.debtor_no = dt.debtor_no
-      date: dt.tran_date last_month
-      filters: dt.type in (1,11)
-      metric:
-        key: net_sales
-        expr: sum((case when dt.type=11 then -1 else 1 end) * dtd.unit_price * (1 - dtd.discount_percent) * dtd.quantity)
-      group_by: dm.name
-      order_by: net_sales desc
-      limit: 10
-    Returns a best-effort dict; any missing pieces are simply omitted.
-    """
-    t = (text or "").strip()
-    out: Dict[str, Any] = {
+def parse_admin_reply_to_hints(text: str, prefixes: List[str], question: str) -> Dict[str, Any]:
+    t = (text or "").strip().lower()
+
+    hints: Dict[str, Any] = {
+        "prefixes": prefixes or [],
+        "question": question or "",
         "tables": {},
         "joins": [],
         "filters": [],
-        "date": {},
         "metric": {},
+        "date": {},
         "group_by": [],
         "order_by": [],
         "limit": None,
-        "raw": t,
+        "__needs": [],
     }
 
-    lines = [ln.strip() for ln in re.split(r"[\r\n]+", t) if ln.strip()]
-    buf_key: Optional[str] = None
-    buf: List[str] = []
+    tables = {}
+    for key, pat in {
+        "dt": r"\bdebtor[_\s]?trans\b",
+        "dtd": r"\bdebtor[_\s]?trans[_\s]?details\b",
+        "dm": r"\bdebtors[_\s]?master\b",
+        "gl": r"\bgl[_\s]?trans\b",
+        "bt": r"\bbank[_\s]?trans\b",
+    }.items():
+        if re.search(pat, t):
+            if key == "dt":
+                tables["dt"] = "debtor_trans"
+            if key == "dtd":
+                tables["dtd"] = "debtor_trans_details"
+            if key == "dm":
+                tables["dm"] = "debtors_master"
+            if key == "gl":
+                tables["gl"] = "gl_trans"
+            if key == "bt":
+                tables["bt"] = "bank_trans"
 
-    def flush_buf() -> None:
-        nonlocal buf_key, buf, out
-        if not buf_key:
-            return
-        body = "\n".join(buf).strip()
-        if buf_key == "joins":
-            for b in re.split(r"^\s*-\s*", body, flags=re.M):
-                b = b.strip()
-                if not b:
-                    continue
-                if "\n" in b:
-                    for sub in [x.strip() for x in b.splitlines() if x.strip()]:
-                        if sub.startswith("-"):
-                            sub = sub[1:].strip()
-                        if sub:
-                            out["joins"].append(sub)
-                else:
-                    out["joins"].append(b)
-        elif buf_key == "metric":
-            mkey = re.search(r"\bkey\s*:\s*([A-Za-z0-9_]+)", body, re.I)
-            mexp = re.search(r"\bexpr\s*:\s*(.+)$", body, re.I | re.S)
-            if mkey:
-                out["metric"]["key"] = mkey.group(1).strip()
-            if mexp:
-                out["metric"]["expr"] = mexp.group(1).strip()
-        else:
-            parts = re.split(r"[,\n]+", body)
-            parts = [p.strip() for p in parts if p.strip()]
-            if buf_key == "filters":
-                out["filters"].extend(parts)
-            elif buf_key == "group_by":
-                out["group_by"].extend(parts)
-            elif buf_key == "order_by":
-                out["order_by"].extend(parts)
-        buf_key = None
-        buf = []
+    if tables:
+        hints["tables"] = tables
 
-    for ln in lines:
-        m = re.match(r"^(tables|joins|date|filters|metric|group_by|order_by|limit)\s*:\s*(.*)$", ln, re.I)
-        if m:
-            flush_buf()
-            key = m.group(1).lower()
-            rest = m.group(2).strip()
-            if key == "tables":
-                for part in re.split(r"[,\s]+", rest):
-                    if "=" in part:
-                        a, b = part.split("=", 1)
-                        a, b = a.strip(), b.strip().strip(",")
-                        if a and b:
-                            out["tables"][a] = b
-            elif key == "date":
-                mcol = re.match(r"^([A-Za-z0-9_\.]+)\s+(.+)$", rest)
-                if mcol:
-                    out["date"]["column"] = mcol.group(1).strip()
-                    out["date"]["range"] = mcol.group(2).strip()
-                else:
-                    out["date"]["range"] = rest
-            elif key == "limit":
-                try:
-                    out["limit"] = int(re.findall(r"\d+", rest)[0])
-                except Exception:
-                    pass
-            else:
-                buf_key = key
-                if rest:
-                    buf.append(rest)
-        else:
-            if buf_key:
-                buf.append(ln)
-    flush_buf()
+    if "debtor_trans_details" in tables.values() and "debtor_trans" in tables.values():
+        hints["joins"].append("dtd.debtor_trans_no = dt.trans_no")
+        hints["joins"].append("dtd.debtor_trans_type = dt.type")
+    if "debtors_master" in tables.values() and "debtor_trans" in tables.values():
+        hints["joins"].append("dm.debtor_no = dt.debtor_no")
 
-    if "metric" in out and out["metric"] and "expr" not in out["metric"]:
-        body = out["metric"]
-        if isinstance(body, str):
-            out["metric"] = {"expr": body}
+    if "last month" in t or "last_month" in t:
+        hints["date"] = {"column": "dt.tran_date", "period": "last_month"}
+    elif "today" in t:
+        hints["date"] = {"column": "dt.tran_date", "period": "today"}
+    elif "yesterday" in t:
+        hints["date"] = {"column": "dt.tran_date", "period": "yesterday"}
+    m = re.findall(r"(\d{4}-\d{2}-\d{2})", t)
+    if len(m) >= 2:
+        hints["date"] = {"start": m[0], "end": m[1], "grain": "day", "column": hints.get("date", {}).get("column", "dt.tran_date")}
 
-    return out
+    if re.search(r"\bcredit\s*note\b", t):
+        hints["filters"].append("dt.type IN (1,11)")
+    elif re.search(r"\binvoice\b", t):
+        hints["filters"].append("dt.type IN (1)")
+
+    if "net" in t and "sales" in t:
+        hints["metric"] = {
+            "key": "net_sales",
+            "expr": "SUM((CASE WHEN dt.type = 11 THEN -1 ELSE 1 END) * dtd.unit_price * (1 - COALESCE(dtd.discount_percent, 0)) * dtd.quantity)",
+        }
+    elif "count" in t:
+        hints["metric"] = {"key": "cnt", "expr": "COUNT(*)"}
+
+    if "top" in t and "customer" in t:
+        hints["group_by"].append("dm.name")
+        hints["order_by"].append("net_sales DESC")
+        hints["limit"] = 10
+
+    if not hints["tables"]:
+        hints["__needs"].append("Which tables should we use (e.g., debtor_trans, debtors_master, gl_trans)?")
+    if not hints["date"]:
+        hints["__needs"].append("What date range should we use (e.g., last month, 2025-08-01 .. 2025-08-31)?")
+    if not hints["metric"]:
+        hints["__needs"].append("Which metric should we compute (e.g., sum of net sales, count of invoices)?")
+
+    return hints
+
+
+def derive_sql_from_hints(hints: Dict[str, Any]) -> str:
+    pfx = (hints.get("prefixes") or [""])[0]
+
+    def T(name: str) -> str:
+        return f"`{pfx}{name}`" if pfx else f"`{name}`"
+
+    tables = hints.get("tables") or {}
+    if not tables:
+        raise ValueError("missing tables")
+
+    parts: List[str] = []
+    metric = hints.get("metric") or {}
+    m_expr = metric.get("expr") or "COUNT(*)"
+    m_alias = metric.get("key") or "metric"
+
+    group_by = hints.get("group_by") or []
+    select_cols: List[str] = []
+    if "dm.name" in group_by:
+        select_cols.append("dm.name AS customer")
+    select_cols.append(f"{m_expr} AS {m_alias}")
+    parts.append("SELECT " + ",\n       ".join(select_cols))
+
+    if "dt" in tables:
+        parts.append(f"FROM {T(tables['dt'])} AS dt")
+    if "dtd" in tables:
+        parts.append(f"JOIN {T(tables['dtd'])} AS dtd ON dtd.debtor_trans_no = dt.trans_no AND dtd.debtor_trans_type = dt.type")
+    if "dm" in tables:
+        parts.append(f"JOIN {T(tables['dm'])} AS dm ON dm.debtor_no = dt.debtor_no")
+
+    where: List[str] = []
+    for f in hints.get("filters") or []:
+        where.append(f)
+    date = hints.get("date") or {}
+    if date.get("period") == "last_month":
+        where.append("DATE_FORMAT(dt.tran_date, '%Y-%m') = DATE_FORMAT(CURRENT_DATE - INTERVAL 1 MONTH, '%Y-%m')")
+    elif date.get("start") and date.get("end"):
+        where.append(f"dt.tran_date BETWEEN '{date['start']}' AND '{date['end']}'")
+
+    if where:
+        parts.append("WHERE " + "\n  AND ".join(where))
+
+    if group_by:
+        gcols = [c.strip("[] ") for c in group_by]
+        parts.append("GROUP BY " + ", ".join(gcols))
+
+    order_by = hints.get("order_by") or []
+    if order_by:
+        parts.append("ORDER BY " + ", ".join(order_by))
+
+    lim = hints.get("limit")
+    if lim:
+        parts.append(f"LIMIT {int(lim)}")
+
+    return " \n".join(parts) + ";"
+
+
 
 
 def _mysql_last_month_range(col: str) -> str:
