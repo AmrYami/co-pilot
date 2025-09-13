@@ -38,6 +38,7 @@ from core.inquiries import (
 )
 from core.emailer import Emailer
 from apps.fa.hints import MISSING_FIELD_QUESTIONS, DOMAIN_HINTS
+from apps.fa.agents import normalize_admin_reply
 
 from types import SimpleNamespace
 
@@ -221,9 +222,11 @@ class Pipeline:
         limit = int(self.settings.get("MAX_CLARIFICATION_ROUNDS", namespace=ns) or 3)
         unlimited = limit == -1
 
+        admin_hints = None
         hints = ""
         if notes:
             hints = "ADMIN_NOTES:\n" + "\n---\n".join(notes)
+            admin_hints = normalize_admin_reply("\n".join(notes))
 
         context = {
             "namespace": ns,
@@ -232,7 +235,9 @@ class Pipeline:
         }
 
         try:
-            canonical_sql, rationale = self.planner.plan(question, context, hints=hints)
+            canonical_sql, rationale = self.planner.plan(
+                question, context, hints=hints, admin_hints=admin_hints
+            )
         except Exception:
             q = self.planner.fallback_clarifying_question(question, context)
             if (not unlimited) and rounds >= limit:
@@ -665,8 +670,10 @@ class Pipeline:
                 pass
 
             enriched_q = question
+            admin_hints = None
             if admin_reply:
                 enriched_q += f"\n\nClarifications: {admin_reply}"
+                admin_hints = normalize_admin_reply(admin_reply)
 
             ctx = self.build_context_pack("fa", prefixes, enriched_q)
             if context:
@@ -677,7 +684,9 @@ class Pipeline:
             if hints:
                 gh.update(hints)
 
-            canonical_sql, rationale = self.planner.plan(enriched_q, ctx, hints=gh)
+            canonical_sql, rationale = self.planner.plan(
+                enriched_q, ctx, hints=gh, admin_hints=admin_hints
+            )
             canonical_sql = extract_sql(canonical_sql) or self._force_sql_only(canonical_sql, question)
             if not canonical_sql:
                 if allow_new_inquiry:
