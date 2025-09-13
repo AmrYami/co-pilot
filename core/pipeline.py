@@ -369,24 +369,71 @@ class Pipeline:
         question = row["question"] or ""
         ns = row["namespace"] or "default"
 
-        extra_hints: list[str] = []
-        if row["admin_reply"]:
-            extra_hints.append(str(row["admin_reply"]))
-        if row["admin_notes"]:
-            for n in row["admin_notes"]:
-                if isinstance(n, dict) and "text" in n:
-                    extra_hints.append(n["text"])
-                else:
-                    extra_hints.append(str(n))
+        admin_reply = row.get("admin_reply")
+        mem_admin_notes = row.get("admin_notes") or []
 
         try:
-            from apps.fa.hints import make_fa_hints
+            from apps.fa.hints import make_fa_hints, try_build_sql_from_hints
 
             hints = make_fa_hints(
-                self.mem_engine, prefixes, question, extra_text=" | ".join(extra_hints)
+                self.mem_engine, prefixes, question, admin_reply=admin_reply
             )
         except Exception:
-            hints = {"admin": " | ".join(extra_hints)}
+            hints = {}
+
+        try:
+            sql_built = try_build_sql_from_hints(hints, prefixes)
+        except Exception:
+            sql_built = None
+
+        if sql_built:
+            try:
+                result = self.validate_and_execute(
+                    sql_built, list(prefixes), auth_email=row.get("auth_email"), inquiry_id=inquiry_id
+                )
+                with self.mem_engine.begin() as cx:
+                    cx.execute(
+                        text(
+                            """UPDATE mem_inquiries SET status='answered', answered_by=:by, answered_at=NOW(), updated_at=NOW() WHERE id = :id"""
+                        ),
+                        {"id": inquiry_id, "by": "admin"},
+                    )
+                return {"status": "ok", "inquiry_id": inquiry_id, "rows": len(result.get("preview") or [])}
+            except Exception:
+                pass
+
+        admin_text = admin_reply or ""
+        notes_texts = [n.get("text", "") for n in mem_admin_notes if isinstance(n, dict)]
+        admin_blob = " | ".join([admin_text] + [t for t in notes_texts if t])
+
+        try:
+            prompt = (
+                f"{question}\n\nADMIN_NOTES:\n{admin_blob}\n\n"
+                "Use the admin’s tables/joins/metric/date. Return a SINGLE MySQL SELECT. No prose."
+            )
+            raw = self.planner.llm.generate(prompt, max_new_tokens=256, temperature=0.0, top_p=1.0)
+            sql_only = extract_sql(raw) or self._force_sql_only(raw, question)
+        except Exception:
+            sql_only = None
+
+        if sql_only:
+            from core.pipeline import SQLRewriter
+
+            sql_exec = SQLRewriter.rewrite_for_prefixes(sql_only, prefixes)
+            try:
+                result = self.validate_and_execute(
+                    sql_exec, list(prefixes), auth_email=row.get("auth_email"), inquiry_id=inquiry_id
+                )
+                with self.mem_engine.begin() as cx:
+                    cx.execute(
+                        text(
+                            """UPDATE mem_inquiries SET status='answered', answered_by=:by, answered_at=NOW(), updated_at=NOW() WHERE id = :id"""
+                        ),
+                        {"id": inquiry_id, "by": "admin"},
+                    )
+                return {"status": "ok", "inquiry_id": inquiry_id, "rows": len(result.get("preview") or [])}
+            except Exception:
+                pass
 
         result = self.answer(
             question=question,
