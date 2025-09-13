@@ -477,189 +477,202 @@ class Pipeline:
             rows = execute_sql(self.app_engine, safe_sql)
             return {"rows": rows[:100], "rowcount": len(rows)}
 
-    def reprocess_inquiry(self, inquiry_id: int) -> Dict[str, Any]:
-        """Reprocess an inquiry after admin notes; derive hints → SQL → execute."""
+    def reprocess_inquiry(self, inquiry_id: int, namespace: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Re-run planning/derivation for an existing inquiry after admin provided notes.
+        Returns a result dict suitable for the admin API.
+        """
+        ns = namespace or self.namespace
 
-        with self.mem_engine.begin() as c:
-            row = c.execute(
+        # 1) load inquiry
+        with self.mem_engine.begin() as conn:
+            row = conn.execute(
                 text(
                     """
-                SELECT id, namespace, prefixes, question, admin_reply
-                  FROM mem_inquiries
-                 WHERE id = %(id)s
+                    SELECT id, namespace, prefixes, question, admin_reply, admin_notes
+                      FROM mem_inquiries
+                     WHERE id = :id
                     """
                 ),
                 {"id": inquiry_id},
-            ).mappings().first()
+            ).fetchone()
 
         if not row:
             return {"ok": False, "inquiry_id": inquiry_id, "error": "not_found"}
 
-        ns = row["namespace"]
-        prefixes = row.get("prefixes") or []
-        question = row.get("question") or ""
-        admin_reply = row.get("admin_reply") or ""
+        prefixes: List[str] = row.prefixes or []
+        question: str = row.question or ""
+        admin_reply: str = row.admin_reply or ""
+        admin_notes: List[Dict[str, Any]] = row.admin_notes or []
 
+        # 2) build hints from question + admin_reply + admin_notes (FA-specific helper)
+        #    keep this call app-facing to respect your "core clean / app logic in apps"
         try:
-            from apps.fa.hints import make_fa_hints, derive_sql_from_hints
+            from apps.fa.hints import make_hints_from_admin
 
-            hints = make_fa_hints(self.mem_engine, prefixes, question, admin_reply=admin_reply)
-        except Exception as e:
-            return {"ok": False, "inquiry_id": inquiry_id, "error": f"hints_failed: {e}"}
-
-        try:
-            sql = derive_sql_from_hints(prefixes, hints)
-        except Exception:
-            sql = None
-
-        if not sql:
-            try:
-                sql, _ = self.planner.plan(
-                    question,
-                    context=self._context_from_hints(hints),
-                    hints=hints,
-                )
-            except Exception as e:
-                return {"ok": False, "inquiry_id": inquiry_id, "error": f"planning_failed: {e}"}
-
-        try:
-            exec_res = self.validate_and_execute(
-                sql=sql,
-                namespace=ns,
-                prefixes=prefixes,
-                inquiry_id=inquiry_id,
+            hints = make_hints_from_admin(
+                self.mem_engine, prefixes, question, admin_reply, admin_notes
             )
+        except Exception as e:
+            return {"ok": False, "inquiry_id": inquiry_id, "error": f"hints_failed: {e!s}"}
+
+        # 3) try planner derivation from hints; if it returns non-SQL, we'll fail back to clarify
+        try:
+            canonical_sql = None
+            if hasattr(self.planner, "derive_sql_from_hints"):
+                canonical_sql = self.planner.derive_sql_from_hints(question, hints)
+            else:
+                from apps.fa.hints import naive_sql_from_hints
+
+                canonical_sql = naive_sql_from_hints(prefixes, hints)
+
+            import re as _re
+
+            if not canonical_sql or not _re.search(r"\bselect\b", canonical_sql, _re.I):
+                return {
+                    "ok": True,
+                    "inquiry_id": inquiry_id,
+                    "result": {
+                        "inquiry_id": inquiry_id,
+                        "status": "needs_clarification",
+                        "message": "I couldn't derive a clean SQL from the admin notes. Add one more hint or confirm the tables.",
+                    },
+                }
         except Exception as e:
             return {
                 "ok": False,
                 "inquiry_id": inquiry_id,
-                "error": f"validation/exec failed: {e}",
-                "sql": sql,
-                "status": "failed",
+                "error": f"derive_failed: {e!s}",
             }
 
-        with self.mem_engine.begin() as c:
-            c.execute(
-                text(
-                    """
-                UPDATE mem_inquiries
-                   SET status = 'answered',
-                       answered_at = NOW(),
-                       updated_at  = NOW()
-                 WHERE id = %(id)s
-                    """
-                ),
-                {"id": inquiry_id},
-            )
-
-        return {"ok": True, "inquiry_id": inquiry_id, "sql": sql, "result": exec_res}
-
-    def validate_and_execute(
-        self,
-        *,
-        sql: str,
-        namespace: str,
-        prefixes: list[str],
-        inquiry_id: int | None = None,
-        auth_email: str | None = None,
-    ) -> dict:
-        """EXPLAIN and (optionally) execute SQL against the active app datasource."""
-
-        app_url = None
+        # 4) validate/execute
         try:
-            app_url = (
-                self.settings.get("APP_DB_URL", namespace)
-                or self.settings.get("FA_DB_URL", namespace)
+            exec_result = self.validate_and_execute(
+                canonical_sql, prefixes, namespace=ns
             )
-            if not app_url:
-                app_url = self.settings.get("APP_DB_URL") or self.settings.get("FA_DB_URL")
-        except Exception:
-            pass
-        if not app_url:
-            import os
-
-            app_url = os.getenv("FA_DB_URL")
-
-        if not app_url:
-            return {"ok": False, "inquiry_id": inquiry_id, "error": "no_app_db_url"}
-
-        app_engine = create_engine(app_url, pool_pre_ping=True)
-
-        def _ensure_limit(sql_txt: str, n: int = 100) -> str:
-            low = sql_txt.lower()
-            if " limit " in low or low.strip().endswith(")"):
-                return sql_txt
-            return f"{sql_txt.rstrip().rstrip(';')} LIMIT {n};"
-
-        validate_only = bool(
-            self.settings.get("VALIDATE_WITH_EXPLAIN_ONLY", namespace) or False
-        )
-        explained_ok = False
-        rows: list[dict] = []
-        err: str | None = None
-
-        with app_engine.connect() as conn:
-            try:
-                conn.execute(sa.text(f"EXPLAIN {sql}"))
-                explained_ok = True
-                if not validate_only:
-                    out = conn.execute(sa.text(_ensure_limit(sql, 100)))
-                    rows = [dict(r) for r in out.fetchmany(100)]
-            except Exception as e:
-                err = str(e)
-
-        status = "answered" if (explained_ok and (validate_only or rows)) else "failed"
-        with self.mem_engine.begin() as c:
-            c.execute(
-                sa.text(
-                    """
-                INSERT INTO mem_runs(namespace, user_id, input_query, plan, sql_generated, sql_final, status,
-                                     rows_returned, created_at)
-                VALUES (:ns, :user, :input, :plan, :gen, :final, :st, :rows, NOW())
-                    """
-                ),
-                {
-                    "ns": namespace,
-                    "user": auth_email or "system",
-                    "input": f"[reprocess] {inquiry_id}" if inquiry_id else "[reprocess]",
-                    "plan": None,
-                    "gen": sql,
-                    "final": sql,
-                    "st": status,
-                    "rows": len(rows) if rows else 0,
-                },
-            )
-            if inquiry_id:
-                c.execute(
-                    sa.text(
+            # Mark inquiry answered
+            with self.mem_engine.begin() as conn:
+                conn.execute(
+                    text(
                         """
-                    UPDATE mem_inquiries
-                       SET status = :st,
-                           answered_at = CASE WHEN :st='answered' THEN NOW() ELSE answered_at END,
-                           answered_by = COALESCE(answered_by, :user),
-                           updated_at  = NOW()
-                     WHERE id = :id
+                        UPDATE mem_inquiries
+                           SET status = 'answered',
+                               updated_at = NOW(),
+                               answered_at = NOW()
+                         WHERE id = :id
                         """
                     ),
-                    {"id": inquiry_id, "st": status, "user": auth_email or "system"},
+                    {"id": inquiry_id},
                 )
-
-        if status == "failed":
+            return {
+                "ok": True,
+                "inquiry_id": inquiry_id,
+                "sql": canonical_sql,
+                "result": exec_result,
+                "status": "answered",
+            }
+        except Exception as e:
             return {
                 "ok": False,
                 "inquiry_id": inquiry_id,
-                "sql": sql,
-                "error": f"validation/exec failed: {err}",
+                "sql": canonical_sql,
+                "error": f"validation/exec failed: {e!s}",
                 "status": "failed",
             }
 
-        return {
-            "ok": True,
-            "inquiry_id": inquiry_id,
-            "status": "answered" if not validate_only else "validated",
-            "sql": sql,
-            "rows": rows[:10] if rows else [],
-        }
+    def validate_and_execute(
+        self, sql: str, prefixes: List[str], *, namespace: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Minimal validator + executor:
+         - optionally EXPLAIN ONLY (VALIDATE_WITH_EXPLAIN_ONLY)
+         - otherwise executes on the app DB, persists a mem_runs row and updates mem_inquiries
+        """
+        ns = namespace or self.namespace
+        start = time.time()
+        env_explain_only = bool(
+            self.settings.get("VALIDATE_WITH_EXPLAIN_ONLY", "false")
+            in ("1", "true", "True", True)
+        )
+
+        # Pick datasource (simple): use APP_DB_URL for the active app/namespace
+        app_db_url = self.settings.get("APP_DB_URL", scope="namespace", namespace=ns)
+        if not app_db_url:
+            raise RuntimeError("APP_DB_URL not configured in settings")
+
+        # Ensure a LIMIT if user didn't set one
+        run_sql = sql
+        if not env_explain_only:
+            import re as _re
+
+            if not _re.search(r"\blimit\s+\d+\b", sql, _re.I):
+                run_sql = f"{sql.rstrip().rstrip(';')} \nLIMIT 50;"
+
+        # Persist run start
+        with self.mem_engine.begin() as conn:
+            run_id_row = conn.execute(
+                text(
+                    """
+                    INSERT INTO mem_runs(namespace, input_query, status, created_at)
+                    VALUES (:ns, :q, 'executing', NOW())
+                    RETURNING id
+                    """
+                ),
+                {"ns": ns, "q": run_sql},
+            ).fetchone()
+        run_id = int(run_id_row[0])
+
+        app_engine = create_engine(app_db_url)
+
+        try:
+            if env_explain_only:
+                q = f"EXPLAIN {sql}"
+            else:
+                q = run_sql
+
+            with app_engine.begin() as conn:
+                res = conn.execute(text(q))
+                rows = res.mappings().fetchmany(50)
+
+            elapsed = int((time.time() - start) * 1000)
+            # Update run
+            with self.mem_engine.begin() as conn:
+                conn.execute(
+                    text(
+                        """
+                        UPDATE mem_runs
+                           SET status = 'complete',
+                               sql_final = :sql,
+                               rows_returned = :rows,
+                               execution_time_ms = :ms,
+                               completed_at = NOW()
+                         WHERE id = :id
+                        """
+                    ),
+                    {"sql": run_sql, "rows": len(rows), "ms": elapsed, "id": run_id},
+                )
+
+            return {
+                "ok": True,
+                "rows": rows,
+                "elapsed_ms": elapsed,
+                "explain_only": env_explain_only,
+                "run_id": run_id,
+            }
+
+        except Exception as e:
+            with self.mem_engine.begin() as conn:
+                conn.execute(
+                    text(
+                        """
+                        UPDATE mem_runs
+                           SET status = 'failed', error_message = :err, completed_at = NOW()
+                         WHERE id = :id
+                        """
+                    ),
+                    {"err": str(e), "id": run_id},
+                )
+            raise
 
     def _context_from_hints(self, h: Dict[str, Any]) -> Dict[str, Any]:
         """Lightweight context pack from hints for planner fallback."""
