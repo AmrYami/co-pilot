@@ -3,7 +3,7 @@ from flask import Blueprint, request, jsonify, current_app
 from werkzeug.exceptions import BadRequest
 from sqlalchemy import text, bindparam
 from sqlalchemy.dialects.postgresql import JSONB
-from core.inquiries import append_admin_note, fetch_inquiry
+from core.inquiries import append_admin_note, fetch_inquiry, set_admin_reply
 
 admin_bp = Blueprint("admin", __name__, url_prefix="/admin")
 
@@ -121,29 +121,38 @@ def get_inquiry(inq_id: int):
 
 @admin_bp.post("/inquiries/<int:inq_id>/reply")
 def admin_reply(inq_id: int):
-    data = request.get_json(force=True) or {}
-    answered_by = data.get("answered_by") or data.get("by") or "admin"
-    admin_reply = data.get("admin_reply") or data.get("reply") or ""
-    process = bool(data.get("process", False))
+    payload = request.get_json(force=True) or {}
+    answered_by = payload.get("answered_by") or "unknown"
+    admin_reply_text = payload.get("admin_reply") or ""
+    process = bool(payload.get("process"))
 
+    mem = current_app.config["MEM_ENGINE"]
     pipeline = current_app.config["PIPELINE"]
-    mem_engine = pipeline.mem_engine
 
     try:
-        rounds = append_admin_note(mem_engine, inq_id, answered_by, admin_reply)
+        rounds = append_admin_note(mem, inq_id, by=answered_by, text_note=admin_reply_text)
+        set_admin_reply(mem, inq_id, reply=admin_reply_text, answered_by=answered_by)
     except Exception as e:
-        return jsonify({"ok": False, "error": f"append_failed: {e}"}), 500
-
-    out = {"ok": True, "inquiry_id": inq_id, "clarification_rounds": rounds}
+        return {"ok": False, "error": f"append_failed: {e}"}, 500
 
     if process:
         try:
-            result = pipeline.reprocess_inquiry(inq_id, answered_by, admin_reply)
+            result = pipeline.reprocess_inquiry(inq_id)
+            return {
+                "ok": True,
+                "inquiry_id": inq_id,
+                "clarification_rounds": rounds,
+                "processed": True,
+                "result": result,
+            }, 200
         except Exception as e:
-            return jsonify({"ok": False, "inquiry_id": inq_id, "error": f"process_failed: {e}"}), 500
-        out["processed"] = True
-        out["result"] = result
-    return jsonify(out)
+            return {
+                "ok": False,
+                "inquiry_id": inq_id,
+                "error": f"process_failed: {e}",
+            }, 500
+
+    return {"ok": True, "inquiry_id": inq_id, "clarification_rounds": rounds}, 200
 
 
 @admin_bp.post("/inquiries/<int:inq_id>/process")
