@@ -8,7 +8,6 @@ These helpers are project-agnostic (no FA-specific code).
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from sqlalchemy.engine import Engine, Row
 from sqlalchemy import text, bindparam
@@ -57,20 +56,30 @@ def summarize_admin_notes(notes: Optional[List[Dict[str, Any]]]) -> str:
 # --- Admin note helpers ----------------------------------------------------
 
 
-def append_admin_note(conn, inquiry_id: int, *, by: str, text_note: str) -> int:
-    """Append a free-text admin note to mem_inquiries.admin_notes and bump rounds."""
-
-    note_obj = {
-        "by": by,
-        "text": text_note,
-        "ts": datetime.now(timezone.utc).isoformat(),
-    }
+def append_admin_note(
+    mem_engine,
+    inquiry_id: int,
+    *,
+    by: str | None,
+    text_note: str | None,
+    admin_reply: str | None = None,
+) -> int:
+    """
+    Append a note to mem_inquiries.admin_notes (JSONB array), and bump clarification_rounds.
+    Avoid sending dicts as parameters; instead build JSONB in SQL via jsonb_build_object.
+    """
 
     sql = text(
         """
         UPDATE mem_inquiries
-           SET admin_notes          = COALESCE(admin_notes, '[]'::jsonb)
-                                      || jsonb_build_array(:note::jsonb),
+           SET admin_notes = COALESCE(admin_notes, '[]'::jsonb)
+                              || jsonb_build_array(
+                                   jsonb_build_object(
+                                     'by',   :by,
+                                     'text', :note_text,
+                                     'ts',   NOW()
+                                   )
+                                 ),
                admin_reply          = COALESCE(:reply, admin_reply),
                answered_by          = COALESCE(:by, answered_by),
                clarification_rounds = COALESCE(clarification_rounds, 0) + 1,
@@ -79,18 +88,15 @@ def append_admin_note(conn, inquiry_id: int, *, by: str, text_note: str) -> int:
      RETURNING clarification_rounds
         """
     )
-
-    res = conn.execute(
-        sql,
-        {
-            "id": inquiry_id,
-            "note": json.dumps(note_obj),
-            "reply": text_note,
-            "by": by,
-        },
-    )
-    rounds = res.scalar_one()
-    return int(rounds)
+    params = {
+        "id": inquiry_id,
+        "by": by,
+        "note_text": text_note or "",
+        "reply": admin_reply,
+    }
+    with mem_engine.begin() as c:
+        row = c.execute(sql, params).fetchone()
+    return int(row[0]) if row else 0
 
 
 def set_admin_reply(mem_engine, inquiry_id: int, reply: str, answered_by: str | None = None) -> None:

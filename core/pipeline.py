@@ -363,6 +363,120 @@ class Pipeline:
                 pass
         return result
 
+    def process_inquiry(self, inquiry_id: int) -> dict:
+        """Re-process an existing inquiry using latest admin notes / hints."""
+        with self.mem_engine.begin() as c:
+            row = c.execute(
+                text(
+                    """
+                SELECT id, namespace, prefixes, question, admin_reply, admin_notes,
+                       COALESCE(clarification_rounds,0) AS rounds
+                  FROM mem_inquiries
+                 WHERE id = :id
+                """
+                ),
+                {"id": inquiry_id},
+            ).mappings().first()
+
+        if not row:
+            return {"ok": False, "inquiry_id": inquiry_id, "error": "not_found"}
+
+        ns = row["namespace"]
+        prefixes = row["prefixes"] or []
+        question = row["question"] or ""
+        admin_reply = row.get("admin_reply") or ""
+        admin_notes = row.get("admin_notes") or []
+
+        try:
+            from apps.fa.hints import make_fa_hints
+
+            hints = make_fa_hints(
+                self.mem_engine,
+                prefixes,
+                question,
+                admin_reply=admin_reply,
+                admin_notes=admin_notes,
+            )
+        except Exception as e:
+            return {"ok": False, "inquiry_id": inquiry_id, "error": f"hints_failed: {e}"}
+
+        sql_from_admin = hints.get("sql")
+        canonical_sql = None
+        rationale = None
+
+        if sql_from_admin and "select" in sql_from_admin.lower():
+            canonical_sql = sql_from_admin
+            rationale = "admin_sql"
+        else:
+            try:
+                canonical_sql, rationale = self.planner.plan(
+                    question,
+                    context={"hints": hints},
+                    hints=hints,
+                )
+            except Exception as e:
+                self._update_inquiry_status(inquiry_id, "needs_clarification")
+                return {
+                    "ok": True,
+                    "inquiry_id": inquiry_id,
+                    "status": "needs_clarification",
+                    "questions": [
+                        "I couldn't derive a clean SQL from the admin notes. Add one more hint or confirm the tables."
+                    ],
+                }
+
+        try:
+            exec_result = self._validate_and_execute_sql(ns, prefixes, canonical_sql)
+        except Exception as e:
+            self._update_inquiry_status(inquiry_id, "failed")
+            return {
+                "ok": False,
+                "inquiry_id": inquiry_id,
+                "status": "failed",
+                "sql": canonical_sql,
+                "error": f"validation/exec failed: {e}",
+            }
+
+        self._update_inquiry_status(inquiry_id, "answered")
+        return {
+            "ok": True,
+            "inquiry_id": inquiry_id,
+            "status": "answered",
+            "sql": canonical_sql,
+            "result": exec_result,
+        }
+
+    def _update_inquiry_status(self, inquiry_id: int, status: str) -> None:
+        with self.mem_engine.begin() as c:
+            c.execute(
+                text(
+                    """
+                UPDATE mem_inquiries
+                   SET status = :st, updated_at = NOW()
+                 WHERE id = :id
+                """
+                ),
+                {"id": inquiry_id, "st": status},
+            )
+
+    def _validate_and_execute_sql(
+        self, namespace: str, prefixes: list[str], sql: str
+    ) -> dict:
+        """
+        Minimal validator+executor stub:
+        - Add LIMIT if missing
+        - EXPLAIN or run based on VALIDATE_WITH_EXPLAIN_ONLY
+        """
+        from core.sql_utils import ensure_limit_100, explain_sql, execute_sql
+
+        safe_sql = ensure_limit_100(sql)
+        if bool(self.settings.get("VALIDATE_WITH_EXPLAIN_ONLY", namespace=namespace)):
+            plan = explain_sql(self.app_engine, safe_sql)
+            return {"explain": plan}
+        else:
+            rows = execute_sql(self.app_engine, safe_sql)
+            return {"rows": rows[:100], "rowcount": len(rows)}
+
     def reprocess_inquiry(self, inquiry_id: int) -> dict:
         """Re-drive an inquiry using the latest admin notes/reply."""
 

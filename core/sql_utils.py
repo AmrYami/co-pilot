@@ -54,3 +54,30 @@ def inject_between_date_filter(sql: str, fully_qualified_col: str, start_iso: st
     if _WHERE_RE.search(base):
         return f"{base} AND {cond}"
     return f"{base} WHERE {cond}"
+
+
+def ensure_limit_100(sql: str) -> str:
+    """Ensure the SQL statement has a LIMIT 100 if none present."""
+    base = _strip_semicolon(sql)
+    if re.search(r"\blimit\b", base, re.I):
+        return base
+    return f"{base} LIMIT 100"
+
+
+def explain_sql(engine, sql: str):
+    """Run EXPLAIN on the given SQL and return the plan rows."""
+    from sqlalchemy import text as _text
+
+    with engine.connect() as c:
+        rs = c.execute(_text(f"EXPLAIN {sql}"))
+        return [tuple(r) for r in rs.fetchall()]
+
+
+def execute_sql(engine, sql: str):
+    """Execute the SQL and return a list of rows (dicts)."""
+    from sqlalchemy import text as _text
+
+    with engine.connect() as c:
+        rs = c.execute(_text(sql))
+        cols = list(rs.keys())
+        return [dict(zip(cols, r)) for r in rs.fetchall()]
