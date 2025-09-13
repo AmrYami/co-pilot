@@ -399,6 +399,107 @@ def parse_admin_reply_to_hints(text: str, prefixes: List[str], question: str) ->
     return hints
 
 
+def make_hints_from_admin(
+    mem_engine,
+    prefixes: List[str],
+    question: str,
+    admin_reply: str,
+    admin_notes: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """
+    Parse natural admin guidance into structured hints. Very tolerant:
+    - finds table names debtor_trans, debtor_trans_details, debtors_master
+    - finds date column like dt.tran_date
+    - detects 'last month'
+    - detects metric words: net sales, sum, count, etc.
+    """
+    text_combined = " ".join([admin_reply] + [n.get("text", "") for n in admin_notes]).lower()
+
+    tables = {}
+    if "debtor_trans_details" in text_combined or "dtd" in text_combined:
+        tables["dtd"] = "debtor_trans_details"
+    if "debtor_trans" in text_combined or "dt" in text_combined:
+        tables["dt"] = "debtor_trans"
+    if "debtors_master" in text_combined or "dm" in text_combined:
+        tables["dm"] = "debtors_master"
+
+    joins = []
+    if "dtd" in tables and "dt" in tables:
+        joins += [
+            "dtd.debtor_trans_no = dt.trans_no",
+            "dtd.debtor_trans_type = dt.type",
+        ]
+    if "dm" in tables and "dt" in tables:
+        joins += ["dm.debtor_no = dt.debtor_no"]
+
+    date = {
+        "column": "dt.tran_date" if "tran_date" in text_combined else None,
+        "period": "last_month" if "last month" in text_combined else None,
+    }
+
+    metric = None
+    if "net sales" in text_combined or "net of credit" in text_combined:
+        metric = {
+            "key": "net_sales",
+            "expr": "SUM((CASE WHEN dt.type = 11 THEN -1 ELSE 1 END) * dtd.unit_price * (1 - COALESCE(dtd.discount_percent, 0)) * dtd.quantity)",
+        }
+    elif re.search(r"\bsum\b", text_combined):
+        metric = {"key": "sum", "expr": "SUM(1)"}
+
+    group_by = ["dm.name"] if ("customer" in text_combined or "customers" in text_combined) else None
+    order_by = ["net_sales DESC"] if metric and metric.get("key") == "net_sales" else None
+    limit = 10 if "top 10" in text_combined or "top10" in text_combined else None
+
+    return {
+        "prefixes": prefixes,
+        "date": date,
+        "tables": tables,
+        "joins": joins,
+        "filters": ["dt.type IN (1,11)"] if "net" in (metric or {}).get("key", "") else [],
+        "metric": metric,
+        "group_by": group_by,
+        "order_by": order_by,
+        "limit": limit,
+        "question": question,
+    }
+
+
+def naive_sql_from_hints(prefixes: List[str], h: Dict[str, Any]) -> str:
+    """Last-ditch builder so we always produce *some* SQL when hints are sufficient."""
+    pfx = prefixes[0].rstrip("_") + "_" if prefixes else ""
+    dt = f"`{pfx}debtor_trans`"
+    dtd = f"`{pfx}debtor_trans_details`"
+    dm = f"`{pfx}debtors_master`"
+
+    metric_expr = h.get("metric", {}).get("expr") or "COUNT(*)"
+    group_by = ", ".join(h.get("group_by") or ["dm.name"])
+    order_by = ", ".join(h.get("order_by") or ["1 DESC"])
+    limit = h.get("limit") or 10
+
+    date_filter = (
+        "AND DATE_FORMAT(dt.tran_date, '%Y-%m') = DATE_FORMAT(CURRENT_DATE - INTERVAL 1 MONTH, '%Y-%m')"
+        if (h.get("date", {}).get("period") == "last_month")
+        else ""
+    )
+
+    sql = f"""
+SELECT dm.name AS customer,
+       {metric_expr} AS net_sales
+FROM {dt} AS dt
+JOIN {dtd} AS dtd
+  ON dtd.debtor_trans_no = dt.trans_no
+ AND dtd.debtor_trans_type = dt.type
+JOIN {dm} AS dm
+  ON dm.debtor_no = dt.debtor_no
+WHERE dt.type IN (1, 11)  -- 1=invoice, 11=credit note
+  {date_filter}
+GROUP BY {group_by}
+ORDER BY {order_by}
+LIMIT {limit};
+""".strip()
+    return sql
+
+
 
 
 

@@ -131,40 +131,29 @@ def get_inquiry(inq_id: int):
 
 @admin_bp.post("/inquiries/<int:inq_id>/reply")
 def admin_reply(inq_id: int):
-    payload = request.get_json(force=True) or {}
-    answered_by = payload.get("answered_by") or "unknown"
-    admin_reply_text = payload.get("admin_reply") or ""
-    process = bool(payload.get("process"))
+    data = request.get_json(force=True) or {}
+    answered_by = data.get("answered_by") or "unknown"
+    admin_reply_text = data.get("admin_reply") or ""
 
-    pipeline = current_app.config["PIPELINE"]
-    mem = pipeline.mem_engine
+    mem = current_app.config["MEM_ENGINE"]
+    rounds = append_admin_note(mem, inq_id, by=answered_by, text_note=admin_reply_text)
 
-    try:
-        rounds = append_admin_note(
-            mem,
-            inq_id,
-            by=answered_by,
-            text_note=admin_reply_text,
-            admin_reply=admin_reply_text,
-        )
-    except Exception as e:
-        return jsonify({"ok": False, "error": f"append_failed: {e}"}), 500
+    processed = False
+    proc_result = None
+    if data.get("process"):
+        pipeline = current_app.config["PIPELINE"]
+        proc_result = pipeline.reprocess_inquiry(inq_id, namespace=pipeline.namespace)
+        processed = True
 
-    result = {
-        "ok": True,
-        "inquiry_id": inq_id,
-        "clarification_rounds": rounds,
-    }
-
-    if process:
-        try:
-            proc = pipeline.reprocess_inquiry(inq_id)
-            result["processed"] = True
-            result["result"] = proc
-        except Exception as e:
-            return jsonify({"ok": False, "inquiry_id": inq_id, "error": f"process_failed: {e}"}), 500
-
-    return jsonify(result), 200
+    return jsonify(
+        {
+            "ok": True,
+            "inquiry_id": inq_id,
+            "clarification_rounds": rounds,
+            "processed": processed,
+            "result": proc_result or None,
+        }
+    ), 200
 
 
 @admin_bp.post("/inquiries/<int:inq_id>/process")
