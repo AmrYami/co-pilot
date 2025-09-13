@@ -18,74 +18,78 @@ def _conn():
 
 @admin_bp.post("/settings/bulk")
 def settings_bulk():
-    mem = current_app.config["MEM_ENGINE"]
+    mem_engine = current_app.config["MEM_ENGINE"]
     payload = request.get_json(force=True) or {}
     ns = payload.get("namespace") or "fa::common"
-    upd = payload.get("updated_by") or "api"
-    items = payload.get("settings") or []
+    updated_by = payload.get("updated_by") or "api"
 
-    upsert = (
-        text(
-            """
-            INSERT INTO mem_settings(
-                namespace, key, value, value_type, scope, scope_id,
-                category, description, overridable, updated_by,
-                created_at, updated_at, is_secret
-            )
-            VALUES (
-                :ns, :key, :val, :vtype, :scope, :scope_id,
-                :cat, :desc, COALESCE(:ovr, true), :upd,
-                NOW(), NOW(), COALESCE(:sec, false)
-            )
-            ON CONFLICT (namespace, key, scope, COALESCE(scope_id, ''))
-            DO UPDATE SET
-                value      = EXCLUDED.value,
-                value_type = EXCLUDED.value_type,
-                updated_by = EXCLUDED.updated_by,
-                updated_at = NOW(),
-                is_secret  = EXCLUDED.is_secret
-            """
-        ).bindparams(bindparam("val", type_=JSONB))
-    )
+    upsert_sql = text(
+        """
+        INSERT INTO mem_settings(
+            namespace, key, value, value_type, scope, scope_id,
+            category, description, overridable, updated_by,
+            created_at, updated_at, is_secret
+        )
+        VALUES (
+            :ns, :key, :val, :vtype, :scope, :scope_id,
+            :cat, :desc, COALESCE(:ovr, true), :upd,
+            NOW(), NOW(), COALESCE(:sec, false)
+        )
+        ON CONFLICT (namespace, key, scope, COALESCE(scope_id, ''))
+        DO UPDATE SET
+            value       = EXCLUDED.value,
+            value_type  = EXCLUDED.value_type,
+            updated_by  = EXCLUDED.updated_by,
+            updated_at  = NOW(),
+            is_secret   = EXCLUDED.is_secret
+        """
+    ).bindparams(bindparam("val", type_=JSONB))
 
-    def infer_type(v, explicit):
-        if explicit:
-            return explicit
+    def _infer_value_type(v):
         if isinstance(v, bool):
             return "bool"
         if isinstance(v, int):
             return "int"
+        if isinstance(v, float):
+            return "float"
         if isinstance(v, (dict, list)):
             return "json"
         return "string"
 
-    updated = 0
-    with mem.begin() as conn:
-        for s in items:
-            key = s["key"]
-            val = s.get("value")
-            vtype = infer_type(val, s.get("value_type"))
-            scope = s.get("scope") or "namespace"
+    items_out = []
+    with mem_engine.begin() as c:
+        for item in payload.get("settings") or []:
+            key = item["key"]
+            scope = item.get("scope", "namespace")
+            scope_id = item.get("scope_id")
+            is_secret = bool(item.get("is_secret", False))
+            cat = item.get("category")
+            desc = item.get("description")
+            ovr = item.get("overridable")
+            val_py = item.get("value")
+            vtype = item.get("value_type") or _infer_value_type(val_py)
 
-            conn.execute(
-                upsert,
+            c.execute(
+                upsert_sql,
                 {
                     "ns": ns,
                     "key": key,
-                    "val": val,
+                    "val": val_py,
                     "vtype": vtype,
                     "scope": scope,
-                    "scope_id": s.get("scope_id"),
-                    "cat": s.get("category"),
-                    "desc": s.get("description"),
-                    "ovr": s.get("overridable"),
-                    "upd": upd,
-                    "sec": bool(s.get("is_secret")),
+                    "scope_id": scope_id,
+                    "cat": cat,
+                    "desc": desc,
+                    "ovr": ovr,
+                    "upd": updated_by,
+                    "sec": is_secret,
                 },
             )
-            updated += 1
+            items_out.append(
+                {"key": key, "value": val_py, "value_type": vtype, "scope": scope}
+            )
 
-    return {"ok": True, "updated": updated}, 200
+    return {"ok": True, "items": items_out}, 200
 
 
 @admin_bp.get("/settings/get")
@@ -123,13 +127,11 @@ def admin_reply(inq_id: int):
     process = bool(data.get("process", False))
 
     pipeline = current_app.config["PIPELINE"]
-    mem = pipeline.mem_engine.connect()
+    mem_engine = pipeline.mem_engine
 
     try:
-        rounds = append_admin_note(mem, inq_id, by=answered_by, text_note=admin_reply)
-        mem.commit()
+        rounds = append_admin_note(mem_engine, inq_id, by=answered_by, text_note=admin_reply)
     except Exception as e:
-        mem.rollback()
         return jsonify({"ok": False, "error": f"append_failed: {e}"}), 500
 
     out = {"ok": True, "inquiry_id": inq_id, "clarification_rounds": rounds}
