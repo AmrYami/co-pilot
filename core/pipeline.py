@@ -477,16 +477,16 @@ class Pipeline:
             rows = execute_sql(self.app_engine, safe_sql)
             return {"rows": rows[:100], "rowcount": len(rows)}
 
-    def reprocess_inquiry(self, inquiry_id: int) -> dict:
-        """Re-drive an inquiry using the latest admin notes/reply."""
+    def reprocess_inquiry(self, inquiry_id: int) -> Dict[str, Any]:
+        """Reprocess an inquiry after admin notes; derive hints → SQL → execute."""
 
-        with self.mem_engine.connect() as c:
+        with self.mem_engine.begin() as c:
             row = c.execute(
-                sa.text(
+                text(
                     """
-                SELECT id, namespace, prefixes, question, auth_email, admin_reply, admin_notes
+                SELECT id, namespace, prefixes, question, admin_reply
                   FROM mem_inquiries
-                 WHERE id = :id
+                 WHERE id = %(id)s
                     """
                 ),
                 {"id": inquiry_id},
@@ -497,54 +497,62 @@ class Pipeline:
 
         ns = row["namespace"]
         prefixes = row.get("prefixes") or []
-        question = row["question"] or ""
-        auth_email = row.get("auth_email") or None
-        admin_text = row.get("admin_reply") or ""
+        question = row.get("question") or ""
+        admin_reply = row.get("admin_reply") or ""
 
-        hints = {}
         try:
-            from apps.fa.hints import parse_admin_reply, derive_sql_from_hints
+            from apps.fa.hints import make_fa_hints, derive_sql_from_hints
 
-            hints = parse_admin_reply(admin_text)
-        except Exception:
-            hints = {}
+            hints = make_fa_hints(self.mem_engine, prefixes, question, admin_reply=admin_reply)
+        except Exception as e:
+            return {"ok": False, "inquiry_id": inquiry_id, "error": f"hints_failed: {e}"}
 
-        sql = None
         try:
-            if hints:
-                sql = derive_sql_from_hints(prefixes, hints)
+            sql = derive_sql_from_hints(prefixes, hints)
         except Exception:
             sql = None
 
-        if sql:
-            return self.validate_and_execute(
+        if not sql:
+            try:
+                sql, _ = self.planner.plan(
+                    question,
+                    context=self._context_from_hints(hints),
+                    hints=hints,
+                )
+            except Exception as e:
+                return {"ok": False, "inquiry_id": inquiry_id, "error": f"planning_failed: {e}"}
+
+        try:
+            exec_res = self.validate_and_execute(
                 sql=sql,
                 namespace=ns,
                 prefixes=prefixes,
                 inquiry_id=inquiry_id,
-                auth_email=auth_email,
             )
-
-        try:
-            result = self.answer(
-                question,
-                {"namespace": ns, "prefixes": prefixes, "auth_email": auth_email, "admin_reply": admin_text},
-                hints=hints,
-                existing_inquiry_id=inquiry_id,
-                allow_new_inquiry=False,
-            )
-            return {
-                "ok": True,
-                "inquiry_id": inquiry_id,
-                "status": result.get("status"),
-                "result": result,
-            }
         except Exception as e:
             return {
                 "ok": False,
                 "inquiry_id": inquiry_id,
-                "error": f"reprocess_failed: {e}",
+                "error": f"validation/exec failed: {e}",
+                "sql": sql,
+                "status": "failed",
             }
+
+        with self.mem_engine.begin() as c:
+            c.execute(
+                text(
+                    """
+                UPDATE mem_inquiries
+                   SET status = 'answered',
+                       answered_at = NOW(),
+                       updated_at  = NOW()
+                 WHERE id = %(id)s
+                    """
+                ),
+                {"id": inquiry_id},
+            )
+
+        return {"ok": True, "inquiry_id": inquiry_id, "sql": sql, "result": exec_res}
 
     def validate_and_execute(
         self,
@@ -651,6 +659,14 @@ class Pipeline:
             "status": "answered" if not validate_only else "validated",
             "sql": sql,
             "rows": rows[:10] if rows else [],
+        }
+
+    def _context_from_hints(self, h: Dict[str, Any]) -> Dict[str, Any]:
+        """Lightweight context pack from hints for planner fallback."""
+        return {
+            "date_range": h.get("date_range") or h.get("date"),
+            "keywords": h.get("keywords"),
+            "prefixes": h.get("prefixes"),
         }
 
     def _legacy_process_inquiry(self, inquiry_id: int) -> dict:

@@ -8,10 +8,12 @@ These helpers are project-agnostic (no FA-specific code).
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from sqlalchemy.engine import Engine, Row
 from sqlalchemy import text, bindparam
 from sqlalchemy.dialects.postgresql import JSONB
+from psycopg2.extras import Json
 
 
 def fetch_inquiry(mem_engine, inquiry_id: int) -> Optional[Dict[str, Any]]:
@@ -60,43 +62,34 @@ def append_admin_note(
     mem_engine,
     inquiry_id: int,
     *,
-    by: str | None,
-    text_note: str | None,
+    by: str,
+    text_note: str,
     admin_reply: str | None = None,
 ) -> int:
-    """
-    Append a note to mem_inquiries.admin_notes (JSONB array), and bump clarification_rounds.
-    Avoid sending dicts as parameters; instead build JSONB in SQL via jsonb_build_object.
-    """
+    """Append an admin note safely using psycopg2 Json binding."""
 
     sql = text(
         """
         UPDATE mem_inquiries
-           SET admin_notes = COALESCE(admin_notes, '[]'::jsonb)
-                              || jsonb_build_array(
-                                   jsonb_build_object(
-                                     'by',   :by,
-                                     'text', :note_text,
-                                     'ts',   NOW()
-                                   )
-                                 ),
-               admin_reply          = COALESCE(:reply, admin_reply),
-               answered_by          = COALESCE(:by, answered_by),
+           SET admin_notes          = COALESCE(admin_notes, '[]'::jsonb) || %(note)s::jsonb,
+               admin_reply          = %(reply)s,
+               answered_by          = %(by)s,
                clarification_rounds = COALESCE(clarification_rounds, 0) + 1,
                updated_at           = NOW()
-         WHERE id = :id
+         WHERE id = %(id)s
      RETURNING clarification_rounds
         """
     )
+    note = {"by": by, "text": text_note, "ts": datetime.now(timezone.utc).isoformat()}
     params = {
         "id": inquiry_id,
+        "note": Json(note),
+        "reply": admin_reply or text_note,
         "by": by,
-        "note_text": text_note or "",
-        "reply": admin_reply,
     }
     with mem_engine.begin() as c:
-        row = c.execute(sql, params).fetchone()
-    return int(row[0]) if row else 0
+        r = c.execute(sql, params).scalar_one()
+    return int(r)
 
 
 def set_admin_reply(mem_engine, inquiry_id: int, reply: str, answered_by: str | None = None) -> None:

@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 from datetime import date, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import re
 
 
@@ -97,6 +97,41 @@ def parse_admin_reply(text: str) -> Dict:
         "order_by": order_by,
         "limit": limit,
     }
+
+
+def try_parse_admin_text(text: str) -> dict:
+    """Parse loose admin notes into a structured hint dict."""
+    d = {"tables": {}, "joins": [], "filters": [], "metric": {}, "date": {}}
+    if not text:
+        return d
+    t = text.lower()
+    for key, rx in {
+        "dt": r"debtor[_\s]?trans",
+        "dtd": r"debtor[_\s]?trans[_\s]?details",
+        "dm": r"debtors[_\s]?master",
+    }.items():
+        m = re.search(rx, t)
+        if m:
+            d["tables"][key] = {"name": m.group(0).replace(" ", "_")}
+    if "tran_date" in t or "date column dt.tran_date" in t:
+        d["date"]["column"] = "dt.tran_date"
+    if "last month" in t or "period last month" in t:
+        d["date"]["period"] = "last_month"
+    if "joined to customers" in t:
+        d["joins"] += [
+            "dtd.debtor_trans_no = dt.trans_no",
+            "dtd.debtor_trans_type = dt.type",
+            "dm.debtor_no = dt.debtor_no",
+        ]
+    if "net sales" in t:
+        d["metric"] = {
+            "key": "net_sales",
+            "expr": ("SUM((CASE WHEN dt.type=11 THEN -1 ELSE 1 END) "
+                     "* dtd.unit_price * (1 - COALESCE(dtd.discount_percent, 0)) * dtd.quantity)"),
+        }
+    if "type in (1,11)" in t or "invoice" in t or "credit note" in t:
+        d["filters"].append("dt.type IN (1,11)")
+    return d
 
 
 def derive_sql_from_hints(prefixes: List[str], h: Dict) -> str:
@@ -223,14 +258,21 @@ def _build(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def make_fa_hints(*args, **kwargs) -> Dict[str, Any]:
-    """Compatible entry point supporting legacy and new call styles."""
+    """Compatible entry point supporting legacy and new call styles.
+
+    Always normalize question (`q`) and prefixes to avoid NameError on old code.
+    """
 
     admin_reply: Optional[str] = None
+    prefixes: List[str] = []
+    q: str = ""
 
     # New-style: single dict positional
     if args and len(args) == 1 and isinstance(args[0], dict):
         payload = dict(args[0])
         admin_reply = payload.get("admin_reply")
+        prefixes = payload.get("prefixes") or []
+        q = (payload.get("question") or "").strip()
         hints = _build(payload)
     # Legacy: 3 positional args -> (mem_engine, prefixes, question[, clarifications])
     elif len(args) >= 3:
@@ -238,6 +280,7 @@ def make_fa_hints(*args, **kwargs) -> Dict[str, Any]:
         clar = args[3] if len(args) > 3 else None
         admin_overrides = args[4] if len(args) > 4 else None
         admin_reply = args[5] if len(args) > 5 else kwargs.get("admin_reply")
+        q = (question or "").strip()
         hints = _build({
             "mem_engine": mem_engine,
             "prefixes": prefixes,
@@ -249,20 +292,26 @@ def make_fa_hints(*args, **kwargs) -> Dict[str, Any]:
     elif "payload" in kwargs and isinstance(kwargs["payload"], dict):
         payload = dict(kwargs["payload"])
         admin_reply = kwargs.get("admin_reply") or payload.get("admin_reply")
+        prefixes = payload.get("prefixes") or []
+        q = (payload.get("question") or "").strip()
         hints = _build(payload)
     else:
         admin_reply = kwargs.get("admin_reply")
+        prefixes = kwargs.get("prefixes") or []
+        q = (kwargs.get("question") or "").strip()
         hints = _build({
             "mem_engine": kwargs.get("mem_engine"),
-            "prefixes": kwargs.get("prefixes") or [],
-            "question": kwargs.get("question") or "",
+            "prefixes": prefixes,
+            "question": q,
             "clarifications": kwargs.get("clarifications"),
             "admin_overrides": kwargs.get("admin_overrides"),
         })
 
     if admin_reply:
-        hints["admin_structured"] = parse_admin_reply_to_hints(admin_reply, prefixes, q)
+        hints["admin_structured"] = try_parse_admin_text(admin_reply)
 
+    hints["question"] = q
+    hints["prefixes"] = prefixes
     return hints
 
 

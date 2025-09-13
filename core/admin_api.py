@@ -158,7 +158,7 @@ def admin_reply(inq_id: int):
 
     if process:
         try:
-            proc = pipeline.process_inquiry(inq_id)
+            proc = pipeline.reprocess_inquiry(inq_id)
             result["processed"] = True
             result["result"] = proc
         except Exception as e:
