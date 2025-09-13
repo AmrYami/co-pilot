@@ -238,22 +238,6 @@ class PlannerAgentFA(CorePlanner):
         cols = ", ".join(sorted({f"{c['table_name']}.{c['column_name']}" for c in context.get('columns', [])}))
         metrics = context.get("metrics", {}) or {}
 
-        # marshal hints for prompt
-        h: List[str] = []
-        if hints:
-            if dr := hints.get("date_range"): h.append(
-                f"DateRange: {dr['start']}..{dr['end']} (grain={dr.get('grain', 'day')})")
-            if eq := hints.get("eq_filters"): h.append("EqFilters: " + ", ".join([f"{k}={v}" for k, v in eq.items()]))
-            if cats := hints.get("categories"):
-                pretty = [f"{c.get('table')} types={c.get('types')}" for c in cats]
-                h.append("Categories: " + "; ".join(pretty))
-            if dims := hints.get("dimensions"):
-                pretty = [f"{k} IN {v}" for k, v in dims.items()]
-                h.append("Dimensions: " + "; ".join(pretty))
-            if items := hints.get("items"):
-                h.append("Items: " + ", ".join(items))
-        hint_txt = "\n".join(h) if h else "(none)"
-
         prompt = (
             "You are a senior SQL generator for MariaDB/MySQL.\n"
             "Return only one SQL query.\n"
@@ -271,10 +255,27 @@ class PlannerAgentFA(CorePlanner):
             "- Items come from stock_master.stock_id; join via debtor_trans_details/sales_order_details when needed.\n"
             "- If the question is ambiguous, ask a single clarifying question instead of guessing.\n\n"
             f"Tables: {tables}\nColumns: {cols}\n"
-            f"Metrics: {', '.join(metrics.keys()) if metrics else '(none)'}\n"
-            f"Hints:\n{hint_txt}\n"
-            "Return as:\nSQL:\n<sql>\nRationale:\n<why>\n"
+            f"Metrics: {', '.join(metrics.keys()) if metrics else '(none)'}"
         )
+
+        h = hints or {}
+        if h.get("date_range"):
+            prompt += (
+                f"\n- Date range: {h['date_range'].get('start')} to {h['date_range'].get('end')}"
+                f" (grain={h['date_range'].get('grain')})"
+            )
+        if h.get("filters"):
+            for f in h["filters"]:
+                if f.get("type") == "dimension":
+                    prompt += f"\n- Filter: {f['key']} = '{f['value']}'"
+                elif f.get("type") == "item":
+                    prompt += f"\n- Filter: item code = '{f['value']}'"
+        if h.get("metric_hint") == "sum_sales":
+            prompt += "\n- Metric: sum of sales amount (invoice lines), net of credit notes."
+        if h.get("table_cues"):
+            prompt += "\n- Prefer tables (if applicable): " + ", ".join(h["table_cues"])
+
+        prompt += "\nReturn as:\nSQL:\n<sql>\nRationale:\n<why>\n"
 
         if hints and hints.get("admin_notes"):
             prompt += (
