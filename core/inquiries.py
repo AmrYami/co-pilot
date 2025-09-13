@@ -57,14 +57,10 @@ def summarize_admin_notes(notes: Optional[List[Dict[str, Any]]]) -> str:
 # --- Admin note helpers ----------------------------------------------------
 
 
-def append_admin_note(mem_engine, inquiry_id: int, by: str, text_note: str) -> int:
-    """
-    Append a structured admin note to mem_inquiries.admin_notes (jsonb array),
-    increment clarification_rounds, and stamp answered_by / admin_reply optionally elsewhere.
+def append_admin_note(conn, inquiry_id: int, *, by: str, text_note: str) -> int:
+    """Append a free-text admin note to mem_inquiries.admin_notes and bump rounds."""
 
-    Returns the updated clarification_rounds.
-    """
-    note: Dict[str, Any] = {
+    note_obj = {
         "by": by,
         "text": text_note,
         "ts": datetime.now(timezone.utc).isoformat(),
@@ -73,17 +69,28 @@ def append_admin_note(mem_engine, inquiry_id: int, by: str, text_note: str) -> i
     sql = text(
         """
         UPDATE mem_inquiries
-           SET admin_notes          = COALESCE(admin_notes, '[]'::jsonb) || :note_array,
+           SET admin_notes          = COALESCE(admin_notes, '[]'::jsonb)
+                                      || jsonb_build_array(:note::jsonb),
+               admin_reply          = COALESCE(:reply, admin_reply),
+               answered_by          = COALESCE(:by, answered_by),
                clarification_rounds = COALESCE(clarification_rounds, 0) + 1,
                updated_at           = NOW()
          WHERE id = :id
      RETURNING clarification_rounds
-    """
-    ).bindparams(bindparam("note_array", type_=JSONB))
+        """
+    )
 
-    with mem_engine.begin() as c:
-        row = c.execute(sql, {"id": inquiry_id, "note_array": [note]}).first()
-        return int(row[0]) if row else 0
+    res = conn.execute(
+        sql,
+        {
+            "id": inquiry_id,
+            "note": json.dumps(note_obj),
+            "reply": text_note,
+            "by": by,
+        },
+    )
+    rounds = res.scalar_one()
+    return int(rounds)
 
 
 def set_admin_reply(mem_engine, inquiry_id: int, reply: str, answered_by: str | None = None) -> None:

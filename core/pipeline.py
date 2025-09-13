@@ -363,6 +363,182 @@ class Pipeline:
                 pass
         return result
 
+    def reprocess_inquiry(self, inquiry_id: int) -> dict:
+        """Re-drive an inquiry using the latest admin notes/reply."""
+
+        with self.mem_engine.connect() as c:
+            row = c.execute(
+                sa.text(
+                    """
+                SELECT id, namespace, prefixes, question, auth_email, admin_reply, admin_notes
+                  FROM mem_inquiries
+                 WHERE id = :id
+                    """
+                ),
+                {"id": inquiry_id},
+            ).mappings().first()
+
+        if not row:
+            return {"ok": False, "inquiry_id": inquiry_id, "error": "not_found"}
+
+        ns = row["namespace"]
+        prefixes = row.get("prefixes") or []
+        question = row["question"] or ""
+        auth_email = row.get("auth_email") or None
+        admin_text = row.get("admin_reply") or ""
+
+        hints = {}
+        try:
+            from apps.fa.hints import parse_admin_reply, derive_sql_from_hints
+
+            hints = parse_admin_reply(admin_text)
+        except Exception:
+            hints = {}
+
+        sql = None
+        try:
+            if hints:
+                sql = derive_sql_from_hints(prefixes, hints)
+        except Exception:
+            sql = None
+
+        if sql:
+            return self.validate_and_execute(
+                sql=sql,
+                namespace=ns,
+                prefixes=prefixes,
+                inquiry_id=inquiry_id,
+                auth_email=auth_email,
+            )
+
+        try:
+            result = self.answer(
+                question,
+                {"namespace": ns, "prefixes": prefixes, "auth_email": auth_email, "admin_reply": admin_text},
+                hints=hints,
+                existing_inquiry_id=inquiry_id,
+                allow_new_inquiry=False,
+            )
+            return {
+                "ok": True,
+                "inquiry_id": inquiry_id,
+                "status": result.get("status"),
+                "result": result,
+            }
+        except Exception as e:
+            return {
+                "ok": False,
+                "inquiry_id": inquiry_id,
+                "error": f"reprocess_failed: {e}",
+            }
+
+    def validate_and_execute(
+        self,
+        *,
+        sql: str,
+        namespace: str,
+        prefixes: list[str],
+        inquiry_id: int | None = None,
+        auth_email: str | None = None,
+    ) -> dict:
+        """EXPLAIN and (optionally) execute SQL against the active app datasource."""
+
+        app_url = None
+        try:
+            app_url = (
+                self.settings.get("APP_DB_URL", namespace)
+                or self.settings.get("FA_DB_URL", namespace)
+            )
+            if not app_url:
+                app_url = self.settings.get("APP_DB_URL") or self.settings.get("FA_DB_URL")
+        except Exception:
+            pass
+        if not app_url:
+            import os
+
+            app_url = os.getenv("FA_DB_URL")
+
+        if not app_url:
+            return {"ok": False, "inquiry_id": inquiry_id, "error": "no_app_db_url"}
+
+        app_engine = create_engine(app_url, pool_pre_ping=True)
+
+        def _ensure_limit(sql_txt: str, n: int = 100) -> str:
+            low = sql_txt.lower()
+            if " limit " in low or low.strip().endswith(")"):
+                return sql_txt
+            return f"{sql_txt.rstrip().rstrip(';')} LIMIT {n};"
+
+        validate_only = bool(
+            self.settings.get("VALIDATE_WITH_EXPLAIN_ONLY", namespace) or False
+        )
+        explained_ok = False
+        rows: list[dict] = []
+        err: str | None = None
+
+        with app_engine.connect() as conn:
+            try:
+                conn.execute(sa.text(f"EXPLAIN {sql}"))
+                explained_ok = True
+                if not validate_only:
+                    out = conn.execute(sa.text(_ensure_limit(sql, 100)))
+                    rows = [dict(r) for r in out.fetchmany(100)]
+            except Exception as e:
+                err = str(e)
+
+        status = "answered" if (explained_ok and (validate_only or rows)) else "failed"
+        with self.mem_engine.begin() as c:
+            c.execute(
+                sa.text(
+                    """
+                INSERT INTO mem_runs(namespace, user_id, input_query, plan, sql_generated, sql_final, status,
+                                     rows_returned, created_at)
+                VALUES (:ns, :user, :input, :plan, :gen, :final, :st, :rows, NOW())
+                    """
+                ),
+                {
+                    "ns": namespace,
+                    "user": auth_email or "system",
+                    "input": f"[reprocess] {inquiry_id}" if inquiry_id else "[reprocess]",
+                    "plan": None,
+                    "gen": sql,
+                    "final": sql,
+                    "st": status,
+                    "rows": len(rows) if rows else 0,
+                },
+            )
+            if inquiry_id:
+                c.execute(
+                    sa.text(
+                        """
+                    UPDATE mem_inquiries
+                       SET status = :st,
+                           answered_at = CASE WHEN :st='answered' THEN NOW() ELSE answered_at END,
+                           answered_by = COALESCE(answered_by, :user),
+                           updated_at  = NOW()
+                     WHERE id = :id
+                        """
+                    ),
+                    {"id": inquiry_id, "st": status, "user": auth_email or "system"},
+                )
+
+        if status == "failed":
+            return {
+                "ok": False,
+                "inquiry_id": inquiry_id,
+                "sql": sql,
+                "error": f"validation/exec failed: {err}",
+                "status": "failed",
+            }
+
+        return {
+            "ok": True,
+            "inquiry_id": inquiry_id,
+            "status": "answered" if not validate_only else "validated",
+            "sql": sql,
+            "rows": rows[:10] if rows else [],
+        }
+
     def _legacy_process_inquiry(self, inquiry_id: int) -> dict:
         """
         Re-plan and try again using the stored inquiry record plus any admin notes.
@@ -1509,145 +1685,6 @@ class ContextBuilder:
         if re.match(r'^\s*select\b', s, flags=re.I):
             return f"{s.rstrip().rstrip(';')} LIMIT {default_limit};"
         return s
-
-    def validate_and_execute(self, sql: str, prefixes: list[str] | None = None) -> dict:
-        ns = self.namespace
-        explain_only = bool(self.settings.get_ns(ns, "VALIDATE_WITH_EXPLAIN_ONLY", False))
-
-        app_url = self.settings.get_ns(ns, "APP_DB_URL")
-        if not app_url:
-            raise RuntimeError("APP_DB_URL is not configured in mem_settings")
-
-        engine = create_engine(app_url, pool_pre_ping=True)
-        t0 = time.time()
-
-        with engine.begin() as c:
-            if explain_only:
-                q = "EXPLAIN " + sql
-                rows = [r[0] if len(r) == 1 else list(r) for r in c.execute(text(q)).fetchall()]
-                took = int((time.time() - t0) * 1000)
-                return {"mode": "explain", "plan": rows, "took_ms": took}
-            else:
-                safe_sql = self._ensure_limit(sql, default_limit=100)
-                res = c.execute(text(safe_sql))
-                cols = list(res.keys()) if hasattr(res, "keys") else []
-                data = [list(r) for r in res.fetchall()]
-                took = int((time.time() - t0) * 1000)
-                return {"mode": "query", "columns": cols, "rows": data, "took_ms": took}
-
-    def _hints_from_admin(
-        self,
-        admin_reply: str,
-        admin_notes: list,
-        prefixes: list[str],
-        question: str,
-    ) -> dict:
-        notes_txt = [n.get("text") if isinstance(n, dict) else str(n) for n in admin_notes or []]
-        combined = " ".join([admin_reply] + [t for t in notes_txt if t]).strip()
-        return {"admin_text": combined, "prefixes": prefixes, "question": question}
-
-    def _derive_sql_from_admin(self, question: str, hints: dict) -> str | None:
-        from core.admin_helpers import derive_sql_from_admin_reply
-
-        inq = {"question": question, "prefixes": hints.get("prefixes", [])}
-        admin_text = hints.get("admin_text", "")
-        sql, _info = derive_sql_from_admin_reply(self, inq, admin_text)
-        return sql
-
-    def reprocess_inquiry(self, inquiry_id: int) -> dict:
-        """
-        Re-attempt derivation & execution after admin clarifications.
-        """
-        ns = self.namespace
-        mem = self.mem_engine
-
-        row = None
-        with mem.begin() as c:
-            row = c.execute(
-                text(
-                    """
-            SELECT id, question, prefixes, admin_reply, admin_notes
-              FROM mem_inquiries
-             WHERE id = :id
-        """
-                ),
-                {"id": inquiry_id},
-            ).mappings().first()
-
-        if not row:
-            raise RuntimeError(f"inquiry {inquiry_id} not found")
-
-        question = row["question"]
-        prefixes = row["prefixes"] or []
-        admin_reply = row["admin_reply"] or ""
-        admin_notes = row["admin_notes"] or []
-
-        hints = self._hints_from_admin(admin_reply, admin_notes, prefixes, question)
-        sql_text = self._derive_sql_from_admin(question, hints)
-        if not sql_text or not re.search(r'^\s*select\b', sql_text, re.I):
-            pass
-
-        if not sql_text:
-            with mem.begin() as c:
-                c.execute(
-                    text(
-                        """
-                UPDATE mem_inquiries
-                   SET status = 'needs_clarification',
-                       updated_at = NOW()
-                 WHERE id = :id
-            """
-                    ),
-                    {"id": inquiry_id},
-                )
-            return {
-                "inquiry_id": inquiry_id,
-                "status": "needs_clarification",
-                "message": "Still not enough info to produce SQL.",
-            }
-
-        try:
-            exec_out = self.validate_and_execute(sql_text, prefixes=prefixes)
-        except Exception as e:
-            with mem.begin() as c:
-                c.execute(
-                    text(
-                        """
-                UPDATE mem_inquiries
-                   SET status = 'failed',
-                       updated_at = NOW()
-                 WHERE id = :id
-            """
-                    ),
-                    {"id": inquiry_id},
-                )
-            return {
-                "inquiry_id": inquiry_id,
-                "status": "failed",
-                "sql": sql_text,
-                "error": f"validation/exec failed: {e}",
-            }
-
-        with mem.begin() as c:
-            c.execute(
-                text(
-                    """
-            UPDATE mem_inquiries
-               SET status      = 'answered',
-                   answered_at = NOW(),
-                   updated_at  = NOW()
-             WHERE id = :id
-        """
-                ),
-                {"id": inquiry_id},
-            )
-
-        return {
-            "inquiry_id": inquiry_id,
-            "status": "answered",
-            "sql": sql_text,
-            "result": exec_out,
-        }
 
     def _legacy_validate_and_execute(
         self,

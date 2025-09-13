@@ -31,6 +31,119 @@ DOMAIN_HINTS = {
 }
 
 
+def parse_admin_reply(text: str) -> Dict:
+    """Parse a free-text admin reply into a structured hint object."""
+    t = (text or "").strip()
+    if not t:
+        return {}
+
+    tables = {}
+    for key in (
+        "debtor_trans",
+        "debtor_trans_details",
+        "debtors_master",
+        "gl_trans",
+        "supp_trans",
+        "bank_trans",
+        "stock_moves",
+    ):
+        if re.search(rf"\b{key}\b", t, re.I):
+            alias = {
+                "debtor_trans": "dt",
+                "debtor_trans_details": "dtd",
+                "debtors_master": "dm",
+            }.get(key, key[:2])
+            tables[alias] = key
+
+    date_col = None
+    m = re.search(r"(date column|column)\s*[:=]\s*([a-zA-Z0-9_\.]+)", t)
+    if m:
+        date_col = m.group(2)
+    period = "last_month" if re.search(r"\blast\s+month\b", t, re.I) else None
+
+    metric = None
+    if re.search(r"\bnet\s+sales\b", t, re.I):
+        metric = {
+            "key": "net_sales",
+            "expr": "SUM((CASE WHEN dt.type=11 THEN -1 ELSE 1 END) * dtd.unit_price * (1 - COALESCE(dtd.discount_percent,0)) * dtd.quantity)",
+        }
+
+    group_by = []
+    if re.search(r"\bcustomer\s+name\b", t, re.I):
+        group_by.append("dm.name")
+    order_by = ["net_sales DESC"] if metric and metric.get("key") == "net_sales" else []
+    limit = 10 if re.search(r"\btop\s*10\b", t, re.I) else None
+
+    joins: List[str] = []
+    if {"dt", "dtd"}.issubset(tables.keys()):
+        joins += [
+            "dtd.debtor_trans_no = dt.trans_no",
+            "dtd.debtor_trans_type = dt.type",
+        ]
+    if {"dt", "dm"}.issubset(tables.keys()):
+        joins += ["dm.debtor_no = dt.debtor_no"]
+
+    filters = []
+    if "dt" in tables:
+        filters.append("dt.type IN (1,11)")
+
+    return {
+        "tables": tables,
+        "joins": joins,
+        "date": {"column": date_col, "period": period},
+        "filters": filters,
+        "metric": metric,
+        "group_by": group_by,
+        "order_by": order_by,
+        "limit": limit,
+    }
+
+
+def derive_sql_from_hints(prefixes: List[str], h: Dict) -> str:
+    """Turn structured hints into a concrete MySQL SQL string with FA prefixes."""
+    if not h or "tables" not in h or not h["tables"]:
+        raise ValueError("insufficient_hints")
+
+    pfx = (prefixes or [""]).pop(0)
+
+    def T(name: str) -> str:
+        return f"`{pfx}{name}`"
+
+    tables = h["tables"]
+    if not {"dt", "dtd", "dm"}.issubset(tables.keys()):
+        raise ValueError("unsupported_hint_combo")
+
+    date_col = h.get("date", {}).get("column") or "dt.tran_date"
+    period = h.get("date", {}).get("period") or "last_month"
+
+    date_filter = ""
+    if period == "last_month":
+        date_filter = "AND DATE_FORMAT(dt.tran_date, '%Y-%m') = DATE_FORMAT(CURRENT_DATE - INTERVAL 1 MONTH, '%Y-%m')"
+
+    metric_expr = h.get("metric", {}).get("expr") or "SUM((CASE WHEN dt.type=11 THEN -1 ELSE 1 END) * dtd.unit_price * (1 - COALESCE(dtd.discount_percent,0)) * dtd.quantity)"
+
+    group_cols = h.get("group_by") or ["dm.name"]
+    order_cols = h.get("order_by") or ["net_sales DESC"]
+    limit = h.get("limit") or 10
+
+    sql = f"""
+SELECT dm.name AS customer,
+       {metric_expr} AS net_sales
+FROM {T('debtor_trans')} AS dt
+JOIN {T('debtor_trans_details')} AS dtd
+  ON dtd.debtor_trans_no = dt.trans_no
+ AND dtd.debtor_trans_type = dt.type
+JOIN {T('debtors_master')} AS dm
+  ON dm.debtor_no = dt.debtor_no
+WHERE dt.type IN (1, 11)
+  {date_filter}
+GROUP BY {', '.join(group_cols)}
+ORDER BY {', '.join(order_cols)}
+LIMIT {int(limit)};
+""".strip()
+    return sql
+
+
 def _last_month_bounds() -> tuple[str, str]:
     today = date.today()
     first_this = today.replace(day=1)
@@ -237,60 +350,6 @@ def parse_admin_reply_to_hints(text: str, prefixes: List[str], question: str) ->
     return hints
 
 
-def derive_sql_from_hints(hints: Dict[str, Any]) -> str:
-    pfx = (hints.get("prefixes") or [""])[0]
-
-    def T(name: str) -> str:
-        return f"`{pfx}{name}`" if pfx else f"`{name}`"
-
-    tables = hints.get("tables") or {}
-    if not tables:
-        raise ValueError("missing tables")
-
-    parts: List[str] = []
-    metric = hints.get("metric") or {}
-    m_expr = metric.get("expr") or "COUNT(*)"
-    m_alias = metric.get("key") or "metric"
-
-    group_by = hints.get("group_by") or []
-    select_cols: List[str] = []
-    if "dm.name" in group_by:
-        select_cols.append("dm.name AS customer")
-    select_cols.append(f"{m_expr} AS {m_alias}")
-    parts.append("SELECT " + ",\n       ".join(select_cols))
-
-    if "dt" in tables:
-        parts.append(f"FROM {T(tables['dt'])} AS dt")
-    if "dtd" in tables:
-        parts.append(f"JOIN {T(tables['dtd'])} AS dtd ON dtd.debtor_trans_no = dt.trans_no AND dtd.debtor_trans_type = dt.type")
-    if "dm" in tables:
-        parts.append(f"JOIN {T(tables['dm'])} AS dm ON dm.debtor_no = dt.debtor_no")
-
-    where: List[str] = []
-    for f in hints.get("filters") or []:
-        where.append(f)
-    date = hints.get("date") or {}
-    if date.get("period") == "last_month":
-        where.append("DATE_FORMAT(dt.tran_date, '%Y-%m') = DATE_FORMAT(CURRENT_DATE - INTERVAL 1 MONTH, '%Y-%m')")
-    elif date.get("start") and date.get("end"):
-        where.append(f"dt.tran_date BETWEEN '{date['start']}' AND '{date['end']}'")
-
-    if where:
-        parts.append("WHERE " + "\n  AND ".join(where))
-
-    if group_by:
-        gcols = [c.strip("[] ") for c in group_by]
-        parts.append("GROUP BY " + ", ".join(gcols))
-
-    order_by = hints.get("order_by") or []
-    if order_by:
-        parts.append("ORDER BY " + ", ".join(order_by))
-
-    lim = hints.get("limit")
-    if lim:
-        parts.append(f"LIMIT {int(lim)}")
-
-    return " \n".join(parts) + ";"
 
 
 
