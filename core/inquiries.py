@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional
 from sqlalchemy.engine import Engine, Row
 from sqlalchemy import text, bindparam
 from sqlalchemy.dialects.postgresql import JSONB
+from psycopg2.extras import Json
 
 
 def fetch_inquiry(mem_engine, inquiry_id: int) -> Optional[Dict[str, Any]]:
@@ -57,52 +58,42 @@ def summarize_admin_notes(notes: Optional[List[Dict[str, Any]]]) -> str:
 # --- Admin note helpers ----------------------------------------------------
 
 
-def append_admin_note(
-    engine,
-    inquiry_id: int,
-    *,
-    by: str,
-    text_note: str,
-    reply: Optional[str] = None,
-) -> int:
+def append_admin_note(conn, inquiry_id: int, by: str, text_note: str) -> int:
     """
-    Append a structured admin note to mem_inquiries.admin_notes (JSONB array),
-    update admin_reply/answered_by, and increment clarification_rounds.
-    Returns the new clarification_rounds value.
+    Append a note to mem_inquiries.admin_notes (jsonb[]), update reply/rounds.
+    Returns the new clarification_rounds.
     """
 
-    note_obj = {
+    note: Dict[str, Any] = {
         "by": by,
         "text": text_note,
         "ts": datetime.now(timezone.utc).isoformat(),
     }
 
-    # Append a single-element JSONB array to the existing array.
-    sql = text(
-        """
+    # NOTE: Use psycopg2 param style (%(name)s) and Json(note) for json adaptation.
+    sql = """
         UPDATE mem_inquiries
-           SET admin_notes          = COALESCE(admin_notes, '[]'::jsonb) || :note_arr,
-               admin_reply          = COALESCE(:reply, admin_reply),
-               answered_by          = :by,
+           SET admin_notes          = COALESCE(admin_notes, '[]'::jsonb)
+                                      || jsonb_build_array(to_jsonb(%(note)s)),
+               admin_reply          = %(reply)s,
+               answered_by          = %(by)s,
                clarification_rounds = COALESCE(clarification_rounds, 0) + 1,
                updated_at           = NOW()
-         WHERE id = :id
+         WHERE id = %(id)s
      RETURNING clarification_rounds
     """
-    ).bindparams(bindparam("note_arr", type_=JSONB))
 
-    with engine.begin() as conn:
-        row = conn.execute(
-            sql,
-            {
-                "id": inquiry_id,
-                "note_arr": [note_obj],
-                "reply": reply,
-                "by": by,
-            },
-        ).first()
+    row = conn.execute(
+        text(sql),
+        {
+            "id": inquiry_id,
+            "note": Json(note),
+            "reply": text_note,
+            "by": by,
+        },
+    ).fetchone()
 
-        return int(row[0]) if row else 0
+    return int(row[0]) if row else 0
 
 
 def update_inquiry_status_run(mem_engine, inquiry_id: int, *,

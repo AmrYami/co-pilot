@@ -37,7 +37,12 @@ from core.inquiries import (
     get_admin_notes,
 )
 from core.emailer import Emailer
-from apps.fa.hints import MISSING_FIELD_QUESTIONS, DOMAIN_HINTS
+from apps.fa.hints import (
+    MISSING_FIELD_QUESTIONS,
+    DOMAIN_HINTS,
+    parse_admin_reply_to_hints,
+    derive_sql_from_hints,
+)
 from apps.fa.agents import normalize_admin_reply
 
 from types import SimpleNamespace
@@ -45,6 +50,13 @@ from types import SimpleNamespace
 
 def _as_dicts(rows):
     return [dict(r) for r in rows]
+
+
+def ensure_limit(sql: str, limit: int) -> str:
+    s = sql.rstrip().rstrip(";")
+    if re.search(r"\blimit\b", s, re.I):
+        return s
+    return f"{s} LIMIT {int(limit)}"
 
 
 # ------------------ config ------------------
@@ -404,7 +416,7 @@ class Pipeline:
             print("[process_inquiry] Derived SQL from hints:\n", canonical_sql)
             # Validate + execute (or EXPLAIN if validate-only)
             try:
-                result = self.validate_and_execute(
+                result = self._legacy_validate_and_execute(
                     canonical_sql,
                     list(prefixes),
                     auth_email=row.get("auth_email"),
@@ -474,7 +486,7 @@ class Pipeline:
 
             sql_exec = SQLRewriter.rewrite_for_prefixes(sql_only, prefixes)
             try:
-                result = self.validate_and_execute(
+                result = self._legacy_validate_and_execute(
                     sql_exec, list(prefixes), auth_email=row.get("auth_email"), inquiry_id=inquiry_id
                 )
                 with self.mem_engine.begin() as cx:
@@ -1057,7 +1069,7 @@ class Pipeline:
         from core.pipeline import SQLRewriter
 
         sql_exec = SQLRewriter.rewrite_for_prefixes(canonical_sql, prefixes)
-        result = self.validate_and_execute(
+        result = self._legacy_validate_and_execute(
             sql_exec, list(prefixes), auth_email=None, inquiry_id=inquiry_id
         )
 
@@ -1124,7 +1136,7 @@ class Pipeline:
         sql_exec = SQLRewriter.rewrite_for_prefixes(canonical_sql, prefixes)
 
         try:
-            result = self.validate_and_execute(sql_exec, list(prefixes), auth_email=None, inquiry_id=inquiry_id)
+            result = self._legacy_validate_and_execute(sql_exec, list(prefixes), auth_email=None, inquiry_id=inquiry_id)
         except Exception:
             followups = self._ask_one_more(question, context)
             with self.mem_engine.begin() as c:
@@ -1422,7 +1434,159 @@ class ContextBuilder:
         scored.sort(key=lambda x: x[0], reverse=True)
         return [c for _, c in scored[:k]]
 
-    def validate_and_execute(
+    def _pick_datasource(self, namespace: str) -> Tuple[str, str]:
+        """
+        Returns (datasource_name, engine_url) for the active app/datasource.
+        Prefers DEFAULT_DATASOURCE in this namespace; falls back to APP_DB_URL.
+        """
+        ds = (self.settings.get("DEFAULT_DATASOURCE", None, namespace=namespace) or "").strip()
+        conns = self.settings.get("DB_CONNECTIONS", [], namespace=namespace) or []
+        url = None
+        if ds and conns:
+            for c in conns:
+                if c.get("name") == ds:
+                    url = c.get("url")
+                    break
+        if not url:
+            url = self.settings.get("APP_DB_URL", None, namespace=namespace)
+            ds = "default"
+        if not url:
+            raise RuntimeError("No datasource configured (DEFAULT_DATASOURCE / APP_DB_URL missing).")
+        return ds, url
+
+    def validate_and_execute(self, sql: str, namespace: str, preview_rows: int = 100) -> Dict[str, Any]:
+        """
+        Validate (EXPLAIN) or execute with a safe LIMIT, and return a standard result dict.
+        """
+        validate_only = bool(self.settings.get("VALIDATE_WITH_EXPLAIN_ONLY", False, namespace=namespace))
+        datasource, engine_url = self._pick_datasource(namespace)
+        engine = create_engine(engine_url)
+
+        sql_final = sql
+        if not validate_only:
+            sql_final = ensure_limit(sql, preview_rows)
+
+        try:
+            if validate_only:
+                explain_sql = f"EXPLAIN {sql}"
+                rows = run_select(engine, explain_sql).get("rows")
+                return {"status": "validated", "datasource": datasource, "rows": rows, "sql_final": explain_sql}
+            else:
+                rows = run_select(engine, sql_final).get("rows")
+                return {"status": "ok", "datasource": datasource, "rows": rows, "sql_final": sql_final}
+        except Exception as e:
+            return {"status": "error", "error": f"{e}", "sql_final": sql_final, "datasource": datasource}
+
+    def reprocess_inquiry(self, inquiry_id: int) -> Dict[str, Any]:
+        """
+        Consume admin notes/reply, derive SQL (FA app), validate/execute,
+        and update mem_inquiries accordingly.
+        """
+        mem = self.mem_engine.connect()
+        row = mem.execute(
+            text(
+                """
+            SELECT id, namespace, prefixes, question, admin_notes, admin_reply,
+                   clarification_rounds
+              FROM mem_inquiries
+             WHERE id = :id
+        """
+            ),
+            {"id": inquiry_id},
+        ).mappings().fetchone()
+        if not row:
+            return {"ok": False, "error": "inquiry_not_found", "inquiry_id": inquiry_id}
+
+        namespace = row["namespace"]
+        prefixes = row["prefixes"] or []
+        question = row["question"] or ""
+        admin_reply = row["admin_reply"] or ""
+        admin_notes = row["admin_notes"] or []
+
+        reply_text = admin_reply or (admin_notes[-1]["text"] if admin_notes else "")
+        hints = parse_admin_reply_to_hints(reply_text, prefixes=prefixes, question=question)
+
+        if hints.get("__needs", []):
+            msg = " / ".join(hints["__needs"])
+            mem.execute(
+                text(
+                    """
+                UPDATE mem_inquiries
+                   SET status = 'needs_clarification',
+                       updated_at = NOW()
+                 WHERE id = :id
+            """
+                ),
+                {"id": inquiry_id},
+            )
+            mem.commit()
+            return {
+                "ok": True,
+                "inquiry_id": inquiry_id,
+                "result": {"status": "needs_clarification", "questions": [msg]},
+            }
+
+        try:
+            sql = derive_sql_from_hints(hints)
+        except Exception as e:
+            mem.execute(
+                text(
+                    """
+                UPDATE mem_inquiries
+                   SET status = 'failed', updated_at = NOW()
+                 WHERE id = :id
+            """
+                ),
+                {"id": inquiry_id},
+            )
+            mem.commit()
+            return {"ok": False, "inquiry_id": inquiry_id, "error": f"derive_failed: {e}"}
+
+        result = self.validate_and_execute(sql, namespace=namespace, preview_rows=100)
+        if result.get("status") in ("ok", "validated"):
+            mem.execute(
+                text(
+                    """
+                UPDATE mem_inquiries
+                   SET status = 'answered',
+                       answered_at = NOW(),
+                       updated_at = NOW()
+                 WHERE id = :id
+            """
+                ),
+                {"id": inquiry_id},
+            )
+            mem.commit()
+            return {
+                "ok": True,
+                "inquiry_id": inquiry_id,
+                "sql": result.get("sql_final", sql),
+                "datasource": result.get("datasource"),
+                "rows": result.get("rows"),
+                "status": "answered",
+            }
+        else:
+            mem.execute(
+                text(
+                    """
+                UPDATE mem_inquiries
+                   SET status = 'failed',
+                       updated_at = NOW()
+                 WHERE id = :id
+            """
+                ),
+                {"id": inquiry_id},
+            )
+            mem.commit()
+            return {
+                "ok": False,
+                "inquiry_id": inquiry_id,
+                "status": "failed",
+                "error": f"validation/exec failed: {result.get('error','unknown')}",
+                "sql": result.get("sql_final", sql),
+            }
+
+    def _legacy_validate_and_execute(
         self,
         sql: str,
         prefixes: list[str],
@@ -1431,8 +1595,7 @@ class ContextBuilder:
         notes: dict | None = None,
     ) -> dict:
         """
-        Validate the SQL via validator, execute it, optionally email preview.
-        Returns dict with keys {sql_final, rows, preview}.
+        Legacy validation/execution path used by older code paths.
         """
         ok, info = self.validator.quick_validate(sql)
         if not ok:
