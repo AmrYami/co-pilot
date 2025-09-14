@@ -3,6 +3,8 @@ from flask import Blueprint, request, jsonify, current_app
 from werkzeug.exceptions import BadRequest
 from sqlalchemy import text
 from core.inquiries import append_admin_note, fetch_inquiry
+from .settings import Settings
+from .sql_exec import get_mem_engine
 import json
 
 admin_bp = Blueprint("admin", __name__, url_prefix="/admin")
@@ -23,81 +25,83 @@ def settings_bulk():
     updated_by = payload.get("updated_by") or "api"
     items = payload.get("settings") or []
 
-    pipeline = current_app.config.get("PIPELINE")
-    mem_engine = None
-    if pipeline is not None:
-        mem_engine = getattr(pipeline, "mem_engine", None)
-    if mem_engine is None:
-        mem_engine = current_app.config.get("MEM_ENGINE")
-    if mem_engine is None:
-        return jsonify({"ok": False, "error": "MEM_ENGINE not configured on app"}), 500
+    # Prefer the app's pooled engine
+    mem_engine = current_app.config.get("MEM_ENGINE")
+    if not mem_engine:
+        mem_engine = get_mem_engine(Settings())
 
-    def _infer_vtype(v):
-        if isinstance(v, bool):  return "bool"
-        if isinstance(v, int):   return "int"
-        if isinstance(v, float): return "float"
-        if isinstance(v, (list, dict)): return "json"
-        return "string"
-
-    results = {"ok": True, "upserted": 0, "updated_by": updated_by, "namespace": ns, "items": []}
+    upserted = []
     with mem_engine.begin() as conn:
         for it in items:
             key = it["key"]
-            raw_val = it.get("value")
-            scope = it.get("scope", "namespace")
-            scope_id = it.get("scope_id")
-            vtype = it.get("value_type") or _infer_vtype(raw_val)
-            cat = it.get("category")
-            desc = it.get("description")
-            ovr = it.get("overridable")
+            scope = it.get("scope") or "namespace"
+            scope_id = it.get("scope_id")  # may be None
             is_secret = bool(it.get("is_secret", False))
+            vtype = it.get("value_type")
+            val = it.get("value")
 
-            val_json = json.dumps(raw_val, ensure_ascii=False)
+            # Normalize JSON on the DB side
+            # We always pass text and CAST on the server:
+            val_json = json_dumps(val)
 
-            upsert_sql = text("""
-                WITH upd AS (
-                    UPDATE mem_settings
-                       SET value      = CAST(:val AS jsonb),
-                           value_type = :vtype,
-                           updated_by = :upd_by,
-                           updated_at = NOW(),
-                           is_secret  = COALESCE(:is_secret, false),
-                           category   = COALESCE(:cat, category),
-                           description= COALESCE(:desc, description),
-                           overridable= COALESCE(:ovr, overridable)
-                     WHERE namespace = :ns
-                       AND key       = :key
-                       AND scope     = :scope
-                       AND (
-                             (:scope_id IS NULL AND scope_id IS NULL)
-                          OR (scope_id = :scope_id)
-                           )
-                 RETURNING id
+            if scope_id is None:
+                # Uses partial-unique index ux_settings_ns_key_scope_null
+                sql = text(
+                    """
+                    INSERT INTO mem_settings(namespace, key, value, value_type, scope, scope_id,
+                                             overridable, updated_by, created_at, updated_at, is_secret)
+                    VALUES (:ns, :key, CAST(:val AS jsonb), :vtype, :scope, NULL,
+                            true, :upd, NOW(), NOW(), :sec)
+                    ON CONFLICT (namespace, key, scope)
+                    DO UPDATE SET
+                      value      = EXCLUDED.value,
+                      value_type = EXCLUDED.value_type,
+                      updated_by = EXCLUDED.updated_by,
+                      updated_at = NOW(),
+                      is_secret  = EXCLUDED.is_secret
+                    """
                 )
-                INSERT INTO mem_settings (
-                    namespace, key, value, value_type, scope, scope_id,
-                    category, description, overridable, updated_by,
-                    created_at, updated_at, is_secret
+                params = {
+                    "ns": ns,
+                    "key": key,
+                    "val": val_json,
+                    "vtype": vtype,
+                    "scope": scope,
+                    "upd": updated_by,
+                    "sec": is_secret,
+                }
+            else:
+                # Uses partial-unique index ux_settings_ns_key_scope_id
+                sql = text(
+                    """
+                    INSERT INTO mem_settings(namespace, key, value, value_type, scope, scope_id,
+                                             overridable, updated_by, created_at, updated_at, is_secret)
+                    VALUES (:ns, :key, CAST(:val AS jsonb), :vtype, :scope, :scope_id,
+                            true, :upd, NOW(), NOW(), :sec)
+                    ON CONFLICT (namespace, key, scope, scope_id)
+                    DO UPDATE SET
+                      value      = EXCLUDED.value,
+                      value_type = EXCLUDED.value_type,
+                      updated_by = EXCLUDED.updated_by,
+                      updated_at = NOW(),
+                      is_secret  = EXCLUDED.is_secret
+                    """
                 )
-                SELECT :ns, :key, CAST(:val AS jsonb), :vtype, :scope, :scope_id,
-                       :cat, :desc, COALESCE(:ovr, true), :upd_by,
-                       NOW(), NOW(), COALESCE(:is_secret, false)
-                WHERE NOT EXISTS (SELECT 1 FROM upd);
-            """)
+                params = {
+                    "ns": ns,
+                    "key": key,
+                    "val": val_json,
+                    "vtype": vtype,
+                    "scope": scope,
+                    "scope_id": scope_id,
+                    "upd": updated_by,
+                    "sec": is_secret,
+                }
 
-            conn.execute(
-                upsert_sql,
-                {
-                    "ns": ns, "key": key, "val": val_json,
-                    "vtype": vtype, "scope": scope, "scope_id": scope_id,
-                    "cat": cat, "desc": desc, "ovr": ovr, "upd_by": updated_by,
-                    "is_secret": is_secret,
-                },
-            )
-            results["upserted"] += 1
-            results["items"].append({"key": key, "scope": scope, "scope_id": scope_id})
+            conn.execute(sql, params)
+            upserted.append({"key": key, "scope": scope, "scope_id": scope_id})
 
-    return jsonify(results)
+    return {"ok": True, "namespace": ns, "updated_by": updated_by, "upserted": upserted}
 
 
 @admin_bp.get("/settings/get")
@@ -166,3 +170,8 @@ def admin_process(inq_id: int):
         return jsonify({"ok": True, "inquiry_id": inq_id, **out})
     except Exception as e:
         return jsonify({"ok": False, "inquiry_id": inq_id, "error": str(e)}), 500
+
+# helper
+
+def json_dumps(v) -> str:
+    return json.dumps(v, ensure_ascii=False)

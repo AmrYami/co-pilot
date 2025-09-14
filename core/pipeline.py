@@ -28,9 +28,9 @@ from core.agents import PlannerAgent, ValidatorAgent
 from core.model_loader import load_model, load_clarifier
 from core.clarifier import ClarifierAgent
 from core.settings import Settings
-from core.sql_exec import get_app_engine, run_select, as_csv
+from core.sql_exec import run_select, as_csv
 from core.datasources import DatasourceRegistry
-from core.research import load_researcher
+from core.research import load_researcher, persist_sources_and_link
 from core.snippets import persist_snippet, build_doc_md
 from core.sql_utils import extract_sql, looks_like_sql
 from core.inquiries import (
@@ -84,14 +84,14 @@ class Pipeline:
             if isinstance(settings, Settings)
             else Settings(namespace=namespace)
         )
-        self.researcher = load_researcher(self.settings, namespace=namespace)
+        self.researcher = load_researcher(self.settings)
         self._researcher_class_path: str | None = None
         self._researcher_fingerprint = None
 
         # 1) Load cfg and build engines
         self.cfg = self._load_cfg(self.settings)
         self.mem_engine = self._make_engine(self.cfg.memory_db_url, pool_name="mem")
-        self.ds = DatasourceRegistry(settings=self.settings, namespace=self.namespace)
+        self.ds = DatasourceRegistry(self.settings)
 
         # Attach mem engine & namespace so Settings can read mem_settings
         try:
@@ -100,7 +100,8 @@ class Pipeline:
         except Exception:
             pass
 
-        self.app_engine = get_app_engine(self.settings, namespace=namespace)
+        self.app_engine = self.ds.engine(None)
+        self.default_ds = self.settings.get("DEFAULT_DATASOURCE", scope="namespace") or "default"
         # Backward-compatible execution shim:
         # Some earlier code expects `self.executor.execute(sql, ns, prefixes, settings)`.
         # Provide a tiny adapter around core.sql_exec.run_select().
@@ -172,7 +173,7 @@ class Pipeline:
             return
 
         # build via research factory (handles class/provider/mode)
-        self.researcher = load_researcher(self.settings, namespace=self.namespace)
+        self.researcher = load_researcher(self.settings)
         self._researcher_fingerprint = desired_key
 
     def _instantiate_researcher(self, class_path: str | None):
