@@ -84,6 +84,10 @@ class Pipeline:
             if isinstance(settings, Settings)
             else Settings(namespace=namespace)
         )
+        # Build datasource registry and choose default engine early
+        self.ds = DatasourceRegistry(self.settings)
+        self.app_engine = self.ds.engine(None)
+
         self.researcher = load_researcher(self.settings)
         self._researcher_class_path: str | None = None
         self._researcher_fingerprint = None
@@ -91,7 +95,6 @@ class Pipeline:
         # 1) Load cfg and build engines
         self.cfg = self._load_cfg(self.settings)
         self.mem_engine = self._make_engine(self.cfg.memory_db_url, pool_name="mem")
-        self.ds = DatasourceRegistry(self.settings)
 
         # Attach mem engine & namespace so Settings can read mem_settings
         try:
@@ -100,7 +103,6 @@ class Pipeline:
         except Exception:
             pass
 
-        self.app_engine = self.ds.engine(None)
         self.default_ds = self.settings.get("DEFAULT_DATASOURCE", scope="namespace") or "default"
         # Backward-compatible execution shim:
         # Some earlier code expects `self.executor.execute(sql, ns, prefixes, settings)`.
@@ -159,9 +161,21 @@ class Pipeline:
 
     def _ensure_researcher_loaded(self) -> None:
         """(Re)build the researcher if relevant settings changed."""
+        enabled = False
+        try:
+            enabled = bool(self.settings.get("RESEARCH_MODE"))
+        except Exception:
+            enabled = False
+
+        if not enabled:
+            print(f"[research] disabled via RESEARCH_MODE for namespace {self.namespace}")
+            self.researcher = None
+            self._researcher_fingerprint = None
+            return
+
         try:
             fp = {
-                "mode": bool(self.settings.get("RESEARCH_MODE", False)),
+                "mode": enabled,
                 "provider": (self.settings.get("RESEARCH_PROVIDER") or "").lower(),
                 "class": self.settings.get("RESEARCHER_CLASS") or "",
             }
