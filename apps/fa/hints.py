@@ -137,6 +137,22 @@ def make_fa_hints(mem_engine, prefixes: List[str], question: str) -> Dict[str, A
     return hints
 
 
+def fa_types_for(settings, namespace: str, categories: list[str]) -> list[int]:
+    """
+    Look up debtor/supplier/bank system type codes from mem_settings.FA_CATEGORY_MAP.
+    """
+    cmap = (settings.get("FA_CATEGORY_MAP", namespace=namespace) or {})
+    types: list[int] = []
+    for cat in categories:
+        meta = cmap.get(cat) or {}
+        for t in meta.get("types", []):
+            try:
+                types.append(int(t))
+            except Exception:
+                continue
+    return sorted(set(types))
+
+
 def parse_admin_answer(answer: str) -> Dict[str, Any]:
     """Placeholder for backward compatibility; returns empty overrides."""
     return {}

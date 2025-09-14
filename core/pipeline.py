@@ -38,8 +38,13 @@ from core.inquiries import (
     get_admin_notes,
 )
 from core.emailer import Emailer
+# Core-level fallback clarifying questions (app can override by returning hints["questions"])
+DEFAULT_MISSING_FIELD_QUESTIONS = [
+    "What date range should we use (e.g., last month, between 2025-08-01 and 2025-08-31)?",
+    "Which tables should we use (e.g., invoices, customers, GL)?",
+    "Which metric should we compute (e.g., net sales, count of invoices)?",
+]
 from apps.fa.hints import (
-    MISSING_FIELD_QUESTIONS,
     DOMAIN_HINTS,
 )
 from apps.fa.agents import normalize_admin_reply
@@ -1258,9 +1263,11 @@ class Pipeline:
                 inquiry_id = self._log_inquiry(
                     ns, prefixes, question, auth_email, status="needs_clarification"
                 )
-            questions = [
-                MISSING_FIELD_QUESTIONS.get(m, f"Please clarify: {m}") for m in missing
-            ]
+            questions = (
+                (hints.get("questions") if hints else None)
+                or [f"Please clarify: {m}" for m in missing]
+                or DEFAULT_MISSING_FIELD_QUESTIONS
+            )
             return self._needs_clarification(inquiry_id, ns, questions)
 
         # -- 1) context

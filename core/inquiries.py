@@ -10,9 +10,10 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
-from sqlalchemy.engine import Engine, Row
 from sqlalchemy import text, bindparam
+from sqlalchemy.engine import Engine, Row
 from sqlalchemy.dialects.postgresql import JSONB
+from psycopg2.extras import Json
 
 
 def fetch_inquiry(mem_engine, inquiry_id: int) -> Optional[Dict[str, Any]]:
@@ -70,14 +71,12 @@ def append_admin_note(mem_engine, inquiry_id: int, *, by: str, text_note: str) -
         "text": text_note,
         "ts": datetime.now(timezone.utc).isoformat(),
     }
-    # stringify once; cast to jsonb inside SQL to avoid psycopg2 adapter quirks
-    note_json = json.dumps(note_obj)
-
+    # Bind as JSON so Postgres knows the type; then append as array element
     sql = text(
         """
         UPDATE mem_inquiries
            SET admin_notes          = COALESCE(admin_notes, '[]'::jsonb)
-                                      || jsonb_build_array(CAST(:note AS jsonb)),
+                                      || jsonb_build_array(:note),
                admin_reply          = COALESCE(:reply, admin_reply),
                answered_by          = COALESCE(:by, answered_by),
                clarification_rounds = COALESCE(clarification_rounds, 0) + 1,
@@ -86,19 +85,14 @@ def append_admin_note(mem_engine, inquiry_id: int, *, by: str, text_note: str) -
      RETURNING clarification_rounds
         """
     )
-
+    params = {
+        "id": inquiry_id,
+        "note": Json(note_obj),
+        "reply": text_note,
+        "by": by,
+    }
     with mem_engine.begin() as conn:
-        row = conn.execute(
-            sql,
-            {
-                "id": inquiry_id,
-                "note": note_json,
-                "reply": text_note,
-                "by": by,
-            },
-        ).fetchone()
-
-    return int(row[0]) if row and row[0] is not None else 0
+        return conn.execute(sql, params).scalar() or 0
 
 
 def set_admin_reply(mem_engine, inquiry_id: int, reply: str, answered_by: str | None = None) -> None:

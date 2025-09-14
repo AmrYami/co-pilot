@@ -9,7 +9,9 @@ import re, json, textwrap
 
 
 from core.agents import ClarifierAgent as CoreClarifier, PlannerAgent as CorePlanner, ValidatorAgent as CoreValidator
+from core.settings import Settings
 from apps.fa.adapters import match_metric, parse_date_range, inject_date_filter, union_for_prefixes
+from apps.fa.hints import fa_types_for
 
 
 def _fa_sale_type_codes(settings) -> List[int]:
@@ -109,9 +111,11 @@ def normalize_admin_reply(text: str) -> Dict[str, Any]:
     # date
     if "tran_date" in lo or "date column" in lo or "date" in lo:
         hint["date"] = {"column": "dt.tran_date", "period": "last_month" if "last month" in lo else "auto"}
-    # filters: net of credit notes => include (1,11)
+    # filters: net of credit notes => include invoice and credit note types from settings
     if "net of credit" in lo or "credit note" in lo or "credit notes" in lo:
-        hint["filters"] = ["dt.type IN (1,11)"]
+        types = fa_types_for(Settings(), "default", ["sales invoice", "credit note"])
+        if types:
+            hint["filters"] = [f"dt.type IN ({', '.join(map(str, types))})"]
     # metric
     if "sum net" in lo or "net of credit" in lo:
         hint["metric"] = {
