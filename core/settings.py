@@ -94,6 +94,45 @@ class Settings:
 
             return default
 
+    def get_json(
+        self,
+        key: str,
+        default=None,
+        *,
+        scope: str = "namespace",
+        scope_id: str | None = None,
+        namespace: str | None = None,
+    ):
+        """
+        Return a setting as a Python object (dict/list/etc).
+        - If stored as JSONB this will already be a native object (depending on your loader).
+        - If stored as text, we try json.loads(); on failure returns `default`.
+        """
+        val = self.get(key, default=None, scope=scope, scope_id=scope_id, namespace=namespace)
+        if val is None:
+            return default
+        # Already a structured type
+        if isinstance(val, (dict, list)):
+            return val
+        # Bytes -> decode then parse
+        if isinstance(val, (bytes, bytearray)):
+            try:
+                return json.loads(val.decode("utf-8"))
+            except Exception:
+                return default
+        # String -> try json.loads
+        if isinstance(val, str):
+            s = val.strip()
+            if not s:
+                return default
+            try:
+                return json.loads(s)
+            except Exception:
+                # Not valid JSON; return default to avoid surprising callers
+                return default
+        # Any other primitive: return as-is (or default)
+        return val
+
     def summary(self, mask_secrets: bool = True) -> Dict[str, Any]:
         """Return a snapshot of cached DB/env values for diagnostics."""
         snap: Dict[str, Any] = {}
