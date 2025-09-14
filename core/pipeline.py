@@ -169,9 +169,7 @@ class Pipeline:
             return
 
         # build via research factory (handles class/provider/mode)
-        from core.research import build_researcher
-
-        self.researcher = build_researcher(self.settings)
+        self.researcher = load_researcher(self.settings, namespace=self.namespace)
         self._researcher_fingerprint = desired_key
 
     def _instantiate_researcher(self, class_path: str | None):

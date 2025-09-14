@@ -536,6 +536,7 @@ def _load_hf(
     max_seq_len: int,
     gen_defaults: Dict[str, Any],
     s: _SettingsShim,
+    device_map: str = "auto",
 ) -> ModelHandle:
     """
     Load a HuggingFace model with optional quantization.
@@ -552,7 +553,7 @@ def _load_hf(
     hf_kwargs: Dict[str, Any] = {
         "trust_remote_code": True,
         "low_cpu_mem_usage": True,
-        "device_map": "auto",
+        "device_map": device_map,
     }
 
     if backend == "hf-4bit":
@@ -642,7 +643,8 @@ def load_clarifier(settings: Any | None = None) -> ModelHandle:
         "top_p": float(s.get("CLARIFIER_TOP_P", "0.9") or 0.9),
         "stop": [],
     }
-    handle = _load_hf(path, backend, max_len, gen_defaults, s)
+    device_map_env = str(os.getenv("CLARIFIER_DEVICE_MAP", "auto")).strip()
+    handle = _load_hf(path, backend, max_len, gen_defaults, s, device_map=device_map_env)
     try:
         handle.meta["role"] = "clarifier"
         handle.meta["max_seq_len"] = max_len
