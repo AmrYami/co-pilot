@@ -193,6 +193,13 @@ def answer():
     ).strip() or None
     followup = bool(inquiry_id and (clarifications or admin_reply_text))
 
+    pipeline: Pipeline = current_app.config["PIPELINE"]
+    # Ensure FA knowledge is ingested for the prefixes before planning
+    try:
+        pipeline.ensure_ingested(app="fa", prefixes=prefixes or [])
+    except Exception as e:
+        print(f"[fa/ingest@answer] non-fatal: {e}")
+
     # 0) Friendly intent gate
     it = detect_intent(question)
     if it.kind in {"greeting", "help"}:
@@ -235,7 +242,6 @@ def answer():
         hints.setdefault("datasource", ds_name)
 
     # 3) Call the pipeline with hints
-    pipeline: Pipeline = current_app.config["PIPELINE"]
     if isinstance(pipeline.settings, Settings):
         pipeline.settings.set_namespace(ns)
 

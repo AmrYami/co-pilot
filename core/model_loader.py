@@ -779,3 +779,61 @@ def load_clarifier_model(settings: Any | None = None) -> "ModelHandle | None":
     except Exception as e:
         print(f"[clarifier] failed to load {backend} at {path}: {e}")
     return None
+
+def load_clarifier(settings):
+    """
+    Optional small model for classification / smalltalk / hinting.
+    Disabled when:
+      - CLARIFIER_MODEL_BACKEND in {"", "off", "none", "0"} OR
+      - CLARIFIER_MODEL_PATH is empty
+    """
+    import os
+    backend = (settings.get("CLARIFIER_MODEL_BACKEND") or os.getenv("CLARIFIER_MODEL_BACKEND") or "").strip().lower()
+    path = (settings.get("CLARIFIER_MODEL_PATH") or os.getenv("CLARIFIER_MODEL_PATH") or "").strip()
+
+    if backend in {"", "off", "none", "0"} or not path:
+        print("[clarifier] disabled")
+        return None
+
+    if backend not in {"hf-4bit", "hf-8bit", "hf-fp16"}:
+        raise ValueError(f"Unknown clarifier backend: {backend}")
+
+    from transformers import BitsAndBytesConfig
+    device_map = os.getenv("CLARIFIER_DEVICE_MAP", "auto")
+    low_cpu = bool(int(os.getenv("CLARIFIER_LOW_CPU_MEM", "1")))
+    quant_type = os.getenv("CLARIFIER_QUANT_TYPE", "nf4")
+    compute_dt = os.getenv("CLARIFIER_COMPUTE_DTYPE", "bfloat16").lower()
+
+    import torch
+    _to_torch = {
+        "bfloat16": torch.bfloat16,
+        "float16": torch.float16,
+        "float32": torch.float32,
+        "fp32": torch.float32,
+    }
+    compute_dtype = _to_torch.get(compute_dt, torch.bfloat16)
+
+    bnb_cfg = None
+    if backend == "hf-4bit":
+        bnb_cfg = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=compute_dtype,
+            bnb_4bit_quant_type=quant_type,
+            llm_int8_enable_fp32_cpu_offload=True if device_map == "cpu" else False,
+        )
+
+    return _load_hf(
+        model_path=path,
+        backend=backend,
+        max_seq_len=int(settings.get("MODEL_MAX_SEQ_LEN") or os.getenv("MODEL_MAX_SEQ_LEN") or 4096),
+        gen_defaults={
+            "max_new_tokens": int(settings.get("GENERATION_MAX_NEW_TOKENS") or os.getenv("GENERATION_MAX_NEW_TOKENS") or 128),
+            "temperature": float(settings.get("GENERATION_TEMPERATURE") or os.getenv("GENERATION_TEMPERATURE") or 0.2),
+            "top_p": float(settings.get("GENERATION_TOP_P") or os.getenv("GENERATION_TOP_P") or 0.9),
+            "stop": [],
+        },
+        s=settings,
+        device_map=device_map,
+        bnb_config=bnb_cfg,
+        low_cpu_mem_usage=low_cpu,
+    )
