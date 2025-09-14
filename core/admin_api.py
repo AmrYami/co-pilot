@@ -1,9 +1,10 @@
 from __future__ import annotations
 from flask import Blueprint, request, jsonify, current_app
 from werkzeug.exceptions import BadRequest
-from sqlalchemy.sql import text, bindparam
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy import text
 from core.inquiries import append_admin_note, fetch_inquiry
+from core.settings import Settings
+from core.memdb import MemoryDB
 import json
 
 admin_bp = Blueprint("admin", __name__, url_prefix="/admin")
@@ -19,43 +20,79 @@ def _conn():
 
 @admin_bp.post("/settings/bulk")
 def settings_bulk():
-    data = request.get_json(force=True) or {}
-    ns = data.get("namespace") or "default"
-    upd = data.get("updated_by") or "api"
-    items = data.get("settings") or []
+    """Idempotent upsert of settings. Values are stored as JSONB."""
+    payload = request.get_json(force=True) or {}
+    ns = payload.get("namespace") or "fa::common"
+    updated_by = payload.get("updated_by") or "api"
+    items = payload.get("settings") or []
 
-    mem = current_app.config["MEM_ENGINE"]
+    mem = MemoryDB(Settings())
+    written = 0
 
-    results = []
-    with mem.begin() as c:
+    upsert_sql = text(
+        """
+        INSERT INTO mem_settings(
+            namespace, key, value, value_type, scope, scope_id,
+            category, description, overridable, updated_by, created_at, updated_at, is_secret
+        )
+        VALUES (
+            :ns, :key, CAST(:val AS jsonb), :vtype, :scope, :scope_id,
+            :cat, :desc, COALESCE(:ovr, true), :upd_by, NOW(), NOW(), :is_secret
+        )
+        ON CONFLICT ON CONSTRAINT ux_mem_settings_ns_key_scope_coalesced
+        DO UPDATE SET
+            value      = EXCLUDED.value,
+            value_type = EXCLUDED.value_type,
+            updated_by = EXCLUDED.updated_by,
+            updated_at = NOW(),
+            is_secret  = EXCLUDED.is_secret;
+        """
+    )
+
+    with mem.engine.begin() as conn:
         for it in items:
-            key   = it["key"]
+            key = it["key"]
             scope = it.get("scope") or "namespace"
             scope_id = it.get("scope_id")
+            cat = it.get("category")
+            desc = it.get("description")
+            overridable = it.get("overridable")
             is_secret = bool(it.get("is_secret", False))
-            # normalize value to JSON text
-            v = it.get("value", None)
-            v_json = json.dumps(v)
-            vtype = it.get("value_type") or infer_type_from_py(v)
-            c.execute(text("""
-                INSERT INTO mem_settings(namespace, key, value, value_type, scope, scope_id,
-                                         category, description, overridable, updated_by, created_at, updated_at, is_secret)
-                VALUES (:ns, :key, :val::jsonb, :vtype, :scope, :scope_id,
-                        :cat, :desc, COALESCE(:ovr, true), :upd_by, NOW(), NOW(), :is_secret)
-                ON CONFLICT (namespace, key, scope, COALESCE(scope_id, ''))
-                DO UPDATE SET
-                    value      = EXCLUDED.value,
-                    value_type = EXCLUDED.value_type,
-                    updated_by = EXCLUDED.updated_by,
-                    updated_at = NOW(),
-                    is_secret  = EXCLUDED.is_secret
-            """), {
-                "ns": ns, "key": key, "val": v_json, "vtype": vtype, "scope": scope, "scope_id": scope_id,
-                "cat": it.get("category"), "desc": it.get("description"),
-                "ovr": it.get("overridable"), "upd_by": upd, "is_secret": is_secret
-            })
-            results.append({"key": key, "ok": True})
-    return jsonify({"ok": True, "updated": results})
+
+            val_py = it.get("value")
+            vtype = it.get("value_type")
+            if vtype is None:
+                if isinstance(val_py, bool):
+                    vtype = "bool"
+                elif isinstance(val_py, int):
+                    vtype = "int"
+                elif isinstance(val_py, (list, dict)):
+                    vtype = "json"
+                else:
+                    vtype = "string"
+
+            try:
+                val_json_text = json.dumps(val_py)
+            except Exception:
+                val_json_text = json.dumps(str(val_py))
+
+            params = {
+                "ns": ns,
+                "key": key,
+                "val": val_json_text,
+                "vtype": vtype,
+                "scope": scope,
+                "scope_id": scope_id,
+                "cat": cat,
+                "desc": desc,
+                "ovr": overridable,
+                "upd_by": updated_by,
+                "is_secret": is_secret,
+            }
+            conn.execute(upsert_sql, params)
+            written += 1
+
+    return jsonify({"ok": True, "namespace": ns, "written": written})
 
 
 def infer_type_from_py(v):
