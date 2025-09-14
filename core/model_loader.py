@@ -34,7 +34,6 @@ import threading
 
 _MODEL_CACHE: dict[tuple, "ModelHandle"] = {}
 _MODEL_LOCK = threading.Lock()
-_CLARIFIER_CACHE = {}
 
 
 class _SettingsShim:
@@ -537,125 +536,120 @@ def _load_hf(
     max_seq_len: int,
     gen_defaults: Dict[str, Any],
     s: _SettingsShim,
-    quant: str | None = None,
 ) -> ModelHandle:
-    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-    import torch
+    """
+    Load a HuggingFace model with optional quantization.
+    Uses a single, consistent `hf_kwargs` dict (fixes NameError).
+    """
+    from transformers import AutoTokenizer, AutoModelForCausalLM
 
-    trust = _parse_bool(s.get("MODEL_TRUST_REMOTE_CODE", "true"), True)
+    tok = AutoTokenizer.from_pretrained(
+        model_path,
+        trust_remote_code=True,
+        use_fast=True
+    )
 
-    dtype_str = (
-        s.get("TORCH_DTYPE") or ("bfloat16" if torch.cuda.is_available() else "float32")
-    ).lower()
-    if dtype_str == "float16":
-        dtype = torch.float16
-    elif dtype_str == "bfloat16":
-        dtype = torch.bfloat16
-    else:
-        dtype = torch.float32
+    hf_kwargs: Dict[str, Any] = {
+        "trust_remote_code": True,
+        "low_cpu_mem_usage": True,
+        "device_map": "auto",
+    }
 
-    kwargs: Dict[str, Any] = {"trust_remote_code": trust}
-    if backend in {"hf-8bit", "hf-4bit"} or quant == "4bit_cpu_offload":
-        bnb_cfg = BitsAndBytesConfig(
+    if backend == "hf-4bit":
+        from transformers import BitsAndBytesConfig
+        qconfig = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_compute_dtype=torch.bfloat16,
-            llm_int8_enable_fp32_cpu_offload=True
+            bnb_4bit_quant_type="fp4",
+            bnb_4bit_use_double_quant=False,
+            llm_int8_enable_fp32_cpu_offload=True,
         )
-        kwargs["quantization_config"] = bnb_cfg
-        kwargs["device_map"] = "auto"
+        hf_kwargs["quantization_config"] = qconfig
+    elif backend == "hf-8bit":
+        from transformers import BitsAndBytesConfig
+        qconfig = BitsAndBytesConfig(
+            load_in_8bit=True,
+            llm_int8_enable_fp32_cpu_offload=True,
+        )
+        hf_kwargs["quantization_config"] = qconfig
+    elif backend in {"hf-fp16", "hf-fp32"}:
+        hf_kwargs["torch_dtype"] = (
+            torch.float16 if backend == "hf-fp16" else torch.float32
+        )
     else:
-        kwargs["torch_dtype"] = dtype
-        device_map = s.get("DEVICE_MAP", "auto") or "auto"
-        if device_map == "auto":
-            kwargs["device_map"] = "auto"
-        max_memory = _parse_max_memory(s.get("MAX_MEMORY"))
-        if max_memory:
-            kwargs["device_map"] = "auto"
-            kwargs["max_memory"] = max_memory
-        if backend == "hf-8bit":
-            kwargs["load_in_8bit"] = True
-        elif backend == "hf-4bit":
-            kwargs["load_in_4bit"] = True
+        raise ValueError(f"Unknown HF backend: {backend}")
 
-    print(f"Loading tokenizer from: {model_path}")
-    tok = AutoTokenizer.from_pretrained(model_path, trust_remote_code=trust)
     print(f"Loading HF model with backend: {backend}")
-    print(f"Load kwargs: {kwargs}")
-    model = AutoModelForCausalLM.from_pretrained(model_path, **kwargs)
+    print(f"Load kwargs: {hf_kwargs}")
+    model = AutoModelForCausalLM.from_pretrained(model_path, **hf_kwargs)
     print("HF model loaded successfully!")
 
     def _generate(prompt: str, **kw: Any) -> str:
         args = {**gen_defaults, **{k: v for k, v in kw.items() if v is not None}}
-        inputs = tok(prompt, return_tensors="pt")
-        inputs = {k: v.to(model.device) for k, v in inputs.items()}
+        max_new = int(args["max_new_tokens"])
+        temp = float(args["temperature"])
+        top_p = float(args["top_p"])
+
+        ids = tok(prompt, return_tensors="pt").to(model.device)
         with torch.inference_mode():
             out = model.generate(
-                **inputs,
-                max_new_tokens=args["max_new_tokens"],
-                do_sample=args["temperature"] > 0,
-                temperature=args["temperature"],
-                top_p=args["top_p"],
-                eos_token_id=_first_token_id(tok, args.get("stop")),
+                **ids,
+                max_new_tokens=max_new,
+                do_sample=True,
+                temperature=temp,
+                top_p=top_p,
+                pad_token_id=tok.eos_token_id or tok.pad_token_id,
             )
         text = tok.decode(out[0], skip_special_tokens=True)
-        # fallback stop handling
-        for sseq in args.get("stop") or []:
-            if sseq and sseq in text:
-                text = text.split(sseq, 1)[0]
+        for s_ in (args.get("stop") or []):
+            if s_ and s_ in text:
+                text = text.split(s_, 1)[0]
         return text
 
-    meta = {
+    handle = ModelHandle("hf", model, tok, _generate)
+    handle.meta = {
         "backend": backend,
+        "device_map": hf_kwargs.get("device_map", "auto"),
         "model_path": model_path,
-        "torch_version": torch.__version__,
-        "dtype": str(dtype),
-        "device_map": load_kwargs.get("device_map", "auto"),
-        "max_memory": max_memory,
         "loaded_at": time.time(),
     }
-    return ModelHandle(backend, model, tok, _generate, meta=meta)
+    if "quantization_config" in hf_kwargs:
+        qc = hf_kwargs["quantization_config"]
+        handle.meta["quantization"] = str(qc)
+    return handle
 
 
-def _first_token_id(tok: Any, stop: Optional[Iterable[str]]) -> Optional[int]:
-    if not stop:
-        return None
-    try:
-        s0 = next(iter(stop))
-        if not s0:
-            return None
-        return tok.convert_tokens_to_ids(s0)
-    except Exception:
-        return None
-
-
-def load_clarifier(settings) -> ModelHandle | None:
+def load_clarifier(settings: Any | None = None) -> ModelHandle:
+    """
+    Load a smaller, cheaper model for intent/clarification; keep it cached.
+    This is called once at app startup (Pipeline.__init__) and cached globally.
+    """
     s = _SettingsShim(settings)
-    model_path = s.get("CLARIFIER_MODEL_PATH")
-    backend = (s.get("CLARIFIER_MODEL_BACKEND") or "hf-4bit").lower()
-    if not model_path:
-        return None
+    path = s.get("CLARIFIER_MODEL_PATH")
+    backend = (s.get("CLARIFIER_MODEL_BACKEND", "hf-4bit") or "hf-4bit").lower()
+    if not path:
+        raise ValueError("CLARIFIER_MODEL_PATH is required")
 
-    key = (backend, model_path, "clarifier")
-    if key in _CLARIFIER_CACHE:
-        return _CLARIFIER_CACHE[key]
+    max_len = int(s.get("CLARIFIER_MAX_SEQ_LEN", "1024") or 1024)
+    key = ("clarifier", backend, path, max_len)
+    if key in _MODEL_CACHE:
+        print("Reusing cached clarifier handle:", key)
+        return _MODEL_CACHE[key]
 
-    if backend.startswith("hf"):
-        handle = _load_hf(
-            model_path,
-            backend="hf-4bit",
-            max_seq_len=int(s.get("CLARIFIER_MAX_SEQ_LEN", "2048") or 2048),
-            gen_defaults={
-                "max_new_tokens": int(s.get("CLARIFIER_MAX_NEW_TOKENS", "96") or 96),
-                "temperature": float(s.get("CLARIFIER_TEMPERATURE", "0.3") or 0.3),
-                "top_p": float(s.get("CLARIFIER_TOP_P", "0.9") or 0.9),
-                "stop": _parse_stop(s.get("CLARIFIER_STOP") or s.get("STOP")),
-            },
-            s=s,
-            quant="4bit_cpu_offload",
-        )
-        _CLARIFIER_CACHE[key] = handle
-        return handle
-    return None
+    gen_defaults = {
+        "max_new_tokens": int(s.get("CLARIFIER_MAX_NEW_TOKENS", "128") or 128),
+        "temperature": float(s.get("CLARIFIER_TEMPERATURE", "0.2") or 0.2),
+        "top_p": float(s.get("CLARIFIER_TOP_P", "0.9") or 0.9),
+        "stop": [],
+    }
+    handle = _load_hf(path, backend, max_len, gen_defaults, s)
+    try:
+        handle.meta["role"] = "clarifier"
+        handle.meta["max_seq_len"] = max_len
+    except Exception:
+        pass
+    _MODEL_CACHE[key] = handle
+    return handle
 
 
 def load_clarifier_model(settings: Any | None = None) -> "ModelHandle | None":
