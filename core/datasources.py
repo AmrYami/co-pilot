@@ -1,59 +1,72 @@
 from __future__ import annotations
 
-from typing import Dict, Optional
+from dataclasses import dataclass
+from typing import Dict, Optional, List
 from sqlalchemy import create_engine
-from .settings import Settings
+from sqlalchemy.engine import Engine
+
+
+@dataclass
+class DSConfig:
+    name: str
+    url: str
+    role: str = "oltp"
 
 
 class DatasourceRegistry:
-    """
-    Builds SQLAlchemy engines from mem_settings:
-      - DB_CONNECTIONS: [{"name":"frontaccounting_bk","url":"...","role":"oltp"}, ...]
-      - DEFAULT_DATASOURCE: name to use when none is requested
-      - APP_DB_URL: fallback single-URL when DB_CONNECTIONS is not set
-      - FA_DB_URL: final env fallback
-    """
-
-    def __init__(self, settings: Settings, namespace: str):
+    def __init__(self, settings, namespace: str):
         self.settings = settings
         self.namespace = namespace
-        self._engines: Dict[str, any] = {}
-        self.default_name: Optional[str] = None
+        self._engines: Dict[str, Engine] = {}
+        self._default_name: Optional[str] = None
 
-        conns = self.settings.get_json("DB_CONNECTIONS", scope="namespace") or []
-        default_ds = self.settings.get("DEFAULT_DATASOURCE", scope="namespace")
-        app_url = (
-            self.settings.get("APP_DB_URL", scope="namespace")
-            or self.settings.get("APP_DB_URL")                       # global
-            or self.settings.get("FA_DB_URL")                        # env bridge
-        )
+        # 1) Primary: DB_CONNECTIONS (namespace scope)
+        conns: List[dict] = self.settings.get_json("DB_CONNECTIONS", scope="namespace") or []
 
-        if conns:
-            for c in conns:
-                name = (c.get("name") or "").strip()
-                url = (c.get("url") or "").strip()
-                if not name or not url:
+        # 2) Fallback: APP_DB_URL + DEFAULT_DATASOURCE (namespace scope)
+        if not conns:
+            app_url = self.settings.get("APP_DB_URL", scope="namespace")
+            default_name = self.settings.get("DEFAULT_DATASOURCE", scope="namespace") or "default"
+            if app_url:
+                conns = [{"name": default_name, "url": app_url, "role": "oltp"}]
+
+        # 3) Build engines if we have any connections
+        for entry in conns:
+            try:
+                name = entry.get("name") or "default"
+                url = entry.get("url")
+                role = entry.get("role") or "oltp"
+                if not url:
                     continue
-                self._engines[name] = create_engine(url, pool_pre_ping=True)
-            # pick default
-            if default_ds and default_ds in self._engines:
-                self.default_name = default_ds
-            elif self._engines:
-                self.default_name = next(iter(self._engines.keys()))
-        elif app_url:
-            # If we only have one URL, expose it under DEFAULT_DATASOURCE if present, else 'app'
-            name = default_ds or "app"
-            self._engines[name] = create_engine(app_url, pool_pre_ping=True)
-            self.default_name = name
+                eng = create_engine(url, pool_pre_ping=True, pool_recycle=3600)
+                self._engines[name] = eng
+            except Exception as e:
+                print(f"[datasources] failed to create engine for {entry}: {e}")
+
+        # Decide default:
+        explicit_default = self.settings.get("DEFAULT_DATASOURCE", scope="namespace")
+        if explicit_default and explicit_default in self._engines:
+            self._default_name = explicit_default
+        elif self._engines:
+            # First item
+            self._default_name = next(iter(self._engines.keys()))
+        else:
+            self._default_name = None
+
+        if self._engines:
+            names = ", ".join(f"{n}" for n in self._engines.keys())
+            print(f"[datasources] engines created: {names} (default={self._default_name})")
         else:
             print("[datasources] no engines created (check DB_CONNECTIONS or APP_DB_URL).")
 
-    def engine(self, name: Optional[str]) -> any:
-        key = name or self.default_name
-        if key and key in self._engines:
-            return self._engines[key]
+    def engine(self, name: Optional[str]) -> Engine:
+        if name:
+            eng = self._engines.get(name)
+            if eng:
+                return eng
+            raise RuntimeError(f"No datasource engine found for '{name}'. Available: {list(self._engines.keys())}")
+        # default
+        if self._default_name and self._default_name in self._engines:
+            return self._engines[self._default_name]
         raise RuntimeError("No datasource engine found for requested datasource.")
-
-    def engines(self) -> Dict[str, any]:
-        return dict(self._engines)
 
