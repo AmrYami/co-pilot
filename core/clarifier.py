@@ -4,7 +4,7 @@ import re
 from typing import Tuple, Dict, Any, Optional
 
 from core.specs import QuestionSpec
-from core.model_loader import load_model, load_clarifier_model
+from core.model_loader import load_model, load_clarifier
 
 
 _SMALTALK = re.compile(r'^\s*(hi|hello|hey|السلام عليكم|مرحبا|أهلًا|اهلا|ازيك)\b', re.I)
@@ -57,7 +57,7 @@ class ClarifierAgent:
 
     def __init__(self, settings):
         self.settings = settings
-        self.llm = load_clarifier_model(settings) or load_model(settings)
+        self.llm = load_clarifier(settings) or load_model(settings)
 
     def classify_and_extract(
         self, question: str, prefixes, domain_hints: Dict[str, Any]

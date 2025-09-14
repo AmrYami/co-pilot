@@ -35,6 +35,7 @@ from core.sql_exec import validate_select, explain, run_select, as_csv
 from core.mailer import send_email_with_attachments
 from core.agents import ValidatorAgent
 from apps.fa.hints import make_fa_hints
+from apps.fa.seeders import seed_fa_knowledge
 
 fa_bp = Blueprint("fa", __name__)
 PREFIX_RE = re.compile(r"^[0-9]+_$")
@@ -158,6 +159,20 @@ def ingest_prefixes():  # type: ignore[no-redef]
         return jsonify({"snapshots": snaps})
     except Exception as e:
         return jsonify({"error": str(e)}), 400
+
+
+@fa_bp.post("/seed")
+def fa_ingest():
+    pipeline = current_app.config["PIPELINE"]
+    ns = pipeline.namespace
+    metrics_dir = pipeline.settings.get("FA_METRICS_PATH", scope="namespace", namespace=ns) \
+                  or pipeline.settings.get("FA_METRICS_PATH", scope="global", namespace=ns) \
+                  or "apps/fa/metrics"
+    join_graph = pipeline.settings.get("FA_JOIN_GRAPH_PATH", scope="namespace", namespace=ns) \
+                  or pipeline.settings.get("FA_JOIN_GRAPH_PATH", scope="global", namespace=ns) \
+                  or "apps/fa/join_graph.yaml"
+    out = seed_fa_knowledge(pipeline.mem_engine, ns, metrics_dir, join_graph)
+    return {"ok": True, "seeded": out}
 
 
 @fa_bp.post("/answer")

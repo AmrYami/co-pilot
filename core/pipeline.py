@@ -25,11 +25,13 @@ import sqlalchemy as sa
 
 import importlib
 from core.agents import PlannerAgent, ValidatorAgent
-from core.model_loader import load_model, load_clarifier_model
+from core.model_loader import load_model, load_clarifier
 from core.clarifier import ClarifierAgent
 from core.settings import Settings
-from core.research import build_researcher
 from core.sql_exec import get_app_engine, run_select, as_csv
+from core.datasources import DatasourceRegistry
+from core.research import load_researcher
+from core.snippets import save_snippet
 from core.sql_utils import extract_sql, looks_like_sql
 from core.inquiries import (
     create_or_update_inquiry,
@@ -82,13 +84,14 @@ class Pipeline:
             if isinstance(settings, Settings)
             else Settings(namespace=namespace)
         )
-        self.researcher = build_researcher(self.settings)
+        self.researcher = load_researcher(self.settings, namespace=namespace)
         self._researcher_class_path: str | None = None
         self._researcher_fingerprint = None
 
         # 1) Load cfg and build engines
         self.cfg = self._load_cfg(self.settings)
         self.mem_engine = self._make_engine(self.cfg.memory_db_url, pool_name="mem")
+        self.ds = DatasourceRegistry(settings=self.settings, namespace=self.namespace)
 
         # Attach mem engine & namespace so Settings can read mem_settings
         try:
@@ -122,7 +125,7 @@ class Pipeline:
 
         # 2) Load the LLM
         self.llm = load_model(self.settings)
-        self.clarifier_llm = load_clarifier_model(self.settings)
+        self.clarifier_llm = load_clarifier(self.settings)
 
         if isinstance(self.llm, dict):
             self.llm = SimpleNamespace(**self.llm)

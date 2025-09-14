@@ -57,48 +57,36 @@ def summarize_admin_notes(notes: Optional[List[Dict[str, Any]]]) -> str:
 # --- Admin note helpers ----------------------------------------------------
 
 
-def append_admin_note(mem_engine, inquiry_id: int, *, by: str, text_note: str) -> int:
+def append_admin_note(mem_engine, inquiry_id: int, by: str, text_note: str) -> int:
     """
-    Append one admin note to mem_inquiries.admin_notes (jsonb[]),
-    and update reply/answered_by/rounds safely.
-
-    Returns: new clarification_rounds (int).
+    Appends one note object into admin_notes JSONB array without casting errors.
+    Returns new clarification_rounds.
     """
-
-    note_obj: Dict[str, Any] = {
+    note_obj = {
         "by": by,
         "text": text_note,
-        "ts": datetime.now(timezone.utc).isoformat(),
+        "ts": datetime.now(timezone.utc).isoformat()
     }
-    # stringify once; cast to jsonb inside SQL to avoid psycopg2 adapter quirks
-    note_json = json.dumps(note_obj)
+    note_json = json.dumps(note_obj, ensure_ascii=False)
 
-    sql = text(
-        """
-        UPDATE mem_inquiries
-           SET admin_notes          = COALESCE(admin_notes, '[]'::jsonb)
-                                      || jsonb_build_array(CAST(:note AS jsonb)),
-               admin_reply          = COALESCE(:reply, admin_reply),
-               answered_by          = COALESCE(:by, answered_by),
-               clarification_rounds = COALESCE(clarification_rounds, 0) + 1,
-               updated_at           = NOW()
-         WHERE id = :id
-     RETURNING clarification_rounds
-        """
-    )
-
-    with mem_engine.begin() as conn:
-        row = conn.execute(
-            sql,
-            {
-                "id": inquiry_id,
-                "note": note_json,
-                "reply": text_note,
-                "by": by,
-            },
-        ).fetchone()
-
-    return int(row[0]) if row and row[0] is not None else 0
+    with mem_engine.begin() as c:
+        r = c.execute(text("""
+            UPDATE mem_inquiries
+               SET admin_notes          = COALESCE(admin_notes, '[]'::jsonb)
+                                          || jsonb_build_array((:note::jsonb)),
+                   admin_reply          = :reply,
+                   answered_by          = :by,
+                   clarification_rounds = COALESCE(clarification_rounds, 0) + 1,
+                   updated_at           = NOW()
+             WHERE id = :id
+         RETURNING clarification_rounds
+        """), {
+            "id": inquiry_id,
+            "note": note_json,
+            "reply": text_note,
+            "by": by
+        })
+        return r.scalar_one()
 
 
 def set_admin_reply(mem_engine, inquiry_id: int, reply: str, answered_by: str | None = None) -> None:

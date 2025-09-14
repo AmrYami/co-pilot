@@ -4,6 +4,7 @@ from werkzeug.exceptions import BadRequest
 from sqlalchemy.sql import text, bindparam
 from sqlalchemy.dialects.postgresql import JSONB
 from core.inquiries import append_admin_note, fetch_inquiry
+import json
 
 admin_bp = Blueprint("admin", __name__, url_prefix="/admin")
 
@@ -19,84 +20,51 @@ def _conn():
 @admin_bp.post("/settings/bulk")
 def settings_bulk():
     data = request.get_json(force=True) or {}
-    ns = data.get("namespace") or "fa::common"
-    updated_by = data.get("updated_by") or "api"
+    ns = data.get("namespace") or "default"
+    upd = data.get("updated_by") or "api"
     items = data.get("settings") or []
 
-    inserted, updated = 0, 0
-    problems: list[dict] = []
+    mem = current_app.config["MEM_ENGINE"]
 
-    upsert_sql = text(
-        """
-        INSERT INTO mem_settings(
-            namespace, key, value, value_type, scope, scope_id,
-            category, description, overridable, updated_by, created_at, updated_at, is_secret
-        )
-        VALUES (
-            :ns, :key, :val, :vtype, :scope, :scope_id,
-            :cat, :desc, COALESCE(:ovr, true), :upd_by, NOW(), NOW(), COALESCE(:is_secret, false)
-        )
-        ON CONFLICT (namespace, key, scope, COALESCE(scope_id, ''))
-        DO UPDATE SET
-            value      = EXCLUDED.value,
-            value_type = EXCLUDED.value_type,
-            updated_by = EXCLUDED.updated_by,
-            updated_at = NOW(),
-            is_secret  = EXCLUDED.is_secret
-    """
-    ).bindparams(bindparam("val", type_=JSONB))
+    results = []
+    with mem.begin() as c:
+        for it in items:
+            key   = it["key"]
+            scope = it.get("scope") or "namespace"
+            scope_id = it.get("scope_id")
+            is_secret = bool(it.get("is_secret", False))
+            # normalize value to JSON text
+            v = it.get("value", None)
+            v_json = json.dumps(v)
+            vtype = it.get("value_type") or infer_type_from_py(v)
+            c.execute(text("""
+                INSERT INTO mem_settings(namespace, key, value, value_type, scope, scope_id,
+                                         category, description, overridable, updated_by, created_at, updated_at, is_secret)
+                VALUES (:ns, :key, :val::jsonb, :vtype, :scope, :scope_id,
+                        :cat, :desc, COALESCE(:ovr, true), :upd_by, NOW(), NOW(), :is_secret)
+                ON CONFLICT (namespace, key, scope, COALESCE(scope_id, ''))
+                DO UPDATE SET
+                    value      = EXCLUDED.value,
+                    value_type = EXCLUDED.value_type,
+                    updated_by = EXCLUDED.updated_by,
+                    updated_at = NOW(),
+                    is_secret  = EXCLUDED.is_secret
+            """), {
+                "ns": ns, "key": key, "val": v_json, "vtype": vtype, "scope": scope, "scope_id": scope_id,
+                "cat": it.get("category"), "desc": it.get("description"),
+                "ovr": it.get("overridable"), "upd_by": upd, "is_secret": is_secret
+            })
+            results.append({"key": key, "ok": True})
+    return jsonify({"ok": True, "updated": results})
 
-    def infer_vtype(py_val) -> str:
-        # Store scalars as JSON too (string/bool/int appear as JSON, e.g. "fa", true, 587)
-        if isinstance(py_val, bool):
-            return "bool"
-        if isinstance(py_val, int):
-            return "int"
-        if isinstance(py_val, float):
-            return "float"
-        if isinstance(py_val, (list, dict)):
-            return "json"
-        return "string"  # str/None/other -> JSON string or null
 
-    engine = current_app.config["MEM_ENGINE"]
-    with engine.begin() as c:
-        for item in items:
-            key = item.get("key")
-            scope = item.get("scope") or "namespace"
-            scope_id = item.get("scope_id")
-            raw_val = item.get("value")
-            vtype = item.get("value_type") or infer_vtype(raw_val)
-            is_secret = bool(item.get("is_secret") or False)
-
-            try:
-                c.execute(
-                    upsert_sql,
-                    {
-                        "ns": ns,
-                        "key": key,
-                        "val": raw_val,
-                        "vtype": vtype,
-                        "scope": scope,
-                        "scope_id": scope_id,
-                        "cat": item.get("category"),
-                        "desc": item.get("description"),
-                        "ovr": item.get("overridable"),
-                        "upd_by": updated_by,
-                        "is_secret": is_secret,
-                    },
-                )
-                updated += 1
-            except Exception as e:
-                problems.append({"key": key, "error": str(e)})
-
-    return {
-        "ok": len(problems) == 0,
-        "namespace": ns,
-        "updated_by": updated_by,
-        "total": len(items),
-        "applied": updated,
-        "errors": problems,
-    }, (200 if not problems else 207)
+def infer_type_from_py(v):
+    if isinstance(v, bool): return "bool"
+    if isinstance(v, int):  return "int"
+    if isinstance(v, float):return "float"
+    if v is None:           return "json"
+    if isinstance(v, (list, dict)): return "json"
+    return "string"
 
 
 @admin_bp.get("/settings/get")

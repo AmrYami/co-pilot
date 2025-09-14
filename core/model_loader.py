@@ -34,6 +34,7 @@ import threading
 
 _MODEL_CACHE: dict[tuple, "ModelHandle"] = {}
 _MODEL_LOCK = threading.Lock()
+_CLARIFIER_CACHE = {}
 
 
 class _SettingsShim:
@@ -536,13 +537,13 @@ def _load_hf(
     max_seq_len: int,
     gen_defaults: Dict[str, Any],
     s: _SettingsShim,
+    quant: str | None = None,
 ) -> ModelHandle:
+    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
     import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
 
     trust = _parse_bool(s.get("MODEL_TRUST_REMOTE_CODE", "true"), True)
 
-    # dtype
     dtype_str = (
         s.get("TORCH_DTYPE") or ("bfloat16" if torch.cuda.is_available() else "float32")
     ).lower()
@@ -553,31 +554,34 @@ def _load_hf(
     else:
         dtype = torch.float32
 
+    kwargs: Dict[str, Any] = {"trust_remote_code": trust}
+    if backend in {"hf-8bit", "hf-4bit"} or quant == "4bit_cpu_offload":
+        bnb_cfg = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            llm_int8_enable_fp32_cpu_offload=True
+        )
+        kwargs["quantization_config"] = bnb_cfg
+        kwargs["device_map"] = "auto"
+    else:
+        kwargs["torch_dtype"] = dtype
+        device_map = s.get("DEVICE_MAP", "auto") or "auto"
+        if device_map == "auto":
+            kwargs["device_map"] = "auto"
+        max_memory = _parse_max_memory(s.get("MAX_MEMORY"))
+        if max_memory:
+            kwargs["device_map"] = "auto"
+            kwargs["max_memory"] = max_memory
+        if backend == "hf-8bit":
+            kwargs["load_in_8bit"] = True
+        elif backend == "hf-4bit":
+            kwargs["load_in_4bit"] = True
+
     print(f"Loading tokenizer from: {model_path}")
     tok = AutoTokenizer.from_pretrained(model_path, trust_remote_code=trust)
-
-    load_kwargs: Dict[str, Any] = {
-        "trust_remote_code": trust,
-        "torch_dtype": dtype,
-    }
-
-    # quantization / memory routing
-    device_map = s.get("DEVICE_MAP", "auto") or "auto"
-    if device_map == "auto":
-        load_kwargs["device_map"] = "auto"
-    max_memory = _parse_max_memory(s.get("MAX_MEMORY"))
-    if max_memory:
-        load_kwargs["device_map"] = "auto"
-        load_kwargs["max_memory"] = max_memory
-
-    if backend == "hf-8bit":
-        load_kwargs["load_in_8bit"] = True
-    elif backend == "hf-4bit":
-        load_kwargs["load_in_4bit"] = True
-
     print(f"Loading HF model with backend: {backend}")
-    print(f"Load kwargs: {load_kwargs}")
-    model = AutoModelForCausalLM.from_pretrained(model_path, **load_kwargs)
+    print(f"Load kwargs: {kwargs}")
+    model = AutoModelForCausalLM.from_pretrained(model_path, **kwargs)
     print("HF model loaded successfully!")
 
     def _generate(prompt: str, **kw: Any) -> str:
@@ -622,6 +626,36 @@ def _first_token_id(tok: Any, stop: Optional[Iterable[str]]) -> Optional[int]:
         return tok.convert_tokens_to_ids(s0)
     except Exception:
         return None
+
+
+def load_clarifier(settings) -> ModelHandle | None:
+    s = _SettingsShim(settings)
+    model_path = s.get("CLARIFIER_MODEL_PATH")
+    backend = (s.get("CLARIFIER_MODEL_BACKEND") or "hf-4bit").lower()
+    if not model_path:
+        return None
+
+    key = (backend, model_path, "clarifier")
+    if key in _CLARIFIER_CACHE:
+        return _CLARIFIER_CACHE[key]
+
+    if backend.startswith("hf"):
+        handle = _load_hf(
+            model_path,
+            backend="hf-4bit",
+            max_seq_len=int(s.get("CLARIFIER_MAX_SEQ_LEN", "2048") or 2048),
+            gen_defaults={
+                "max_new_tokens": int(s.get("CLARIFIER_MAX_NEW_TOKENS", "96") or 96),
+                "temperature": float(s.get("CLARIFIER_TEMPERATURE", "0.3") or 0.3),
+                "top_p": float(s.get("CLARIFIER_TOP_P", "0.9") or 0.9),
+                "stop": _parse_stop(s.get("CLARIFIER_STOP") or s.get("STOP")),
+            },
+            s=s,
+            quant="4bit_cpu_offload",
+        )
+        _CLARIFIER_CACHE[key] = handle
+        return handle
+    return None
 
 
 def load_clarifier_model(settings: Any | None = None) -> "ModelHandle | None":
