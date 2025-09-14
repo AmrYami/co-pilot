@@ -35,3 +35,11 @@ def load_researcher(settings, namespace: str) -> Optional[BaseResearcher]:
     mod = __import__(mod_name, fromlist=[cls_name])
     cls = getattr(mod, cls_name)
     return cls(settings=settings, namespace=namespace)
+
+
+# Backward compatibility shim
+def build_researcher(settings, namespace: Optional[str] = None) -> Optional[BaseResearcher]:
+    return load_researcher(settings, namespace=namespace)
+
+
+__all__ = ["load_researcher", "build_researcher"]
