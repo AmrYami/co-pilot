@@ -260,7 +260,7 @@ class Settings:
 
     def empty_result_autoretry(self, namespace: str | None = None) -> bool:
         return bool(
-            self.get("EMPTY_RESULT_AUTORETRY", default=True, namespace=namespace)
+            self.get("EMPTY_RESULT_AUTORETRY", default=False, namespace=namespace)
         )
 
     def empty_result_window_days(self, namespace: str | None = None) -> int:
