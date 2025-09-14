@@ -75,6 +75,23 @@ def _parse_max_memory(v: Optional[str]) -> Optional[Dict[str, str]]:
     return mm or None
 
 
+def _dtype_from_str(s: Optional[str], default: torch.dtype) -> torch.dtype:
+    if not s:
+        return default
+    s = s.strip().lower()
+    if s in ("fp32", "float32"):
+        return torch.float32
+    if s in ("bf16", "bfloat16"):
+        return torch.bfloat16
+    if s in ("fp16", "float16", "half"):
+        return torch.float16
+    return default
+
+
+def _env_true(val: Optional[str]) -> bool:
+    return str(val or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
 def _setup_gpu_devices(s: _SettingsShim) -> None:
     """Setup GPU device ordering and visibility"""
     llm_gpu = s.get("LLM_GPU")
@@ -535,123 +552,144 @@ def _load_hf(
     backend: str,
     max_seq_len: int,
     gen_defaults: Dict[str, Any],
-    s: _SettingsShim,
-    device_map: str = "auto",
+    s: Any,
+    *,
+    device_map: Optional[str] = None
 ) -> ModelHandle:
-    """
-    Load a HuggingFace model with optional quantization.
-    Uses a single, consistent `hf_kwargs` dict (fixes NameError).
-    """
+
     from transformers import AutoTokenizer, AutoModelForCausalLM
+    try:
+        from transformers import BitsAndBytesConfig
+    except Exception:
+        BitsAndBytesConfig = None  # type: ignore[assignment]
 
-    tok = AutoTokenizer.from_pretrained(
-        model_path,
-        trust_remote_code=True,
-        use_fast=True
-    )
-
+    # ---- Build kwargs for Transformers.from_pretrained
     hf_kwargs: Dict[str, Any] = {
         "trust_remote_code": True,
-        "low_cpu_mem_usage": True,
-        "device_map": device_map,
     }
 
-    if backend == "hf-4bit":
-        from transformers import BitsAndBytesConfig
-        qconfig = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.bfloat16,
-            bnb_4bit_quant_type="fp4",
-            bnb_4bit_use_double_quant=False,
-            llm_int8_enable_fp32_cpu_offload=True,
-        )
-        hf_kwargs["quantization_config"] = qconfig
-    elif backend == "hf-8bit":
-        from transformers import BitsAndBytesConfig
-        qconfig = BitsAndBytesConfig(
-            load_in_8bit=True,
-            llm_int8_enable_fp32_cpu_offload=True,
-        )
-        hf_kwargs["quantization_config"] = qconfig
-    elif backend in {"hf-fp16", "hf-fp32"}:
-        hf_kwargs["torch_dtype"] = (
-            torch.float16 if backend == "hf-fp16" else torch.float32
-        )
-    else:
-        raise ValueError(f"Unknown HF backend: {backend}")
+    # Device map (cpu | auto | cuda:N | balanced etc.)
+    if device_map:
+        hf_kwargs["device_map"] = device_map
 
-    print(f"Loading HF model with backend: {backend}")
-    print(f"Load kwargs: {hf_kwargs}")
-    model = AutoModelForCausalLM.from_pretrained(model_path, **hf_kwargs)
-    print("HF model loaded successfully!")
+    # Low CPU mem usage hint
+    if _env_true(os.getenv("CLARIFIER_LOW_CPU_MEM", str(s.get("CLARIFIER_LOW_CPU_MEM", "1")))):
+        hf_kwargs["low_cpu_mem_usage"] = True
 
-    def _generate(prompt: str, **kw: Any) -> str:
-        args = {**gen_defaults, **{k: v for k, v in kw.items() if v is not None}}
-        max_new = int(args["max_new_tokens"])
-        temp = float(args["temperature"])
-        top_p = float(args["top_p"])
+    # Quantization / dtype
+    if backend in {"hf-4bit", "hf-8bit"}:
+        if BitsAndBytesConfig is None:
+            raise RuntimeError("bitsandbytes not available but hf-{4,8}bit requested")
 
-        ids = tok(prompt, return_tensors="pt").to(model.device)
-        with torch.inference_mode():
-            out = model.generate(
-                **ids,
-                max_new_tokens=max_new,
-                do_sample=True,
-                temperature=temp,
-                top_p=top_p,
-                pad_token_id=tok.eos_token_id or tok.pad_token_id,
+        # Offload flag (used mainly for int8, harmless for 4bit)
+        offload_fp32 = _env_true(os.getenv("CLARIFIER_OFFLOAD_FP32", str(s.get("CLARIFIER_OFFLOAD_FP32", "0"))))
+
+        # Are we targeting CPU?
+        dm = (device_map or "").strip().lower()
+        on_cpu = (dm == "cpu")
+
+        # Decide quantization specifics
+        if backend == "hf-4bit":
+            default_quant_type = "nf4" if on_cpu else "fp4"
+            quant_type = os.getenv("CLARIFIER_QUANT_TYPE", default_quant_type)
+            compute_dtype = _dtype_from_str(
+                os.getenv("CLARIFIER_COMPUTE_DTYPE", "float32" if on_cpu else "bfloat16"),
+                torch.float32 if on_cpu else torch.bfloat16,
             )
+
+            bnb_cfg = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type=quant_type,
+                bnb_4bit_compute_dtype=compute_dtype,
+                llm_int8_enable_fp32_cpu_offload=offload_fp32,
+            )
+            hf_kwargs["quantization_config"] = bnb_cfg
+
+        elif backend == "hf-8bit":
+            bnb_cfg = BitsAndBytesConfig(
+                load_in_8bit=True,
+                llm_int8_enable_fp32_cpu_offload=offload_fp32,
+            )
+            hf_kwargs["quantization_config"] = bnb_cfg
+
+    elif backend in {"hf-fp16", "hf-bf16"}:
+        hf_kwargs["torch_dtype"] = torch.bfloat16 if backend == "hf-bf16" else torch.float16
+
+    # (Optional) print debug
+    print("Loading HF model with backend:", backend)
+    dbg_q = hf_kwargs.get("quantization_config")
+    print(
+        "Load kwargs:",
+        {k: (str(v) if k != "quantization_config" else f"BitsAndBytesConfig {{...}}") for k, v in hf_kwargs.items()},
+    )
+
+    # ---- Actually load
+    tok = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(model_path, **hf_kwargs)
+
+    # Build generator function (minimal; you can reuse your existing one)
+    def _generate(prompt: str, **kw: Any) -> str:
+        from transformers import TextStreamer
+        max_new = int(kw.get("max_new_tokens", gen_defaults["max_new_tokens"]))
+        temperature = float(kw.get("temperature", gen_defaults["temperature"]))
+        top_p = float(kw.get("top_p", gen_defaults["top_p"]))
+
+        inputs = tok(prompt, return_tensors="pt")
+        # Move to device if not CPU map
+        if device_map and device_map != "cpu":
+            inputs = {k: v.to(model.device) for k, v in inputs.items()}
+
+        out = model.generate(
+            **inputs,
+            max_new_tokens=max_new,
+            do_sample=True,
+            temperature=temperature,
+            top_p=top_p,
+            pad_token_id=tok.eos_token_id,
+        )
         text = tok.decode(out[0], skip_special_tokens=True)
-        for s_ in (args.get("stop") or []):
+        # stop handling
+        for s_ in kw.get("stop", []) or gen_defaults.get("stop", []) or []:
             if s_ and s_ in text:
                 text = text.split(s_, 1)[0]
         return text
 
-    handle = ModelHandle("hf", model, tok, _generate)
-    handle.meta = {
-        "backend": backend,
-        "device_map": hf_kwargs.get("device_map", "auto"),
-        "model_path": model_path,
-        "loaded_at": time.time(),
-    }
-    if "quantization_config" in hf_kwargs:
-        qc = hf_kwargs["quantization_config"]
-        handle.meta["quantization"] = str(qc)
-    return handle
+    return ModelHandle(backend, model, tok, _generate)
 
 
-def load_clarifier(settings: Any | None = None) -> ModelHandle:
-    """
-    Load a smaller, cheaper model for intent/clarification; keep it cached.
-    This is called once at app startup (Pipeline.__init__) and cached globally.
-    """
+def load_clarifier(settings: Any | None = None) -> Optional[ModelHandle]:
     s = _SettingsShim(settings)
     path = s.get("CLARIFIER_MODEL_PATH")
-    backend = (s.get("CLARIFIER_MODEL_BACKEND", "hf-4bit") or "hf-4bit").lower()
     if not path:
-        raise ValueError("CLARIFIER_MODEL_PATH is required")
+        print("[clarifier] no CLARIFIER_MODEL_PATH set; clarifier disabled")
+        return None
 
-    max_len = int(s.get("CLARIFIER_MAX_SEQ_LEN", "1024") or 1024)
-    key = ("clarifier", backend, path, max_len)
-    if key in _MODEL_CACHE:
-        print("Reusing cached clarifier handle:", key)
-        return _MODEL_CACHE[key]
+    backend = (s.get("CLARIFIER_MODEL_BACKEND", "hf-4bit") or "hf-4bit").lower()
+    max_len = int(s.get("CLARIFIER_MAX_SEQ_LEN", "2048") or 2048)
+    device_map_env = (s.get("CLARIFIER_DEVICE_MAP", os.getenv("CLARIFIER_DEVICE_MAP", "auto")) or "auto").lower()
 
     gen_defaults = {
-        "max_new_tokens": int(s.get("CLARIFIER_MAX_NEW_TOKENS", "128") or 128),
-        "temperature": float(s.get("CLARIFIER_TEMPERATURE", "0.2") or 0.2),
+        "max_new_tokens": int(s.get("CLARIFIER_MAX_NEW", "128") or 128),
+        "temperature": float(s.get("CLARIFIER_TEMPERATURE", "0.3") or 0.3),
         "top_p": float(s.get("CLARIFIER_TOP_P", "0.9") or 0.9),
         "stop": [],
     }
-    device_map_env = str(os.getenv("CLARIFIER_DEVICE_MAP", "auto")).strip()
-    handle = _load_hf(path, backend, max_len, gen_defaults, s, device_map=device_map_env)
+
+    quant_type = os.getenv("CLARIFIER_QUANT_TYPE", "nf4" if device_map_env == "cpu" else "fp4")
+    compute_str = os.getenv("CLARIFIER_COMPUTE_DTYPE", "float32" if device_map_env == "cpu" else "bfloat16")
+    key = ("clarifier", path, backend, device_map_env, quant_type, compute_str, max_len)
+    if key in _MODEL_CACHE:
+        print("Reusing cached clarifier:", key)
+        return _MODEL_CACHE[key]
+
     try:
-        handle.meta["role"] = "clarifier"
-        handle.meta["max_seq_len"] = max_len
-    except Exception:
-        pass
-    _MODEL_CACHE[key] = handle
-    return handle
+        handle = _load_hf(path, backend, max_len, gen_defaults, s, device_map=device_map_env)
+        _MODEL_CACHE[key] = handle
+        print("Clarifier loaded & cached.")
+        return handle
+    except Exception as e:
+        print(f"[clarifier] failed to load {backend} at {path}: {e}")
+        return None
 
 
 def load_clarifier_model(settings: Any | None = None) -> "ModelHandle | None":
