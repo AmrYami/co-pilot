@@ -85,7 +85,7 @@ class Pipeline:
             else Settings(namespace=namespace)
         )
         # Build datasource registry and choose default engine early
-        self.ds = DatasourceRegistry(self.settings)
+        self.ds = DatasourceRegistry(self.settings, namespace=self.namespace)
         self.app_engine = self.ds.engine(None)
 
         self.researcher = load_researcher(self.settings)
