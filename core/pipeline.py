@@ -40,7 +40,6 @@ from core.inquiries import (
     get_admin_notes,
 )
 from core.emailer import Emailer
-from apps.fa.sqlutils import widen_date_filter_mysql
 from apps.fa.hints import (
     MISSING_FIELD_QUESTIONS,
     DOMAIN_HINTS,
@@ -126,7 +125,11 @@ class Pipeline:
 
         # 2) Load the LLM
         self.llm = load_model(self.settings)
-        self.clarifier_llm = load_clarifier(self.settings)
+        try:
+            self.clarifier_llm = load_clarifier(self.settings)
+        except Exception as e:
+            print("[clarifier] failed to load:", e)
+            self.clarifier_llm = None
 
         if isinstance(self.llm, dict):
             self.llm = SimpleNamespace(**self.llm)
@@ -522,7 +525,7 @@ class Pipeline:
         Returns execution-like dict with autowiden_applied flag and sql_used.
         """
         window_days = self.settings.empty_result_window_days(namespace)
-        widened = widen_date_filter_mysql(sql, days=window_days)
+        widened = self._widen_date_filter_mysql(sql, days=window_days)
         if widened == sql:
             return {"autowiden_applied": False, "sql_used": sql, "rowcount": 0, "rows": []}
 
@@ -530,6 +533,19 @@ class Pipeline:
         exec2["autowiden_applied"] = True
         exec2["sql_used"] = widened
         return exec2
+
+    _LAST_MONTH_EQ = re.compile(
+        r"DATE_FORMAT\(\s*(?P<col>[\w\.`]+)\s*,\s*'%Y-%m'\s*\)\s*=\s*DATE_FORMAT\(\s*CURRENT_DATE\s*-\s*INTERVAL\s*1\s*MONTH\s*,\s*'%Y-%m'\s*\)",
+        re.IGNORECASE,
+    )
+
+    def _widen_date_filter_mysql(self, sql: str, days: int) -> str:
+        """Widen common last-month equality filter to a rolling window."""
+        def _repl(m: re.Match) -> str:
+            col = m.group("col")
+            return f"{col} >= CURRENT_DATE - INTERVAL {int(days)} DAY"
+
+        return self._LAST_MONTH_EQ.sub(_repl, sql, count=1)
 
     def _maybe_persist_snippet(
         self,

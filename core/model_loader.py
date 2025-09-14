@@ -653,54 +653,89 @@ def _load_hf(
 
 
 def load_clarifier(settings: Any | None = None) -> Optional[ModelHandle]:
+    """Load the optional clarifier model unless explicitly disabled."""
     s = _SettingsShim(settings)
-    path = s.get("CLARIFIER_MODEL_PATH")
+    backend = (
+        os.getenv("CLARIFIER_MODEL_BACKEND", s.get("CLARIFIER_MODEL_BACKEND", "")) or ""
+    ).strip().lower()
+    if backend in ("", "off", "disabled", "none"):
+        print("[clarifier] disabled (backend=off)")
+        return None
+
+    path = os.getenv("CLARIFIER_MODEL_PATH", s.get("CLARIFIER_MODEL_PATH"))
     if not path:
-        print("[clarifier] no CLARIFIER_MODEL_PATH set; clarifier disabled")
+        print("[clarifier] disabled (no CLARIFIER_MODEL_PATH)")
         return None
 
-    backend = (s.get("CLARIFIER_MODEL_BACKEND", "hf-4bit") or "hf-4bit").lower()
-    max_len = int(s.get("CLARIFIER_MAX_SEQ_LEN", "2048") or 2048)
-    device_map = (s.get("CLARIFIER_DEVICE_MAP") or os.getenv("CLARIFIER_DEVICE_MAP") or "auto").lower()
-
+    max_len = int(
+        os.getenv(
+            "CLARIFIER_MAX_SEQ_LEN",
+            s.get("CLARIFIER_MAX_SEQ_LEN", s.get("MODEL_MAX_SEQ_LEN", "4096")),
+        )
+    )
     gen_defaults = {
-        "max_new_tokens": int(s.get("CLARIFIER_MAX_NEW", "128") or 128),
-        "temperature": float(s.get("CLARIFIER_TEMPERATURE", "0.3") or 0.3),
-        "top_p": float(s.get("CLARIFIER_TOP_P", "0.9") or 0.9),
-        "stop": [],
-    }
-
-    qt_env = s.get("CLARIFIER_QUANT_TYPE") or os.getenv("CLARIFIER_QUANT_TYPE")
-    quant_type = "nf4" if device_map == "cpu" else (qt_env or "fp4")
-    offload = str(s.get("CLARIFIER_OFFLOAD_FP32") or os.getenv("CLARIFIER_OFFLOAD_FP32") or "0").lower() in {"1","true","y","yes"}
-    low_cpu = str(s.get("CLARIFIER_LOW_CPU_MEM") or os.getenv("CLARIFIER_LOW_CPU_MEM") or "1").lower() in {"1","true","y","yes"}
-
-    from transformers import BitsAndBytesConfig
-    hf_kwargs = {
-        "trust_remote_code": True,
-        "device_map": device_map,
-        "low_cpu_mem_usage": low_cpu,
-        "quantization_config": BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type=quant_type,
-            bnb_4bit_compute_dtype=torch.bfloat16,
-            llm_int8_enable_fp32_cpu_offload=offload,
+        "max_new_tokens": int(os.getenv("CLARIFIER_MAX_NEW_TOKENS", "128")),
+        "temperature": float(
+            os.getenv(
+                "CLARIFIER_TEMPERATURE",
+                os.getenv("GENERATION_TEMPERATURE", "0.2"),
+            )
         ),
+        "top_p": float(
+            os.getenv("CLARIFIER_TOP_P", os.getenv("GENERATION_TOP_P", "0.9"))
+        ),
+        "stop": _parse_stop(s.get("CLARIFIER_STOP", s.get("STOP"))),
     }
 
-    key = ("clarifier", path, backend, device_map, quant_type, offload, low_cpu, max_len)
-    if key in _MODEL_CACHE:
-        print("Reusing cached clarifier:", key)
-        return _MODEL_CACHE[key]
+    hf_kwargs: Dict[str, Any] = {"trust_remote_code": True}
+    if _env_true(os.getenv("CLARIFIER_LOW_CPU_MEM", "0")):
+        hf_kwargs["low_cpu_mem_usage"] = True
+    device_map_env = os.getenv("CLARIFIER_DEVICE_MAP", os.getenv("CLARIFIER_DEVICE", "auto"))
+    hf_kwargs["device_map"] = device_map_env
 
-    try:
-        handle = _load_hf(path, backend, max_len, gen_defaults, s, device_map=device_map, hf_kwargs=hf_kwargs)
-        _MODEL_CACHE[key] = handle
-        print("Clarifier loaded & cached.")
-        return handle
-    except Exception as e:
-        print(f"[clarifier] failed to load {backend} at {path}: {e}")
-        return None
+    if backend == "hf-cpu":
+        import torch
+
+        hf_kwargs["torch_dtype"] = torch.float32
+        hf_kwargs["device_map"] = "cpu"
+        backend = "hf-fp16"
+
+    if backend == "hf-4bit":
+        from transformers import BitsAndBytesConfig
+        import torch
+
+        qtype = (os.getenv("CLARIFIER_QUANT_TYPE", "nf4") or "nf4").lower()
+        comp = (os.getenv("CLARIFIER_COMPUTE_DTYPE", "bfloat16") or "bfloat16").lower()
+        comp_dt = {
+            "bfloat16": torch.bfloat16,
+            "float16": torch.float16,
+            "float32": torch.float32,
+        }[comp]
+        hf_kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type=qtype,
+            bnb_4bit_compute_dtype=comp_dt,
+            llm_int8_enable_fp32_cpu_offload=_env_true(
+                os.getenv("CLARIFIER_OFFLOAD_FP32", "0")
+            ),
+        )
+    elif backend == "hf-8bit":
+        from transformers import BitsAndBytesConfig
+
+        hf_kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_8bit=True,
+            llm_int8_enable_fp32_cpu_offload=_env_true(
+                os.getenv("CLARIFIER_OFFLOAD_FP32", "0")
+            ),
+        )
+    elif backend == "hf-fp16":
+        import torch
+
+        hf_kwargs.setdefault("torch_dtype", torch.float16)
+
+    print("Loading HF model with backend:", backend)
+    print("Load kwargs:", hf_kwargs)
+    return _load_hf(path, backend, max_len, gen_defaults, s, hf_kwargs=hf_kwargs)
 
 
 def load_clarifier_model(settings: Any | None = None) -> "ModelHandle | None":
