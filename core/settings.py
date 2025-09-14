@@ -258,6 +258,26 @@ class Settings:
         v = self.get("ENDUSER_CAN_CLARIFY", namespace=namespace)
         return str(v).strip().lower() in {"1", "true", "yes", "y"}
 
+    def empty_result_autoretry(self, namespace: str | None = None) -> bool:
+        return bool(
+            self.get("EMPTY_RESULT_AUTORETRY", default=True, namespace=namespace)
+        )
+
+    def empty_result_window_days(self, namespace: str | None = None) -> int:
+        try:
+            return int(
+                self.get(
+                    "EMPTY_RESULT_AUTORETRY_DAYS", default=90, namespace=namespace
+                )
+            )
+        except Exception:
+            return 90
+
+    def snippets_autosave(self, namespace: str | None = None) -> bool:
+        return bool(
+            self.get("SNIPPETS_AUTOSAVE", default=True, namespace=namespace)
+        )
+
     def research_enabled(self, namespace: str | None = None) -> bool:
         """Namespace-aware research policy with sane fallbacks."""
         # 1) per-namespace toggle
