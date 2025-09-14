@@ -6,7 +6,6 @@ from core.pipeline import Pipeline
 from apps.fa.app import fa_bp
 from core.admin_api import admin_bp
 
-
 def create_app() -> Flask:
     app = Flask(__name__)
 
