@@ -1,55 +1,37 @@
-# core/research.py
 from __future__ import annotations
-from typing import Any, Dict, List, Tuple, Optional
-import importlib
+from dataclasses import dataclass
+from typing import List, Dict, Any, Optional, Tuple
+import hashlib
 
-from .settings import Settings
+@dataclass
+class SourceDoc:
+    source_type: str      # 'internal_doc', 'web', ...
+    locator: str          # path or URL
+    title: str
+    content: str          # parsed text
+    is_redistributable: bool = True
 
-class Researcher:
-    def search(self, question: str, context: Dict[str, Any]) -> Tuple[str, List[int]]:
-        return "", []
+@dataclass
+class ResearchResult:
+    facts: Dict[str, Any]
+    sources: List[SourceDoc]
+    summary: str
 
-class NullResearcher(Researcher):
-    pass
+class BaseResearcher:
+    def __init__(self, settings, namespace: str):
+        self.settings = settings
+        self.namespace = namespace
 
-def _load_class(path: str):
-    mod, cls = path.split(":")
-    return getattr(importlib.import_module(mod), cls)
+    def search(self, question: str, prefixes: list[str]) -> ResearchResult:
+        # default: no-op
+        return ResearchResult(facts={}, sources=[], summary="")
 
-def build_researcher(settings) -> Optional[Any]:
-    try:
-        if not settings.research_enabled():
-            return None
-    except Exception:
+# Simple loader from FQCN in settings
+def load_researcher(settings, namespace: str) -> Optional[BaseResearcher]:
+    fqcn = settings.get("RESEARCHER_CLASS", scope="global", namespace=namespace)
+    if not fqcn:
         return None
-
-    # Highest precedence: explicit class
-    class_path = settings.get("RESEARCHER_CLASS")
-    if class_path:
-        try:
-            return _load_class(class_path)(settings)
-        except Exception:
-            return NullResearcher()
-
-    # Otherwise provider key
-    provider = (settings.get("RESEARCH_PROVIDER", "disabled") or "disabled").lower()
-    if provider in ("disabled", "none"):
-        return None
-    if provider in ("null", "stub"):
-        return NullResearcher()
-
-    # Future: add real providers here
-    return NullResearcher()
-
-
-def maybe_research(settings: Settings, question: str, namespace: str | None = None) -> str | None:
-    if not settings.research_enabled(namespace):
-        return None
-    cls_path = settings.get("RESEARCHER_CLASS", namespace=namespace)
-    if not cls_path:
-        return None
-    mod, _, cls = cls_path.rpartition(".")
-    if not mod or not cls:
-        return None
-    C = getattr(importlib.import_module(mod), cls)
-    return C().run(question)
+    mod_name, cls_name = fqcn.rsplit(".", 1)
+    mod = __import__(mod_name, fromlist=[cls_name])
+    cls = getattr(mod, cls_name)
+    return cls(settings=settings, namespace=namespace)
