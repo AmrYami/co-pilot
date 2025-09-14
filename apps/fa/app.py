@@ -372,6 +372,7 @@ def answer():
                 "status": "ok",
                 "sql": result.get("sql"),
                 "rationale": result.get("rationale"),
+                **({"message": result.get("message")} if result.get("message") else {}),
                 **({"warnings": warnings} if warnings else {}),
             }
         )
