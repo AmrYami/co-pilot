@@ -3,11 +3,29 @@ from flask import Blueprint, request, jsonify, current_app
 from werkzeug.exceptions import BadRequest
 from sqlalchemy import text
 from core.inquiries import append_admin_note, fetch_inquiry
-from .settings import Settings
-from .sql_exec import get_mem_engine
 import json
 
 admin_bp = Blueprint("admin", __name__, url_prefix="/admin")
+
+
+def _json_literal(val) -> str:
+    # Always send JSON to the DB; mem_settings.value is jsonb.
+    if isinstance(val, (dict, list, bool, int, float)) or val is None:
+        return json.dumps(val)
+    # Strings as JSON string
+    return json.dumps(str(val))
+
+
+def _infer_value_type(val, explicit: str | None) -> str:
+    if explicit:
+        return explicit
+    if isinstance(val, bool):
+        return "bool"
+    if isinstance(val, int):
+        return "int"
+    if isinstance(val, (dict, list)):
+        return "json"
+    return "string"
 
 
 def _conn():
@@ -25,83 +43,83 @@ def settings_bulk():
     updated_by = payload.get("updated_by") or "api"
     items = payload.get("settings") or []
 
-    # Prefer the app's pooled engine
     mem_engine = current_app.config.get("MEM_ENGINE")
-    if not mem_engine:
-        mem_engine = get_mem_engine(Settings())
+    if mem_engine is None:
+        return jsonify({"ok": False, "error": "MEM_ENGINE not configured"}), 500
 
-    upserted = []
+    # Ensure the two partial unique indexes exist
+    with mem_engine.begin() as conn:
+        conn.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_settings_ns_key_scope_null "
+            "ON mem_settings(namespace, key, scope) WHERE scope_id IS NULL"
+        ))
+        conn.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_settings_ns_key_scope_id "
+            "ON mem_settings(namespace, key, scope, scope_id) WHERE scope_id IS NOT NULL"
+        ))
+
+    upsert_null = text("""
+        INSERT INTO mem_settings(
+            namespace, key, value, value_type, scope, scope_id,
+            overridable, updated_by, created_at, updated_at, is_secret
+        )
+        VALUES (
+            :ns, :key, CAST(:val AS jsonb), :vtype, :scope, NULL,
+            COALESCE(:ovr, true), :upd, NOW(), NOW(), COALESCE(:sec, false)
+        )
+        ON CONFLICT (namespace, key, scope) WHERE scope_id IS NULL
+        DO UPDATE SET
+            value      = EXCLUDED.value,
+            value_type = EXCLUDED.value_type,
+            updated_by = EXCLUDED.updated_by,
+            updated_at = NOW(),
+            is_secret  = EXCLUDED.is_secret;
+    """)
+
+    upsert_scoped = text("""
+        INSERT INTO mem_settings(
+            namespace, key, value, value_type, scope, scope_id,
+            overridable, updated_by, created_at, updated_at, is_secret
+        )
+        VALUES (
+            :ns, :key, CAST(:val AS jsonb), :vtype, :scope, :scope_id,
+            COALESCE(:ovr, true), :upd, NOW(), NOW(), COALESCE(:sec, false)
+        )
+        ON CONFLICT (namespace, key, scope, scope_id) WHERE scope_id IS NOT NULL
+        DO UPDATE SET
+            value      = EXCLUDED.value,
+            value_type = EXCLUDED.value_type,
+            updated_by = EXCLUDED.updated_by,
+            updated_at = NOW(),
+            is_secret  = EXCLUDED.is_secret;
+    """)
+
+    upserted = 0
     with mem_engine.begin() as conn:
         for it in items:
             key = it["key"]
             scope = it.get("scope") or "namespace"
-            scope_id = it.get("scope_id")  # may be None
-            is_secret = bool(it.get("is_secret", False))
-            vtype = it.get("value_type")
-            val = it.get("value")
-
-            # Normalize JSON on the DB side
-            # We always pass text and CAST on the server:
-            val_json = json_dumps(val)
-
-            if scope_id is None:
-                # Uses partial-unique index ux_settings_ns_key_scope_null
-                sql = text(
-                    """
-                    INSERT INTO mem_settings(namespace, key, value, value_type, scope, scope_id,
-                                             overridable, updated_by, created_at, updated_at, is_secret)
-                    VALUES (:ns, :key, CAST(:val AS jsonb), :vtype, :scope, NULL,
-                            true, :upd, NOW(), NOW(), :sec)
-                    ON CONFLICT (namespace, key, scope)
-                    DO UPDATE SET
-                      value      = EXCLUDED.value,
-                      value_type = EXCLUDED.value_type,
-                      updated_by = EXCLUDED.updated_by,
-                      updated_at = NOW(),
-                      is_secret  = EXCLUDED.is_secret
-                    """
-                )
-                params = {
-                    "ns": ns,
-                    "key": key,
-                    "val": val_json,
-                    "vtype": vtype,
-                    "scope": scope,
-                    "upd": updated_by,
-                    "sec": is_secret,
-                }
+            scope_id = it.get("scope_id")
+            vtype = _infer_value_type(it.get("value"), it.get("value_type"))
+            val = _json_literal(it.get("value"))
+            params = {
+                "ns": ns,
+                "key": key,
+                "val": val,
+                "vtype": vtype,
+                "scope": scope,
+                "scope_id": scope_id,
+                "ovr": it.get("overridable"),
+                "upd": updated_by,
+                "sec": bool(it.get("is_secret", False)),
+            }
+            if scope_id is None or scope_id == "":
+                conn.execute(upsert_null, params)
             else:
-                # Uses partial-unique index ux_settings_ns_key_scope_id
-                sql = text(
-                    """
-                    INSERT INTO mem_settings(namespace, key, value, value_type, scope, scope_id,
-                                             overridable, updated_by, created_at, updated_at, is_secret)
-                    VALUES (:ns, :key, CAST(:val AS jsonb), :vtype, :scope, :scope_id,
-                            true, :upd, NOW(), NOW(), :sec)
-                    ON CONFLICT (namespace, key, scope, scope_id)
-                    DO UPDATE SET
-                      value      = EXCLUDED.value,
-                      value_type = EXCLUDED.value_type,
-                      updated_by = EXCLUDED.updated_by,
-                      updated_at = NOW(),
-                      is_secret  = EXCLUDED.is_secret
-                    """
-                )
-                params = {
-                    "ns": ns,
-                    "key": key,
-                    "val": val_json,
-                    "vtype": vtype,
-                    "scope": scope,
-                    "scope_id": scope_id,
-                    "upd": updated_by,
-                    "sec": is_secret,
-                }
+                conn.execute(upsert_scoped, params)
+            upserted += 1
 
-            conn.execute(sql, params)
-            upserted.append({"key": key, "scope": scope, "scope_id": scope_id})
-
-    return {"ok": True, "namespace": ns, "updated_by": updated_by, "upserted": upserted}
+    return jsonify({"ok": True, "namespace": ns, "updated_by": updated_by, "upserted": upserted})
 
 
 @admin_bp.get("/settings/get")
@@ -173,5 +191,4 @@ def admin_process(inq_id: int):
 
 # helper
 
-def json_dumps(v) -> str:
-    return json.dumps(v, ensure_ascii=False)
+ 
