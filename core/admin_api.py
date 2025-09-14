@@ -3,8 +3,6 @@ from flask import Blueprint, request, jsonify, current_app
 from werkzeug.exceptions import BadRequest
 from sqlalchemy import text
 from core.inquiries import append_admin_note, fetch_inquiry
-from core.settings import Settings
-from core.sql_exec import get_mem_engine
 import json
 
 admin_bp = Blueprint("admin", __name__, url_prefix="/admin")
@@ -20,115 +18,86 @@ def _conn():
 
 @admin_bp.post("/settings/bulk")
 def settings_bulk():
-    """
-    Upsert a batch of settings into mem_settings.
-    Expects JSON:
-    {
-      "namespace": "fa::common",
-      "updated_by": "amr",
-      "settings": [
-         {"key": "...", "value": <any json>, "scope": "namespace|global|user", "scope_id": null|"...",
-          "value_type": "string|int|bool|json", "category": "...", "description": "...", "is_secret": false, "overridable": true}
-      ]
-    }
-    """
-    payload = request.get_json(force=True, silent=False) or {}
-    ns = payload.get("namespace") or "default"
+    payload = request.get_json(force=True) or {}
+    ns = payload.get("namespace") or "fa::common"
     updated_by = payload.get("updated_by") or "api"
     items = payload.get("settings") or []
 
-    mem_engine = get_mem_engine(Settings())  # reuse pool
-    results = []
-    errors = []
+    pipeline = current_app.config.get("PIPELINE")
+    mem_engine = None
+    if pipeline is not None:
+        mem_engine = getattr(pipeline, "mem_engine", None)
+    if mem_engine is None:
+        mem_engine = current_app.config.get("MEM_ENGINE")
+    if mem_engine is None:
+        return jsonify({"ok": False, "error": "MEM_ENGINE not configured on app"}), 500
 
-    # Decide a value_type if not provided
-    def infer_value_type(v) -> str:
+    def _infer_vtype(v):
         if isinstance(v, bool):  return "bool"
         if isinstance(v, int):   return "int"
         if isinstance(v, float): return "float"
         if isinstance(v, (list, dict)): return "json"
         return "string"
 
-    # Two upsert statements (one for NULL scope_id, one for non-null)
-    UPSERT_NULL = text("""
-        INSERT INTO mem_settings(
-            namespace, key, value, value_type, scope, scope_id,
-            category, description, overridable, updated_by, created_at, updated_at, is_secret
-        )
-        VALUES (
-            :ns, :key, CAST(:val_json AS jsonb), :vtype, :scope, NULL,
-            :cat, :desc, COALESCE(:ovr, true), :upd_by, NOW(), NOW(), COALESCE(:is_secret, false)
-        )
-        ON CONFLICT (namespace, key, scope) WHERE scope_id IS NULL
-        DO UPDATE SET
-            value      = EXCLUDED.value,
-            value_type = EXCLUDED.value_type,
-            updated_by = EXCLUDED.updated_by,
-            updated_at = NOW(),
-            is_secret  = EXCLUDED.is_secret;
-    """)
-
-    UPSERT_SCOPED = text("""
-        INSERT INTO mem_settings(
-            namespace, key, value, value_type, scope, scope_id,
-            category, description, overridable, updated_by, created_at, updated_at, is_secret
-        )
-        VALUES (
-            :ns, :key, CAST(:val_json AS jsonb), :vtype, :scope, :scope_id,
-            :cat, :desc, COALESCE(:ovr, true), :upd_by, NOW(), NOW(), COALESCE(:is_secret, false)
-        )
-        ON CONFLICT (namespace, key, scope, scope_id)
-        DO UPDATE SET
-            value      = EXCLUDED.value,
-            value_type = EXCLUDED.value_type,
-            updated_by = EXCLUDED.updated_by,
-            updated_at = NOW(),
-            is_secret  = EXCLUDED.is_secret;
-    """)
-
+    results = {"ok": True, "upserted": 0, "updated_by": updated_by, "namespace": ns, "items": []}
     with mem_engine.begin() as conn:
         for it in items:
-            key = it.get("key")
-            if not key:
-                errors.append({"key": None, "error": "missing key"})
-                continue
-
-            val = it.get("value")
-            val_type = it.get("value_type") or infer_value_type(val)
-            scope = (it.get("scope") or "namespace").lower()
-            scope_id = it.get("scope_id")  # may be None
+            key = it["key"]
+            raw_val = it.get("value")
+            scope = it.get("scope", "namespace")
+            scope_id = it.get("scope_id")
+            vtype = it.get("value_type") or _infer_vtype(raw_val)
             cat = it.get("category")
             desc = it.get("description")
+            ovr = it.get("overridable")
             is_secret = bool(it.get("is_secret", False))
-            overridable = it.get("overridable")
-            # IMPORTANT: always JSON-encode before CAST(:val_json AS jsonb)
-            val_json = json.dumps(val)
 
-            params = {
-                "ns": ns,
-                "key": key,
-                "val_json": val_json,
-                "vtype": val_type,
-                "scope": scope,
-                "scope_id": scope_id,
-                "cat": cat,
-                "desc": desc,
-                "ovr": overridable,
-                "upd_by": updated_by,
-                "is_secret": is_secret,
-            }
+            val_json = json.dumps(raw_val, ensure_ascii=False)
 
-            try:
-                if scope_id is None:
-                    conn.execute(UPSERT_NULL, params)
-                else:
-                    conn.execute(UPSERT_SCOPED, params)
-                results.append({"key": key, "ok": True})
-            except Exception as e:
-                errors.append({"key": key, "error": f"{type(e).__name__}: {e}"})
+            upsert_sql = text("""
+                WITH upd AS (
+                    UPDATE mem_settings
+                       SET value      = CAST(:val AS jsonb),
+                           value_type = :vtype,
+                           updated_by = :upd_by,
+                           updated_at = NOW(),
+                           is_secret  = COALESCE(:is_secret, false),
+                           category   = COALESCE(:cat, category),
+                           description= COALESCE(:desc, description),
+                           overridable= COALESCE(:ovr, overridable)
+                     WHERE namespace = :ns
+                       AND key       = :key
+                       AND scope     = :scope
+                       AND (
+                             (:scope_id IS NULL AND scope_id IS NULL)
+                          OR (scope_id = :scope_id)
+                           )
+                 RETURNING id
+                )
+                INSERT INTO mem_settings (
+                    namespace, key, value, value_type, scope, scope_id,
+                    category, description, overridable, updated_by,
+                    created_at, updated_at, is_secret
+                )
+                SELECT :ns, :key, CAST(:val AS jsonb), :vtype, :scope, :scope_id,
+                       :cat, :desc, COALESCE(:ovr, true), :upd_by,
+                       NOW(), NOW(), COALESCE(:is_secret, false)
+                WHERE NOT EXISTS (SELECT 1 FROM upd);
+            """)
 
-    return jsonify({"ok": len(errors) == 0, "updated_by": updated_by, "namespace": ns,
-                    "results": results, "errors": errors}), (200 if not errors else 207)
+            conn.execute(
+                upsert_sql,
+                {
+                    "ns": ns, "key": key, "val": val_json,
+                    "vtype": vtype, "scope": scope, "scope_id": scope_id,
+                    "cat": cat, "desc": desc, "ovr": ovr, "upd_by": updated_by,
+                    "is_secret": is_secret,
+                },
+            )
+            results["upserted"] += 1
+            results["items"].append({"key": key, "scope": scope, "scope_id": scope_id})
+
+    return jsonify(results)
 
 
 @admin_bp.get("/settings/get")

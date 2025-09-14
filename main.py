@@ -16,6 +16,8 @@ def create_app() -> Flask:
     app.extensions["pipeline"] = pipeline
     app.config["PIPELINE"] = pipeline
     app.config["MEM_ENGINE"] = pipeline.mem_engine
+    if app.config["MEM_ENGINE"] is None:
+        raise RuntimeError("pipeline.mem_engine is None – check MEMORY_DB_URL setting")
     app.config["SETTINGS"] = pipeline.settings
 
     # admin_bp already has url_prefix="/admin"
