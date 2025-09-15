@@ -22,7 +22,7 @@ store one per process and call `set_namespace(...)` before use.
 
 from __future__ import annotations
 
-import json, threading
+import json, threading, os
 from typing import Any, Dict, Optional
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
@@ -40,6 +40,96 @@ class Settings:
         self._runtime_overrides: Dict[str, Any] = {}
         self._cache: Dict[str, Any] = {}
         self._lock = threading.RLock()
+
+    # ---- internal fetch helpers ----
+    def _fetch_row(
+        self,
+        key: str,
+        *,
+        namespace: str,
+        scope: str = "namespace",
+        scope_id: str | None = None,
+    ) -> Optional[dict]:
+        """Fetch a raw row from mem_settings with caching."""
+        if not self._mem_engine:
+            return None
+        cache_key = self._cache_key(namespace, key, scope, scope_id)
+        if cache_key in self._cache:
+            return self._cache[cache_key]
+
+        params = {"key": key, "ns": namespace, "sc": scope, "sid": scope_id}
+        if scope_id is None:
+            sql = text(
+                """
+                SELECT key, value, value_type
+                  FROM mem_settings
+                 WHERE namespace = :ns AND key = :key AND scope = :sc AND scope_id IS NULL
+                 LIMIT 1
+                """
+            )
+        else:
+            sql = text(
+                """
+                SELECT key, value, value_type
+                  FROM mem_settings
+                 WHERE namespace = :ns AND key = :key AND scope = :sc AND scope_id = :sid
+                 LIMIT 1
+                """
+            )
+
+        with self._mem_engine.begin() as c:
+            row = c.execute(sql, params).mappings().first()
+
+        if row:
+            d = dict(row)
+            self._cache[cache_key] = d
+            return d
+        self._cache[cache_key] = None
+        return None
+
+    def _coerce(self, value: Any, value_type: Optional[str]) -> Any:
+        """Coerce the raw DB value according to its declared value_type."""
+        v = value
+        if isinstance(v, str):
+            v_str = v.strip()
+            if (
+                (v_str.startswith("{") and v_str.endswith("}"))
+                or (v_str.startswith("[") and v_str.endswith("]"))
+                or (v_str.startswith('"') and v_str.endswith('"'))
+                or v_str in {"true", "false", "null"}
+            ):
+                try:
+                    v = json.loads(v_str)
+                except Exception:
+                    pass
+        t = (value_type or "").lower()
+        if t in ("bool", "boolean"):
+            if isinstance(v, bool):
+                return v
+            if isinstance(v, str):
+                return v.strip().lower() in {"1", "true", "yes", "on"}
+            if isinstance(v, (int, float)):
+                return bool(v)
+            return False
+        if t in ("int", "integer"):
+            try:
+                return int(v)
+            except Exception:
+                return None
+        if t == "json":
+            if isinstance(v, (dict, list)):
+                return v
+            try:
+                return json.loads(v)
+            except Exception:
+                return None
+        if t in ("string", "str", ""):
+            if v is None:
+                return None
+            if isinstance(v, (dict, list)):
+                return json.dumps(v)
+            return str(v)
+        return v
 
     # ---------------- Public API ----------------
     def set_namespace(self, namespace: str) -> None:
@@ -70,106 +160,53 @@ class Settings:
         scope_id: str | None = None,
         namespace: str | None = None,
     ) -> Any:
-        """Get a setting by key with precedence runtime→DB→env→default.
-        `scope` can be 'user' with a `scope_id` to fetch user-specific overrides.
-        `namespace` optionally overrides the active namespace for this lookup.
-        """
+        """Get a setting by key with precedence runtime→DB→env→default."""
         with self._lock:
             ns = namespace or self._namespace
-            # runtime
             if key in self._runtime_overrides:
                 return self._runtime_overrides[key]
 
-            # DB
-            val = self._get_from_db(key, scope=scope, scope_id=scope_id, namespace=ns)
-            if val is not None:
-                return val
+            row = self._fetch_row(key, namespace=ns, scope=scope or "namespace", scope_id=scope_id)
+            if row is not None:
+                return self._coerce(row.get("value"), row.get("value_type"))
 
-            # env
-            from os import getenv
-
-            env_val = getenv(key)
+            env_val = os.getenv(key)
             if env_val is not None:
                 return env_val
-
             return default
 
     def get_json(
         self,
         key: str,
-        default=None,
+        default: Any = None,
         *,
         scope: str = "namespace",
         scope_id: str | None = None,
         namespace: str | None = None,
-    ):
-        """
-        Return a setting as a Python object (dict/list/etc).
-        - If stored as JSONB this will already be a native object (depending on your loader).
-        - If stored as text, we try json.loads(); on failure returns `default`.
-        """
-        val = self.get(key, default=None, scope=scope, scope_id=scope_id, namespace=namespace)
-        if val is None:
+    ) -> Any:
+        row = self._fetch_row(key, namespace=namespace or self._namespace, scope=scope, scope_id=scope_id)
+        if not row:
             return default
-        # Already a structured type
-        if isinstance(val, (dict, list)):
-            return val
-        # Bytes -> decode then parse
-        if isinstance(val, (bytes, bytearray)):
-            try:
-                return json.loads(val.decode("utf-8"))
-            except Exception:
-                return default
-        # String -> try json.loads
-        if isinstance(val, str):
-            s = val.strip()
-            if not s:
-                return default
-            try:
-                return json.loads(s)
-            except Exception:
-                # Not valid JSON; return default to avoid surprising callers
-                return default
-        # Any other primitive: return as-is (or default)
-        return val
+        val = self._coerce(row.get("value"), row.get("value_type"))
+        return val if isinstance(val, (dict, list)) or val is None else default
 
     def get_str(
         self,
         key: str,
-        default: str = "",
+        default: Optional[str] = None,
         *,
         scope: str = "namespace",
         scope_id: str | None = None,
         namespace: str | None = None,
-    ) -> str:
-        val = self.get(key, default=None, scope=scope, scope_id=scope_id, namespace=namespace)
+    ) -> Optional[str]:
+        row = self._fetch_row(key, namespace=namespace or self._namespace, scope=scope, scope_id=scope_id)
+        if not row:
+            return default
+        val = self._coerce(row.get("value"), row.get("value_type"))
         if val is None:
             return default
-        return val if isinstance(val, str) else str(val)
+        return str(val)
 
-    @staticmethod
-    def _coerce_bool(v: Any, default: bool = False) -> bool:
-        if v is None:
-            return default
-        if isinstance(v, bool):
-            return v
-        if isinstance(v, (int, float)):
-            return v != 0
-        if isinstance(v, str):
-            t = v.strip().lower()
-            return t in {"1", "true", "t", "yes", "y", "on"}
-        return default
-
-    @staticmethod
-    def _coerce_int(v: Any, default: int = 0) -> int:
-        if v is None:
-            return default
-        if isinstance(v, bool):
-            return 1 if v else 0
-        try:
-            return int(v)
-        except Exception:
-            return default
 
     def get_bool(
         self,
@@ -180,20 +217,29 @@ class Settings:
         scope_id: str | None = None,
         namespace: str | None = None,
     ) -> bool:
-        val = self.get(key, default=None, scope=scope, scope_id=scope_id, namespace=namespace)
-        return self._coerce_bool(val, default)
+        row = self._fetch_row(key, namespace=namespace or self._namespace, scope=scope, scope_id=scope_id)
+        if not row:
+            return default
+        val = self._coerce(row.get("value"), row.get("value_type"))
+        return bool(val) if val is not None else default
 
     def get_int(
         self,
         key: str,
-        default: int = 0,
+        default: Optional[int] = None,
         *,
         scope: str = "namespace",
         scope_id: str | None = None,
         namespace: str | None = None,
-    ) -> int:
-        val = self.get(key, default=None, scope=scope, scope_id=scope_id, namespace=namespace)
-        return self._coerce_int(val, default)
+    ) -> Optional[int]:
+        row = self._fetch_row(key, namespace=namespace or self._namespace, scope=scope, scope_id=scope_id)
+        if not row:
+            return default
+        try:
+            val = self._coerce(row.get("value"), row.get("value_type"))
+            return int(val)
+        except Exception:
+            return default
 
     def summary(self, mask_secrets: bool = True) -> Dict[str, Any]:
         """Return a snapshot of cached DB/env values for diagnostics."""
@@ -206,68 +252,6 @@ class Settings:
         return snap
 
     # ---------------- Internals ----------------
-    def _get_from_db(
-        self,
-        key: str,
-        *,
-        scope: str | None,
-        scope_id: str | None,
-        namespace: str,
-    ) -> Any | None:
-        if not self._mem_engine:
-            return None
-        cache_key = self._cache_key(namespace, key, scope, scope_id)
-        if cache_key in self._cache:
-            entry = self._cache[cache_key]
-            return entry["value"] if isinstance(entry, dict) else entry
-
-        # precedence: user(scope=user+scope_id) > namespace > global
-        sql = text(
-            """
-            SELECT key, value, value_type, is_secret, scope, scope_id
-            FROM mem_settings
-            WHERE key = :key AND (
-                (scope = 'user' AND scope_id = :scope_id AND namespace = :ns) OR
-                (scope = 'namespace' AND namespace = :ns) OR
-                (scope = 'global')
-            )
-            ORDER BY CASE scope WHEN 'user' THEN 1 WHEN 'namespace' THEN 2 ELSE 3 END
-            LIMIT 1
-            """
-        )
-        params = {"key": key, "ns": namespace, "scope_id": scope_id}
-        try:
-            with self._mem_engine.connect() as c:  # type: ignore[union-attr]
-                r = c.execute(sql, params).mappings().first()
-        except Exception:
-            r = None
-        if not r:
-            self._cache[cache_key] = None
-            return None
-
-        raw = r["value"]
-        if isinstance(raw, (bytes, bytearray)):
-            raw = raw.decode("utf-8", "ignore")
-        try:
-            # value is JSONB in DB; convert to python
-            parsed = (
-                raw
-                if isinstance(raw, (dict, list, int, float, bool))
-                else json.loads(raw)
-            )
-        except Exception:
-            parsed = raw
-
-        entry = {
-            "value": parsed,
-            "value_type": r["value_type"],
-            "is_secret": r["is_secret"],
-            "scope": r["scope"],
-            "scope_id": r["scope_id"],
-        }
-        self._cache[cache_key] = entry
-        return entry["value"]
-
     def _cache_key(
         self, namespace: str, key: str, scope: str | None, scope_id: str | None
     ) -> str:
