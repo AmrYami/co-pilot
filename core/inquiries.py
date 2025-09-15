@@ -7,8 +7,7 @@ These helpers are project-agnostic (no FA-specific code).
 
 from __future__ import annotations
 
-import json
-from datetime import datetime, timezone
+import json, datetime
 from typing import Any, Dict, List, Optional
 from sqlalchemy.engine import Engine, Row
 from sqlalchemy import text, bindparam
@@ -58,33 +57,35 @@ def summarize_admin_notes(notes: Optional[List[Dict[str, Any]]]) -> str:
 
 
 def append_admin_note(mem_engine, inquiry_id: int, *, by: str, text_note: str) -> int:
+    """Append a structured admin note and increment clarification_rounds."""
     note = {
         "by": by,
-        "text": (text_note or "").strip(),
-        "ts": datetime.now(timezone.utc).isoformat(),
+        "text": text_note,
+        "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     }
-    note_json = json.dumps(note)
-
+    payload = {
+        "id": inquiry_id,
+        "by": by,
+        "reply": text_note,
+        "note": json.dumps(note),
+    }
     sql = text(
         """
         UPDATE mem_inquiries
-           SET admin_notes          = COALESCE(admin_notes, '[]'::jsonb)
-                                      || jsonb_build_array(to_jsonb(%(note)s::json)),
-               admin_reply          = COALESCE(%(reply)s, admin_reply),
-               answered_by          = COALESCE(%(by)s, answered_by),
+           SET admin_notes = COALESCE(admin_notes, '[]'::jsonb)
+                              || jsonb_build_array(CAST(:note AS jsonb)),
+               admin_reply = COALESCE(:reply, admin_reply),
+               answered_by = COALESCE(:by, answered_by),
                clarification_rounds = COALESCE(clarification_rounds, 0) + 1,
-               updated_at           = NOW()
-         WHERE id = %(id)s
+               updated_at = NOW()
+         WHERE id = :id
      RETURNING clarification_rounds
         """
     )
-    with mem_engine.begin() as c:
-        r = c.execute(
-            sql,
-            {"id": inquiry_id, "by": by, "reply": text_note, "note": note_json},
-        )
-        rounds = r.scalar_one()
-    return rounds
+    with mem_engine.connect() as conn:
+        r = conn.execute(sql, payload)
+        row = r.first()
+        return int(row[0]) if row else 0
 
 
 def set_admin_reply(mem_engine, inquiry_id: int, reply: str, answered_by: str | None = None) -> None:

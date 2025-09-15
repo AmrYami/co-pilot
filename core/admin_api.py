@@ -3,6 +3,8 @@ from flask import Blueprint, request, jsonify, current_app
 from werkzeug.exceptions import BadRequest
 from sqlalchemy import text
 from core.inquiries import append_admin_note, fetch_inquiry
+from core.settings import Settings
+from core.sql_exec import get_mem_engine
 import json
 
 admin_bp = Blueprint("admin", __name__, url_prefix="/admin")
@@ -152,28 +154,21 @@ def get_inquiry(inq_id: int):
 @admin_bp.post("/inquiries/<int:inq_id>/reply")
 def admin_reply(inq_id: int):
     data = request.get_json(force=True) or {}
-    answered_by = data.get("answered_by") or "unknown"
-    admin_reply_text = data.get("admin_reply") or ""
+    answered_by = data.get("answered_by") or "admin@local"
+    admin_reply_txt = (data.get("admin_reply") or "").strip()
+    process = bool(data.get("process"))
 
-    mem = current_app.config["MEM_ENGINE"]
-    rounds = append_admin_note(mem, inq_id, by=answered_by, text_note=admin_reply_text)
+    mem = get_mem_engine(Settings())
+    rounds = append_admin_note(mem, inq_id, by=answered_by, text_note=admin_reply_txt)
 
-    processed = False
-    proc_result = None
-    if data.get("process"):
+    result = {"ok": True, "inquiry_id": inq_id, "clarification_rounds": rounds}
+
+    if process:
         pipeline = current_app.config["PIPELINE"]
-        proc_result = pipeline.reprocess_inquiry(inq_id, namespace=pipeline.namespace)
-        processed = True
+        proc = pipeline.reprocess_inquiry(inq_id, namespace=pipeline.namespace)
+        result.update({"processed": True, "result": proc})
 
-    return jsonify(
-        {
-            "ok": True,
-            "inquiry_id": inq_id,
-            "clarification_rounds": rounds,
-            "processed": processed,
-            "result": proc_result or None,
-        }
-    ), 200
+    return jsonify(result)
 
 
 @admin_bp.post("/inquiries/<int:inq_id>/process")
