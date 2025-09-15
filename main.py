@@ -5,12 +5,14 @@ from core.settings import Settings
 from core.pipeline import Pipeline
 from apps.fa.app import fa_bp
 from core.admin_api import admin_bp
+from core.sql_exec import init_mem_engine
 
 def create_app() -> Flask:
     app = Flask(__name__)
 
     settings = Settings()
     pipeline = Pipeline(settings=settings, namespace="fa::common")
+    init_mem_engine(settings)
 
     app.extensions = getattr(app, "extensions", {})
     app.extensions["pipeline"] = pipeline

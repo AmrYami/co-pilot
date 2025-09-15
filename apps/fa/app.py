@@ -168,7 +168,7 @@ def fa_seed():
     ns = data.get("namespace") or "fa::common"
     try:
         settings = Settings(namespace=ns)
-        mem = get_mem_engine(settings.memory_db_url())
+        mem = get_mem_engine(settings)
         res = seed_if_missing(mem, ns, settings=settings, force=bool(data.get("force")))
         return jsonify({"ok": True, "namespace": ns, **res})
     except Exception as e:

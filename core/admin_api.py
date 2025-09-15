@@ -3,7 +3,6 @@ from flask import Blueprint, request, jsonify, current_app
 from werkzeug.exceptions import BadRequest
 from sqlalchemy import text
 from core.inquiries import append_admin_note, fetch_inquiry
-from core.settings import Settings
 from core.sql_exec import get_mem_engine
 import json
 
@@ -158,13 +157,13 @@ def admin_reply(inq_id: int):
     admin_reply_txt = (data.get("admin_reply") or "").strip()
     process = bool(data.get("process"))
 
-    mem = get_mem_engine(Settings())
+    pipeline = current_app.config["PIPELINE"]
+    mem = get_mem_engine(pipeline.settings)
     rounds = append_admin_note(mem, inq_id, by=answered_by, text_note=admin_reply_txt)
 
     result = {"ok": True, "inquiry_id": inq_id, "clarification_rounds": rounds}
 
     if process:
-        pipeline = current_app.config["PIPELINE"]
         proc = pipeline.reprocess_inquiry(inq_id, namespace=pipeline.namespace)
         result.update({"processed": True, "result": proc})
 

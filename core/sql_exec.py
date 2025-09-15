@@ -1,14 +1,20 @@
 # core/sql_exec.py
 from __future__ import annotations
+import os, threading
 from typing import Any, Dict, Optional, Tuple
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 import re, csv
 from io import StringIO
+from core.settings import Settings
 
 SAFE_SQL_RE = re.compile(r"(?is)^\s*(with|select)\b")
 
 _ENGINES: Dict[str, Engine] = {}
+
+_MEM_ENGINE = None
+_MEM_URL = None
+_MEM_LOCK = threading.Lock()
 
 
 def get_app_engine(settings, namespace: str) -> Engine:
@@ -23,18 +29,32 @@ def get_app_engine(settings, namespace: str) -> Engine:
     return eng
 
 
-def get_mem_engine(mem) -> Engine:
-    """Return a cached Engine for the given mem database."""
-    if isinstance(mem, Engine):
-        return mem
-    if isinstance(mem, str):
-        key = f"mem::{mem}"
-        if key in _ENGINES:
-            return _ENGINES[key]
-        eng = create_engine(mem, pool_pre_ping=True, pool_recycle=3600)
-        _ENGINES[key] = eng
-        return eng
-    raise RuntimeError("MEM_ENGINE not configured")
+def init_mem_engine(settings: Settings) -> "Engine":
+    """Create (or reuse) the global mem engine from settings/env."""
+    global _MEM_ENGINE, _MEM_URL
+    url = settings.get("MEMORY_DB_URL", scope="global") or os.getenv("MEMORY_DB_URL")
+    if not url:
+        raise RuntimeError("MEMORY_DB_URL not set in settings or environment")
+
+    if _MEM_ENGINE is not None and _MEM_URL == url:
+        return _MEM_ENGINE
+
+    with _MEM_LOCK:
+        if _MEM_ENGINE is not None and _MEM_URL == url:
+            return _MEM_ENGINE
+        _MEM_ENGINE = create_engine(url, pool_pre_ping=True, future=True)
+        _MEM_URL = url
+        return _MEM_ENGINE
+
+
+def get_mem_engine(settings: Settings | None = None) -> "Engine":
+    """Return global engine; lazily initialize from provided settings or a default Settings()."""
+    global _MEM_ENGINE
+    if _MEM_ENGINE is not None:
+        return _MEM_ENGINE
+    if settings is None:
+        settings = Settings()
+    return init_mem_engine(settings)
 
 def validate_select(sql: str) -> Tuple[bool, str]:
     s = sql.strip().lstrip("(")
