@@ -11,7 +11,12 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from sqlalchemy.engine import Engine, Row
 from sqlalchemy import text
-from psycopg2.extras import Json
+import json
+try:
+    # Guard import so code works even if PostgreSQL dialect isn't installed
+    from sqlalchemy.dialects.postgresql import JSONB  # noqa: F401
+except Exception:  # pragma: no cover - fallback when dialect missing
+    JSONB = None
 
 
 def fetch_inquiry(mem_engine, inquiry_id: int) -> Optional[Dict[str, Any]]:
@@ -57,27 +62,27 @@ def summarize_admin_notes(notes: Optional[List[Dict[str, Any]]]) -> str:
 
 
 def append_admin_note(mem_engine, inquiry_id: int, by: str, text_note: str) -> int:
-    """Append an admin note and update reply metadata.
+    """Append an admin note and update reply metadata safely.
 
-    The note is bound using ``psycopg2.extras.Json`` to ensure proper JSONB
-    handling on PostgreSQL without manual casts or format tricks.
+    JSON is sent as text and CAST on the server side to avoid driver quirks.
     """
 
-    note = {"by": by, "text": text_note, "ts": datetime.now(timezone.utc).isoformat()}
-    params = {"id": inquiry_id, "note": Json(note), "reply": text_note, "by": by}
+    note_obj = {"by": by, "text": text_note, "ts": datetime.now(timezone.utc).isoformat()}
+    note_txt = json.dumps(note_obj, ensure_ascii=False)
     sql = text(
         """
         UPDATE mem_inquiries
-           SET admin_notes          = COALESCE(admin_notes, '[]'::jsonb) || jsonb_build_array(:note),
-               admin_reply          = COALESCE(:reply, admin_reply),
-               answered_by          = COALESCE(:by, answered_by),
-               answered_at          = NOW(),
+           SET admin_notes = COALESCE(admin_notes, '[]'::jsonb)
+                              || jsonb_build_array(CAST(:note AS jsonb)),
+               admin_reply = :reply,
+               answered_by = :by,
                clarification_rounds = COALESCE(clarification_rounds, 0) + 1,
-               updated_at           = NOW()
+               updated_at = NOW()
          WHERE id = :id
      RETURNING clarification_rounds
     """
     )
+    params = {"id": inquiry_id, "note": note_txt, "reply": text_note, "by": by}
     with mem_engine.begin() as c:
         row = c.execute(sql, params).fetchone()
     return int(row[0]) if row else 0
@@ -276,77 +281,58 @@ def create_or_update_inquiry(
     status: str = "open",
     research_summary: Optional[str] = None,
     source_ids: Optional[List[int]] = None,
+    admin_reply: Optional[str] = None,
+    answered_by: Optional[str] = None,
+    last_sql: Optional[str] = None,
+    last_error: Optional[str] = None,
 ) -> int:
+    """Insert a new inquiry row and return its id.
+
+    JSON values are sent as TEXT and cast server-side to jsonb to avoid driver
+    casting issues.
     """
-    Insert a new inquiry row. Tries full JSONB/modern schema first,
-    then falls back to a minimal, legacy-compatible insert if needed.
-    Returns the new inquiry id.
+
+    pfx_txt = json.dumps(prefixes or [], ensure_ascii=False)
+    src_txt = json.dumps(source_ids or [], ensure_ascii=False)
+
+    sql = text(
+        """
+        INSERT INTO mem_inquiries(
+            namespace, prefixes, question, auth_email,
+            run_id, research_enabled, research_summary, source_ids,
+            status, datasource, admin_reply, answered_by,
+            last_sql, last_error, created_at, updated_at
+        )
+        VALUES (
+            :ns, CAST(:pfx AS jsonb), :q, :mail,
+            :run_id, :re, :rs, CAST(:src AS jsonb),
+            :st, :ds, :reply, :by,
+            :last_sql, :last_error, NOW(), NOW()
+        )
+        RETURNING id
     """
-    pfx_list = prefixes or []
-    src_list = source_ids or []
+    )
 
-    # Try modern schema (JSONB + extra columns)
-    try:
-        params: Dict[str, Any] = {
-            "ns": namespace,
-            "pfx": pfx_list,
-            "q": question,
-            "mail": auth_email,
-            "run_id": run_id,
-            "re": bool(research_enabled),
-            "rs": research_summary,
-            "src": src_list,
-            "st": status,
-            "ds": datasource,
-        }
-        sql = text("""
-            INSERT INTO mem_inquiries(
-                namespace, prefixes, question, auth_email,
-                run_id, research_enabled, research_summary, source_ids,
-                status, datasource, created_at, updated_at
-            )
-            VALUES (
-                :ns, :pfx, :q, :mail,
-                :run_id, :re, :rs, :src,
-                :st, :ds, NOW(), NOW()
-            )
-            RETURNING id
-        """)
-        if JSONB is not None:
-            sql = sql.bindparams(
-                bindparam("pfx", type_=JSONB),
-                bindparam("src", type_=JSONB),
-            )
+    params: Dict[str, Any] = {
+        "ns": namespace,
+        "pfx": pfx_txt,
+        "q": question,
+        "mail": auth_email,
+        "run_id": run_id,
+        "re": bool(research_enabled),
+        "rs": research_summary,
+        "src": src_txt,
+        "st": status,
+        "ds": datasource,
+        "reply": admin_reply,
+        "by": answered_by,
+        "last_sql": last_sql,
+        "last_error": last_error,
+    }
 
-        with mem_engine.begin() as con:
-            new_id = con.execute(sql, params).scalar_one()
-            return int(new_id)
-
-    except Exception:
-        # Fall back to a very small subset that matches legacy tables.
-        # Store prefixes/source_ids as TEXT (JSON string) if needed.
-        params2: Dict[str, Any] = {
-            "ns": namespace,
-            "pfx_txt": json.dumps(pfx_list, ensure_ascii=False),
-            "q": question,
-            "mail": auth_email,
-            "st": status,
-            "ds": datasource,
-        }
-        sql2 = text("""
-            INSERT INTO mem_inquiries(
-                namespace, prefixes, question, auth_email,
-                status, datasource, created_at, updated_at
-            )
-            VALUES (
-                :ns, :pfx_txt, :q, :mail,
-                :st, :ds, NOW(), NOW()
-            )
-            RETURNING id
-        """)
-        with mem_engine.begin() as con:
-            new_id = con.execute(sql2, params2).scalar_one()
-            return int(new_id)
+    with mem_engine.begin() as con:
+        row = con.execute(sql, params).fetchone()
+    return int(row[0]) if row else 0
 
 
 def set_feedback(mem_engine: Engine, *, inquiry_id: int, satisfied: bool, rating: Optional[int], comment: Optional[str]) -> None:
