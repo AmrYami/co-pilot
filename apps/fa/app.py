@@ -31,11 +31,12 @@ from apps.fa.adapters import expand_keywords
 from apps.fa.config import FAConfig, get_metrics
 from core.inquiries import set_feedback
 from core.alerts import queue_alert, notify_admins_via_email
-from core.sql_exec import validate_select, explain, run_select, as_csv
+from core.sql_exec import validate_select, explain, run_select, as_csv, get_mem_engine
 from core.mailer import send_email_with_attachments
 from core.agents import ValidatorAgent
 from apps.fa.hints import make_fa_hints
 from apps.fa.seeders import seed_all
+from apps.fa.seed import seed_if_missing
 
 fa_bp = Blueprint("fa", __name__)
 PREFIX_RE = re.compile(r"^[0-9]+_$")
@@ -159,6 +160,19 @@ def ingest_prefixes():  # type: ignore[no-redef]
         return jsonify({"snapshots": snaps})
     except Exception as e:
         return jsonify({"error": str(e)}), 400
+
+
+@fa_bp.post("/seed")
+def fa_seed():
+    data = request.get_json(silent=True) or {}
+    ns = data.get("namespace") or "fa::common"
+    try:
+        settings = Settings(namespace=ns)
+        mem = get_mem_engine(settings.memory_db_url())
+        res = seed_if_missing(mem, ns, settings=settings, force=bool(data.get("force")))
+        return jsonify({"ok": True, "namespace": ns, **res})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 @fa_bp.post("/admin/seed")
