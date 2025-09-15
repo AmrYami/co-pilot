@@ -31,7 +31,7 @@ from core.settings import Settings
 from core.sql_exec import run_select, as_csv
 from core.datasources import DatasourceRegistry
 from core.research import load_researcher, persist_sources_and_link
-from core.snippets import save_snippet
+from core.snippets import save_snippet, autosave_snippet
 from core.sql_utils import extract_sql, looks_like_sql
 from core.inquiries import (
     create_or_update_inquiry,
@@ -58,26 +58,6 @@ def ensure_limit(sql: str, limit: int) -> str:
     if re.search(r"\blimit\b", s, re.I):
         return s
     return f"{s} LIMIT {int(limit)}"
-
-
-_DATE_FMT_EQ_RE = re.compile(
-    r"DATE_FORMAT\s*\(\s*([a-zA-Z0-9_\.]+)\s*,\s*'%Y-%m'\s*\)\s*=\s*DATE_FORMAT\s*\(\s*CURRENT_DATE\s*-\s*INTERVAL\s+1\s+MONTH\s*,\s*'%Y-%m'\s*\)",
-    re.IGNORECASE,
-)
-
-
-def widen_date_window_mysql(sql: str, days: int) -> Tuple[str, bool]:
-    """
-    If the SQL filters 'last month' via DATE_FORMAT(...)=DATE_FORMAT(...),
-    widen it to 'last N days'. Returns (new_sql, changed).
-    """
-
-    def _repl(m: re.Match) -> str:
-        col = m.group(1)
-        return f"{col} >= CURRENT_DATE - INTERVAL {int(days)} DAY"
-
-    new_sql, n = _DATE_FMT_EQ_RE.subn(_repl, sql)
-    return (new_sql, n > 0)
 
 
 # ------------------ config ------------------
@@ -479,8 +459,12 @@ class Pipeline:
 
         sql_used = canonical_sql
         result = exec_result
-        empty_retry = self.settings.get_bool("EMPTY_RESULT_AUTORETRY", scope="namespace") or False
-        empty_days = int(self.settings.get("EMPTY_RESULT_AUTORETRY_DAYS", scope="namespace") or 90)
+        empty_retry = self.settings.get_bool(
+            "EMPTY_RESULT_AUTORETRY", scope="namespace", default=False
+        )
+        empty_days = self.settings.get_int(
+            "EMPTY_RESULT_AUTORETRY_DAYS", scope="namespace", default=90
+        )
 
         message = None
         if isinstance(result.get("rows"), list) and len(result["rows"]) == 0:
@@ -488,8 +472,8 @@ class Pipeline:
             retried = False
             retry_sql = canonical_sql
             if empty_retry:
-                widened_sql, changed = widen_date_window_mysql(canonical_sql, empty_days)
-                if changed:
+                widened_sql = self._widen_date_window(canonical_sql, empty_days)
+                if widened_sql != canonical_sql:
                     retry_sql = widened_sql
                     retry_res = self._validate_and_execute_sql(ns, prefixes, retry_sql)
                     if isinstance(retry_res.get("rows"), list) and len(retry_res["rows"]) > 0:
@@ -525,6 +509,23 @@ class Pipeline:
         if message:
             out["note"] = message
         return out
+
+    def _widen_date_window(self, sql: str, days: int) -> str:
+        """
+        Replace common 'last month' patterns with a >= CURRENT_DATE - INTERVAL N DAY window.
+        Safe no-op if no match is found.
+        """
+        import re
+
+        patterns = [
+            r"DATE_FORMAT\((?P<col>[^,]+),\s*'%Y-%m'\)\s*=\s*DATE_FORMAT\(CURRENT_DATE\s*-\s*INTERVAL\s*\d+\s*MONTH,\s*'%Y-%m'\)",
+            r"MONTH\((?P<col>[^)]+)\)\s*=\s*MONTH\(CURRENT_DATE\s*-\s*INTERVAL\s*\d+\s*MONTH\)\s+AND\s+YEAR\(\1\)\s*=\s*YEAR\(CURRENT_DATE\s*-\s*INTERVAL\s*\d+\s*MONTH\)",
+        ]
+        repl = r"\g<col> >= CURRENT_DATE - INTERVAL %d DAY" % int(days)
+        new_sql = sql
+        for p in patterns:
+            new_sql = re.sub(p, repl, new_sql, flags=re.I)
+        return new_sql
 
     def _update_inquiry_status(self, inquiry_id: int, status: str) -> None:
         with self.mem_engine.begin() as c:
@@ -570,7 +571,7 @@ class Pipeline:
             row = conn.execute(
                 text(
                     """
-                    SELECT id, namespace, prefixes, question, admin_reply, admin_notes
+                    SELECT id, namespace, prefixes, question, admin_reply, admin_notes, datasource
                       FROM mem_inquiries
                      WHERE id = :id
                     """
@@ -585,6 +586,7 @@ class Pipeline:
         question: str = row.question or ""
         admin_reply: str = row.admin_reply or ""
         admin_notes: List[Dict[str, Any]] = row.admin_notes or []
+        datasource = getattr(row, "datasource", None) or self.default_ds
 
         # 2) build hints from question + admin_reply + admin_notes (FA-specific helper)
         #    keep this call app-facing to respect your "core clean / app logic in apps"
@@ -642,8 +644,12 @@ class Pipeline:
 
         sql_used = canonical_sql
         result = exec_result
-        empty_retry = self.settings.get_bool("EMPTY_RESULT_AUTORETRY", scope="namespace") or False
-        empty_days = int(self.settings.get("EMPTY_RESULT_AUTORETRY_DAYS", scope="namespace") or 90)
+        empty_retry = self.settings.get_bool(
+            "EMPTY_RESULT_AUTORETRY", scope="namespace", default=False
+        )
+        empty_days = self.settings.get_int(
+            "EMPTY_RESULT_AUTORETRY_DAYS", scope="namespace", default=90
+        )
 
         message = None
         if result.get("ok", True) and isinstance(result.get("rows"), list) and len(result["rows"]) == 0:
@@ -651,8 +657,8 @@ class Pipeline:
             retried = False
             retry_sql = canonical_sql
             if empty_retry:
-                widened_sql, changed = widen_date_window_mysql(canonical_sql, empty_days)
-                if changed:
+                widened_sql = self._widen_date_window(canonical_sql, empty_days)
+                if widened_sql != canonical_sql:
                     retry_sql = widened_sql
                     retry_res = self.validate_and_execute(retry_sql, prefixes, namespace=ns)
                     if retry_res.get("ok", True) and isinstance(retry_res.get("rows"), list) and len(retry_res["rows"]) > 0:
@@ -683,9 +689,19 @@ class Pipeline:
                     "note": message,
                 }
 
-        if self.settings.get_bool("SNIPPETS_AUTOSAVE", scope="namespace") and isinstance(result.get("rows"), list) and len(result["rows"]) > 0:
+        if (
+            self.settings.get_bool("SNIPPETS_AUTOSAVE", scope="namespace", default=True)
+            and isinstance(result.get("rows"), list)
+            and len(result["rows"]) > 0
+        ):
             try:
-                save_snippet(self.mem_engine, ns, question, sql_used, tags=["fa", "auto", "snippet"])
+                autosave_snippet(
+                    self.mem_engine,
+                    ns,
+                    datasource,
+                    sql_used,
+                    tags=["fa", "sales", "top10"],
+                )
             except Exception as e:
                 print(f"[snippets] autosave failed: {e}")
 

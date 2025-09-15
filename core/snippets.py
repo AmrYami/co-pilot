@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from sqlalchemy import text
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 _TABLE_RE = re.compile(r'\b(?:FROM|JOIN)\s+`?([a-zA-Z0-9_\.]+)`?', re.IGNORECASE)
 
@@ -55,4 +55,21 @@ Source question: {question}
                 :doc_md, :doc_erd, CAST(:tags AS jsonb), NOW(), NOW()
             )
         """), payload)
+
+
+def autosave_snippet(
+    mem_engine, namespace: str, datasource: Optional[str], sql_raw: str, tags: Optional[List[str]] = None
+):
+    """Store a minimal reusable snippet of a verified answer."""
+    tags = tags or []
+    with mem_engine.begin() as c:
+        c.execute(
+            text(
+                """
+            INSERT INTO mem_snippets(namespace, sql_raw, tags, datasource, created_at, updated_at)
+            VALUES (:ns, :sql_raw, :tags::jsonb, :ds, NOW(), NOW())
+            """
+            ),
+            {"ns": namespace, "sql_raw": sql_raw, "tags": tags, "ds": datasource},
+        )
 
