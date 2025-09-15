@@ -323,6 +323,7 @@ def answer():
                 auth_email=auth_email,
                 run_id=None,
                 research_enabled=bool(s.get("RESEARCH_MODE", False)),
+                datasource=ds_name,
                 status=effective_status,
                 research_summary=research_summary,
                 source_ids=source_ids,

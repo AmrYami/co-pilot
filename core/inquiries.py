@@ -57,37 +57,31 @@ def summarize_admin_notes(notes: Optional[List[Dict[str, Any]]]) -> str:
 # --- Admin note helpers ----------------------------------------------------
 
 
-def append_admin_note(mem_engine, inquiry_id: int, by: str, text_note: str) -> int:
-    """
-    Append one admin note to mem_inquiries.admin_notes (jsonb array),
-    increment clarification_rounds, and set admin_reply / answered_by.
-
-    Returns the new clarification_rounds value.
-    """
-    note_obj = {
-        "by": by,
-        "text": text_note,
+def append_admin_note(mem_engine, inquiry_id: int, *, by: str, text_note: str) -> int:
+    note = {
+        "by": by or "unknown",
+        "text": text_note or "",
         "ts": datetime.now(timezone.utc).isoformat(),
     }
-
-    stmt = text(
+    # IMPORTANT: use :named params, and cast to jsonb
+    sql = text(
         """
         UPDATE mem_inquiries
-           SET admin_notes          = COALESCE(admin_notes, '[]'::jsonb)
-                                      || jsonb_build_array(:note),
+           SET admin_notes          = COALESCE(admin_notes, '[]'::jsonb) || :note::jsonb,
                admin_reply          = COALESCE(:reply, admin_reply),
                answered_by          = COALESCE(:by, answered_by),
                clarification_rounds = COALESCE(clarification_rounds, 0) + 1,
                updated_at           = NOW()
          WHERE id = :id
      RETURNING clarification_rounds
-    """
-    ).bindparams(bindparam("note", type_=JSONB))
-
-    params = {"id": inquiry_id, "note": note_obj, "reply": text_note, "by": by}
+        """
+    )
     with mem_engine.begin() as conn:
-        r = conn.execute(stmt, params)
-        return r.scalar_one()
+        rounds = conn.execute(
+            sql,
+            {"id": inquiry_id, "by": by, "reply": text_note, "note": json.dumps(note)},
+        ).scalar_one()
+    return rounds
 
 
 def set_admin_reply(mem_engine, inquiry_id: int, reply: str, answered_by: str | None = None) -> None:
@@ -279,6 +273,7 @@ def create_or_update_inquiry(
     auth_email: Optional[str],
     run_id: Optional[int],
     research_enabled: bool,
+    datasource: str,
     status: str = "open",
     research_summary: Optional[str] = None,
     source_ids: Optional[List[int]] = None,
@@ -303,17 +298,18 @@ def create_or_update_inquiry(
             "rs": research_summary,
             "src": src_list,
             "st": status,
+            "ds": datasource,
         }
         sql = text("""
             INSERT INTO mem_inquiries(
                 namespace, prefixes, question, auth_email,
                 run_id, research_enabled, research_summary, source_ids,
-                status, created_at, updated_at
+                status, datasource, created_at, updated_at
             )
             VALUES (
                 :ns, :pfx, :q, :mail,
                 :run_id, :re, :rs, :src,
-                :st, NOW(), NOW()
+                :st, :ds, NOW(), NOW()
             )
             RETURNING id
         """)
@@ -336,15 +332,16 @@ def create_or_update_inquiry(
             "q": question,
             "mail": auth_email,
             "st": status,
+            "ds": datasource,
         }
         sql2 = text("""
             INSERT INTO mem_inquiries(
                 namespace, prefixes, question, auth_email,
-                status, created_at, updated_at
+                status, datasource, created_at, updated_at
             )
             VALUES (
                 :ns, :pfx_txt, :q, :mail,
-                :st, NOW(), NOW()
+                :st, :ds, NOW(), NOW()
             )
             RETURNING id
         """)
