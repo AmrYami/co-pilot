@@ -615,24 +615,49 @@ class Pipeline:
 
         result = self._execute_sql(app_engine, sql, ns, inquiry_id)
 
-        empty_retry = self.settings.get_bool(
-            "EMPTY_RESULT_AUTORETRY", namespace=ns, scope="namespace", default=False
+        result, final_sql = self._maybe_autoretry_empty(
+            sql, result, app_engine, date_col_hint="dt.tran_date"
         )
-        if result.get("ok") and result.get("rows") == [] and empty_retry:
-            days = self.settings.get_int(
-                "EMPTY_RESULT_AUTORETRY_DAYS", namespace=ns, scope="namespace", default=90
-            ) or 90
-            widened = self._widen_date_sql(sql, days_back=days)
-            result = self._execute_sql(app_engine, widened, ns, inquiry_id)
-            result["sql"] = widened
 
-        if result.get("ok"):
+        if (
+            self.settings.get_bool("SNIPPETS_AUTOSAVE", scope="namespace")
+            and result.get("ok")
+        ):
             try:
-                self._save_snippet(ns, sql=result["sql"], tags=["fa", "sales", "top10"])
+                with self.mem_engine.begin() as conn:
+                    conn.execute(
+                        text(
+                            """
+                INSERT INTO mem_snippets(namespace, title, description, sql_template, sql_raw,
+                                         input_tables, filters_applied, tags, datasource, created_at, updated_at)
+                VALUES (:ns, :title, :desc, :tmpl, :raw,
+                        :tables, :filters, :tags, :ds, NOW(), NOW())
+                            """
+                        ),
+                        {
+                            "ns": ns,
+                            "title": "Top customers by net sales (last month / rolling)",
+                            "desc": "Derived from admin-confirmed joins and metric; auto-saved.",
+                            "tmpl": final_sql,
+                            "raw": final_sql,
+                            "tables": json.dumps([
+                                "debtor_trans",
+                                "debtor_trans_details",
+                                "debtors_master",
+                            ]),
+                            "filters": json.dumps(
+                                ["dt.type IN (1,11)", "date range filter"]
+                            ),
+                            "tags": json.dumps(
+                                ["fa", "sales", "top10", "customers"]
+                            ),
+                            "ds": self.ds.default or "frontaccounting_bk",
+                        },
+                    )
             except Exception:
                 pass
 
-        return {"ok": True, "inquiry_id": inquiry_id, "result": result, "sql": result.get("sql")}
+        return {"ok": True, "inquiry_id": inquiry_id, "result": result, "sql": final_sql}
 
     def _sql_from_notes_or_defaults(self, row: dict) -> Optional[str]:
         pfx = ""
@@ -660,14 +685,6 @@ LIMIT 10;
 """.strip()
         return sql
 
-    def _widen_date_sql(self, sql: str, *, days_back: int) -> str:
-        if "DATE_FORMAT(dt.tran_date" in sql:
-            return sql.replace(
-                "DATE_FORMAT(dt.tran_date, '%Y-%m') = DATE_FORMAT(CURRENT_DATE - INTERVAL 1 MONTH, '%Y-%m')",
-                f"dt.tran_date >= CURRENT_DATE - INTERVAL {int(days_back)} DAY",
-            )
-        return sql
-
     def _execute_sql(self, engine, sql: str, ns: str, inquiry_id: int) -> Dict[str, Any]:
         try:
             with engine.begin() as c:
@@ -693,25 +710,56 @@ LIMIT 10;
         except Exception as e:
             return {"ok": False, "error": f"validation/exec failed: {e}", "sql": sql}
 
-    def _save_snippet(self, ns: str, *, sql: str, tags: Optional[List[str]] = None):
-        with self.mem_engine.begin() as m:
-            m.execute(
-                text(
-                    """
-                INSERT INTO mem_snippets(namespace, title, sql_raw, tags, created_at, updated_at, datasource)
-                VALUES (:ns, :title, :sql, :tags::jsonb, NOW(), NOW(), :ds)
-                    """
-                ),
-                {
-                    "ns": ns,
-                    "title": "top 10 customers last month (net sales)",
-                    "sql": sql,
-                    "tags": json.dumps(tags or ["fa"]),
-                    "ds": self.settings.get_str(
-                        "DEFAULT_DATASOURCE", namespace=ns, scope="namespace"
-                    ),
-                },
+    def _maybe_autoretry_empty(
+        self, sql: str, exec_result: dict, engine, date_col_hint: str = None
+    ):
+        """If no rows and setting enabled, try widening to N days on MySQL only."""
+        if not (exec_result.get("ok") and exec_result.get("rows") == []):
+            return exec_result, sql
+
+        if not self.settings.get_bool("EMPTY_RESULT_AUTORETRY", scope="namespace"):
+            exec_result["message"] = (
+                "No results for last month. Try last 3 months or a custom range."
             )
+            return exec_result, sql
+
+        days = int(
+            self.settings.get_int(
+                "EMPTY_RESULT_AUTORETRY_DAYS", default=90, scope="namespace"
+            )
+            or 90
+        )
+
+        widened = sql
+        widened = re.sub(
+            r"AND\s+DATE_FORMAT\([^)]*?\)\s*=\s*DATE_FORMAT\([^)]*?\)",
+            f"AND (dt.tran_date >= CURDATE() - INTERVAL {days} DAY)",
+            widened,
+            flags=re.IGNORECASE,
+        )
+        if widened == sql:
+            col = date_col_hint or "dt.tran_date"
+            widened = re.sub(
+                r"\bWHERE\b",
+                f"WHERE ({col} >= CURDATE() - INTERVAL {days} DAY) AND ",
+                widened,
+                count=1,
+                flags=re.IGNORECASE,
+            )
+
+        try:
+            rerun_ns = self.sql_exec.execute(engine, widened, explain_only=False)
+            rerun = (
+                rerun_ns.__dict__
+                if hasattr(rerun_ns, "__dict__")
+                else dict(rerun_ns)
+            )
+            rerun["message"] = f"No results for last month. Showing last {days} days instead."
+            return rerun, widened
+        except Exception as e:
+            exec_result["message"] = "No results for last month. Try widening the date range."
+            exec_result["auto_retry_error"] = str(e)
+            return exec_result, sql
 
     def validate_and_execute(
         self, sql: str, prefixes: List[str], *, namespace: Optional[str] = None
