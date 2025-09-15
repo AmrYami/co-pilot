@@ -1,119 +1,58 @@
 from __future__ import annotations
-from typing import Iterable, Optional, Sequence, List, Dict, Any
-from sqlalchemy import text, Engine
-import json
-import datetime as dt
+
+import re
+from sqlalchemy import text
+from typing import List, Dict, Any
+
+_TABLE_RE = re.compile(r'\b(?:FROM|JOIN)\s+`?([a-zA-Z0-9_\.]+)`?', re.IGNORECASE)
 
 
-def save_snippet(
-    mem: Engine,
-    namespace: str,
-    *,
-    title: str,
-    description: Optional[str],
-    sql_raw: str,
-    input_tables: List[str],
-    output_columns: Optional[List[str]] = None,
-    filters_applied: Optional[List[str]] = None,
-    parameters: Optional[Dict[str, Any]] = None,
-    tags: Optional[List[str]] = None,
-    datasource: Optional[str] = None,
-) -> int:
-    ins = text(
-        """
-        INSERT INTO mem_snippets(
-            namespace, title, description, sql_raw,
-            input_tables, output_columns, filters_applied, parameters,
-            tags, datasource, created_at, updated_at
-        )
-        VALUES (
-            :ns, :title, :desc, :sql,
-            :in_tables, :out_cols, :filters, :params,
-            :tags, :ds, NOW(), NOW()
-        )
-        RETURNING id
-        """
-    )
-    with mem.begin() as conn:
-        rid = conn.execute(
-            ins,
-            {
-                "ns": namespace,
-                "title": title,
-                "desc": description,
-                "sql": sql_raw,
-                "in_tables": json.dumps(input_tables or []),
-                "out_cols": json.dumps(output_columns or []),
-                "filters": json.dumps(filters_applied or []),
-                "params": json.dumps(parameters or {}),
-                "tags": json.dumps(tags or []),
-                "ds": datasource,
-            },
-        ).scalar_one()
-    return int(rid)
+def _extract_tables(sql: str) -> List[str]:
+    found = []
+    for m in _TABLE_RE.finditer(sql or ""):
+        t = m.group(1)
+        if t and t not in found:
+            found.append(t)
+    return found
 
-def build_doc_md(sql: str,
-                 title: str | None = None,
-                 rationale: str | None = None,
-                 datasource: str | None = None) -> str:
-    title = title or "Saved query"
-    lines = [f"# {title}"]
-    if datasource:
-        lines.append(f"- **Datasource**: `{datasource}`")
-    if rationale:
-        lines.append(f"- **Rationale**: {rationale}")
-    lines += ["", "```sql", sql.strip(), "```"]
-    return "\n".join(lines)
 
-def persist_snippet(mem_engine,
-                    namespace: str,
-                    sql_raw: str,
-                    *,
-                    title: str | None = None,
-                    description: str | None = None,
-                    tags: Optional[Sequence[str]] = None,
-                    input_tables: Optional[Sequence[str]] = None,
-                    filters_applied: Optional[Sequence[str]] = None,
-                    parameters: Optional[dict] = None,
-                    doc_md: Optional[str] = None,
-                    datasource: Optional[str] = None,
-                    verified: bool = False,
-                    verified_by: Optional[str] = None) -> int:
-    """
-    Inserts into mem_snippets and returns new snippet id.
-    """
-    with mem_engine.begin() as c:
-        res = c.execute(
-            text("""
-                INSERT INTO mem_snippets(
-                    namespace, title, description,
-                    sql_template, sql_raw,
-                    input_tables, filters_applied, parameters,
-                    doc_md, tags, datasource, is_verified, verified_by, created_at, updated_at
-                )
-                VALUES (
-                    :ns, :title, :desc,
-                    :tpl, :raw,
-                    :in_tabs, :filters, :params,
-                    :doc_md, :tags, :ds, :ver, :ver_by, NOW(), NOW()
-                )
-                RETURNING id
-            """),
-            {
-                "ns": namespace,
-                "title": title,
-                "desc": description,
-                "tpl": None,  # reserved for future parameterization
-                "raw": sql_raw,
-                "in_tabs": json.dumps(list(input_tables or [])),
-                "filters": json.dumps(list(filters_applied or [])),
-                "params": json.dumps(parameters or {}),
-                "doc_md": doc_md or build_doc_md(sql_raw, title, datasource=datasource),
-                "tags": json.dumps(list(tags or [])),
-                "ds": datasource,
-                "ver": bool(verified),
-                "ver_by": verified_by,
-            },
-        )
-        new_id = res.scalar_one()
-    return int(new_id)
+def save_snippet(mem_engine, namespace: str, question: str, sql: str, tags: List[str] | None = None):
+    if not sql:
+        return
+    input_tables = _extract_tables(sql)
+    doc_md = f"""### Auto snippet
+Source question: {question}
+
+**Tables**: {", ".join(input_tables) or "-"}
+"""
+
+    payload = {
+        "namespace": namespace,
+        "title": (question[:120] if question else "Auto snippet"),
+        "description": "Auto-saved after successful run",
+        "sql_template": sql,
+        "sql_raw": sql,
+        "input_tables": input_tables,
+        "output_columns": None,
+        "filters_applied": None,
+        "parameters": None,
+        "doc_md": doc_md,
+        "doc_erd": None,
+        "tags": (tags or ["fa", "auto", "snippet"])
+    }
+
+    with mem_engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO mem_snippets(
+                namespace, title, description, sql_template, sql_raw,
+                input_tables, output_columns, filters_applied, parameters,
+                doc_md, doc_erd, tags, created_at, updated_at
+            )
+            VALUES (
+                :namespace, :title, :description, :sql_template, :sql_raw,
+                CAST(:input_tables AS jsonb), CAST(:output_columns AS jsonb),
+                CAST(:filters_applied AS jsonb), CAST(:parameters AS jsonb),
+                :doc_md, :doc_erd, CAST(:tags AS jsonb), NOW(), NOW()
+            )
+        """), payload)
+

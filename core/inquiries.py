@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional
 from sqlalchemy.engine import Engine, Row
 from sqlalchemy import text, bindparam
 from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.types import JSON
 
 
 def fetch_inquiry(mem_engine, inquiry_id: int) -> Optional[Dict[str, Any]]:
@@ -59,34 +60,39 @@ def summarize_admin_notes(notes: Optional[List[Dict[str, Any]]]) -> str:
 
 def append_admin_note(mem_engine, inquiry_id: int, by: str, text_note: str) -> int:
     """
-    Appends one note object into admin_notes JSONB array without casting errors.
-    Returns new clarification_rounds.
+    Append one admin note to mem_inquiries.admin_notes (jsonb array),
+    increment clarification_rounds, and set admin_reply / answered_by.
+
+    Returns the new clarification_rounds value.
     """
     note_obj = {
         "by": by,
         "text": text_note,
         "ts": datetime.now(timezone.utc).isoformat()
     }
-    note_json = json.dumps(note_obj, ensure_ascii=False)
 
-    with mem_engine.begin() as c:
-        r = c.execute(text("""
-            UPDATE mem_inquiries
-               SET admin_notes          = COALESCE(admin_notes, '[]'::jsonb)
-                                          || jsonb_build_array((:note::jsonb)),
-                   admin_reply          = :reply,
-                   answered_by          = :by,
-                   clarification_rounds = COALESCE(clarification_rounds, 0) + 1,
-                   updated_at           = NOW()
-             WHERE id = :id
-         RETURNING clarification_rounds
-        """), {
-            "id": inquiry_id,
-            "note": note_json,
-            "reply": text_note,
-            "by": by
-        })
-        return r.scalar_one()
+    sql = text(
+        """
+        UPDATE mem_inquiries
+           SET admin_notes          = COALESCE(admin_notes, '[]'::jsonb)
+                                      || jsonb_build_array(CAST(:note AS jsonb)),
+               admin_reply          = COALESCE(:reply, admin_reply),
+               answered_by          = COALESCE(:by, answered_by),
+               clarification_rounds = COALESCE(clarification_rounds, 0) + 1,
+               updated_at           = NOW()
+         WHERE id = :id
+     RETURNING clarification_rounds
+    """
+    ).bindparams(
+        bindparam("note", type_=JSON)
+    )
+
+    with mem_engine.begin() as conn:
+        row = conn.execute(
+            sql,
+            {"id": inquiry_id, "note": note_obj, "reply": text_note, "by": by}
+        ).first()
+        return int(row[0]) if row else 0
 
 
 def set_admin_reply(mem_engine, inquiry_id: int, reply: str, answered_by: str | None = None) -> None:
