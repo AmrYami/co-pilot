@@ -31,7 +31,7 @@ from core.settings import Settings
 from core.sql_exec import run_select, as_csv
 from core.datasources import DatasourceRegistry
 from core.research import load_researcher, persist_sources_and_link
-from core.snippets import persist_snippet, build_doc_md
+from core.snippets import save_snippet
 from core.sql_utils import extract_sql, looks_like_sql
 from core.inquiries import (
     create_or_update_inquiry,
@@ -584,24 +584,18 @@ class Pipeline:
                 input_tabs.append(tok.strip("`"))
         tags = ["fa", "auto", "snippet"] + list(tags_extra or [])
         title = question[:80] if question else "Saved query"
-        doc = build_doc_md(
-            sql, title=title, rationale="Auto-saved after successful run", datasource=datasource
-        )
         try:
-            snip_id = persist_snippet(
+            snip_id = save_snippet(
                 self.mem_engine,
                 namespace,
-                sql_raw=sql,
                 title=title,
                 description=None,
-                tags=tags,
+                sql_raw=sql,
                 input_tables=input_tabs,
                 filters_applied=[],
                 parameters={"source": "pipeline.autosave"},
-                doc_md=doc,
+                tags=tags,
                 datasource=datasource,
-                verified=False,
-                verified_by=None,
             )
             return snip_id
         except Exception as e:
