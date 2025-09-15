@@ -31,7 +31,7 @@ from core.settings import Settings
 from core.sql_exec import run_select, as_csv
 from core.datasources import DatasourceRegistry
 from core.research import load_researcher, persist_sources_and_link
-from core.snippets import save_snippet, autosave_snippet
+from core.snippets import save_snippet
 from core.sql_utils import extract_sql, looks_like_sql
 from core.inquiries import (
     create_or_update_inquiry,
@@ -122,6 +122,30 @@ class Pipeline:
                         return run_select(self.app_engine, sql)
 
             self.executor = SimpleNamespace(execute=_exec)
+
+        def _sql_exec(engine, sql, explain_only=False):
+            start = time.time()
+            try:
+                res = run_select(engine, sql)
+                rows = res.get("rows")
+                return SimpleNamespace(
+                    ok=True,
+                    rows=rows,
+                    elapsed_ms=int((time.time() - start) * 1000),
+                    explain_only=explain_only,
+                    run_id=None,
+                )
+            except Exception as e:
+                return SimpleNamespace(
+                    ok=False,
+                    rows=[],
+                    elapsed_ms=int((time.time() - start) * 1000),
+                    explain_only=explain_only,
+                    run_id=None,
+                    error=str(e),
+                )
+
+        self.sql_exec = SimpleNamespace(execute=_sql_exec)
 
         # cache of (namespace, datasource_url) -> Engine
         self._ds_engines: Dict[tuple[str, str], Any] = {}
@@ -560,13 +584,8 @@ class Pipeline:
 
 
     def reprocess_inquiry(self, inquiry_id: int, namespace: Optional[str] = None) -> Dict[str, Any]:
-        """
-        Re-run planning/derivation for an existing inquiry after admin provided notes.
-        Returns a result dict suitable for the admin API.
-        """
+        """Re-run planning/derivation for an existing inquiry after admin notes."""
         ns = namespace or self.namespace
-
-        # 1) load inquiry
         with self.mem_engine.begin() as conn:
             row = conn.execute(
                 text(
@@ -577,19 +596,16 @@ class Pipeline:
                     """
                 ),
                 {"id": inquiry_id},
-            ).fetchone()
+            ).mappings().one()
 
-        if not row:
-            return {"ok": False, "inquiry_id": inquiry_id, "error": "not_found"}
+        prefixes: List[str] = row.get("prefixes") or []
+        question: str = row.get("question") or ""
+        admin_reply: str = row.get("admin_reply") or ""
+        admin_notes: List[Dict[str, Any]] = row.get("admin_notes") or []
 
-        prefixes: List[str] = row.prefixes or []
-        question: str = row.question or ""
-        admin_reply: str = row.admin_reply or ""
-        admin_notes: List[Dict[str, Any]] = row.admin_notes or []
-        datasource = getattr(row, "datasource", None) or self.default_ds
+        ds_name = row.get("datasource") or self.settings.get_str("DEFAULT_DATASOURCE", scope="namespace") or "frontaccounting_bk"
+        engine = self.ds.engine(ds_name)
 
-        # 2) build hints from question + admin_reply + admin_notes (FA-specific helper)
-        #    keep this call app-facing to respect your "core clean / app logic in apps"
         try:
             from apps.fa.hints import make_hints_from_admin
 
@@ -599,7 +615,6 @@ class Pipeline:
         except Exception as e:
             return {"ok": False, "inquiry_id": inquiry_id, "error": f"hints_failed: {e!s}"}
 
-        # 3) try planner derivation from hints; if it returns non-SQL, we'll fail back to clarify
         try:
             canonical_sql = None
             if hasattr(self.planner, "derive_sql_from_hints"):
@@ -622,112 +637,148 @@ class Pipeline:
                     },
                 }
         except Exception as e:
-            return {
-                "ok": False,
-                "inquiry_id": inquiry_id,
-                "error": f"derive_failed: {e!s}",
-            }
+            return {"ok": False, "inquiry_id": inquiry_id, "error": f"derive_failed: {e!s}"}
 
-        # 4) validate/execute
-        try:
-            exec_result = self.validate_and_execute(
-                canonical_sql, prefixes, namespace=ns
-            )
-        except Exception as e:
-            return {
-                "ok": False,
-                "inquiry_id": inquiry_id,
-                "sql": canonical_sql,
-                "error": f"validation/exec failed: {e!s}",
-                "status": "failed",
-            }
+        sql = canonical_sql
+        result = self.sql_exec.execute(engine, sql, explain_only=False)
 
-        sql_used = canonical_sql
-        result = exec_result
-        empty_retry = self.settings.get_bool(
-            "EMPTY_RESULT_AUTORETRY", scope="namespace", default=False
-        )
-        empty_days = self.settings.get_int(
-            "EMPTY_RESULT_AUTORETRY_DAYS", scope="namespace", default=90
-        )
-
-        message = None
-        if result.get("ok", True) and isinstance(result.get("rows"), list) and len(result["rows"]) == 0:
-            message = "No results for last month. You can try last 3 months or specify a date range (e.g., 2025-06-01 to 2025-08-31)."
-            retried = False
-            retry_sql = canonical_sql
-            if empty_retry:
-                widened_sql = self._widen_date_window(canonical_sql, empty_days)
-                if widened_sql != canonical_sql:
-                    retry_sql = widened_sql
-                    retry_res = self.validate_and_execute(retry_sql, prefixes, namespace=ns)
-                    if retry_res.get("ok", True) and isinstance(retry_res.get("rows"), list) and len(retry_res["rows"]) > 0:
-                        retried = True
-                        result = retry_res
-                        sql_used = retry_sql
-                        message = f"No rows last month; auto-retried with last {empty_days} days."
-            if not retried:
+        if result.ok and not result.rows:
+            if self.settings.get_bool("EMPTY_RESULT_AUTORETRY", scope="namespace", default=False):
+                days = int(self.settings.get_int("EMPTY_RESULT_AUTORETRY_DAYS", scope="namespace", default=90))
+                widened_sql = _append_wider_date_guard(sql, days)
+                result2 = self.sql_exec.execute(engine, widened_sql, explain_only=False)
+                final = result2 if (result2.ok and result2.rows) else result
+                sql_used = widened_sql if final is result2 else sql
+                note = (
+                    "No rows for last month. Auto-retried with last {} days.".format(days)
+                    if final is result2
+                    else "No rows for last month."
+                )
+                if final.ok and final.rows and self.settings.get_bool("SNIPPETS_AUTOSAVE", scope="namespace", default=True):
+                    with self.mem_engine.begin() as mem:
+                        mem.execute(
+                            text(
+                                """
+            INSERT INTO mem_snippets(namespace, title, description, sql_template, sql_raw,
+                                     input_tables, filters_applied, tags, created_at, updated_at, datasource)
+            VALUES (:ns, :title, :desc, :tmpl, :raw,
+                    :in_tables::jsonb, :filters::jsonb, :tags::jsonb, NOW(), NOW(), :ds)
+                                """
+                            ),
+                            {
+                                "ns": self.namespace,
+                                "title": "Top 10 customers by net sales (last month)",
+                                "desc": "FA net sales with invoices & credit notes, grouped by customer; seeded automatically.",
+                                "tmpl": sql_used,
+                                "raw": sql_used,
+                                "in_tables": json.dumps(["debtor_trans", "debtor_trans_details", "debtors_master"]),
+                                "filters": json.dumps(["dt.type IN (1,11)", "last month or widened guard"]),
+                                "tags": json.dumps(["fa", "sales", "top10", "customers"]),
+                                "ds": ds_name,
+                            },
+                        )
                 with self.mem_engine.begin() as conn:
                     conn.execute(
                         text(
                             """
-                            UPDATE mem_inquiries
-                               SET status = 'answered',
-                                   updated_at = NOW(),
-                                   answered_at = NOW()
-                             WHERE id = :id
-                            """
+                        UPDATE mem_inquiries
+                           SET status = 'answered',
+                               updated_at = NOW(),
+                               answered_at = NOW()
+                         WHERE id = :id
+                        """
                         ),
                         {"id": inquiry_id},
                     )
                 return {
                     "ok": True,
-                    "inquiry_id": inquiry_id,
-                    "sql": canonical_sql,
-                    "result": result,
                     "status": "answered",
-                    "note": message,
+                    "sql": sql_used,
+                    "result": {
+                        "ok": final.ok,
+                        "rows": final.rows,
+                        "elapsed_ms": final.elapsed_ms,
+                        "explain_only": final.explain_only,
+                        "run_id": final.run_id,
+                        "note": note,
+                    },
                 }
-
-        if (
-            self.settings.get_bool("SNIPPETS_AUTOSAVE", scope="namespace", default=True)
-            and isinstance(result.get("rows"), list)
-            and len(result["rows"]) > 0
-        ):
-            try:
-                autosave_snippet(
-                    self.mem_engine,
-                    ns,
-                    datasource,
-                    sql_used,
-                    tags=["fa", "sales", "top10"],
-                )
-            except Exception as e:
-                print(f"[snippets] autosave failed: {e}")
-
-        with self.mem_engine.begin() as conn:
-            conn.execute(
-                text(
-                    """
+            else:
+                with self.mem_engine.begin() as conn:
+                    conn.execute(
+                        text(
+                            """
+                        UPDATE mem_inquiries
+                           SET status = 'answered',
+                               updated_at = NOW(),
+                               answered_at = NOW()
+                         WHERE id = :id
+                        """
+                        ),
+                        {"id": inquiry_id},
+                    )
+                return {
+                    "ok": True,
+                    "status": "answered",
+                    "sql": sql,
+                    "result": {
+                        "ok": True,
+                        "rows": [],
+                        "elapsed_ms": result.elapsed_ms,
+                        "explain_only": result.explain_only,
+                        "run_id": result.run_id,
+                        "note": "No results for last month. Try last 3 months or a custom date range.",
+                    },
+                }
+        else:
+            if result.ok and result.rows and self.settings.get_bool("SNIPPETS_AUTOSAVE", scope="namespace", default=True):
+                with self.mem_engine.begin() as mem:
+                    mem.execute(
+                        text(
+                            """
+            INSERT INTO mem_snippets(namespace, title, description, sql_template, sql_raw,
+                                     input_tables, filters_applied, tags, created_at, updated_at, datasource)
+            VALUES (:ns, :title, :desc, :tmpl, :raw,
+                    :in_tables::jsonb, :filters::jsonb, :tags::jsonb, NOW(), NOW(), :ds)
+                            """
+                        ),
+                        {
+                            "ns": self.namespace,
+                            "title": "Top 10 customers by net sales (last month)",
+                            "desc": "FA net sales with invoices & credit notes, grouped by customer; seeded automatically.",
+                            "tmpl": sql,
+                            "raw": sql,
+                            "in_tables": json.dumps(["debtor_trans", "debtor_trans_details", "debtors_master"]),
+                            "filters": json.dumps(["dt.type IN (1,11)", "last month or widened guard"]),
+                            "tags": json.dumps(["fa", "sales", "top10", "customers"]),
+                            "ds": ds_name,
+                        },
+                    )
+            with self.mem_engine.begin() as conn:
+                conn.execute(
+                    text(
+                        """
                     UPDATE mem_inquiries
                        SET status = 'answered',
                            updated_at = NOW(),
                            answered_at = NOW()
                      WHERE id = :id
                     """
-                ),
-                {"id": inquiry_id},
-            )
-        out = {
-            "ok": True,
-            "inquiry_id": inquiry_id,
-            "sql": sql_used,
-            "result": result,
-            "status": "answered",
-        }
-        if message:
-            out["note"] = message
-        return out
+                    ),
+                    {"id": inquiry_id},
+                )
+            return {
+                "ok": True,
+                "status": "answered",
+                "sql": sql,
+                "result": {
+                    "ok": result.ok,
+                    "rows": result.rows,
+                    "elapsed_ms": result.elapsed_ms,
+                    "explain_only": result.explain_only,
+                    "run_id": result.run_id,
+                },
+            }
 
     def validate_and_execute(
         self, sql: str, prefixes: List[str], *, namespace: Optional[str] = None
@@ -1055,6 +1106,7 @@ class Pipeline:
         question: str,
         auth_email: str | None,
         *,
+        datasource: str,
         status: str,
     ) -> int | None:
         try:
@@ -1066,6 +1118,7 @@ class Pipeline:
                 auth_email=auth_email,
                 run_id=None,
                 research_enabled=bool(self.settings.get("RESEARCH_MODE", False)),
+                datasource=datasource,
                 status=status,
                 research_summary=None,
                 source_ids=None,
@@ -1212,7 +1265,12 @@ class Pipeline:
             if not canonical_sql:
                 if allow_new_inquiry:
                     inquiry_id = self._log_inquiry(
-                        ns, prefixes, question, auth_email, status="needs_clarification"
+                        ns,
+                        prefixes,
+                        question,
+                        auth_email,
+                        datasource=ds_name,
+                        status="needs_clarification",
                     )
                 try:
                     qs = self.planner.fallback_clarifying_question(enriched_q, ctx, gh) or []
@@ -1339,7 +1397,12 @@ class Pipeline:
         if missing:
             if allow_new_inquiry:
                 inquiry_id = self._log_inquiry(
-                    ns, prefixes, question, auth_email, status="needs_clarification"
+                    ns,
+                    prefixes,
+                    question,
+                    auth_email,
+                    datasource=ds_name,
+                    status="needs_clarification",
                 )
             questions = [
                 MISSING_FIELD_QUESTIONS.get(m, f"Please clarify: {m}") for m in missing
@@ -1363,7 +1426,12 @@ class Pipeline:
         if not canonical_sql:
             if allow_new_inquiry:
                 inquiry_id = self._log_inquiry(
-                    ns, prefixes, question, auth_email, status="needs_clarification"
+                    ns,
+                    prefixes,
+                    question,
+                    auth_email,
+                    datasource=ds_name,
+                    status="needs_clarification",
                 )
             try:
                 qs = self.planner.fallback_clarifying_question(question, ctx, gh) or []
@@ -2017,6 +2085,18 @@ class ContextBuilder:
             "preview": res.get("rows"),
         }
 
+
+# helper for widening date guard on empty results
+def _append_wider_date_guard(sql: str, days: int) -> str:
+    # naive but safe: before GROUP BY/ORDER BY/LIMIT append an extra guard on any 'tran_date' column
+    guard = f" AND (dt.tran_date >= CURRENT_DATE - INTERVAL '{days} DAY') "
+    tokens = ["\nGROUP BY", "\nORDER BY", "\nLIMIT"]
+    cut = len(sql)
+    for t in tokens:
+        pos = sql.upper().find(t)
+        if pos != -1:
+            cut = min(cut, pos)
+    return sql[:cut] + guard + sql[cut:]
 
 # ------------------ simple SQL rewriter ------------------
 class SQLRewriter:
