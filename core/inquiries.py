@@ -7,11 +7,11 @@ These helpers are project-agnostic (no FA-specific code).
 
 from __future__ import annotations
 
-import json, datetime
+import json
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from sqlalchemy.engine import Engine, Row
-from sqlalchemy import text, bindparam
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy import text
 
 
 def fetch_inquiry(mem_engine, inquiry_id: int) -> Optional[Dict[str, Any]]:
@@ -56,36 +56,39 @@ def summarize_admin_notes(notes: Optional[List[Dict[str, Any]]]) -> str:
 # --- Admin note helpers ----------------------------------------------------
 
 
-def append_admin_note(mem_engine, inquiry_id: int, *, by: str, text_note: str) -> int:
-    """Append a structured admin note and increment clarification_rounds."""
+def append_admin_note(mem_engine, inquiry_id: int, by: str, text_note: str) -> int:
+    """
+    Append admin note (JSON) and bump clarification_rounds atomically.
+    """
     note = {
         "by": by,
         "text": text_note,
-        "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "ts": datetime.now(timezone.utc).isoformat(),
     }
-    payload = {
-        "id": inquiry_id,
-        "by": by,
-        "reply": text_note,
-        "note": json.dumps(note),
-    }
+
     sql = text(
         """
         UPDATE mem_inquiries
            SET admin_notes = COALESCE(admin_notes, '[]'::jsonb)
                               || jsonb_build_array(CAST(:note AS jsonb)),
-               admin_reply = COALESCE(:reply, admin_reply),
-               answered_by = COALESCE(:by, answered_by),
+               admin_reply  = COALESCE(:reply, admin_reply),
+               answered_by  = COALESCE(:by, answered_by),
                clarification_rounds = COALESCE(clarification_rounds, 0) + 1,
-               updated_at = NOW()
+               updated_at   = NOW()
          WHERE id = :id
      RETURNING clarification_rounds
-        """
+    """
     )
-    with mem_engine.connect() as conn:
-        r = conn.execute(sql, payload)
-        row = r.first()
-        return int(row[0]) if row else 0
+
+    with mem_engine.begin() as conn:
+        params = {
+            "id": inquiry_id,
+            "note": json.dumps(note),
+            "reply": text_note,
+            "by": by,
+        }
+        rounds = conn.execute(sql, params).scalar_one()
+        return rounds
 
 
 def set_admin_reply(mem_engine, inquiry_id: int, reply: str, answered_by: str | None = None) -> None:

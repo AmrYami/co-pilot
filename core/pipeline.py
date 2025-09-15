@@ -28,7 +28,7 @@ from core.agents import PlannerAgent, ValidatorAgent
 from core.model_loader import load_model, load_clarifier
 from core.clarifier import ClarifierAgent
 from core.settings import Settings
-from core.sql_exec import run_select, as_csv
+from core.sql_exec import run_select, as_csv, get_mem_engine
 from core.datasources import DatasourceRegistry
 from core.research import load_researcher, persist_sources_and_link
 from core.snippets import save_snippet
@@ -84,6 +84,11 @@ class Pipeline:
             if isinstance(settings, Settings)
             else Settings(namespace=namespace)
         )
+        self.mem = get_mem_engine(self.settings)
+        try:
+            self.settings.attach_mem_engine(self.mem)
+        except Exception:
+            pass
         # Build datasource registry and choose default engine early
         self.ds = DatasourceRegistry(self.settings, namespace=self.namespace)
         self.app_engine = self.ds.engine(None)
@@ -94,11 +99,10 @@ class Pipeline:
 
         # 1) Load cfg and build engines
         self.cfg = self._load_cfg(self.settings)
-        self.mem_engine = self._make_engine(self.cfg.memory_db_url, pool_name="mem")
+        self.mem_engine = self.mem
 
-        # Attach mem engine & namespace so Settings can read mem_settings
+        # Attach namespace so Settings can read mem_settings
         try:
-            self.settings.attach_mem_engine(self.mem_engine)
             self.settings.set_namespace(namespace)
         except Exception:
             pass
