@@ -175,20 +175,9 @@ class Settings:
                 return env_val
             return default
 
-    def get_json(
-        self,
-        key: str,
-        default: Any = None,
-        *,
-        scope: str = "namespace",
-        scope_id: str | None = None,
-        namespace: str | None = None,
-    ) -> Any:
-        row = self._fetch_row(key, namespace=namespace or self._namespace, scope=scope, scope_id=scope_id)
-        if not row:
-            return default
-        val = self._coerce(row.get("value"), row.get("value_type"))
-        return val if isinstance(val, (dict, list)) or val is None else default
+    def get_json(self, key: str, *, scope="namespace", default=None):
+        v = self.get(key, scope=scope)
+        return v if v is not None else default
 
     def get_str(
         self,
@@ -208,36 +197,22 @@ class Settings:
         return str(val)
 
 
-    def get_bool(
-        self,
-        key: str,
-        default: bool = False,
-        *,
-        scope: str = "namespace",
-        scope_id: str | None = None,
-        namespace: str | None = None,
-    ) -> bool:
-        row = self._fetch_row(key, namespace=namespace or self._namespace, scope=scope, scope_id=scope_id)
-        if not row:
-            return default
-        val = self._coerce(row.get("value"), row.get("value_type"))
-        return bool(val) if val is not None else default
+    def get_bool(self, key: str, *, scope="namespace", default=False) -> bool:
+        v = self.get(key, scope=scope)
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, str):
+            s = v.strip().lower()
+            if s in ("true", "1", "yes", "y", "on"):
+                return True
+            if s in ("false", "0", "no", "n", "off"):
+                return False
+        return bool(v) if v is not None else default
 
-    def get_int(
-        self,
-        key: str,
-        default: Optional[int] = None,
-        *,
-        scope: str = "namespace",
-        scope_id: str | None = None,
-        namespace: str | None = None,
-    ) -> Optional[int]:
-        row = self._fetch_row(key, namespace=namespace or self._namespace, scope=scope, scope_id=scope_id)
-        if not row:
-            return default
+    def get_int(self, key: str, *, scope="namespace", default=0) -> int:
+        v = self.get(key, scope=scope)
         try:
-            val = self._coerce(row.get("value"), row.get("value_type"))
-            return int(val)
+            return int(v)
         except Exception:
             return default
 
