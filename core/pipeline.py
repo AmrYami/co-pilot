@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Callable
 from datetime import datetime
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, text, select
 from sqlalchemy import text as _sqltext
 from sqlalchemy.engine import Engine
 import sqlalchemy as sa
@@ -58,6 +58,89 @@ def ensure_limit(sql: str, limit: int) -> str:
     if re.search(r"\blimit\b", s, re.I):
         return s
     return f"{s} LIMIT {int(limit)}"
+
+
+def _guess_metric_and_entity(question: str):
+    q = question.lower()
+    metric = "net_sales" if any(w in q for w in ["sales", "revenue", "net sales"]) else None
+    entity = "customer" if any(w in q for w in ["customer", "customers", "debtor", "debtors"]) else None
+    top_n = None
+    for tok in q.split():
+        if tok.isdigit():
+            try:
+                n = int(tok)
+                if 1 <= n <= 200:
+                    top_n = n
+                    break
+            except:
+                pass
+    if top_n is None and "top" in q:
+        top_n = 10
+    last_month = ("last month" in q) or ("previous month" in q)
+    return metric, entity, top_n, last_month
+
+
+def _fa_date_clause_last_month(alias: str):
+    return f"DATE_FORMAT({alias}.tran_date, '%Y-%m') = DATE_FORMAT(CURRENT_DATE - INTERVAL 1 MONTH, '%Y-%m')"
+
+
+def _fa_types_clause(settings, *, scope="namespace"):
+    fmap = settings.get_json("FA_CATEGORY_MAP", scope="global", default={}) or {}
+    inv = fmap.get("sales invoice", {}).get("types", [])
+    cn = fmap.get("credit note", {}).get("types", [])
+    codes = sorted(set((inv or []) + (cn or [])))
+    if not codes:
+        codes = [10, 11]
+    joined = ", ".join(str(c) for c in codes)
+    return f"dt.type IN ({joined})"
+
+
+def _fastplan_topn_from_net_sales(mem_engine, settings, namespace, prefixes, question):
+    metric, entity, top_n, last_month = _guess_metric_and_entity(question)
+    if metric != "net_sales" or entity != "customer":
+        return None
+
+    with mem_engine.begin() as conn:
+        m = conn.execute(
+            text(
+                """SELECT calculation_sql FROM mem_metrics
+                     WHERE namespace = :ns AND metric_key = 'net_sales' AND is_active = true
+                     ORDER BY id DESC LIMIT 1"""
+            ),
+            {"ns": namespace},
+        ).fetchone()
+    if not m:
+        return None
+
+    prefix = prefixes[0] if prefixes else ""
+    dt = f"`{prefix}debtor_trans`"
+    dtd = f"`{prefix}debtor_trans_details`"
+    dm = f"`{prefix}debtors_master`"
+
+    date_clause = _fa_date_clause_last_month("dt") if last_month else "1=1"
+    type_clause = _fa_types_clause(settings)
+
+    limit = top_n or 10
+
+    sql = f"""
+    SELECT dm.name AS customer,
+           SUM((CASE WHEN dt.type = 11 THEN -1 ELSE 1 END)
+               * dtd.unit_price
+               * (1 - COALESCE(dtd.discount_percent, 0))
+               * dtd.quantity) AS net_sales
+      FROM {dt} AS dt
+      JOIN {dtd} AS dtd
+        ON dtd.debtor_trans_no = dt.trans_no
+       AND dtd.debtor_trans_type = dt.type
+      JOIN {dm} AS dm
+        ON dm.debtor_no = dt.debtor_no
+     WHERE {type_clause}
+       AND {date_clause}
+     GROUP BY dm.name
+     ORDER BY net_sales DESC
+     LIMIT {limit}
+    """
+    return sql.strip()
 
 
 # ------------------ config ------------------
@@ -189,9 +272,8 @@ class Pipeline:
 
     def _ensure_researcher_loaded(self) -> None:
         """(Re)build the researcher if RESEARCH_MODE is enabled."""
-        ns = self.namespace
         enabled = self.settings.get_bool(
-            "RESEARCH_MODE", namespace=ns, scope="namespace", default=False
+            "RESEARCH_MODE", scope="namespace", default=False
         )
         if not enabled:
             print("[research] disabled via RESEARCH_MODE")
@@ -617,7 +699,7 @@ class Pipeline:
         if not sql:
             return {"ok": False, "error": "no_sql_generated", "inquiry_id": inquiry_id}
 
-        result = self._execute_sql(app_engine, sql, ns, inquiry_id)
+        result = self._execute_sql(app_engine, sql, explain_only=False)
 
         result, final_sql = self._maybe_autoretry_empty(
             sql, result, app_engine, date_col_hint="dt.tran_date"
@@ -689,30 +771,45 @@ LIMIT 10;
 """.strip()
         return sql
 
-    def _execute_sql(self, engine, sql: str, ns: str, inquiry_id: int) -> Dict[str, Any]:
-        try:
-            with engine.begin() as c:
-                rows = c.execute(text(sql)).fetchall()
-            with self.mem_engine.begin() as m:
-                m.execute(
-                    text(
-                        """
-                    INSERT INTO mem_runs(namespace, input_query, sql_final, status, rows_returned, created_at)
-                    VALUES (:ns, :q, :sql, 'complete', :n, NOW())
-                        """
-                    ),
-                    {"ns": ns, "q": f"inq:{inquiry_id}", "sql": sql, "n": len(rows)},
-                )
-            return {
-                "ok": True,
-                "rows": [tuple(r) for r in rows],
-                "elapsed_ms": 0,
-                "explain_only": False,
-                "run_id": None,
-                "sql": sql,
-            }
-        except Exception as e:
-            return {"ok": False, "error": f"validation/exec failed: {e}", "sql": sql}
+    def _execute_sql(self, engine, sql: str, explain_only: bool = False):
+        from sqlalchemy import text
+        with engine.begin() as conn:
+            if explain_only:
+                try:
+                    conn.execute(text("EXPLAIN " + sql))
+                    return {"ok": True, "rows": [], "explain_only": True}
+                except Exception as e:
+                    return {"ok": False, "error": str(e), "explain_only": True}
+            else:
+                try:
+                    rows = conn.execute(text(sql)).fetchall()
+                    return {
+                        "ok": True,
+                        "rows": [tuple(r) for r in rows],
+                        "explain_only": False,
+                    }
+                except Exception as e:
+                    return {"ok": False, "error": str(e), "explain_only": False}
+
+    def _save_snippet(self, *, sql_raw: str, description: str, tags: list[str]):
+        from sqlalchemy import text
+        with self.mem_engine.begin() as conn:
+            conn.execute(
+                text(
+                    """
+            INSERT INTO mem_snippets(namespace, title, description, sql_template, sql_raw, tags, is_verified, created_at, updated_at)
+            VALUES (:ns, :title, :desc, :tmpl, :raw, :tags::jsonb, true, NOW(), NOW())
+                    """
+                ),
+                {
+                    "ns": self.namespace,
+                    "title": "top_customers_net_sales",
+                    "desc": description,
+                    "tmpl": sql_raw,
+                    "raw": sql_raw,
+                    "tags": __import__("json").dumps(tags),
+                },
+            )
 
     def _maybe_autoretry_empty(
         self, sql: str, exec_result: dict, engine, date_col_hint: str = None
@@ -1340,6 +1437,66 @@ LIMIT 10;
                     "inquiry_id": inquiry_id,
                     "error": err or (info.get("error") if isinstance(info, dict) else None),
                 }
+
+        fast_sql = _fastplan_topn_from_net_sales(
+            self.mem_engine, self.settings, self.namespace, prefixes, question
+        )
+        if fast_sql:
+            result = self._execute_sql(
+                self.app_engine,
+                fast_sql,
+                explain_only=self.settings.get_bool(
+                    "VALIDATE_WITH_EXPLAIN_ONLY", scope="global", default=False
+                ),
+            )
+            if (
+                result.get("ok") and not result.get("rows")
+            ) and self.settings.get_bool(
+                "EMPTY_RESULT_AUTORETRY", scope="namespace", default=True
+            ):
+                days = self.settings.get_int(
+                    "EMPTY_RESULT_AUTORETRY_DAYS", scope="namespace", default=90
+                )
+                widened = fast_sql.replace(
+                    _fa_date_clause_last_month("dt"),
+                    "dt.tran_date >= CURRENT_DATE - INTERVAL %d DAY" % days,
+                )
+                result2 = self._execute_sql(
+                    self.app_engine, widened, explain_only=False
+                )
+                if result2.get("ok") and result2.get("rows"):
+                    result2[
+                        "note"
+                    ] = f"No results for last month; auto‑retried last {days} days."
+                    if self.settings.get_bool(
+                        "SNIPPETS_AUTOSAVE", scope="namespace", default=True
+                    ):
+                        self._save_snippet(
+                            sql_raw=widened,
+                            description="Top N customers by net sales (auto‑retry window)",
+                            tags=["fa", "sales", "topN", "auto_retry"],
+                        )
+                    return {"status": "answered", "ok": True, **result2}
+                return {
+                    "status": "answered",
+                    "ok": True,
+                    "rows": [],
+                    "sql": fast_sql,
+                    "message": "No rows for last month. Try a wider date window (e.g., last 3 months).",
+                }
+
+            if (
+                self.settings.get_bool(
+                    "SNIPPETS_AUTOSAVE", scope="namespace", default=True
+                )
+                and result.get("ok")
+            ):
+                self._save_snippet(
+                    sql_raw=fast_sql,
+                    description="Top N customers by net sales (last month)",
+                    tags=["fa", "sales", "topN"],
+                )
+            return {"status": "answered", "ok": True, **result}
 
         clarifier = ClarifierAgent(self.settings)
         spec = clarifier.classify_and_extract(question, prefixes, DOMAIN_HINTS)

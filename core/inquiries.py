@@ -56,39 +56,39 @@ def summarize_admin_notes(notes: Optional[List[Dict[str, Any]]]) -> str:
 # --- Admin note helpers ----------------------------------------------------
 
 
-def append_admin_note(mem_engine, inquiry_id: int, by: str, text_note: str) -> int:
-    """
-    Append admin note (JSON) and bump clarification_rounds atomically.
-    """
+def append_admin_note(mem_engine, inquiry_id: int, *, by: str, text_note: str) -> int:
     note = {
         "by": by,
         "text": text_note,
-        "ts": datetime.now(timezone.utc).isoformat(),
+        "ts": __import__("datetime").datetime.utcnow().isoformat() + "Z",
     }
-
+    # IMPORTANT: pass note as JSON string and cast to jsonb on the PG side
     sql = text(
         """
         UPDATE mem_inquiries
-           SET admin_notes = COALESCE(admin_notes, '[]'::jsonb)
-                              || jsonb_build_array(CAST(:note AS jsonb)),
-               admin_reply  = COALESCE(:reply, admin_reply),
-               answered_by  = COALESCE(:by, answered_by),
+           SET admin_notes          = COALESCE(admin_notes, '[]'::jsonb)
+                                      || jsonb_build_array( %(note)s::jsonb ),
+               admin_reply          = COALESCE(%(reply)s, admin_reply),
+               answered_by          = COALESCE(%(by)s, answered_by),
+               answered_at          = NOW(),
                clarification_rounds = COALESCE(clarification_rounds, 0) + 1,
-               updated_at   = NOW()
-         WHERE id = :id
+               updated_at           = NOW()
+         WHERE id = %(id)s
      RETURNING clarification_rounds
     """
     )
-
     with mem_engine.begin() as conn:
-        params = {
-            "id": inquiry_id,
-            "note": json.dumps(note),
-            "reply": text_note,
-            "by": by,
-        }
-        rounds = conn.execute(sql, params).scalar_one()
-        return rounds
+        r = conn.execute(
+            sql,
+            {
+                "id": inquiry_id,
+                "note": json.dumps(note),
+                "reply": text_note,
+                "by": by,
+            },
+        )
+        row = r.fetchone()
+        return int(row[0]) if row else 0
 
 
 def set_admin_reply(mem_engine, inquiry_id: int, reply: str, answered_by: str | None = None) -> None:
