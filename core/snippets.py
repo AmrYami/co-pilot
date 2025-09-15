@@ -1,8 +1,56 @@
 from __future__ import annotations
-from typing import Iterable, Optional, Sequence
-from sqlalchemy import text
+from typing import Iterable, Optional, Sequence, List, Dict, Any
+from sqlalchemy import text, Engine
 import json
 import datetime as dt
+
+
+def save_snippet(
+    mem: Engine,
+    namespace: str,
+    *,
+    title: str,
+    description: Optional[str],
+    sql_raw: str,
+    input_tables: List[str],
+    output_columns: Optional[List[str]] = None,
+    filters_applied: Optional[List[str]] = None,
+    parameters: Optional[Dict[str, Any]] = None,
+    tags: Optional[List[str]] = None,
+    datasource: Optional[str] = None,
+) -> int:
+    ins = text(
+        """
+        INSERT INTO mem_snippets(
+            namespace, title, description, sql_raw,
+            input_tables, output_columns, filters_applied, parameters,
+            tags, datasource, created_at, updated_at
+        )
+        VALUES (
+            :ns, :title, :desc, :sql,
+            :in_tables, :out_cols, :filters, :params,
+            :tags, :ds, NOW(), NOW()
+        )
+        RETURNING id
+        """
+    )
+    with mem.begin() as conn:
+        rid = conn.execute(
+            ins,
+            {
+                "ns": namespace,
+                "title": title,
+                "desc": description,
+                "sql": sql_raw,
+                "in_tables": json.dumps(input_tables or []),
+                "out_cols": json.dumps(output_columns or []),
+                "filters": json.dumps(filters_applied or []),
+                "params": json.dumps(parameters or {}),
+                "tags": json.dumps(tags or []),
+                "ds": datasource,
+            },
+        ).scalar_one()
+    return int(rid)
 
 def build_doc_md(sql: str,
                  title: str | None = None,
