@@ -7,11 +7,11 @@ These helpers are project-agnostic (no FA-specific code).
 
 from __future__ import annotations
 
-import json
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from sqlalchemy.engine import Engine, Row
 from sqlalchemy import text
+from psycopg2.extras import Json
 
 
 def fetch_inquiry(mem_engine, inquiry_id: int) -> Optional[Dict[str, Any]]:
@@ -56,39 +56,31 @@ def summarize_admin_notes(notes: Optional[List[Dict[str, Any]]]) -> str:
 # --- Admin note helpers ----------------------------------------------------
 
 
-def append_admin_note(mem_engine, inquiry_id: int, *, by: str, text_note: str) -> int:
-    note = {
-        "by": by,
-        "text": text_note,
-        "ts": __import__("datetime").datetime.utcnow().isoformat() + "Z",
-    }
-    # IMPORTANT: pass note as JSON string and cast to jsonb on the PG side
+def append_admin_note(mem_engine, inquiry_id: int, by: str, text_note: str) -> int:
+    """Append an admin note and update reply metadata.
+
+    The note is bound using ``psycopg2.extras.Json`` to ensure proper JSONB
+    handling on PostgreSQL without manual casts or format tricks.
+    """
+
+    note = {"by": by, "text": text_note, "ts": datetime.now(timezone.utc).isoformat()}
+    params = {"id": inquiry_id, "note": Json(note), "reply": text_note, "by": by}
     sql = text(
         """
         UPDATE mem_inquiries
-           SET admin_notes          = COALESCE(admin_notes, '[]'::jsonb)
-                                      || jsonb_build_array( %(note)s::jsonb ),
-               admin_reply          = COALESCE(%(reply)s, admin_reply),
-               answered_by          = COALESCE(%(by)s, answered_by),
+           SET admin_notes          = COALESCE(admin_notes, '[]'::jsonb) || jsonb_build_array(:note),
+               admin_reply          = COALESCE(:reply, admin_reply),
+               answered_by          = COALESCE(:by, answered_by),
                answered_at          = NOW(),
                clarification_rounds = COALESCE(clarification_rounds, 0) + 1,
                updated_at           = NOW()
-         WHERE id = %(id)s
+         WHERE id = :id
      RETURNING clarification_rounds
     """
     )
-    with mem_engine.begin() as conn:
-        r = conn.execute(
-            sql,
-            {
-                "id": inquiry_id,
-                "note": json.dumps(note),
-                "reply": text_note,
-                "by": by,
-            },
-        )
-        row = r.fetchone()
-        return int(row[0]) if row else 0
+    with mem_engine.begin() as c:
+        row = c.execute(sql, params).fetchone()
+    return int(row[0]) if row else 0
 
 
 def set_admin_reply(mem_engine, inquiry_id: int, reply: str, answered_by: str | None = None) -> None:

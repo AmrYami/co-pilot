@@ -174,6 +174,11 @@ class Pipeline:
             pass
         # Build datasource registry and choose default engine early
         self.ds = DatasourceRegistry(self.settings, namespace=self.namespace)
+        # Let registry pick default; if you prefer explicit:
+        # default_name = self.settings.get_str(
+        #     "DEFAULT_DATASOURCE", scope="namespace", namespace=self.namespace
+        # )
+        # self.app_engine = self.ds.engine(default_name)
         self.app_engine = self.ds.engine(None)
 
         self.researcher = None
@@ -273,7 +278,10 @@ class Pipeline:
     def _ensure_researcher_loaded(self) -> None:
         """(Re)build the researcher if RESEARCH_MODE is enabled."""
         enabled = self.settings.get_bool(
-            "RESEARCH_MODE", scope="namespace", default=False
+            "RESEARCH_MODE",
+            scope="namespace",
+            namespace=self.namespace,
+            default=False,
         )
         if not enabled:
             print("[research] disabled via RESEARCH_MODE")
@@ -573,10 +581,16 @@ class Pipeline:
         sql_used = canonical_sql
         result = exec_result
         empty_retry = self.settings.get_bool(
-            "EMPTY_RESULT_AUTORETRY", scope="namespace", default=False
+            "EMPTY_RESULT_AUTORETRY",
+            scope="namespace",
+            namespace=ns,
+            default=False,
         )
         empty_days = self.settings.get_int(
-            "EMPTY_RESULT_AUTORETRY_DAYS", scope="namespace", default=90
+            "EMPTY_RESULT_AUTORETRY_DAYS",
+            scope="namespace",
+            namespace=ns,
+            default=90,
         )
 
         message = None
@@ -605,7 +619,9 @@ class Pipeline:
                     "note": message,
                 }
 
-        if self.settings.get_bool("SNIPPETS_AUTOSAVE", scope="namespace") and isinstance(result.get("rows"), list) and len(result["rows"]) > 0:
+        if self.settings.get_bool(
+            "SNIPPETS_AUTOSAVE", scope="namespace", namespace=ns
+        ) and isinstance(result.get("rows"), list) and len(result["rows"]) > 0:
             try:
                 save_snippet(self.mem_engine, ns, question, sql_used, tags=["fa", "auto", "snippet"])
             except Exception as e:
@@ -706,7 +722,7 @@ class Pipeline:
         )
 
         if (
-            self.settings.get_bool("SNIPPETS_AUTOSAVE", scope="namespace")
+            self.settings.get_bool("SNIPPETS_AUTOSAVE", scope="namespace", namespace=ns)
             and result.get("ok")
         ):
             try:
@@ -818,7 +834,9 @@ LIMIT 10;
         if not (exec_result.get("ok") and exec_result.get("rows") == []):
             return exec_result, sql
 
-        if not self.settings.get_bool("EMPTY_RESULT_AUTORETRY", scope="namespace"):
+        if not self.settings.get_bool(
+            "EMPTY_RESULT_AUTORETRY", scope="namespace", namespace=self.namespace
+        ):
             exec_result["message"] = (
                 "No results for last month. Try last 3 months or a custom range."
             )
@@ -826,7 +844,10 @@ LIMIT 10;
 
         days = int(
             self.settings.get_int(
-                "EMPTY_RESULT_AUTORETRY_DAYS", default=90, scope="namespace"
+                "EMPTY_RESULT_AUTORETRY_DAYS",
+                default=90,
+                scope="namespace",
+                namespace=self.namespace,
             )
             or 90
         )
@@ -1452,10 +1473,16 @@ LIMIT 10;
             if (
                 result.get("ok") and not result.get("rows")
             ) and self.settings.get_bool(
-                "EMPTY_RESULT_AUTORETRY", scope="namespace", default=True
+                "EMPTY_RESULT_AUTORETRY",
+                scope="namespace",
+                namespace=self.namespace,
+                default=True,
             ):
                 days = self.settings.get_int(
-                    "EMPTY_RESULT_AUTORETRY_DAYS", scope="namespace", default=90
+                    "EMPTY_RESULT_AUTORETRY_DAYS",
+                    scope="namespace",
+                    namespace=self.namespace,
+                    default=90,
                 )
                 widened = fast_sql.replace(
                     _fa_date_clause_last_month("dt"),
@@ -1469,7 +1496,10 @@ LIMIT 10;
                         "note"
                     ] = f"No results for last month; auto‑retried last {days} days."
                     if self.settings.get_bool(
-                        "SNIPPETS_AUTOSAVE", scope="namespace", default=True
+                        "SNIPPETS_AUTOSAVE",
+                        scope="namespace",
+                        namespace=self.namespace,
+                        default=True,
                     ):
                         self._save_snippet(
                             sql_raw=widened,
@@ -1487,7 +1517,10 @@ LIMIT 10;
 
             if (
                 self.settings.get_bool(
-                    "SNIPPETS_AUTOSAVE", scope="namespace", default=True
+                    "SNIPPETS_AUTOSAVE",
+                    scope="namespace",
+                    namespace=self.namespace,
+                    default=True,
                 )
                 and result.get("ok")
             ):
