@@ -59,28 +59,31 @@ def summarize_admin_notes(notes: Optional[List[Dict[str, Any]]]) -> str:
 
 def append_admin_note(mem_engine, inquiry_id: int, *, by: str, text_note: str) -> int:
     note = {
-        "by": by or "unknown",
-        "text": text_note or "",
+        "by": by,
+        "text": (text_note or "").strip(),
         "ts": datetime.now(timezone.utc).isoformat(),
     }
-    # IMPORTANT: use :named params, and cast to jsonb
+    note_json = json.dumps(note)
+
     sql = text(
         """
         UPDATE mem_inquiries
-           SET admin_notes          = COALESCE(admin_notes, '[]'::jsonb) || :note::jsonb,
-               admin_reply          = COALESCE(:reply, admin_reply),
-               answered_by          = COALESCE(:by, answered_by),
+           SET admin_notes          = COALESCE(admin_notes, '[]'::jsonb)
+                                      || jsonb_build_array(to_jsonb(%(note)s::json)),
+               admin_reply          = COALESCE(%(reply)s, admin_reply),
+               answered_by          = COALESCE(%(by)s, answered_by),
                clarification_rounds = COALESCE(clarification_rounds, 0) + 1,
                updated_at           = NOW()
-         WHERE id = :id
+         WHERE id = %(id)s
      RETURNING clarification_rounds
         """
     )
-    with mem_engine.begin() as conn:
-        rounds = conn.execute(
+    with mem_engine.begin() as c:
+        r = c.execute(
             sql,
-            {"id": inquiry_id, "by": by, "reply": text_note, "note": json.dumps(note)},
-        ).scalar_one()
+            {"id": inquiry_id, "by": by, "reply": text_note, "note": note_json},
+        )
+        rounds = r.scalar_one()
     return rounds
 
 
