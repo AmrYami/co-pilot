@@ -175,8 +175,15 @@ class Settings:
                 return env_val
             return default
 
-    def get_json(self, key: str, *, scope="namespace", default=None):
-        v = self.get(key, scope=scope)
+    def get_json(
+        self,
+        key: str,
+        *,
+        scope: str = "namespace",
+        namespace: str | None = None,
+        default=None,
+    ):
+        v = self.get(key, scope=scope, namespace=namespace)
         return v if v is not None else default
 
     def get_str(
@@ -197,8 +204,15 @@ class Settings:
         return str(val)
 
 
-    def get_bool(self, key: str, *, scope="namespace", default=False) -> bool:
-        v = self.get(key, scope=scope)
+    def get_bool(
+        self,
+        key: str,
+        *,
+        scope: str = "namespace",
+        namespace: str | None = None,
+        default=False,
+    ) -> bool:
+        v = self.get(key, scope=scope, namespace=namespace)
         if isinstance(v, bool):
             return v
         if isinstance(v, str):
@@ -209,8 +223,15 @@ class Settings:
                 return False
         return bool(v) if v is not None else default
 
-    def get_int(self, key: str, *, scope="namespace", default=0) -> int:
-        v = self.get(key, scope=scope)
+    def get_int(
+        self,
+        key: str,
+        *,
+        scope: str = "namespace",
+        namespace: str | None = None,
+        default=0,
+    ) -> int:
+        v = self.get(key, scope=scope, namespace=namespace)
         try:
             return int(v)
         except Exception:
