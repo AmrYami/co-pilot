@@ -60,6 +60,26 @@ def ensure_limit(sql: str, limit: int) -> str:
     return f"{s} LIMIT {int(limit)}"
 
 
+_DATE_FMT_EQ_RE = re.compile(
+    r"DATE_FORMAT\s*\(\s*([a-zA-Z0-9_\.]+)\s*,\s*'%Y-%m'\s*\)\s*=\s*DATE_FORMAT\s*\(\s*CURRENT_DATE\s*-\s*INTERVAL\s+1\s+MONTH\s*,\s*'%Y-%m'\s*\)",
+    re.IGNORECASE,
+)
+
+
+def widen_date_window_mysql(sql: str, days: int) -> Tuple[str, bool]:
+    """
+    If the SQL filters 'last month' via DATE_FORMAT(...)=DATE_FORMAT(...),
+    widen it to 'last N days'. Returns (new_sql, changed).
+    """
+
+    def _repl(m: re.Match) -> str:
+        col = m.group(1)
+        return f"{col} >= CURRENT_DATE - INTERVAL {int(days)} DAY"
+
+    new_sql, n = _DATE_FMT_EQ_RE.subn(_repl, sql)
+    return (new_sql, n > 0)
+
+
 # ------------------ config ------------------
 @dataclass
 class PipelineConfig:
@@ -457,35 +477,42 @@ class Pipeline:
                 "error": f"validation/exec failed: {e}",
             }
 
-        message = None
-        sql_used = exec_result.get("sql_used", canonical_sql)
-        if exec_result.get("rowcount", 0) == 0:
-            if self.settings.empty_result_autoretry(ns):
-                retry = self._maybe_autowiden_and_retry(
-                    sql=canonical_sql, namespace=ns, prefixes=prefixes
-                )
-                if retry.get("rowcount", 0) > 0:
-                    exec_result = retry
-                    sql_used = retry.get("sql_used", canonical_sql)
-                    message = (
-                        f"No results for last month; expanded to last {self.settings.empty_result_window_days(ns)} days."
-                    )
-                else:
-                    exec_result = retry
-                    message = (
-                        "No results for last month. Try last 3 months or a specific range (e.g., between 2024-06-01 and 2024-08-31)."
-                    )
-            else:
-                message = "No results for last month. Try widening the date range."
+        sql_used = canonical_sql
+        result = exec_result
+        empty_retry = self.settings.get_bool("EMPTY_RESULT_AUTORETRY", scope="namespace") or False
+        empty_days = int(self.settings.get("EMPTY_RESULT_AUTORETRY_DAYS", scope="namespace") or 90)
 
-        snip_id = self._maybe_persist_snippet(
-            sql=sql_used,
-            namespace=ns,
-            datasource=self.settings.default_datasource(ns),
-            rows_count=exec_result.get("rowcount", 0),
-            question=question,
-            tags_extra=["autowiden"] if exec_result.get("autowiden_applied") else [],
-        )
+        message = None
+        if isinstance(result.get("rows"), list) and len(result["rows"]) == 0:
+            message = "No results for last month. You can try last 3 months or specify a date range (e.g., 2025-06-01 to 2025-08-31)."
+            retried = False
+            retry_sql = canonical_sql
+            if empty_retry:
+                widened_sql, changed = widen_date_window_mysql(canonical_sql, empty_days)
+                if changed:
+                    retry_sql = widened_sql
+                    retry_res = self._validate_and_execute_sql(ns, prefixes, retry_sql)
+                    if isinstance(retry_res.get("rows"), list) and len(retry_res["rows"]) > 0:
+                        retried = True
+                        result = retry_res
+                        sql_used = retry_sql
+                        message = f"No rows last month; auto-retried with last {empty_days} days."
+            if not retried:
+                self._update_inquiry_status(inquiry_id, "answered")
+                return {
+                    "ok": True,
+                    "inquiry_id": inquiry_id,
+                    "status": "answered",
+                    "sql": canonical_sql,
+                    "result": result,
+                    "note": message,
+                }
+
+        if self.settings.get_bool("SNIPPETS_AUTOSAVE", scope="namespace") and isinstance(result.get("rows"), list) and len(result["rows"]) > 0:
+            try:
+                save_snippet(self.mem_engine, ns, question, sql_used, tags=["fa", "auto", "snippet"])
+            except Exception as e:
+                print(f"[snippets] autosave failed: {e}")
 
         self._update_inquiry_status(inquiry_id, "answered")
         out = {
@@ -493,12 +520,10 @@ class Pipeline:
             "inquiry_id": inquiry_id,
             "status": "answered",
             "sql": sql_used,
-            "result": exec_result,
+            "result": result,
         }
         if message:
-            out["message"] = message
-        if snip_id:
-            out["snippet_id"] = snip_id
+            out["note"] = message
         return out
 
     def _update_inquiry_status(self, inquiry_id: int, status: str) -> None:
@@ -532,75 +557,6 @@ class Pipeline:
             rows = execute_sql(self.app_engine, safe_sql)
             return {"rows": rows[:100], "rowcount": len(rows), "sql_used": sql}
 
-    def _maybe_autowiden_and_retry(
-        self, *, sql: str, namespace: str, prefixes: list[str]
-    ) -> dict:
-        """
-        If the first execution returned zero rows, optionally widen date window and retry once.
-        Returns execution-like dict with autowiden_applied flag and sql_used.
-        """
-        window_days = self.settings.empty_result_window_days(namespace)
-        widened = self._widen_date_filter_mysql(sql, days=window_days)
-        if widened == sql:
-            return {"autowiden_applied": False, "sql_used": sql, "rowcount": 0, "rows": []}
-
-        exec2 = self._validate_and_execute_sql(namespace, prefixes, widened)
-        exec2["autowiden_applied"] = True
-        exec2["sql_used"] = widened
-        return exec2
-
-    _LAST_MONTH_EQ = re.compile(
-        r"DATE_FORMAT\(\s*(?P<col>[\w\.`]+)\s*,\s*'%Y-%m'\s*\)\s*=\s*DATE_FORMAT\(\s*CURRENT_DATE\s*-\s*INTERVAL\s*1\s*MONTH\s*,\s*'%Y-%m'\s*\)",
-        re.IGNORECASE,
-    )
-
-    def _widen_date_filter_mysql(self, sql: str, days: int) -> str:
-        """Widen common last-month equality filter to a rolling window."""
-        def _repl(m: re.Match) -> str:
-            col = m.group("col")
-            return f"{col} >= CURRENT_DATE - INTERVAL {int(days)} DAY"
-
-        return self._LAST_MONTH_EQ.sub(_repl, sql, count=1)
-
-    def _maybe_persist_snippet(
-        self,
-        *,
-        sql: str,
-        namespace: str,
-        datasource: str | None,
-        rows_count: int,
-        question: str,
-        tags_extra=None,
-    ) -> Optional[int]:
-        """Save to mem_snippets when result is non-empty."""
-        if not self.settings.snippets_autosave(namespace):
-            return None
-        if rows_count <= 0:
-            return None
-
-        input_tabs = []
-        for tok in sql.split():
-            if tok.startswith("`") and tok.endswith("`"):
-                input_tabs.append(tok.strip("`"))
-        tags = ["fa", "auto", "snippet"] + list(tags_extra or [])
-        title = question[:80] if question else "Saved query"
-        try:
-            snip_id = save_snippet(
-                self.mem_engine,
-                namespace,
-                title=title,
-                description=None,
-                sql_raw=sql,
-                input_tables=input_tabs,
-                filters_applied=[],
-                parameters={"source": "pipeline.autosave"},
-                tags=tags,
-                datasource=datasource,
-            )
-            return snip_id
-        except Exception as e:
-            print(f"[snippet] persist failed: {e}")
-            return None
 
     def reprocess_inquiry(self, inquiry_id: int, namespace: Optional[str] = None) -> Dict[str, Any]:
         """
@@ -675,27 +631,6 @@ class Pipeline:
             exec_result = self.validate_and_execute(
                 canonical_sql, prefixes, namespace=ns
             )
-            # Mark inquiry answered
-            with self.mem_engine.begin() as conn:
-                conn.execute(
-                    text(
-                        """
-                        UPDATE mem_inquiries
-                           SET status = 'answered',
-                               updated_at = NOW(),
-                               answered_at = NOW()
-                         WHERE id = :id
-                        """
-                    ),
-                    {"id": inquiry_id},
-                )
-            return {
-                "ok": True,
-                "inquiry_id": inquiry_id,
-                "sql": canonical_sql,
-                "result": exec_result,
-                "status": "answered",
-            }
         except Exception as e:
             return {
                 "ok": False,
@@ -704,6 +639,79 @@ class Pipeline:
                 "error": f"validation/exec failed: {e!s}",
                 "status": "failed",
             }
+
+        sql_used = canonical_sql
+        result = exec_result
+        empty_retry = self.settings.get_bool("EMPTY_RESULT_AUTORETRY", scope="namespace") or False
+        empty_days = int(self.settings.get("EMPTY_RESULT_AUTORETRY_DAYS", scope="namespace") or 90)
+
+        message = None
+        if result.get("ok", True) and isinstance(result.get("rows"), list) and len(result["rows"]) == 0:
+            message = "No results for last month. You can try last 3 months or specify a date range (e.g., 2025-06-01 to 2025-08-31)."
+            retried = False
+            retry_sql = canonical_sql
+            if empty_retry:
+                widened_sql, changed = widen_date_window_mysql(canonical_sql, empty_days)
+                if changed:
+                    retry_sql = widened_sql
+                    retry_res = self.validate_and_execute(retry_sql, prefixes, namespace=ns)
+                    if retry_res.get("ok", True) and isinstance(retry_res.get("rows"), list) and len(retry_res["rows"]) > 0:
+                        retried = True
+                        result = retry_res
+                        sql_used = retry_sql
+                        message = f"No rows last month; auto-retried with last {empty_days} days."
+            if not retried:
+                with self.mem_engine.begin() as conn:
+                    conn.execute(
+                        text(
+                            """
+                            UPDATE mem_inquiries
+                               SET status = 'answered',
+                                   updated_at = NOW(),
+                                   answered_at = NOW()
+                             WHERE id = :id
+                            """
+                        ),
+                        {"id": inquiry_id},
+                    )
+                return {
+                    "ok": True,
+                    "inquiry_id": inquiry_id,
+                    "sql": canonical_sql,
+                    "result": result,
+                    "status": "answered",
+                    "note": message,
+                }
+
+        if self.settings.get_bool("SNIPPETS_AUTOSAVE", scope="namespace") and isinstance(result.get("rows"), list) and len(result["rows"]) > 0:
+            try:
+                save_snippet(self.mem_engine, ns, question, sql_used, tags=["fa", "auto", "snippet"])
+            except Exception as e:
+                print(f"[snippets] autosave failed: {e}")
+
+        with self.mem_engine.begin() as conn:
+            conn.execute(
+                text(
+                    """
+                    UPDATE mem_inquiries
+                       SET status = 'answered',
+                           updated_at = NOW(),
+                           answered_at = NOW()
+                     WHERE id = :id
+                    """
+                ),
+                {"id": inquiry_id},
+            )
+        out = {
+            "ok": True,
+            "inquiry_id": inquiry_id,
+            "sql": sql_used,
+            "result": result,
+            "status": "answered",
+        }
+        if message:
+            out["note"] = message
+        return out
 
     def validate_and_execute(
         self, sql: str, prefixes: List[str], *, namespace: Optional[str] = None
