@@ -13,7 +13,6 @@ from typing import Any, Dict, List, Optional
 from sqlalchemy.engine import Engine, Row
 from sqlalchemy import text, bindparam
 from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.types import JSON
 
 
 def fetch_inquiry(mem_engine, inquiry_id: int) -> Optional[Dict[str, Any]]:
@@ -68,14 +67,14 @@ def append_admin_note(mem_engine, inquiry_id: int, by: str, text_note: str) -> i
     note_obj = {
         "by": by,
         "text": text_note,
-        "ts": datetime.now(timezone.utc).isoformat()
+        "ts": datetime.now(timezone.utc).isoformat(),
     }
 
-    sql = text(
+    stmt = text(
         """
         UPDATE mem_inquiries
            SET admin_notes          = COALESCE(admin_notes, '[]'::jsonb)
-                                      || jsonb_build_array(CAST(:note AS jsonb)),
+                                      || jsonb_build_array(:note),
                admin_reply          = COALESCE(:reply, admin_reply),
                answered_by          = COALESCE(:by, answered_by),
                clarification_rounds = COALESCE(clarification_rounds, 0) + 1,
@@ -83,16 +82,12 @@ def append_admin_note(mem_engine, inquiry_id: int, by: str, text_note: str) -> i
          WHERE id = :id
      RETURNING clarification_rounds
     """
-    ).bindparams(
-        bindparam("note", type_=JSON)
-    )
+    ).bindparams(bindparam("note", type_=JSONB))
 
+    params = {"id": inquiry_id, "note": note_obj, "reply": text_note, "by": by}
     with mem_engine.begin() as conn:
-        row = conn.execute(
-            sql,
-            {"id": inquiry_id, "note": note_obj, "reply": text_note, "by": by}
-        ).first()
-        return int(row[0]) if row else 0
+        r = conn.execute(stmt, params)
+        return r.scalar_one()
 
 
 def set_admin_reply(mem_engine, inquiry_id: int, reply: str, answered_by: str | None = None) -> None:

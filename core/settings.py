@@ -133,6 +133,68 @@ class Settings:
         # Any other primitive: return as-is (or default)
         return val
 
+    def get_str(
+        self,
+        key: str,
+        default: str = "",
+        *,
+        scope: str = "namespace",
+        scope_id: str | None = None,
+        namespace: str | None = None,
+    ) -> str:
+        val = self.get(key, default=None, scope=scope, scope_id=scope_id, namespace=namespace)
+        if val is None:
+            return default
+        return val if isinstance(val, str) else str(val)
+
+    @staticmethod
+    def _coerce_bool(v: Any, default: bool = False) -> bool:
+        if v is None:
+            return default
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, (int, float)):
+            return v != 0
+        if isinstance(v, str):
+            t = v.strip().lower()
+            return t in {"1", "true", "t", "yes", "y", "on"}
+        return default
+
+    @staticmethod
+    def _coerce_int(v: Any, default: int = 0) -> int:
+        if v is None:
+            return default
+        if isinstance(v, bool):
+            return 1 if v else 0
+        try:
+            return int(v)
+        except Exception:
+            return default
+
+    def get_bool(
+        self,
+        key: str,
+        default: bool = False,
+        *,
+        scope: str = "namespace",
+        scope_id: str | None = None,
+        namespace: str | None = None,
+    ) -> bool:
+        val = self.get(key, default=None, scope=scope, scope_id=scope_id, namespace=namespace)
+        return self._coerce_bool(val, default)
+
+    def get_int(
+        self,
+        key: str,
+        default: int = 0,
+        *,
+        scope: str = "namespace",
+        scope_id: str | None = None,
+        namespace: str | None = None,
+    ) -> int:
+        val = self.get(key, default=None, scope=scope, scope_id=scope_id, namespace=namespace)
+        return self._coerce_int(val, default)
+
     def summary(self, mask_secrets: bool = True) -> Dict[str, Any]:
         """Return a snapshot of cached DB/env values for diagnostics."""
         snap: Dict[str, Any] = {}
