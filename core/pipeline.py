@@ -6,6 +6,26 @@ from core.settings import Settings
 from core.sql_exec import get_mem_engine
 from core.datasources import DatasourceRegistry
 
+try:  # pragma: no cover - optional hints module
+    from apps.dw.hints import (
+        get_join_hints,
+        get_metric_hints,
+        get_reserved_terms,
+        get_date_columns,
+    )
+except Exception:  # pragma: no cover - fallback if hints unavailable
+    def get_join_hints(*args, **kwargs):
+        return []
+
+    def get_metric_hints(*args, **kwargs):
+        return {}
+
+    def get_reserved_terms(*args, **kwargs):
+        return {}
+
+    def get_date_columns(*args, **kwargs):
+        return {}
+
 
 class Pipeline:
     """Lightweight pipeline wrapper for DocuWare flows."""
