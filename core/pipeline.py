@@ -44,6 +44,20 @@ from core.emailer import Emailer
 from types import SimpleNamespace
 
 
+try:  # pragma: no cover - optional DocuWare hints
+    from apps.dw.hints import (
+        default_table as dw_default_table,
+        metric_sql_map as dw_metric_map,
+    )
+
+    APP_HINTS = {
+        "default_table": dw_default_table(),
+        "metric_sql": dw_metric_map(),
+    }
+except Exception:  # pragma: no cover - hints are optional
+    APP_HINTS = {}
+
+
 def _as_dicts(rows):
     return [dict(r) for r in rows]
 
@@ -711,7 +725,13 @@ class Pipeline:
             "SNIPPETS_AUTOSAVE", scope="namespace", namespace=ns
         ) and isinstance(result.get("rows"), list) and len(result["rows"]) > 0:
             try:
-                save_snippet(self.mem_engine, ns, question, sql_used, tags=["fa", "auto", "snippet"])
+            save_snippet(
+                self.mem_engine,
+                ns,
+                question,
+                sql_used,
+                tags=[self.active_app, "auto", "snippet"],
+            )
             except Exception as e:
                 print(f"[snippets] autosave failed: {e}")
 
@@ -839,7 +859,7 @@ class Pipeline:
                                 ["dt.type IN (1,11)", "date range filter"]
                             ),
                             "tags": json.dumps(
-                                ["fa", "sales", "top10", "customers"]
+                                [self.active_app, "sales", "top10", "customers"]
                             ),
                             "ds": self.ds.default or "frontaccounting_bk",
                         },
@@ -1309,6 +1329,9 @@ LIMIT 10;
         self, source: str, prefixes: Iterable[str], fa_version: Optional[str] = None
     ) -> Dict[str, int]:
         """Ensure metadata for given prefixes exists/updated. Returns {prefix: snapshot_id}."""
+        source = (source or self.active_app or "").strip().lower()
+        alias_map = {"docuware": "dw"}
+        source = alias_map.get(source, source)
         if source not in (self.active_app, "fa"):
             raise ValueError(f"Unknown source '{source}'")
         if not self.app_engine:
@@ -1339,7 +1362,7 @@ LIMIT 10;
                 )
             out[p] = ing.ingest_prefix(p, fa_version=fa_version)
             # drop cache for this namespace so next context build reloads
-            self._cache.pop(f"fa::{p}", None)
+            self._cache.pop(f"{source}::{p}", None)
         return out
 
     def build_context_pack(
@@ -1349,9 +1372,16 @@ LIMIT 10;
         query: str,
         keyword_expander: Optional[Callable[[List[str]], List[str]]] = None,
     ) -> Dict[str, Any]:
-        if source != "fa":
-            raise ValueError("Unknown source; only 'fa' is supported right now")
-        namespaces = [f"fa::{p}" for p in prefixes]
+        source = (source or self.active_app or "").strip().lower()
+        alias_map = {"docuware": "dw"}
+        source = alias_map.get(source, source)
+        if source not in (self.active_app, "fa"):
+            source = self.active_app
+
+        namespaces = [f"{source}::{p}" for p in prefixes or [] if p]
+        if not namespaces:
+            namespaces = [self.namespace]
+
         ctx = ContextBuilder(
             self.mem_engine,
             namespaces,
@@ -1409,6 +1439,11 @@ LIMIT 10;
             ds_name = self.settings.default_datasource(ns)
         context["datasource"] = ds_name
 
+        if APP_HINTS.get("default_table") and "default_table" not in context:
+            context["default_table"] = APP_HINTS["default_table"]
+        if APP_HINTS.get("metric_sql") and "metric_sql" not in context:
+            context["metric_sql"] = APP_HINTS["metric_sql"]
+
         if inquiry_id and (admin_reply or clarifications):
             try:
                 with self.mem_engine.begin() as con:
@@ -1431,7 +1466,7 @@ LIMIT 10;
                 enriched_q += f"\n\nClarifications: {admin_reply}"
                 admin_hints = self.normalize_admin_reply(admin_reply)
 
-            ctx = self.build_context_pack("fa", prefixes, enriched_q)
+            ctx = self.build_context_pack(self.active_app, prefixes, enriched_q)
             if context:
                 ctx.update({k: v for k, v in context.items() if v is not None})
 
@@ -1583,7 +1618,7 @@ LIMIT 10;
                         self._save_snippet(
                             sql_raw=widened,
                             description="Top N customers by net sales (auto‑retry window)",
-                            tags=["fa", "sales", "topN", "auto_retry"],
+                            tags=[self.active_app, "sales", "topN", "auto_retry"],
                         )
                     return {"status": "answered", "ok": True, **result2}
                 return {
@@ -1606,7 +1641,7 @@ LIMIT 10;
                 self._save_snippet(
                     sql_raw=fast_sql,
                     description="Top N customers by net sales (last month)",
-                    tags=["fa", "sales", "topN"],
+                    tags=[self.active_app, "sales", "topN"],
                 )
             return {"status": "answered", "ok": True, **result}
 
@@ -1626,7 +1661,7 @@ LIMIT 10;
             }
 
         if spec.intent == "raw_sql":
-            ctx = self.build_context_pack("fa", prefixes, question)
+            ctx = self.build_context_pack(self.active_app, prefixes, question)
             sql = SQLRewriter.rewrite_for_prefixes(question, prefixes)
             ok, info = self.validator.quick_validate(sql)
             if not ok:
@@ -1665,7 +1700,7 @@ LIMIT 10;
             return self._needs_clarification(inquiry_id, ns, questions)
 
         # -- 1) context
-        ctx = self.build_context_pack("fa", prefixes, question)
+        ctx = self.build_context_pack(self.active_app, prefixes, question)
         if context:
             ctx.update({k: v for k, v in context.items() if v is not None})
 
@@ -1710,7 +1745,9 @@ LIMIT 10;
             self._ensure_researcher_loaded()
             prefixes = context.get("prefixes") or []
             ns_for_settings = (
-                f"fa::{prefixes[0]}" if prefixes else getattr(self, "namespace", "fa::common")
+                f"{self.active_app}::{prefixes[0]}"
+                if prefixes
+                else getattr(self, "namespace", f"{self.active_app}::common")
             )
             if ds_name and self.settings.research_allowed(ds_name, ns_for_settings) and self.researcher:
                 summary, source_ids = self.researcher.search(question, ctx)
@@ -1834,7 +1871,7 @@ LIMIT 10;
             self.mem_engine, prefixes, question, None, overrides
         )
 
-        context = self.build_context_pack("fa", prefixes, question)
+        context = self.build_context_pack(self.active_app, prefixes, question)
         raw_out = self.planner.plan(question, context, hints=fa_hints)
 
         sql_or_none = self._coerce_sql_or_none(raw_out)

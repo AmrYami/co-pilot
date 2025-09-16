@@ -1,0 +1,12 @@
+metrics:
+  - metric_key: contract_value_gross
+    metric_name: Contract Value (Gross)
+    description: "Net of VAT plus VAT; NVL to treat nulls as zero"
+    calculation_sql: "NVL(CONTRACT_VALUE_NET_OF_VAT, 0) + NVL(VAT, 0)"
+    required_tables: ["Contract"]
+    required_columns:
+      - "CONTRACT_VALUE_NET_OF_VAT"
+      - "VAT"
+    category: "contracts"
+    owner: "dw-team"
+    version: 1
