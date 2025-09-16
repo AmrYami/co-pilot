@@ -132,7 +132,11 @@ def create_dw_blueprint(settings: Settings) -> Blueprint:
                 c.execute(text("""
                     INSERT INTO mem_metrics(namespace, metric_key, metric_name, description,
                                             calculation_sql, required_tables, required_columns, category, owner, is_active)
-                    VALUES(:ns, :key, :name, :desc, :calc, :rt::jsonb, :rc::jsonb, 'contracts','dw', true)
+                    VALUES(
+                        :ns, :key, :name, :desc, :calc,
+                        CAST(:rt AS jsonb), CAST(:rc AS jsonb),
+                        'contracts', 'dw', true
+                    )
                     ON CONFLICT (namespace, metric_key, version) DO UPDATE
                       SET calculation_sql = EXCLUDED.calculation_sql,
                           description      = EXCLUDED.description,

@@ -7,15 +7,15 @@ from core.settings import Settings
 
 def _ensure_mem_settings_conflict_support(conn):
     """
-    Ensure a single expression-based unique index exists so ON CONFLICT
-    with COALESCE(scope_id,'') works for both NULL and non-NULL scope_id.
+    Ensure a unique index exists on (namespace, key, scope) to support the
+    ON CONFLICT clause used by the settings bulk upsert.
     """
 
     conn.execute(
         text(
             """
-            CREATE UNIQUE INDEX IF NOT EXISTS ux_mem_settings_ns_key_scope_coalesced
-            ON mem_settings (namespace, key, scope, (COALESCE(scope_id,'')));
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_mem_settings_ns_key_scope
+            ON mem_settings (namespace, key, scope);
             """
         )
     )
@@ -38,7 +38,7 @@ def create_admin_blueprint(settings: Settings) -> Blueprint:
                                      overridable, updated_by, created_at, updated_at, is_secret)
             VALUES (:ns, :key, CAST(:val AS jsonb), :vtype, :scope, :scope_id,
                     COALESCE(:ovr, true), :upd_by, NOW(), NOW(), :is_secret)
-            ON CONFLICT (namespace, key, scope, COALESCE(scope_id,''))
+            ON CONFLICT (namespace, key, scope)
             DO UPDATE SET
               value      = EXCLUDED.value,
               value_type = EXCLUDED.value_type,
