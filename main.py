@@ -4,6 +4,7 @@ from flask import Flask
 from core.settings import Settings
 from core.pipeline import Pipeline
 from apps.fa.app import fa_bp
+from apps.docuware import docuware_bp
 from core.admin_api import admin_bp
 from core.sql_exec import init_mem_engine
 
@@ -26,6 +27,7 @@ def create_app() -> Flask:
     app.register_blueprint(admin_bp)
 
     app.register_blueprint(fa_bp, url_prefix="/fa")
+    app.register_blueprint(docuware_bp)
 
     @app.get("/__routes")
     def _routes():
