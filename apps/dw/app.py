@@ -1,187 +1,221 @@
-"""DocuWare blueprint exposing seeding and answering endpoints."""
-
-from __future__ import annotations
-
-import logging
-from typing import Iterable, List
-
-from flask import Blueprint, jsonify, request, current_app
+from flask import Blueprint, request, jsonify
 from sqlalchemy import text
+import re
 
 from core.pipeline import Pipeline
-from core.seed import upsert_metrics
-from core.settings import Settings
-from core.snippets import save_snippet
-from core.sql_exec import get_mem_engine, run_sql
-
-from .derive import route_question_to_sql
 
 
-logger = logging.getLogger(__name__)
+def create_dw_blueprint(pipeline: Pipeline) -> Blueprint:
+    bp = Blueprint("dw", __name__)
+    namespace = pipeline.namespace
 
-dw_bp = Blueprint("dw", __name__, url_prefix="/dw")
+    def _dw_engine():
+        return pipeline.ds.engine(None)
 
-DEFAULT_NAMESPACE = "dw::common"
+    @bp.post("/seed")
+    def seed():
+        mem = pipeline.mem
 
+        metric_net = text(
+            """
+            INSERT INTO mem_metrics(namespace, metric_key, metric_name, description,
+                                    calculation_sql, required_tables, required_columns,
+                                    category, owner, is_active, verified_at, created_at, updated_at)
+            VALUES
+              (:ns,'contract_value_net','Contract Value (Net of VAT)',
+               'Base contract amount excluding VAT',
+               'NVL(CONTRACT_VALUE_NET_OF_VAT,0)',
+               '["Contract"]','["CONTRACT_VALUE_NET_OF_VAT"]',
+               'contracts','system', true, NOW(), NOW(), NOW())
+            ON CONFLICT (namespace, metric_key, version) DO NOTHING;
+            """
+        )
+        metric_vat = text(
+            """
+            INSERT INTO mem_metrics(namespace, metric_key, metric_name, description,
+                                    calculation_sql, required_tables, required_columns,
+                                    category, owner, is_active, verified_at, created_at, updated_at)
+            VALUES
+              (:ns,'contract_value_vat','VAT Amount',
+               'Value-added tax amount on contract',
+               'NVL(VAT,0)',
+               '["Contract"]','["VAT"]',
+               'contracts','system', true, NOW(), NOW(), NOW())
+            ON CONFLICT (namespace, metric_key, version) DO NOTHING;
+            """
+        )
+        metric_gross = text(
+            """
+            INSERT INTO mem_metrics(namespace, metric_key, metric_name, description,
+                                    calculation_sql, required_tables, required_columns,
+                                    category, owner, is_active, verified_at, created_at, updated_at)
+            VALUES
+              (:ns,'contract_value_gross','Contract Value (Gross)',
+               'Net + VAT',
+               'NVL(CONTRACT_VALUE_NET_OF_VAT,0) + NVL(VAT,0)',
+               '["Contract"]','["CONTRACT_VALUE_NET_OF_VAT","VAT"]',
+               'contracts','system', true, NOW(), NOW(), NOW())
+            ON CONFLICT (namespace, metric_key, version) DO NOTHING;
+            """
+        )
 
-def _current_pipeline() -> Pipeline:
-    """Return the process-wide pipeline instance, creating it if required."""
-
-    pipe = getattr(current_app, "pipeline", None)
-    if isinstance(pipe, Pipeline):
-        return pipe
-
-    settings = Settings(namespace=DEFAULT_NAMESPACE)
-    pipe = Pipeline(settings=settings, namespace=DEFAULT_NAMESPACE)
-    current_app.pipeline = pipe
-    return pipe
-
-
-def _seed_metrics(mem_engine, namespace: str, metrics: Iterable[dict], *, force: bool) -> int:
-    """Insert or refresh DocuWare metrics for the provided namespace."""
-
-    if force:
-        with mem_engine.begin() as conn:
-            conn.execute(
-                text("DELETE FROM mem_metrics WHERE namespace = :ns"),
-                {"ns": namespace},
+        snippet_sql = text(
+            """
+            INSERT INTO mem_snippets(namespace, title, description, sql_template, input_tables, output_columns, tags, created_at, updated_at, is_verified)
+            VALUES (
+              :ns,
+              'contract_stakeholders_rows',
+              'Unroll CONTRACT_STAKEHOLDER_[1..8] + DEPARTMENT_[1..8] into rows (no DB view).',
+              :tpl,
+              '["Contract"]',
+              '["DWDOCID","CONTRACT_ID","CONTRACT_OWNER","OWNER_DEPARTMENT","CONTRACT_VALUE_NET_OF_VAT","VAT","CONTRACT_VALUE_GROSS","START_DATE","END_DATE","REQUEST_DATE","CONTRACT_STATUS","REQUEST_TYPE","ENTITY_NO","DEPARTMENT_OUL","SLOT","STAKEHOLDER","DEPARTMENT"]',
+              '["dw","contracts","stakeholders","unnest"]',
+              NOW(), NOW(), true
             )
-
-    result = upsert_metrics(mem_engine, namespace=namespace, metrics=list(metrics))
-    return result.count
-
-
-def _reset_join_graph(mem_engine, namespace: str, *, force: bool) -> None:
-    """Clear join graph entries when force=True (DocuWare currently single-table)."""
-
-    if not force:
-        return
-
-    with mem_engine.begin() as conn:
-        conn.execute(
-            text("DELETE FROM mem_join_graph WHERE namespace = :ns"),
-            {"ns": namespace},
+            ON CONFLICT DO NOTHING;
+            """
         )
 
+        template_sql = """
+SELECT
+  DWDOCID, CONTRACT_ID, CONTRACT_OWNER, OWNER_DEPARTMENT,
+  CONTRACT_VALUE_NET_OF_VAT, VAT,
+  NVL(CONTRACT_VALUE_NET_OF_VAT,0) + NVL(VAT,0) AS CONTRACT_VALUE_GROSS,
+  START_DATE, END_DATE, REQUEST_DATE, CONTRACT_STATUS, REQUEST_TYPE,
+  ENTITY_NO, DEPARTMENT_OUL,
+  '1' AS SLOT, CONTRACT_STAKEHOLDER_1 AS STAKEHOLDER, DEPARTMENT_1 AS DEPARTMENT
+FROM Contract
+UNION ALL
+SELECT DWDOCID, CONTRACT_ID, CONTRACT_OWNER, OWNER_DEPARTMENT,
+       CONTRACT_VALUE_NET_OF_VAT, VAT,
+       NVL(CONTRACT_VALUE_NET_OF_VAT,0) + NVL(VAT,0),
+       START_DATE, END_DATE, REQUEST_DATE, CONTRACT_STATUS, REQUEST_TYPE,
+       ENTITY_NO, DEPARTMENT_OUL,
+       '2', CONTRACT_STAKEHOLDER_2, DEPARTMENT_2
+FROM Contract
+UNION ALL
+SELECT DWDOCID, CONTRACT_ID, CONTRACT_OWNER, OWNER_DEPARTMENT,
+       CONTRACT_VALUE_NET_OF_VAT, VAT,
+       NVL(CONTRACT_VALUE_NET_OF_VAT,0) + NVL(VAT,0),
+       START_DATE, END_DATE, REQUEST_DATE, CONTRACT_STATUS, REQUEST_TYPE,
+       ENTITY_NO, DEPARTMENT_OUL,
+       '3', CONTRACT_STAKEHOLDER_3, DEPARTMENT_3
+FROM Contract
+UNION ALL
+SELECT DWDOCID, CONTRACT_ID, CONTRACT_OWNER, OWNER_DEPARTMENT,
+       CONTRACT_VALUE_NET_OF_VAT, VAT,
+       NVL(CONTRACT_VALUE_NET_OF_VAT,0) + NVL(VAT,0),
+       START_DATE, END_DATE, REQUEST_DATE, CONTRACT_STATUS, REQUEST_TYPE,
+       ENTITY_NO, DEPARTMENT_OUL,
+       '4', CONTRACT_STAKEHOLDER_4, DEPARTMENT_4
+FROM Contract
+UNION ALL
+SELECT DWDOCID, CONTRACT_ID, CONTRACT_OWNER, OWNER_DEPARTMENT,
+       CONTRACT_VALUE_NET_OF_VAT, VAT,
+       NVL(CONTRACT_VALUE_NET_OF_VAT,0) + NVL(VAT,0),
+       START_DATE, END_DATE, REQUEST_DATE, CONTRACT_STATUS, REQUEST_TYPE,
+       ENTITY_NO, DEPARTMENT_OUL,
+       '5', CONTRACT_STAKEHOLDER_5, DEPARTMENT_5
+FROM Contract
+UNION ALL
+SELECT DWDOCID, CONTRACT_ID, CONTRACT_OWNER, OWNER_DEPARTMENT,
+       CONTRACT_VALUE_NET_OF_VAT, VAT,
+       NVL(CONTRACT_VALUE_NET_OF_VAT,0) + NVL(VAT,0),
+       START_DATE, END_DATE, REQUEST_DATE, CONTRACT_STATUS, REQUEST_TYPE,
+       ENTITY_NO, DEPARTMENT_OUL,
+       '6', CONTRACT_STAKEHOLDER_6, DEPARTMENT_6
+FROM Contract
+UNION ALL
+SELECT DWDOCID, CONTRACT_ID, CONTRACT_OWNER, OWNER_DEPARTMENT,
+       CONTRACT_VALUE_NET_OF_VAT, VAT,
+       NVL(CONTRACT_VALUE_NET_OF_VAT,0) + NVL(VAT,0),
+       START_DATE, END_DATE, REQUEST_DATE, CONTRACT_STATUS, REQUEST_TYPE,
+       ENTITY_NO, DEPARTMENT_OUL,
+       '7', CONTRACT_STAKEHOLDER_7, DEPARTMENT_7
+FROM Contract
+UNION ALL
+SELECT DWDOCID, CONTRACT_ID, CONTRACT_OWNER, OWNER_DEPARTMENT,
+       CONTRACT_VALUE_NET_OF_VAT, VAT,
+       NVL(CONTRACT_VALUE_NET_OF_VAT,0) + NVL(VAT,0),
+       START_DATE, END_DATE, REQUEST_DATE, CONTRACT_STATUS, REQUEST_TYPE,
+       ENTITY_NO, DEPARTMENT_OUL,
+       '8', CONTRACT_STAKEHOLDER_8, DEPARTMENT_8
+FROM Contract
+""".strip()
 
-@dw_bp.route("/seed", methods=["POST"])
-def seed() -> tuple:
-    """Seed minimal DocuWare knowledge into the in-memory metadata store."""
+        with mem.begin() as conn:
+            conn.execute(metric_net, {"ns": namespace})
+            conn.execute(metric_vat, {"ns": namespace})
+            conn.execute(metric_gross, {"ns": namespace})
+            conn.execute(snippet_sql, {"ns": namespace, "tpl": template_sql})
 
-    payload = request.get_json(force=True, silent=True) or {}
-    namespace = (payload.get("namespace") or DEFAULT_NAMESPACE).strip()
-    force = bool(payload.get("force"))
+        return jsonify(ok=True, namespace=namespace, metrics=3, snippets=1)
 
-    settings = Settings(namespace=namespace)
-    mem_engine = get_mem_engine(settings)
-    settings.attach_mem_engine(mem_engine)
+    @bp.post("/answer")
+    def answer():
+        payload = request.get_json(force=True)
+        question = (payload.get("question") or "").strip().lower()
 
-    metrics: List[dict] = [
-        {
-            "metric_key": "contract_value_gross",
-            "metric_name": "Contract Gross Value",
-            "description": "NVL(CONTRACT_VALUE_NET_OF_VAT,0) + NVL(VAT,0)",
-            "calculation_sql": "NVL(CONTRACT_VALUE_NET_OF_VAT,0) + NVL(VAT,0)",
-            "required_tables": ["Contract"],
-            "required_columns": ["CONTRACT_VALUE_NET_OF_VAT", "VAT"],
-            "category": "contracts",
-        },
-        {
-            "metric_key": "contract_count_active",
-            "metric_name": "Active Contracts Count",
-            "description": "Count of contracts with END_DATE >= SYSDATE",
-            "calculation_sql": "CASE WHEN END_DATE IS NULL OR END_DATE >= SYSDATE THEN 1 ELSE 0 END",
-            "required_tables": ["Contract"],
-            "required_columns": ["END_DATE"],
-            "category": "contracts",
-        },
-    ]
+        if not question:
+            return jsonify(status="needs_clarification", questions=["Provide a question to answer."]), 200
 
-    metric_count = _seed_metrics(mem_engine, namespace, metrics, force=force)
-    _reset_join_graph(mem_engine, namespace, force=force)
+        if "expir" in question and "day" in question:
+            match = re.search(r"next\s+(\d+)\s*day", question)
+            days = int(match.group(1)) if match else 30
+            sql = text(
+                """
+                SELECT CONTRACT_ID,
+                       CONTRACT_OWNER,
+                       OWNER_DEPARTMENT,
+                       END_DATE,
+                       NVL(CONTRACT_VALUE_NET_OF_VAT,0) + NVL(VAT,0) AS CONTRACT_VALUE_GROSS
+                  FROM Contract
+                 WHERE END_DATE BETWEEN TRUNC(SYSDATE) AND TRUNC(SYSDATE) + :days
+                 ORDER BY END_DATE ASC
+                """
+            )
+            engine = _dw_engine()
+            with engine.begin() as conn:
+                rows = [dict(r) for r in conn.execute(sql, {"days": days}).mappings().all()]
+            return jsonify(status="answered", rows=rows, sql=str(sql)), 200
 
-    return jsonify({"ok": True, "namespace": namespace, "metrics": metric_count}), 200
+        if "top" in question and "stakeholder" in question:
+            sql = text(
+                """
+                SELECT STAKEHOLDER,
+                       SUM(NVL(CONTRACT_VALUE_NET_OF_VAT,0) + NVL(VAT,0)) AS GROSS_TOTAL
+                FROM (
+                    SELECT NVL(CONTRACT_VALUE_NET_OF_VAT,0) AS NETV, NVL(VAT,0) AS VAT,
+                           CONTRACT_STAKEHOLDER_1 AS STAKEHOLDER FROM Contract
+                    UNION ALL SELECT NVL(CONTRACT_VALUE_NET_OF_VAT,0), NVL(VAT,0), CONTRACT_STAKEHOLDER_2 FROM Contract
+                    UNION ALL SELECT NVL(CONTRACT_VALUE_NET_OF_VAT,0), NVL(VAT,0), CONTRACT_STAKEHOLDER_3 FROM Contract
+                    UNION ALL SELECT NVL(CONTRACT_VALUE_NET_OF_VAT,0), NVL(VAT,0), CONTRACT_STAKEHOLDER_4 FROM Contract
+                    UNION ALL SELECT NVL(CONTRACT_VALUE_NET_OF_VAT,0), NVL(VAT,0), CONTRACT_STAKEHOLDER_5 FROM Contract
+                    UNION ALL SELECT NVL(CONTRACT_VALUE_NET_OF_VAT,0), NVL(VAT,0), CONTRACT_STAKEHOLDER_6 FROM Contract
+                    UNION ALL SELECT NVL(CONTRACT_VALUE_NET_OF_VAT,0), NVL(VAT,0), CONTRACT_STAKEHOLDER_7 FROM Contract
+                    UNION ALL SELECT NVL(CONTRACT_VALUE_NET_OF_VAT,0), NVL(VAT,0), CONTRACT_STAKEHOLDER_8 FROM Contract
+                )
+                WHERE STAKEHOLDER IS NOT NULL
+                GROUP BY STAKEHOLDER
+                ORDER BY GROSS_TOTAL DESC
+                FETCH FIRST 10 ROWS ONLY
+                """
+            )
+            engine = _dw_engine()
+            with engine.begin() as conn:
+                rows = [dict(r) for r in conn.execute(sql).mappings().all()]
+            return jsonify(status="answered", rows=rows, sql=str(sql)), 200
 
-
-def _autosave_snippet(pipe: Pipeline, question: str, sql: str) -> None:
-    """Persist a reusable snippet when autosave is enabled for the namespace."""
-
-    try:
-        enabled = pipe.settings.get_bool(
-            "SNIPPETS_AUTOSAVE",
-            scope="namespace",
-            namespace=pipe.namespace,
-            default=True,
-        )
-    except Exception:  # pragma: no cover - defensive fallback
-        enabled = False
-
-    if not enabled:
-        return
-
-    try:
-        save_snippet(
-            pipe.mem_engine,
-            pipe.namespace,
-            question or "Auto snippet",
-            sql,
-            tags=[pipe.active_app or "dw", "auto", "snippet"],
-        )
-    except Exception as exc:  # pragma: no cover - logging only
-        logger.exception("SNIPPETS_AUTOSAVE failed: %s", exc)
-
-
-@dw_bp.route("/answer", methods=["POST"])
-def answer():
-    """Handle DocuWare questions by routing to a simple SQL generator."""
-
-    payload = request.get_json(force=True, silent=True) or {}
-    question = (payload.get("question") or "").strip()
-
-    if not question:
-        return jsonify({"ok": False, "error": "missing_question"}), 400
-
-    pipeline = _current_pipeline()
-
-    sql = route_question_to_sql(question)
-    if not sql:
-        clarifiers = [
-            "Should I show top departments or top stakeholders by contract value?",
-            "Which date range should I use (e.g., last month, last 3 months, last year)?",
-        ]
         return (
             jsonify(
-                {
-                    "ok": False,
-                    "status": "needs_clarification",
-                    "questions": clarifiers,
-                }
+                status="needs_clarification",
+                questions=[
+                    "Which time window or filter (e.g., next 30 days, this quarter)?",
+                    "Aggregate by what (stakeholder, owner_department, entity_no)?",
+                    "Return which columns?",
+                ],
             ),
             200,
         )
 
-    result = run_sql(pipeline.app_engine, sql)
-
-    if result.ok:
-        _autosave_snippet(pipeline, question, sql)
-        payload = {
-            "ok": True,
-            "status": "answered",
-            "sql": sql.strip(),
-            "columns": result.columns,
-            "rows": result.rows,
-            "rowcount": result.rowcount,
-        }
-        return jsonify(payload), 200
-
-    return (
-        jsonify(
-            {
-                "ok": False,
-                "status": "failed",
-                "sql": sql.strip(),
-                "error": result.error,
-            }
-        ),
-        400,
-    )
+    return bp

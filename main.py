@@ -1,34 +1,26 @@
-"""Flask application entry point for DocuWare endpoints."""
+from flask import Flask
 
-import os
-
-from flask import Flask, jsonify
-
-from core.pipeline import Pipeline
 from core.settings import Settings
+from core.pipeline import Pipeline
+from core.routes import register_common_routes
+from core.admin_api import create_admin_blueprint
+from apps.dw.app import create_dw_blueprint
 
 
-def create_app():
+def create_app() -> Flask:
+    settings = Settings()
+
     app = Flask(__name__)
 
-    namespace = os.getenv("ACTIVE_NAMESPACE", "dw::common")
-    settings = Settings(namespace=namespace)
-    pipeline = Pipeline(settings=settings, namespace=namespace)
+    # Health and route inspection endpoints
+    register_common_routes(app)
 
-    app.config["ACTIVE_NAMESPACE"] = namespace
-    app.config["SETTINGS"] = settings
-    app.config["PIPELINE"] = pipeline
-    app.config["MEM_ENGINE"] = pipeline.mem_engine
-    app.pipeline = pipeline
+    # Build pipeline with DocuWare namespace by default
+    active_ns = settings.get("ACTIVE_NAMESPACE", "dw::common")
+    pipeline = Pipeline(settings=settings, namespace=active_ns)
 
-    from apps.dw.app import dw_bp
-    from core.admin_api import admin_bp
-
-    app.register_blueprint(dw_bp)
-    app.register_blueprint(admin_bp)
-
-    @app.get("/healthz")
-    def healthz():
-        return jsonify({"ok": True, "app": "dw", "namespace": namespace})
+    # Register blueprints
+    app.register_blueprint(create_admin_blueprint(settings), url_prefix="/admin")
+    app.register_blueprint(create_dw_blueprint(pipeline), url_prefix="/dw")
 
     return app
