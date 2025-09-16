@@ -1,5 +1,3 @@
-"""DocuWare application package."""
+from .app import create_dw_blueprint
 
-from .app import dw_bp
-
-__all__ = ["dw_bp"]
+__all__ = ["create_dw_blueprint"]
