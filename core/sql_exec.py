@@ -1,21 +1,40 @@
-# core/sql_exec.py
 from __future__ import annotations
-import os, threading
+
+import csv
+import os
+import re
+import threading
 from dataclasses import dataclass
+from io import StringIO
 from typing import Any, Dict, List, Optional, Tuple
+
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
-import re, csv
-from io import StringIO
+
 from core.settings import Settings
 
 SAFE_SQL_RE = re.compile(r"(?is)^\s*(with|select)\b")
 
 _ENGINES: Dict[str, Engine] = {}
 
-_MEM_ENGINE = None
-_MEM_URL = None
+_MEM_ENGINE: Engine | None = None
+_MEM_URL: str | None = None
 _MEM_LOCK = threading.Lock()
+
+
+def get_engine_for_url(url: str, *, pool_pre_ping: bool = True, pool_recycle: int = 3600) -> Engine:
+    """Create or reuse an Engine for the provided SQLAlchemy URL."""
+
+    if not url:
+        raise ValueError("Database URL must be provided")
+
+    key = f"url::{url}::{pool_recycle}" if pool_pre_ping else f"url::{url}::np"
+    if key in _ENGINES:
+        return _ENGINES[key]
+
+    engine = create_engine(url, pool_pre_ping=pool_pre_ping, pool_recycle=pool_recycle)
+    _ENGINES[key] = engine
+    return engine
 
 
 @dataclass
@@ -45,7 +64,7 @@ def get_app_engine(settings, namespace: str) -> Engine:
     key = f"{namespace}::{url}"
     if key in _ENGINES:
         return _ENGINES[key]
-    eng = create_engine(url, pool_pre_ping=True, pool_recycle=3600)
+    eng = get_engine_for_url(url)
     _ENGINES[key] = eng
     return eng
 

@@ -1,107 +1,33 @@
-from __future__ import annotations
-
-"""Datasource registry with robust fallbacks.
-
-This registry constructs SQLAlchemy engines from several possible sources in
-priority order:
-
-1. `DB_CONNECTIONS` setting for the active namespace
-2. `APP_DB_URL`/`FA_DB_URL` setting for the namespace combined with
-   `DEFAULT_DATASOURCE`
-3. Environment variables `FA_DB_URL` or `APP_DB_URL`
-
-If no engines are created after checking the above, a warning is printed and
-any attempt to retrieve an engine will raise a ``RuntimeError``.
-"""
-
-import os
-from sqlalchemy import create_engine
-
-
-def _safe(v, default=None):
-    return v if v not in (None, "", []) else default
+from core.settings import Settings
+from core.sql_exec import get_engine_for_url
 
 
 class DatasourceRegistry:
-    def __init__(self, settings, namespace: str | None = None):
-        """
-        Build engine map with multiple fallbacks.
-
-        Parameters
-        ----------
-        settings:
-            ``Settings`` instance providing configuration access.
-        namespace:
-            Namespace used when resolving settings; defaults to ``"default"``.
-        """
-
+    def __init__(self, settings: Settings, namespace: str):
         self.settings = settings
-        self.namespace = namespace or "default"
+        self.namespace = namespace
         self._engines: dict[str, any] = {}
-        self._default_name: str | None = None
-        self._build()
 
-    def _build(self) -> None:
-        """Populate the internal engine map."""
-
-        # 1) Settings: DB_CONNECTIONS scoped to namespace
-        conns = (
-            self.settings.get_json(
-                "DB_CONNECTIONS", scope="namespace", namespace=self.namespace
-            )
-            or []
-        )
-
-        # 2) Fallback to APP_DB_URL/FA_DB_URL in settings
-        if not conns:
-            app_db_url = (
-                self.settings.get_str(
-                    "APP_DB_URL", scope="namespace", namespace=self.namespace
-                )
-                or self.settings.get_str(
-                    "FA_DB_URL", scope="namespace", namespace=self.namespace
-                )
-            )
-            if app_db_url:
-                ds_name = self.settings.get_str(
-                    "DEFAULT_DATASOURCE", scope="namespace", namespace=self.namespace
-                ) or "docuware"
-                conns = [{"name": ds_name, "url": app_db_url, "role": "oltp"}]
-
-        # 3) Environment variable fallback
-        if not conns:
-            app_db_url = os.getenv("FA_DB_URL") or os.getenv("APP_DB_URL")
-            if app_db_url:
-                ds_name = self.settings.get_str(
-                    "DEFAULT_DATASOURCE", scope="namespace", namespace=self.namespace
-                ) or "docuware"
-                conns = [{"name": ds_name, "url": app_db_url, "role": "oltp"}]
-
-        for c in conns:
-            url = _safe(c.get("url"))
-            name = _safe(c.get("name"), "docuware")
-            if not url:
-                continue
-            try:
-                eng = create_engine(url, pool_pre_ping=True, pool_recycle=300)
-                self._engines[name] = eng
-                if not self._default_name:
-                    self._default_name = name
-            except Exception as e:  # pragma: no cover - logging only
-                print(f"[datasources] failed to create engine '{name}': {e}")
+        conns = settings.get_json("DB_CONNECTIONS", scope="namespace", default=[])
+        if conns:
+            for c in conns:
+                name = c["name"]
+                url = c["url"]
+                self._engines[name] = get_engine_for_url(url)
+        else:
+            app_url = settings.get("APP_DB_URL", scope="namespace")
+            if app_url:
+                self._engines["__default__"] = get_engine_for_url(app_url)
 
         if not self._engines:
             print("[datasources] no engines created (check DB_CONNECTIONS or APP_DB_URL).")
 
-    # ------------------------------------------------------------------
-    def engine(self, name: str | None = None):
-        """Return an engine by name or the configured default."""
-
-        if name and name in self._engines:
-            return self._engines[name]
-        if self._default_name and self._default_name in self._engines:
-            return self._engines[self._default_name]
-        if len(self._engines) == 1:
-            return next(iter(self._engines.values()))
+    def engine(self, ds_name: str | None):
+        if ds_name and ds_name in self._engines:
+            return self._engines[ds_name]
+        default_name = self.settings.get("DEFAULT_DATASOURCE", scope="namespace")
+        if default_name and default_name in self._engines:
+            return self._engines[default_name]
+        if "__default__" in self._engines:
+            return self._engines["__default__"]
         raise RuntimeError("No datasource engine found for requested datasource.")
-
