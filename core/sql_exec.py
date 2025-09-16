@@ -1,7 +1,8 @@
 # core/sql_exec.py
 from __future__ import annotations
 import os, threading
-from typing import Any, Dict, Optional, Tuple
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 import re, csv
@@ -15,6 +16,26 @@ _ENGINES: Dict[str, Engine] = {}
 _MEM_ENGINE = None
 _MEM_URL = None
 _MEM_LOCK = threading.Lock()
+
+
+@dataclass
+class SQLExecutionResult:
+    """Normalised result wrapper for SQL execution."""
+
+    ok: bool
+    columns: List[str]
+    rows: List[Dict[str, Any]]
+    rowcount: int
+    error: Optional[str] = None
+
+    def dict(self) -> Dict[str, Any]:
+        return {
+            "ok": self.ok,
+            "columns": self.columns,
+            "rows": self.rows,
+            "rowcount": self.rowcount,
+            "error": self.error,
+        }
 
 
 def get_app_engine(settings, namespace: str) -> Engine:
@@ -75,6 +96,39 @@ def run_select(engine: Engine, sql: str, limit: Optional[int] = None) -> Dict[st
         cols = list(rs.keys())
         rows = [dict(zip(cols, list(r))) for r in rs]
     return {"columns": cols, "rows": rows, "rowcount": len(rows)}
+
+
+def run_sql(engine: Engine, sql: str, limit: Optional[int] = None) -> SQLExecutionResult:
+    """Execute a read-only SQL statement and normalise the response."""
+
+    valid, message = validate_select(sql)
+    if not valid:
+        return SQLExecutionResult(
+            ok=False,
+            columns=[],
+            rows=[],
+            rowcount=0,
+            error=message,
+        )
+
+    try:
+        result = run_select(engine, sql, limit)
+    except Exception as exc:  # pragma: no cover - passthrough to caller
+        return SQLExecutionResult(
+            ok=False,
+            columns=[],
+            rows=[],
+            rowcount=0,
+            error=str(exc),
+        )
+
+    rows = result.get("rows", [])
+    return SQLExecutionResult(
+        ok=True,
+        columns=result.get("columns", []),
+        rows=rows,
+        rowcount=result.get("rowcount") or len(rows),
+    )
 
 def as_csv(result: Dict[str, Any]) -> bytes:
     cols = result["columns"]
