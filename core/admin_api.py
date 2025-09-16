@@ -1,9 +1,60 @@
 from flask import Blueprint, request, jsonify
-from sqlalchemy import text
+from sqlalchemy import text, inspect
 import json
+import threading
 
 from core.sql_exec import get_mem_engine
 from core.settings import Settings
+
+
+_MEM_SETTINGS_CONSTRAINT_LOCK = threading.Lock()
+_MEM_SETTINGS_CONSTRAINT_ENSURED = False
+
+
+def _ensure_mem_settings_unique_constraint(conn) -> None:
+    """Guarantee a non-partial uniqueness guard for (namespace, key, scope, scope_id)."""
+
+    global _MEM_SETTINGS_CONSTRAINT_ENSURED
+    if _MEM_SETTINGS_CONSTRAINT_ENSURED:
+        return
+
+    with _MEM_SETTINGS_CONSTRAINT_LOCK:
+        if _MEM_SETTINGS_CONSTRAINT_ENSURED:
+            return
+
+        inspector = inspect(conn)
+        if not inspector.has_table("mem_settings"):
+            return
+
+        dialect = conn.engine.dialect.name
+        if dialect == "postgresql":
+            conn.execute(
+                text(
+                    """
+                    DO $$
+                    BEGIN
+                        ALTER TABLE mem_settings
+                            ADD CONSTRAINT uq_mem_settings_ns_key_scope_scopeid
+                            UNIQUE (namespace, key, scope, scope_id);
+                    EXCEPTION
+                        WHEN duplicate_object THEN NULL;
+                    END
+                    $$;
+                    """
+                )
+            )
+        else:
+            conn.execute(
+                text(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS
+                        uq_mem_settings_ns_key_scope_scopeid
+                    ON mem_settings(namespace, key, scope, scope_id)
+                    """
+                )
+            )
+
+        _MEM_SETTINGS_CONSTRAINT_ENSURED = True
 
 
 def create_admin_blueprint(settings: Settings) -> Blueprint:
@@ -23,7 +74,7 @@ def create_admin_blueprint(settings: Settings) -> Blueprint:
                                      overridable, updated_by, created_at, updated_at, is_secret)
             VALUES (:ns, :key, CAST(:val AS jsonb), :vtype, :scope, :scope_id,
                     true, :upd_by, NOW(), NOW(), :is_secret)
-            ON CONFLICT (namespace, key, scope)
+            ON CONFLICT (namespace, key, scope, scope_id)
             DO UPDATE SET
               value      = EXCLUDED.value,
               value_type = EXCLUDED.value_type,
@@ -35,11 +86,12 @@ def create_admin_blueprint(settings: Settings) -> Blueprint:
 
         upserted = 0
         with mem.begin() as conn:
+            _ensure_mem_settings_unique_constraint(conn)
             for it in items:
                 key = it["key"]
                 vtype = it.get("value_type")
                 scope = it.get("scope", "namespace")
-                scope_id = it.get("scope_id")
+                scope_id = it.get("scope_id") or ""
                 is_secret = bool(it.get("is_secret", False))
 
                 raw_val = it.get("value")
