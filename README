@@ -74,3 +74,27 @@ ada0cb7fe3ce8f35023d648179118888791b7d09
 
 5ebee83
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+python3 check_and_import_contracts.py \
+  --dsn localhost:1521/FREEPDB1 \
+  --user docuware \
+  --password 'Strong#Pass1' \
+  --excel "Sample Contracts 2.xlsx"
