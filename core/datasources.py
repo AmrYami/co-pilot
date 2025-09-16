@@ -65,7 +65,7 @@ class DatasourceRegistry:
             if app_db_url:
                 ds_name = self.settings.get_str(
                     "DEFAULT_DATASOURCE", scope="namespace", namespace=self.namespace
-                ) or "default"
+                ) or "docuware"
                 conns = [{"name": ds_name, "url": app_db_url, "role": "oltp"}]
 
         # 3) Environment variable fallback
@@ -74,12 +74,12 @@ class DatasourceRegistry:
             if app_db_url:
                 ds_name = self.settings.get_str(
                     "DEFAULT_DATASOURCE", scope="namespace", namespace=self.namespace
-                ) or "default"
+                ) or "docuware"
                 conns = [{"name": ds_name, "url": app_db_url, "role": "oltp"}]
 
         for c in conns:
             url = _safe(c.get("url"))
-            name = _safe(c.get("name"), "default")
+            name = _safe(c.get("name"), "docuware")
             if not url:
                 continue
             try:
