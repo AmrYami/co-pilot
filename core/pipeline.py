@@ -14,6 +14,7 @@ import re
 import io
 import csv
 import time
+import logging
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Callable
 from datetime import datetime
@@ -42,6 +43,9 @@ from core.inquiries import (
 from core.emailer import Emailer
 
 from types import SimpleNamespace
+
+
+logger = logging.getLogger(__name__)
 
 
 try:  # pragma: no cover - optional DocuWare hints
@@ -725,15 +729,15 @@ class Pipeline:
             "SNIPPETS_AUTOSAVE", scope="namespace", namespace=ns
         ) and isinstance(result.get("rows"), list) and len(result["rows"]) > 0:
             try:
-            save_snippet(
-                self.mem_engine,
-                ns,
-                question,
-                sql_used,
-                tags=[self.active_app, "auto", "snippet"],
-            )
+                save_snippet(
+                    self.mem_engine,
+                    ns,
+                    question,
+                    sql_used,
+                    tags=[self.active_app, "auto", "snippet"],
+                )
             except Exception as e:
-                print(f"[snippets] autosave failed: {e}")
+                logger.exception("SNIPPETS_AUTOSAVE failed: %s", e)
 
         self._update_inquiry_status(inquiry_id, "answered")
         out = {
