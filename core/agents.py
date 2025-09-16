@@ -141,6 +141,16 @@ class PlannerAgent:
         out = self.llm.generate(prompt, max_new_tokens=256, temperature=0.2, top_p=0.9)
         return self._split(out)
 
+    def fallback_clarifying_question(
+        self,
+        question: str,
+        context: Dict[str, Any],
+        hints: Dict[str, Any] | None = None,
+    ) -> List[str]:
+        return [
+            "I couldn't derive a clean SQL. Can you clarify the tables, filters, or date range?"
+        ]
+
 class ValidatorAgent:
     def __init__(self, fa_engine: Optional[Engine], settings: Optional["Settings"]=None) -> None:
         """

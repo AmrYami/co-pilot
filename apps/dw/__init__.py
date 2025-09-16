@@ -1,0 +1,1 @@
+"""DocuWare application package."""

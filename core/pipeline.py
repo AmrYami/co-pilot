@@ -23,7 +23,7 @@ from sqlalchemy import text as _sqltext
 from sqlalchemy.engine import Engine
 import sqlalchemy as sa
 
-import importlib
+from importlib import import_module
 from core.agents import PlannerAgent, ValidatorAgent
 from core.model_loader import load_model, load_clarifier
 from core.clarifier import ClarifierAgent
@@ -40,11 +40,6 @@ from core.inquiries import (
     get_admin_notes,
 )
 from core.emailer import Emailer
-from apps.fa.hints import (
-    MISSING_FIELD_QUESTIONS,
-    DOMAIN_HINTS,
-)
-from apps.fa.agents import normalize_admin_reply
 
 from types import SimpleNamespace
 
@@ -257,18 +252,44 @@ class Pipeline:
 
         self._prefix_re = _re.compile(self.cfg.prefix_regex)
 
-        # 4) Dynamic app adapter (default: 'fa')
-        active_app = (
-            self.settings.get("ACTIVE_APP", namespace=namespace) or "fa"
-        ).strip()
-        modname = f"apps.{active_app}.agents"
-        mod = importlib.import_module(modname)
-        if hasattr(mod, "get_planner"):
-            self.planner = mod.get_planner(self.llm, self.settings)
+        # 4) Dynamic app adapter (default: 'dw')
+        self.active_app = (
+            (self.settings.get("ACTIVE_APP", namespace=namespace) or "dw").strip()
+            or "dw"
+        )
+        self.hints = self._load_hints(self.active_app)
+        self.domain_hints = getattr(self.hints, "DOMAIN_HINTS", {}) or {}
+        self.missing_field_questions = (
+            getattr(self.hints, "MISSING_FIELD_QUESTIONS", {}) or {}
+        )
+
+        self.app_agents = self._load_app_module("agents", fallback="apps.common.agents")
+        if hasattr(self.app_agents, "get_planner"):
+            self.planner = self.app_agents.get_planner(self.llm, self.settings)
         else:
-            self.planner = getattr(mod, "FAPlanner")(self.llm, self.settings)
-        ValidatorCls = getattr(mod, "ValidatorAgentFA", ValidatorAgent)
-        self.validator = ValidatorCls(self.app_engine, self.settings)
+            planner_cls = getattr(self.app_agents, "FAPlanner", PlannerAgent)
+            try:
+                self.planner = planner_cls(self.llm, self.settings)
+            except TypeError:
+                self.planner = planner_cls(self.llm)
+
+        if hasattr(self.app_agents, "get_validator"):
+            self.validator = self.app_agents.get_validator(
+                self.app_engine, self.settings
+            )
+        else:
+            validator_cls = (
+                getattr(self.app_agents, "ValidatorAgentFA", None)
+                or getattr(self.app_agents, "ValidatorAgent", None)
+                or ValidatorAgent
+            )
+            self.validator = validator_cls(self.app_engine, self.settings)
+
+        self.normalize_admin_reply = getattr(
+            self.app_agents, "normalize_admin_reply", lambda text: {}
+        )
+        self.app_derive = self._load_app_module("derive", optional=True)
+        self.app_ingestor = self._load_app_module("ingestor", optional=True)
 
         # 5) Researcher: load after engines & settings are ready
         self._ensure_researcher_loaded()
@@ -315,14 +336,86 @@ class Pipeline:
         if not class_path:
             return None
         try:
-            import importlib
-
             mod_name, _, cls_name = class_path.rpartition(".")
-            mod = importlib.import_module(mod_name)
+            mod = import_module(mod_name)
             cls = getattr(mod, cls_name)
             return cls(settings=self.settings, mem_engine=self.mem_engine)
         except Exception:
             return None
+
+    def _load_hints(self, active_app: str):
+        try:
+            return import_module(f"apps.{active_app}.hints")
+        except ModuleNotFoundError:
+            return import_module("apps.common.hints")
+
+    def _load_app_module(
+        self,
+        suffix: str,
+        fallback: str | None = None,
+        optional: bool = False,
+    ):
+        module_names: List[str] = []
+        if suffix:
+            module_names.append(f"apps.{self.active_app}.{suffix}")
+        if fallback:
+            module_names.append(fallback)
+        for name in module_names:
+            try:
+                return import_module(name)
+            except ModuleNotFoundError:
+                continue
+        if optional:
+            return None
+        raise ModuleNotFoundError(
+            f"Unable to import module for app '{self.active_app}' (suffix='{suffix}')"
+        )
+
+    def _make_app_hints(self, *args, **kwargs) -> dict:
+        maker = getattr(self.hints, "make_fa_hints", None) or getattr(
+            self.hints, "make_hints", None
+        )
+        if callable(maker):
+            try:
+                return maker(*args, **kwargs) or {}
+            except Exception:
+                return {}
+        return {}
+
+    def _parse_admin_answer(self, text: str) -> dict:
+        parser = getattr(self.hints, "parse_admin_answer", None) or getattr(
+            self.hints, "parse_admin_reply_to_hints", None
+        )
+        if callable(parser):
+            try:
+                return parser(text) or {}
+            except Exception:
+                return {}
+        return {}
+
+    def _try_build_sql_from_hints(self, *args, **kwargs):
+        modules = [self.app_derive, self.hints]
+        for mod in modules:
+            if mod is None:
+                continue
+            func = getattr(mod, "try_build_sql_from_hints", None)
+            if callable(func):
+                try:
+                    return func(*args, **kwargs)
+                except Exception:
+                    continue
+        return None
+
+    def _get_ingestor_cls(self):
+        module = self.app_ingestor
+        if module is None:
+            return None
+        if hasattr(module, "get_ingestor") and callable(module.get_ingestor):
+            return module.get_ingestor
+        cls = getattr(module, "FASchemaIngestor", None) or getattr(
+            module, "Ingestor", None
+        )
+        return cls
 
     def _render_help(self, context: Dict[str, Any] | None = None) -> str:
         return (
@@ -381,7 +474,7 @@ class Pipeline:
         hints = ""
         if notes:
             hints = "ADMIN_NOTES:\n" + "\n---\n".join(notes)
-            admin_hints = normalize_admin_reply("\n".join(notes))
+            admin_hints = self.normalize_admin_reply("\n".join(notes))
 
         context = {
             "namespace": ns,
@@ -528,18 +621,13 @@ class Pipeline:
         admin_reply = row.get("admin_reply") or ""
         admin_notes = row.get("admin_notes") or []
 
-        try:
-            from apps.fa.hints import make_fa_hints
-
-            hints = make_fa_hints(
-                self.mem_engine,
-                prefixes,
-                question,
-                admin_reply=admin_reply,
-                admin_notes=admin_notes,
-            )
-        except Exception as e:
-            return {"ok": False, "inquiry_id": inquiry_id, "error": f"hints_failed: {e}"}
+        hints = self._make_app_hints(
+            self.mem_engine,
+            prefixes,
+            question,
+            admin_reply=admin_reply,
+            admin_notes=admin_notes,
+        )
 
         sql_from_admin = hints.get("sql")
         canonical_sql = None
@@ -1013,27 +1101,15 @@ LIMIT 10;
         admin_reply = row.get("admin_reply")
         mem_admin_notes = row.get("admin_notes") or []
 
-        try:
-            from apps.fa.hints import make_fa_hints
-
-            hints = make_fa_hints(
-                self.mem_engine, prefixes, question, admin_reply=admin_reply
-            )
-        except Exception:
-            hints = {}
+        hints = self._make_app_hints(
+            self.mem_engine, prefixes, question, admin_reply=admin_reply
+        )
 
         print("[process_inquiry] Hints for derive:", hints)
 
-        sql_built = None
-        try:
-            from apps.fa.derive import try_build_sql_from_hints as _derive_sql
-            sql_built = _derive_sql(self.mem_engine, prefixes, question, hints)
-        except Exception:
-            try:
-                from apps.fa.hints import try_build_sql_from_hints as _derive_sql
-                sql_built = _derive_sql(hints, prefixes)
-            except Exception:
-                sql_built = None
+        sql_built = self._try_build_sql_from_hints(
+            self.mem_engine, prefixes, question, hints
+        )
 
         if sql_built:
             canonical_sql = sql_built
@@ -1152,8 +1228,7 @@ LIMIT 10;
         question = row.get("question") or ""
         auth_email = row.get("auth_email")
         ns = row.get("namespace") or self.namespace
-        from apps.fa.hints import make_fa_hints
-        hints = make_fa_hints(self.mem_engine, prefixes, question)
+        hints = self._make_app_hints(self.mem_engine, prefixes, question)
         context = {"namespace": ns, "prefixes": prefixes, "auth_email": auth_email}
         out = self.answer(
             question,
@@ -1233,25 +1308,29 @@ LIMIT 10;
     def ensure_ingested(
         self, source: str, prefixes: Iterable[str], fa_version: Optional[str] = None
     ) -> Dict[str, int]:
-        """Ensure metadata for given prefixes exists/updated. Returns {prefix: snapshot_id}.
-        For source=="fa", uses apps.fa.ingestor.FASchemaIngestor.
-        """
-        if source != "fa":
-            raise ValueError("Unknown source; only 'fa' is supported right now")
+        """Ensure metadata for given prefixes exists/updated. Returns {prefix: snapshot_id}."""
+        if source not in (self.active_app, "fa"):
+            raise ValueError(f"Unknown source '{source}'")
         if not self.app_engine:
             raise RuntimeError("APP_DB_URL not configured")
 
-        # local import keeps core reusable
-        from apps.fa.ingestor import FASchemaIngestor
+        ingestor_cls = self._get_ingestor_cls()
+        if ingestor_cls is None:
+            raise RuntimeError(
+                f"Ingestor unavailable for app '{self.active_app}'."
+            )
 
-        ing = FASchemaIngestor(
-            fa_engine=self.app_engine,
+        kwargs = dict(
             mem_engine=self.mem_engine,
             prefix_regex=self.cfg.prefix_regex,
             sample_rows_per_table=self.cfg.sample_rows_per_table,
             profile_stats=self.cfg.profile_stats,
-            namespace_prefix="fa::",
+            namespace_prefix=f"{source}::",
         )
+        try:
+            ing = ingestor_cls(fa_engine=self.app_engine, **kwargs)
+        except TypeError:
+            ing = ingestor_cls(app_engine=self.app_engine, **kwargs)
         out: Dict[str, int] = {}
         for p in prefixes:
             if not self._prefix_re.match(p):
@@ -1350,7 +1429,7 @@ LIMIT 10;
             admin_hints = None
             if admin_reply:
                 enriched_q += f"\n\nClarifications: {admin_reply}"
-                admin_hints = normalize_admin_reply(admin_reply)
+                admin_hints = self.normalize_admin_reply(admin_reply)
 
             ctx = self.build_context_pack("fa", prefixes, enriched_q)
             if context:
@@ -1532,7 +1611,7 @@ LIMIT 10;
             return {"status": "answered", "ok": True, **result}
 
         clarifier = ClarifierAgent(self.settings)
-        spec = clarifier.classify_and_extract(question, prefixes, DOMAIN_HINTS)
+        spec = clarifier.classify_and_extract(question, prefixes, self.domain_hints)
 
         if spec.intent in {"smalltalk", "help"}:
             return {
@@ -1580,7 +1659,8 @@ LIMIT 10;
                     status="needs_clarification",
                 )
             questions = [
-                MISSING_FIELD_QUESTIONS.get(m, f"Please clarify: {m}") for m in missing
+                self.missing_field_questions.get(m, f"Please clarify: {m}")
+                for m in missing
             ]
             return self._needs_clarification(inquiry_id, ns, questions)
 
@@ -1749,10 +1829,10 @@ LIMIT 10;
             f"- {n.get('note')}" for n in notes if isinstance(n, dict) and n.get("note")
         ).strip()
 
-        from apps.fa.hints import make_fa_hints, parse_admin_answer
-
-        overrides = parse_admin_answer(notes_txt) if notes_txt else None
-        fa_hints = make_fa_hints(self.mem_engine, prefixes, question, None, overrides)
+        overrides = self._parse_admin_answer(notes_txt) if notes_txt else None
+        fa_hints = self._make_app_hints(
+            self.mem_engine, prefixes, question, None, overrides
+        )
 
         context = self.build_context_pack("fa", prefixes, question)
         raw_out = self.planner.plan(question, context, hints=fa_hints)
