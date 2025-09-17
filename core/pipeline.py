@@ -1,19 +1,30 @@
 from __future__ import annotations
 
-from typing import Any
+import json
+import logging
+from typing import Any, Dict, List, Optional, Sequence
 
-from core.settings import Settings
-from core.sql_exec import get_mem_engine
+from sqlalchemy import text
+
+from core.agents import PlannerAgent, ValidatorAgent
 from core.datasources import DatasourceRegistry
+from core.intent import IntentRouter
+from core.model_loader import load_model
+from core.research import load_researcher
+from core.settings import Settings
+from core.snippets import autosave_snippet
+from core.sql_exec import SQLExecutionResult, get_mem_engine, run_sql
+from core.sql_utils import extract_sql
 
 try:  # pragma: no cover - optional hints module
     from apps.dw.hints import (
+        get_date_columns,
         get_join_hints,
         get_metric_hints,
         get_reserved_terms,
-        get_date_columns,
     )
 except Exception:  # pragma: no cover - fallback if hints unavailable
+
     def get_join_hints(*args, **kwargs):
         return []
 
@@ -27,20 +38,22 @@ except Exception:  # pragma: no cover - fallback if hints unavailable
         return {}
 
 
+log = logging.getLogger(__name__)
+
+
 class Pipeline:
-    """Lightweight pipeline wrapper for DocuWare flows."""
+    """LLM-assisted SQL pipeline used by the DocuWare app."""
 
     def __init__(self, settings: Settings | None = None, namespace: str = "dw::common") -> None:
         self.settings = settings or Settings(namespace=namespace)
-        self.namespace = namespace
+        self.namespace = namespace or getattr(self.settings, "namespace", "dw::common")
 
-        # Attach namespace to settings so DB reads resolve correctly.
         try:
-            self.settings.set_namespace(namespace)
+            self.settings.set_namespace(self.namespace)
         except AttributeError:
             pass
 
-        # Memory engine (Postgres) used for metadata + settings overrides.
+        # Memory DB (Postgres) for metadata and bookkeeping
         self.mem = get_mem_engine(self.settings)
         self.mem_engine = self.mem
         try:
@@ -48,31 +61,477 @@ class Pipeline:
         except AttributeError:
             pass
 
-        # Datasource registry (Oracle, etc.).
+        # Datasource registry (Oracle for DocuWare)
         self.ds = DatasourceRegistry(self.settings, namespace=self.namespace)
 
-        # Resolve default application engine eagerly for request handlers.
         try:
             self.app_engine = self.ds.engine(None)
         except Exception:
             self.app_engine = None
 
-        # Active app flag retained for compatibility; defaults to DocuWare.
-        self.active_app = (self.settings.get("ACTIVE_APP", scope="namespace") or "dw").strip() or "dw"
+        self.intent_router = IntentRouter()
+
+        # Clarifier stays disabled per environment request
+        self.clarifier_llm = None
+
+        # Load the SQL generation model (SQLCoder via ExLlama2 or configured backend)
+        self.llm = load_model(self.settings)
+
+        self.validator = (
+            ValidatorAgent(self.app_engine, self.settings) if self.app_engine else None
+        )
+
+        try:
+            self.researcher = load_researcher(self.settings)
+        except Exception:
+            self.researcher = None
+
+        self.active_app = (
+            (self.settings.get("ACTIVE_APP", scope="namespace") or "dw").strip() or "dw"
+        )
 
     # ------------------------------------------------------------------
-    def engine(self, name: str | None = None):
-        return self.ds.engine(name)
+    def answer(
+        self,
+        *,
+        question: str,
+        prefixes: Optional[Sequence[str]] = None,
+        auth_email: Optional[str] = None,
+        namespace: Optional[str] = None,
+        datasource: Optional[str] = None,
+        dialect: str = "oracle",
+        app_tag: Optional[str] = None,
+        context: Optional[Dict[str, Any]] = None,
+        hints: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        prefixes = list(prefixes or [])
+        namespace = namespace or self.namespace
+        question_text = (question or "").strip()
 
-    # Compatibility shims ------------------------------------------------
-    def ensure_ingested(self, *args: Any, **kwargs: Any):  # pragma: no cover - legacy stub
-        raise NotImplementedError("Ingestion is not supported in the simplified pipeline.")
+        if not question_text:
+            return {"ok": False, "status": "error", "error": "question_empty"}
 
-    def answer(self, *args: Any, **kwargs: Any):  # pragma: no cover - legacy stub
-        raise NotImplementedError("LLM answering is not available in the simplified pipeline.")
+        intent = self.intent_router.classify(question_text)
+        if intent.kind == "smalltalk":
+            return {
+                "ok": False,
+                "status": "smalltalk",
+                "message": "Please ask a DocuWare data question.",
+            }
+        if intent.kind == "help":
+            return {
+                "ok": False,
+                "status": "help",
+                "message": "Try asking about DocuWare contracts or stakeholders.",
+            }
 
-    def reprocess_inquiry(self, *args: Any, **kwargs: Any):  # pragma: no cover - legacy stub
-        raise NotImplementedError("Inquiry reprocessing is not available in the simplified pipeline.")
+        ds_engine = self._resolve_engine(datasource)
 
-    def apply_admin_and_retry(self, *args: Any, **kwargs: Any):  # pragma: no cover - legacy stub
-        raise NotImplementedError("Admin retry is not available in the simplified pipeline.")
+        if intent.kind == "raw_sql":
+            return self._run_raw_sql(
+                question_text,
+                engine=ds_engine,
+                namespace=namespace,
+                prefixes=prefixes,
+                auth_email=auth_email,
+                datasource=datasource,
+                app_tag=app_tag,
+            )
+
+        base_context = self._build_context(namespace)
+        if context:
+            base_context.update(context)
+        base_context["prefixes"] = prefixes
+        base_context["dialect"] = dialect
+
+        plan = self._plan_sql(question_text, base_context, hints or {})
+        if plan.get("status") != "ok" or not plan.get("sql"):
+            return {
+                "ok": False,
+                "status": plan.get("status", "needs_clarification"),
+                "questions": plan.get("questions"),
+                "context": {"namespace": namespace, "prefixes": prefixes},
+                "rationale": plan.get("rationale"),
+            }
+
+        sql_text = plan["sql"]
+        rationale = plan.get("rationale")
+
+        if self.validator and getattr(self.validator, "fa", None):
+            valid, info = self.validator.quick_validate(sql_text)
+            if not valid:
+                return {
+                    "ok": False,
+                    "status": "validation_failed",
+                    "error": info.get("error"),
+                    "details": info,
+                }
+
+        exec_result = self._execute_sql(ds_engine, sql_text)
+        final_sql = sql_text
+        final_result = exec_result
+        attempts = [
+            {"sql": sql_text, "rowcount": exec_result.rowcount, "type": "initial"}
+        ]
+
+        if exec_result.rowcount == 0:
+            retry = self._maybe_autoretry(
+                question_text,
+                base_context,
+                hints or {},
+                ds_engine,
+            )
+            if retry is not None:
+                final_sql = retry["sql"]
+                final_result = retry["result"]
+                rationale = retry.get("rationale") or rationale
+                attempts.append(
+                    {
+                        "sql": retry["sql"],
+                        "rowcount": retry["result"].rowcount,
+                        "type": "auto_retry",
+                    }
+                )
+
+        rows = list(final_result.rows)
+        columns = list(final_result.columns)
+        rowcount = final_result.rowcount
+
+        meta: Dict[str, Any] = {
+            "namespace": namespace,
+            "datasource": datasource or self._default_datasource(),
+            "dialect": dialect,
+            "rationale": rationale,
+            "attempts": attempts,
+            "prefixes": prefixes,
+        }
+
+        response: Dict[str, Any] = {
+            "ok": True,
+            "status": "ok",
+            "sql": final_sql,
+            "rows": rows,
+            "columns": columns,
+            "rowcount": rowcount,
+            "meta": meta,
+        }
+
+        if rowcount == 0:
+            response["hint"] = self._friendly_empty_hint()
+
+        run_id = self._record_run(
+            namespace=namespace,
+            question=question_text,
+            sql=final_sql,
+            rows=rows,
+            datasource=datasource,
+            auth_email=auth_email,
+        )
+        if run_id is not None:
+            response["run_id"] = run_id
+
+        try:
+            tags = self._build_tags(app_tag, prefixes)
+            autosave_snippet(self.mem_engine, namespace, datasource, final_sql, tags=tags)
+        except Exception as exc:  # pragma: no cover - best effort
+            log.debug("autosave snippet failed: %s", exc)
+
+        return response
+
+    # ------------------------------------------------------------------
+    def _default_datasource(self) -> Optional[str]:
+        return self.settings.get_string("DEFAULT_DATASOURCE", scope="namespace")
+
+    # ------------------------------------------------------------------
+    def _resolve_engine(self, datasource: Optional[str]):
+        try:
+            return self.ds.engine(datasource)
+        except Exception:
+            return self.ds.engine(None)
+
+    # ------------------------------------------------------------------
+    def _run_raw_sql(
+        self,
+        sql_text: str,
+        *,
+        engine,
+        namespace: str,
+        prefixes: Sequence[str],
+        auth_email: Optional[str],
+        datasource: Optional[str],
+        app_tag: Optional[str],
+    ) -> Dict[str, Any]:
+        try:
+            result = self._execute_sql(engine, sql_text)
+        except Exception as exc:
+            return {
+                "ok": False,
+                "status": "raw_sql_error",
+                "error": str(exc),
+            }
+
+        rows = list(result.rows)
+        response = {
+            "ok": True,
+            "status": "ok",
+            "sql": sql_text,
+            "rows": rows,
+            "columns": list(result.columns),
+            "rowcount": result.rowcount,
+            "meta": {
+                "namespace": namespace,
+                "datasource": datasource or self._default_datasource(),
+                "prefixes": list(prefixes),
+                "mode": "raw_sql",
+            },
+        }
+
+        run_id = self._record_run(
+            namespace=namespace,
+            question=sql_text,
+            sql=sql_text,
+            rows=rows,
+            datasource=datasource,
+            auth_email=auth_email,
+        )
+        if run_id is not None:
+            response["run_id"] = run_id
+
+        try:
+            tags = self._build_tags(app_tag, prefixes)
+            autosave_snippet(self.mem_engine, namespace, datasource, sql_text, tags=tags)
+        except Exception:
+            pass
+
+        return response
+
+    # ------------------------------------------------------------------
+    def _build_context(self, namespace: str) -> Dict[str, Any]:
+        context: Dict[str, Any] = {
+            "tables": [],
+            "columns": [],
+            "metrics": {},
+            "join_hints": [],
+            "reserved_terms": {},
+            "date_columns": {},
+        }
+
+        with self.mem_engine.connect() as conn:
+            tables = conn.execute(
+                text(
+                    """
+                    SELECT table_name, schema_name, table_comment
+                      FROM mem_tables
+                     WHERE namespace = :ns
+                  ORDER BY table_name
+                    """
+                ),
+                {"ns": namespace},
+            ).mappings().all()
+            columns = conn.execute(
+                text(
+                    """
+                    SELECT t.table_name, c.column_name, c.data_type, c.is_nullable
+                      FROM mem_columns c
+                      JOIN mem_tables t ON t.id = c.table_id
+                     WHERE t.namespace = :ns
+                  ORDER BY t.table_name, c.column_name
+                    """
+                ),
+                {"ns": namespace},
+            ).mappings().all()
+            metrics = conn.execute(
+                text(
+                    """
+                    SELECT metric_key, metric_name, calculation_sql, description
+                      FROM mem_metrics
+                     WHERE namespace = :ns
+                  ORDER BY metric_key
+                    """
+                ),
+                {"ns": namespace},
+            ).mappings().all()
+
+        context["tables"] = [dict(row) for row in tables]
+        context["columns"] = [dict(row) for row in columns]
+        context["metrics"] = {row["metric_key"]: dict(row) for row in metrics if row.get("metric_key")}
+
+        try:
+            context["join_hints"] = get_join_hints(namespace)
+        except Exception:
+            context["join_hints"] = []
+        try:
+            context["reserved_terms"] = get_reserved_terms(namespace)
+        except Exception:
+            context["reserved_terms"] = {}
+        try:
+            context["date_columns"] = get_date_columns(namespace)
+        except Exception:
+            context["date_columns"] = {}
+        try:
+            metric_hints = get_metric_hints(namespace)
+            if metric_hints:
+                context.setdefault("metrics", {})
+                for key, expr in metric_hints.items():
+                    context["metrics"].setdefault(key, {"calculation_sql": expr})
+        except Exception:
+            pass
+
+        return context
+
+    # ------------------------------------------------------------------
+    def _plan_sql(self, question: str, context: Dict[str, Any], hints: Dict[str, Any]) -> Dict[str, Any]:
+        planner = PlannerAgent(self.llm)
+        sql_text, rationale = planner.plan(question, context, hints)
+        sql_candidate = extract_sql(sql_text) or sql_text.strip()
+
+        if not sql_candidate or not sql_candidate.lower().startswith(("select", "with")):
+            return {
+                "status": "needs_clarification",
+                "questions": planner.fallback_clarifying_question(question, context, hints),
+                "rationale": rationale,
+            }
+
+        return {"status": "ok", "sql": sql_candidate, "rationale": rationale}
+
+    # ------------------------------------------------------------------
+    def _execute_sql(self, engine, sql_text: str) -> SQLExecutionResult:
+        result = run_sql(engine, sql_text)
+        if not result.ok:
+            raise RuntimeError(result.error or "SQL execution failed")
+        return result
+
+    # ------------------------------------------------------------------
+    def _maybe_autoretry(
+        self,
+        question: str,
+        context: Dict[str, Any],
+        hints: Dict[str, Any],
+        engine,
+    ) -> Optional[Dict[str, Any]]:
+        enabled = bool(self.settings.get_bool("EMPTY_RESULT_AUTORETRY", default=False))
+        if not enabled:
+            return None
+
+        widen_days = self.settings.get_int("EMPTY_RESULT_AUTORETRY_DAYS", default=90) or 90
+        retry_question = (
+            f"{question}\n\nIf no rows are returned, widen the window to roughly the last {widen_days} days."
+        )
+        retry_hints = dict(hints)
+        retry_hints["autoretry_days"] = widen_days
+
+        retry_plan = self._plan_sql(retry_question, context, retry_hints)
+        if retry_plan.get("status") != "ok" or not retry_plan.get("sql"):
+            return None
+
+        try:
+            retry_result = self._execute_sql(engine, retry_plan["sql"])
+        except Exception:
+            return None
+
+        if retry_result.rowcount <= 0:
+            return None
+
+        return {
+            "sql": retry_plan["sql"],
+            "result": retry_result,
+            "rationale": retry_plan.get("rationale"),
+        }
+
+    # ------------------------------------------------------------------
+    def _record_run(
+        self,
+        *,
+        namespace: str,
+        question: str,
+        sql: str,
+        rows: List[Dict[str, Any]],
+        datasource: Optional[str],
+        auth_email: Optional[str],
+    ) -> Optional[int]:
+        sample_json = json.dumps(rows[:5], default=str)
+        attempts = [
+            (
+                """
+                INSERT INTO mem_runs(namespace, run_type, datasource, input_query, sql_text, row_count, result_sample)
+                VALUES (:ns, :rtype, :ds, :query, :sql, :count, CAST(:sample AS jsonb))
+                RETURNING id
+                """.strip(),
+                {
+                    "ns": namespace,
+                    "rtype": "dw_pipeline",
+                    "ds": datasource,
+                    "query": question,
+                    "sql": sql,
+                    "count": len(rows),
+                    "sample": sample_json,
+                },
+            ),
+            (
+                """
+                INSERT INTO mem_runs(namespace, run_type, input_query, sql_text, row_count, result_sample)
+                VALUES (:ns, :rtype, :query, :sql, :count, CAST(:sample AS jsonb))
+                RETURNING id
+                """.strip(),
+                {
+                    "ns": namespace,
+                    "rtype": "dw_pipeline",
+                    "query": question,
+                    "sql": sql,
+                    "count": len(rows),
+                    "sample": sample_json,
+                },
+            ),
+            (
+                """
+                INSERT INTO mem_runs(namespace, input_query, sql_text, row_count)
+                VALUES (:ns, :query, :sql, :count)
+                RETURNING id
+                """.strip(),
+                {
+                    "ns": namespace,
+                    "query": question,
+                    "sql": sql,
+                    "count": len(rows),
+                },
+            ),
+            (
+                """
+                INSERT INTO mem_runs(namespace, input_query, sql_text)
+                VALUES (:ns, :query, :sql)
+                RETURNING id
+                """.strip(),
+                {
+                    "ns": namespace,
+                    "query": question,
+                    "sql": sql,
+                },
+            ),
+        ]
+
+        for stmt_text, params in attempts:
+            try:
+                with self.mem_engine.begin() as conn:
+                    row = conn.execute(text(stmt_text), params).fetchone()
+                if row and row[0] is not None:
+                    return int(row[0])
+            except Exception:
+                continue
+        return None
+
+    # ------------------------------------------------------------------
+    def _friendly_empty_hint(self) -> str:
+        return (
+            "No results returned. Try widening the date range or removing filters such as "
+            "department or stakeholder."
+        )
+
+    # ------------------------------------------------------------------
+    def _build_tags(
+        self, app_tag: Optional[str], prefixes: Sequence[str]
+    ) -> List[str]:
+        tags = [self.active_app]
+        if app_tag:
+            tags.append(app_tag)
+        tags.extend(f"prefix:{p}" for p in prefixes if p)
+        return sorted({t for t in tags if t})

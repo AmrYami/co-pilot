@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List
+from typing import Any, Dict, TYPE_CHECKING
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, jsonify, request, current_app
 from sqlalchemy import inspect, text
 
 from core.datasources import DatasourceRegistry
@@ -11,9 +11,67 @@ from core.settings import Settings
 
 from .answerer import AnswerError, StakeholderAnswerer
 
+if TYPE_CHECKING:  # pragma: no cover
+    from core.pipeline import Pipeline
+
 
 NAMESPACE = "dw::common"
 dw_bp = Blueprint("dw", __name__)
+
+_PIPELINE_HANDLE: "Pipeline | None" = None
+
+
+def create_dw_blueprint(settings: Settings | None = None, pipeline: "Pipeline | None" = None) -> Blueprint:
+    """Return the DocuWare blueprint wired to the provided pipeline/settings."""
+
+    global _PIPELINE_HANDLE
+
+    if settings is not None:
+        try:
+            settings.set_namespace(NAMESPACE)
+        except AttributeError:
+            pass
+
+    _PIPELINE_HANDLE = pipeline
+    return dw_bp
+
+
+def _fallback_rule_answer(question: str) -> Dict[str, Any] | None:
+    """Attempt the legacy rule-based answerer as a safety net."""
+
+    settings = Settings(namespace=NAMESPACE)
+    mem = settings.mem_engine()
+    registry = DatasourceRegistry(settings, namespace=NAMESPACE)
+    answerer = StakeholderAnswerer(settings, mem, registry)
+
+    try:
+        result = answerer.answer(question)
+    except AnswerError:
+        return None
+    except Exception:
+        return None
+
+    response: Dict[str, Any] = {
+        "ok": True,
+        "sql": result.sql,
+        "rows": result.rows,
+        "meta": {
+            "top_n": result.top_n,
+            "date_start": result.date_start.isoformat(),
+            "date_end": result.date_end.isoformat(),
+            "tags": result.tags,
+        },
+    }
+    if not result.rows:
+        response["hint"] = (
+            "No results for last month. Try a wider window (e.g., last 90 days) or "
+            "use START_DATE/END_DATE filters."
+        )
+
+    if result.run_id is not None:
+        response["run_id"] = result.run_id
+
+    return response
 
 
 def _infer_value_type(value):
@@ -385,34 +443,34 @@ def answer():
     if not question:
         return jsonify({"ok": False, "error": "Question text is required."}), 400
 
-    settings = Settings(namespace=NAMESPACE)
-    mem = settings.mem_engine()
-    registry = DatasourceRegistry(settings, namespace=NAMESPACE)
-    answerer = StakeholderAnswerer(settings, mem, registry)
+    prefixes = payload.get("prefixes") or []
+    auth_email = payload.get("auth_email")
+
+    pipeline = _PIPELINE_HANDLE or current_app.config.get("pipeline")
+    if pipeline is None:
+        return jsonify({"ok": False, "error": "Pipeline not initialized"}), 500
 
     try:
-        result = answerer.answer(question)
-    except AnswerError as exc:
-        return jsonify({"ok": False, "error": str(exc)}), 400
-
-    response: Dict[str, Any] = {
-        "ok": True,
-        "sql": result.sql,
-        "rows": result.rows,
-        "meta": {
-            "top_n": result.top_n,
-            "date_start": result.date_start.isoformat(),
-            "date_end": result.date_end.isoformat(),
-            "tags": result.tags,
-        },
-    }
-    if not result.rows:
-        response["hint"] = (
-            "No results for last month. Try a wider window (e.g., last 90 days) or "
-            "use START_DATE/END_DATE filters."
+        result = pipeline.answer(
+            question=question,
+            prefixes=prefixes,
+            auth_email=auth_email,
+            namespace=NAMESPACE,
+            datasource="docuware",
+            dialect="oracle",
+            app_tag="dw",
         )
+    except Exception as exc:
+        fallback = _fallback_rule_answer(question)
+        if fallback:
+            return jsonify(fallback)
+        return jsonify({"ok": False, "error": str(exc)}), 500
 
-    if result.run_id is not None:
-        response["run_id"] = result.run_id
+    status = 200
+    if not result.get("ok", False):
+        if result.get("status") in {"smalltalk", "help", "needs_clarification", "ambiguous"}:
+            status = 400
+        elif result.get("error"):
+            status = 500
 
-    return jsonify(response)
+    return jsonify(result), status
