@@ -304,8 +304,8 @@ def create_or_update_inquiry(
             last_sql, last_error, created_at, updated_at
         )
         VALUES (
-            :ns, CAST(:pfx AS jsonb), :q, :mail,
-            :run_id, :re, :rs, CAST(:src AS jsonb),
+            :ns, :pfx, :q, :mail,
+            :run_id, :re, :rs, :src,
             :st, :ds, :reply, :by,
             :last_sql, :last_error, NOW(), NOW()
         )
