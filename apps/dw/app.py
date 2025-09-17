@@ -1,200 +1,256 @@
+from __future__ import annotations
+
+import hashlib
+import json
+from typing import Any, Dict, List
+
 from flask import Blueprint, current_app, jsonify, request
+from sqlalchemy import inspect as sqla_inspect, text
+from sqlalchemy.exc import SQLAlchemyError
+
+from core.datasources import DatasourceRegistry
 from core.settings import Settings
 from core.sql_exec import get_mem_engine
-from sqlalchemy import text
-import json
 
 
-def create_dw_blueprint(settings: Settings) -> Blueprint:
-    """
-    DW blueprint factory. We avoid any FA imports here.
-    """
-    bp = Blueprint("dw", __name__, url_prefix="/dw")
+dw_bp = Blueprint("dw", __name__)
 
-    @bp.route("/seed", methods=["POST"])
-    def seed():
-        """
-        Seed minimal knowledge for table Contract into memory DB (mem_* tables).
-        No Oracle views. Only mem_* tables are touched.
-        """
-        payload = request.get_json(silent=True) or {}
-        ns = payload.get("namespace") or "dw::common"
-        force = bool(payload.get("force", False))
 
-        mem = get_mem_engine(settings)
+def _payload() -> Dict[str, Any]:
+    return request.get_json(silent=True) or {}
 
-        # 1) Basic mappings / glossary for Contract (stakeholders & departments)
-        #    This helps the planner recognize common terms.
-        mappings = [
-            # alias, canonical, mapping_type, scope
-            ("stakeholder", "contract_stakeholder", "term", "global"),
-            ("department",  "department",           "term", "global"),
-            ("owner",       "contract_owner",       "term", "global"),
-            ("value",       "contract_value_gross", "metric","global"),
-            ("net value",   "contract_value_net",   "metric","global"),
-            ("vat",         "vat",                  "term", "global"),
-        ]
 
-        metrics = [
-            # metric_key, metric_name, calculation_sql, required_tables, required_columns, description
-            ("contract_value_gross",
-             "Contract Value (Gross)",
-             # NVL for Oracle
-             "NVL(CONTRACT_VALUE_NET_OF_VAT,0) + NVL(VAT,0)",
-             ["Contract"],
-             ["CONTRACT_VALUE_NET_OF_VAT", "VAT"],
-             "Gross value = net + VAT"),
+def _namespace(payload: Dict[str, Any] | None = None) -> str:
+    if payload and payload.get("namespace"):
+        return str(payload["namespace"])
+    arg_ns = request.args.get("namespace")
+    if arg_ns:
+        return arg_ns
+    payload = payload or _payload()
+    ns = payload.get("namespace")
+    return str(ns) if ns else "dw::common"
 
-            ("active_contracts_count",
-             "Active Contracts Count",
-             "COUNT(*) FILTER (WHERE END_DATE IS NULL OR END_DATE >= SYSDATE)",
-             ["Contract"],
-             ["END_DATE"],
-             "Number of contracts not yet expired"),
-        ]
 
-        # Snippet: unpivot stakeholders ↔ departments without creating a view (UNION ALL)
-        unpivot_sql = """
-        SELECT DWDOCID, CONTRACT_ID, CONTRACT_OWNER, OWNER_DEPARTMENT,
-               CONTRACT_VALUE_NET_OF_VAT, VAT,
-               NVL(CONTRACT_VALUE_NET_OF_VAT,0) + NVL(VAT,0) AS CONTRACT_VALUE_GROSS,
-               START_DATE, END_DATE, REQUEST_DATE, CONTRACT_STATUS, REQUEST_TYPE,
-               ENTITY_NO, DEPARTMENT_OUL, SLOT, STAKEHOLDER, DEPARTMENT
-        FROM (
-          SELECT DWDOCID, CONTRACT_ID, CONTRACT_OWNER, OWNER_DEPARTMENT,
-                 CONTRACT_VALUE_NET_OF_VAT, VAT,
-                 START_DATE, END_DATE, REQUEST_DATE, CONTRACT_STATUS, REQUEST_TYPE,
-                 ENTITY_NO, DEPARTMENT_OUL,
-                 '1' AS SLOT, CONTRACT_STAKEHOLDER_1 AS STAKEHOLDER, DEPARTMENT_1 AS DEPARTMENT FROM Contract
-          UNION ALL
-          SELECT DWDOCID, CONTRACT_ID, CONTRACT_OWNER, OWNER_DEPARTMENT,
-                 CONTRACT_VALUE_NET_OF_VAT, VAT,
-                 START_DATE, END_DATE, REQUEST_DATE, CONTRACT_STATUS, REQUEST_TYPE,
-                 ENTITY_NO, DEPARTMENT_OUL,
-                 '2', CONTRACT_STAKEHOLDER_2, DEPARTMENT_2 FROM Contract
-          UNION ALL
-          SELECT DWDOCID, CONTRACT_ID, CONTRACT_OWNER, OWNER_DEPARTMENT,
-                 CONTRACT_VALUE_NET_OF_VAT, VAT,
-                 START_DATE, END_DATE, REQUEST_DATE, CONTRACT_STATUS, REQUEST_TYPE,
-                 ENTITY_NO, DEPARTMENT_OUL,
-                 '3', CONTRACT_STAKEHOLDER_3, DEPARTMENT_3 FROM Contract
-          UNION ALL
-          SELECT DWDOCID, CONTRACT_ID, CONTRACT_OWNER, OWNER_DEPARTMENT,
-                 CONTRACT_VALUE_NET_OF_VAT, VAT,
-                 START_DATE, END_DATE, REQUEST_DATE, CONTRACT_STATUS, REQUEST_TYPE,
-                 ENTITY_NO, DEPARTMENT_OUL,
-                 '4', CONTRACT_STAKEHOLDER_4, DEPARTMENT_4 FROM Contract
-          UNION ALL
-          SELECT DWDOCID, CONTRACT_ID, CONTRACT_OWNER, OWNER_DEPARTMENT,
-                 CONTRACT_VALUE_NET_OF_VAT, VAT,
-                 START_DATE, END_DATE, REQUEST_DATE, CONTRACT_STATUS, REQUEST_TYPE,
-                 ENTITY_NO, DEPARTMENT_OUL,
-                 '5', CONTRACT_STAKEHOLDER_5, DEPARTMENT_5 FROM Contract
-          UNION ALL
-          SELECT DWDOCID, CONTRACT_ID, CONTRACT_OWNER, OWNER_DEPARTMENT,
-                 CONTRACT_VALUE_NET_OF_VAT, VAT,
-                 START_DATE, END_DATE, REQUEST_DATE, CONTRACT_STATUS, REQUEST_TYPE,
-                 ENTITY_NO, DEPARTMENT_OUL,
-                 '6', CONTRACT_STAKEHOLDER_6, DEPARTMENT_6 FROM Contract
-          UNION ALL
-          SELECT DWDOCID, CONTRACT_ID, CONTRACT_OWNER, OWNER_DEPARTMENT,
-                 CONTRACT_VALUE_NET_OF_VAT, VAT,
-                 START_DATE, END_DATE, REQUEST_DATE, CONTRACT_STATUS, REQUEST_TYPE,
-                 ENTITY_NO, DEPARTMENT_OUL,
-                 '7', CONTRACT_STAKEHOLDER_7, DEPARTMENT_7 FROM Contract
-          UNION ALL
-          SELECT DWDOCID, CONTRACT_ID, CONTRACT_OWNER, OWNER_DEPARTMENT,
-                 CONTRACT_VALUE_NET_OF_VAT, VAT,
-                 START_DATE, END_DATE, REQUEST_DATE, CONTRACT_STATUS, REQUEST_TYPE,
-                 ENTITY_NO, DEPARTMENT_OUL,
-                 '8', CONTRACT_STAKEHOLDER_8, DEPARTMENT_8 FROM Contract
+@dw_bp.route("/dw/seed", methods=["POST"])
+def seed() -> Any:
+    payload = _payload()
+    ns = _namespace(payload)
+
+    settings = Settings(namespace=ns)
+    mem = get_mem_engine(settings)
+
+    required_tables = json.dumps(["Contract"])
+    required_columns = json.dumps(["CONTRACT_VALUE_NET_OF_VAT", "VAT"])
+
+    with mem.begin() as conn:
+        conn.execute(
+            text(
+                """
+                INSERT INTO mem_metrics(
+                    namespace, metric_key, metric_name, description,
+                    calculation_sql, required_tables, required_columns,
+                    category, owner, is_active
+                )
+                VALUES (
+                    :ns, :key, :name, :desc,
+                    :calc, CAST(:rt AS jsonb), CAST(:rc AS jsonb),
+                    'contracts', 'dw', true
+                )
+                ON CONFLICT (namespace, metric_key, version) DO UPDATE
+                SET calculation_sql = EXCLUDED.calculation_sql,
+                    description      = EXCLUDED.description,
+                    updated_at       = NOW()
+                """
+            ),
+            {
+                "ns": ns,
+                "key": "contract_value_gross",
+                "name": "Contract Value (Gross)",
+                "desc": "Gross value = net + VAT",
+                "calc": "NVL(CONTRACT_VALUE_NET_OF_VAT,0) + NVL(VAT,0)",
+                "rt": required_tables,
+                "rc": required_columns,
+            },
         )
-        """
 
-        with mem.begin() as c:
-            if force:
-                c.execute(text("DELETE FROM mem_mappings WHERE namespace=:ns"), {"ns": ns})
-                c.execute(text("DELETE FROM mem_metrics  WHERE namespace=:ns"), {"ns": ns})
-                c.execute(text("DELETE FROM mem_snippets WHERE namespace=:ns"), {"ns": ns})
+    return jsonify(
+        {
+            "ok": True,
+            "namespace": ns,
+            "seeded_metrics": ["contract_value_gross"],
+        }
+    )
 
-            # Upsert mappings
-            for alias, canonical, mtype, scope in mappings:
-                c.execute(text("""
-                    INSERT INTO mem_mappings(namespace, alias, canonical, mapping_type, scope, source, confidence)
-                    VALUES (:ns, :alias, :canonical, :mtype, :scope, 'seed', 0.95)
-                    ON CONFLICT (namespace, alias, mapping_type, scope) DO UPDATE
-                      SET canonical = EXCLUDED.canonical,
-                          updated_at = NOW()
-                """), dict(ns=ns, alias=alias, canonical=canonical, mtype=mtype, scope=scope))
 
-            # Upsert metrics
-            for key, name, sql_expr, req_tables, req_cols, desc in metrics:
-                c.execute(text("""
-                    INSERT INTO mem_metrics(namespace, metric_key, metric_name, description,
-                                            calculation_sql, required_tables, required_columns, category, owner, is_active)
-                    VALUES(
-                        :ns, :key, :name, :desc, :calc,
-                        CAST(:rt AS jsonb), CAST(:rc AS jsonb),
-                        'contracts', 'dw', true
+@dw_bp.route("/dw/ingest", methods=["POST"])
+def ingest() -> Any:
+    payload = _payload()
+    ns = _namespace(payload)
+    tables: List[str] = payload.get("tables") or ["Contract"]
+
+    settings = Settings(namespace=ns)
+    mem = get_mem_engine(settings)
+
+    ds_registry = DatasourceRegistry(settings, namespace=ns)
+    oracle_engine = ds_registry.engine(None)
+    inspector = sqla_inspect(oracle_engine)
+
+    processed: List[str] = []
+    errors: List[Dict[str, Any]] = []
+
+    schema_signature = hashlib.sha256(
+        f"{ns}::{'|'.join(sorted(tables))}".encode("utf-8")
+    ).hexdigest()[:16]
+
+    with mem.begin() as conn:
+        snapshot_id = conn.execute(
+            text(
+                """
+                INSERT INTO mem_snapshots(namespace, schema_hash, diff_from)
+                VALUES (:ns, :hash, NULL)
+                ON CONFLICT (namespace, schema_hash) DO UPDATE
+                SET schema_hash = EXCLUDED.schema_hash
+                RETURNING id
+                """
+            ),
+            {"ns": ns, "hash": schema_signature},
+        ).scalar_one()
+
+        for table_name in tables:
+            try:
+                columns = inspector.get_columns(table_name)
+                pk = inspector.get_pk_constraint(table_name) or {}
+            except SQLAlchemyError as exc:  # pragma: no cover - inspection errors
+                errors.append({"table": table_name, "error": str(exc)})
+                continue
+
+            pk_cols = pk.get("constrained_columns") or []
+
+            table_row_id = conn.execute(
+                text(
+                    """
+                    INSERT INTO mem_tables(
+                        namespace, snapshot_id, table_name, schema_name,
+                        row_count, size_bytes, primary_key, engine_name, table_comment
                     )
-                    ON CONFLICT (namespace, metric_key, version) DO UPDATE
-                      SET calculation_sql = EXCLUDED.calculation_sql,
-                          description      = EXCLUDED.description,
-                          updated_at       = NOW()
-                """), dict(
-                    ns=ns, key=key, name=name, desc=desc, calc=sql_expr,
-                    rt=json.dumps(req_tables), rc=json.dumps(req_cols)
-                ))
+                    VALUES (
+                        :ns, :sid, :tname, NULL,
+                        NULL, NULL, CAST(:pk AS jsonb), 'oracle', NULL
+                    )
+                    ON CONFLICT (namespace, table_name, schema_name) DO UPDATE
+                    SET snapshot_id = EXCLUDED.snapshot_id,
+                        primary_key = EXCLUDED.primary_key,
+                        updated_at  = NOW()
+                    RETURNING id
+                    """
+                ),
+                {
+                    "ns": ns,
+                    "sid": snapshot_id,
+                    "tname": table_name,
+                    "pk": json.dumps(pk_cols),
+                },
+            ).scalar_one()
 
-            # Saved snippet for unpivot
-            c.execute(text("""
-                INSERT INTO mem_snippets(namespace, title, description, sql_template, input_tables, tags, is_verified, verified_by)
-                VALUES(:ns, 'dw_contract_stakeholders_unpivot',
-                       'UNION ALL unpivot of 8 stakeholder/department pairs (no DB views).',
-                       :sql, '["Contract"]'::jsonb, '["dw","contracts","unpivot"]'::jsonb, true, 'seed')
-                ON CONFLICT DO NOTHING
-            """), dict(ns=ns, sql=unpivot_sql))
-
-        return jsonify({"ok": True, "namespace": ns, "seeded": {"mappings": len(mappings), "metrics": len(metrics), "snippets": 1}})
-
-    @bp.route("/answer", methods=["POST"])
-    def answer():
-        """
-        Hand the question to Pipeline.answer using the DW namespace.
-        """
-        payload = request.get_json(force=True) or {}
-        question  = payload.get("question") or ""
-        auth_email = payload.get("auth_email")
-        prefixes   = payload.get("prefixes") or []   # keep shape consistent
-
-        # Use the pipeline created in main app factory
-        pipeline = current_app.config.get("pipeline")
-        if not pipeline:
-            return jsonify({"ok": False, "error": "Pipeline not available"}), 500
-
-        try:
-            result = pipeline.answer(
-                question=question,
-                auth_email=auth_email,
-                prefixes=prefixes,
-                datasource="docuware",
-                namespace="dw::common",
+            conn.execute(
+                text(
+                    "DELETE FROM mem_columns WHERE namespace = :ns AND table_id = :tid"
+                ),
+                {"ns": ns, "tid": table_row_id},
             )
-        except NotImplementedError as exc:  # pragma: no cover - legacy pipeline stub
-            return jsonify({"ok": False, "error": str(exc)}), 501
 
-        return jsonify(result)
+            for col in columns:
+                conn.execute(
+                    text(
+                        """
+                        INSERT INTO mem_columns(
+                            namespace, table_id, column_name, data_type,
+                            is_nullable, default_value, max_length,
+                            numeric_precision, numeric_scale, is_primary
+                        )
+                        VALUES (
+                            :ns, :tid, :cname, :dtype,
+                            :nullable, :dflt, :len,
+                            :prec, :scale, :is_pk
+                        )
+                        """
+                    ),
+                    {
+                        "ns": ns,
+                        "tid": table_row_id,
+                        "cname": col.get("name"),
+                        "dtype": str(col.get("type")),
+                        "nullable": bool(col.get("nullable", True)),
+                        "dflt": col.get("default"),
+                        "len": col.get("length"),
+                        "prec": col.get("precision"),
+                        "scale": col.get("scale"),
+                        "is_pk": col.get("name") in pk_cols,
+                    },
+                )
 
-    @bp.route("/metrics", methods=["GET"])
-    def metrics():
-        ns = request.args.get("namespace") or "dw::common"
-        mem = get_mem_engine(settings)
-        rows = mem.execute(text("""
-            SELECT metric_key, metric_name, calculation_sql, description
-              FROM mem_metrics
-             WHERE namespace = :ns AND is_active = true
-             ORDER BY metric_key
-        """), {"ns": ns}).mappings().all()
-        return jsonify({"ok": True, "namespace": ns, "metrics": rows})
+            processed.append(table_name)
 
-    return bp
+    return jsonify(
+        {
+            "ok": not errors,
+            "namespace": ns,
+            "tables": processed,
+            "errors": errors,
+        }
+    )
+
+
+@dw_bp.route("/dw/metrics", methods=["GET"])
+def metrics() -> Any:
+    ns = _namespace({})
+    settings = Settings(namespace=ns)
+    mem = get_mem_engine(settings)
+
+    with mem.connect() as conn:
+        result = conn.execute(
+            text(
+                """
+                SELECT metric_key, metric_name, description, calculation_sql,
+                       category, owner, is_active
+                  FROM mem_metrics
+                 WHERE namespace = :ns
+                 ORDER BY metric_key
+                """
+            ),
+            {"ns": ns},
+        ).mappings().all()
+
+    metrics_rows = [dict(row) for row in result]
+    return jsonify({"ok": True, "namespace": ns, "metrics": metrics_rows})
+
+
+@dw_bp.route("/dw/answer", methods=["POST"])
+def answer() -> Any:
+    payload = _payload()
+    question = payload.get("question") or ""
+    auth_email = payload.get("auth_email")
+    prefixes = payload.get("prefixes") or []
+    ns = _namespace(payload)
+
+    pipeline = current_app.config.get("pipeline")
+    if not pipeline:
+        return jsonify({"ok": False, "error": "Pipeline not available"}), 500
+
+    try:
+        result = pipeline.answer(
+            question=question,
+            auth_email=auth_email,
+            prefixes=prefixes,
+            datasource="docuware",
+            namespace=ns,
+        )
+    except NotImplementedError as exc:  # pragma: no cover - legacy stub
+        return jsonify({"ok": False, "error": str(exc)}), 501
+
+    return jsonify(result)
+
+
+def create_dw_blueprint(settings: Settings | None = None) -> Blueprint:
+    """Compatibility factory for legacy imports."""
+    return dw_bp

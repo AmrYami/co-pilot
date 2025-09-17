@@ -111,6 +111,27 @@ def create_admin_blueprint(settings: Settings) -> Blueprint:
             )
         return jsonify(ok=True, items=out)
 
+    @bp.get("/settings/summary")
+    def settings_summary():
+        ns = request.args.get("namespace") or settings.get("ACTIVE_NAMESPACE", "dw::common")
+
+        mem = get_mem_engine(settings)
+        with mem.connect() as conn:
+            rows = conn.execute(
+                text(
+                    """
+                    SELECT key, value, value_type, scope
+                      FROM mem_settings
+                     WHERE namespace = :ns
+                     ORDER BY key
+                    """
+                ),
+                {"ns": ns},
+            ).mappings().all()
+
+        items = [dict(row) for row in rows]
+        return jsonify({"ok": True, "namespace": ns, "items": items})
+
     return bp
 
 
