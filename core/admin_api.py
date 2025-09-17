@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import json
 
-from flask import Blueprint, request
-from sqlalchemy import text
+from flask import Blueprint, jsonify, request
+from sqlalchemy import bindparam, text
 
 from core.settings import Settings
 from core.sql_exec import get_mem_engine
@@ -11,100 +11,181 @@ from core.sql_exec import get_mem_engine
 admin_bp = Blueprint("admin", __name__)
 
 
-def _ensure_mem_settings_unique_constraint(conn) -> None:
-    conn.execute(
-        text(
-            "DROP INDEX IF EXISTS ux_mem_settings_ns_key_scope_coalesced"
-        )
+def _manual_upsert_setting(
+    conn,
+    *,
+    ns: str,
+    key: str,
+    value_json: str,
+    value_type: str,
+    scope: str,
+    scope_id,
+    updated_by: str,
+    is_secret: bool = False,
+) -> None:
+    update_stmt = text(
+        """
+        UPDATE mem_settings
+           SET value = CAST(:val AS jsonb),
+               value_type = :vtype,
+               updated_by = :upd_by,
+               updated_at = NOW(),
+               is_secret  = :secret
+         WHERE namespace = :ns
+           AND key       = :key
+           AND scope     = :scope
+           AND ((:scope_id IS NULL AND scope_id IS NULL) OR scope_id = :scope_id)
+        """
+    )
+    result = conn.execute(
+        update_stmt,
+        {
+            "ns": ns,
+            "key": key,
+            "val": value_json,
+            "vtype": value_type,
+            "scope": scope,
+            "scope_id": scope_id,
+            "upd_by": updated_by,
+            "secret": is_secret,
+        },
+    )
+    if result.rowcount and result.rowcount > 0:
+        return
+
+    insert_stmt = text(
+        """
+        INSERT INTO mem_settings(namespace, key, value, value_type, scope, scope_id,
+                                 overridable, updated_by, created_at, updated_at, is_secret)
+        VALUES (:ns, :key, CAST(:val AS jsonb), :vtype, :scope, :scope_id,
+                true, :upd_by, NOW(), NOW(), :secret)
+        """
     )
     conn.execute(
-        text(
-            """
-            CREATE UNIQUE INDEX IF NOT EXISTS ux_settings_ns_key_scope_null
-              ON mem_settings (namespace, key, scope)
-             WHERE scope_id IS NULL
-            """
-        )
-    )
-    conn.execute(
-        text(
-            """
-            CREATE UNIQUE INDEX IF NOT EXISTS ux_settings_ns_key_scope_id
-              ON mem_settings (namespace, key, scope, scope_id)
-             WHERE scope_id IS NOT NULL
-            """
-        )
+        insert_stmt,
+        {
+            "ns": ns,
+            "key": key,
+            "val": value_json,
+            "vtype": value_type,
+            "scope": scope,
+            "scope_id": scope_id,
+            "upd_by": updated_by,
+            "secret": is_secret,
+        },
     )
 
 
-@admin_bp.route("/admin/settings/bulk", methods=["POST"])
+def _infer_value_type(value) -> str:
+    if isinstance(value, bool):
+        return "bool"
+    if isinstance(value, int) and not isinstance(value, bool):
+        return "int"
+    if isinstance(value, float):
+        return "float"
+    if isinstance(value, (list, dict)):
+        return "json"
+    return "string"
+
+
+@admin_bp.post("/settings/bulk")
 def settings_bulk():
-    payload = request.get_json(force=True)
-    ns = payload.get("namespace", "dw::common")
-    updated_by = payload.get("updated_by", "admin")
-    items = payload.get("settings", [])
+    payload = request.get_json(force=True) or {}
+    ns = payload.get("namespace") or "default"
+    updated_by = payload.get("updated_by") or "admin"
+    settings_items = payload.get("settings") or []
 
-    s = Settings(namespace=ns)
-    mem = get_mem_engine(s)
+    settings = Settings(namespace=ns)
+    mem = get_mem_engine(settings)
 
     with mem.begin() as conn:
-        _ensure_mem_settings_unique_constraint(conn)
-        for item in items:
+        for item in settings_items:
             key = item["key"]
-            val = item.get("value")
-            vtype = item.get("value_type")
-            scope = item.get("scope", "namespace")
+            scope = item.get("scope") or "namespace"
             scope_id = item.get("scope_id")
-            is_secret = bool(item.get("is_secret", False))
+            value = item.get("value")
+            value_type = item.get("value_type") or _infer_value_type(value)
+            is_secret = bool(item.get("is_secret"))
 
-            if scope_id in (None, ""):
-                stmt = text(
-                    """
-                    INSERT INTO mem_settings(namespace, key, value, value_type, scope, scope_id,
-                                             overridable, updated_by, created_at, updated_at, is_secret)
-                    VALUES (:ns, :key, CAST(:val AS jsonb), :vtype, :scope, NULL,
-                            true, :upd, NOW(), NOW(), :is_secret)
-                    ON CONFLICT ON CONSTRAINT ux_settings_ns_key_scope_null
-                    DO UPDATE SET
-                      value      = EXCLUDED.value,
-                      value_type = EXCLUDED.value_type,
-                      updated_by = EXCLUDED.updated_by,
-                      updated_at = NOW(),
-                      is_secret  = EXCLUDED.is_secret
-                    """
-                )
-            else:
-                stmt = text(
-                    """
-                    INSERT INTO mem_settings(namespace, key, value, value_type, scope, scope_id,
-                                             overridable, updated_by, created_at, updated_at, is_secret)
-                    VALUES (:ns, :key, CAST(:val AS jsonb), :vtype, :scope, :scope_id,
-                            true, :upd, NOW(), NOW(), :is_secret)
-                    ON CONFLICT ON CONSTRAINT ux_settings_ns_key_scope_id
-                    DO UPDATE SET
-                      value      = EXCLUDED.value,
-                      value_type = EXCLUDED.value_type,
-                      updated_by = EXCLUDED.updated_by,
-                      updated_at = NOW(),
-                      is_secret  = EXCLUDED.is_secret
-                    """
-                )
+            value_json = json.dumps(value, ensure_ascii=False)
 
-            conn.execute(
-                stmt,
-                {
-                    "ns": ns,
-                    "key": key,
-                    "val": json.dumps(val),
-                    "vtype": vtype,
-                    "scope": scope,
-                    "scope_id": scope_id,
-                    "upd": updated_by,
-                    "is_secret": is_secret,
-                },
+            _manual_upsert_setting(
+                conn,
+                ns=ns,
+                key=key,
+                value_json=value_json,
+                value_type=value_type,
+                scope=scope,
+                scope_id=scope_id,
+                updated_by=updated_by,
+                is_secret=is_secret,
             )
 
-    return {"ok": True, "namespace": ns, "upserted": len(items)}
+    return jsonify({"ok": True, "namespace": ns, "upserted": len(settings_items)})
+
+
+@admin_bp.get("/settings/get")
+def settings_get():
+    ns = request.args.get("namespace") or "default"
+    keys_param = request.args.get("keys")
+    keys = [k for k in (keys_param.split(",") if keys_param else []) if k]
+
+    settings = Settings(namespace=ns)
+    mem = get_mem_engine(settings)
+
+    with mem.begin() as conn:
+        if keys:
+            stmt = (
+                text(
+                    """
+                    SELECT key, value, value_type, scope, scope_id
+                      FROM mem_settings
+                     WHERE namespace = :ns
+                       AND key IN :keys
+                    """
+                ).bindparams(bindparam("keys", expanding=True))
+            )
+            rows = conn.execute(stmt, {"ns": ns, "keys": keys}).mappings().all()
+        else:
+            rows = conn.execute(
+                text(
+                    """
+                    SELECT key, value, value_type, scope, scope_id
+                      FROM mem_settings
+                     WHERE namespace = :ns
+                    """
+                ),
+                {"ns": ns},
+            ).mappings().all()
+
+    items = [dict(row) for row in rows]
+    return jsonify({"ok": True, "namespace": ns, "items": items})
+
+
+@admin_bp.get("/settings/summary")
+def settings_summary():
+    ns = request.args.get("namespace") or "default"
+    settings = Settings(namespace=ns)
+    mem = get_mem_engine(settings)
+
+    with mem.begin() as conn:
+        total = conn.execute(
+            text("SELECT COUNT(*) FROM mem_settings WHERE namespace = :ns"),
+            {"ns": ns},
+        ).scalar_one()
+        keys = conn.execute(
+            text(
+                """
+                SELECT DISTINCT key
+                  FROM mem_settings
+                 WHERE namespace = :ns
+              ORDER BY key
+                """
+            ),
+            {"ns": ns},
+        ).scalars().all()
+
+    return jsonify({"ok": True, "namespace": ns, "total": total, "keys": keys})
 
 
 def create_admin_blueprint(settings: Settings | None = None) -> Blueprint:
