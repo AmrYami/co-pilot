@@ -13,7 +13,28 @@ from .answerer import AnswerError, StakeholderAnswerer
 
 
 NAMESPACE = "dw::common"
-dw_bp = Blueprint("dw", __name__, url_prefix="/dw")
+dw_bp = Blueprint("dw", __name__)
+
+
+def _ensure_mem_snapshot_schema(mem_engine) -> None:
+    with mem_engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                ALTER TABLE mem_snapshots
+                ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                UPDATE mem_snapshots
+                   SET updated_at = COALESCE(updated_at, created_at)
+                 WHERE updated_at IS NULL
+                """
+            )
+        )
 
 
 def _seed_semantic_layer(mem_engine) -> Dict[str, List[str]]:
@@ -44,35 +65,35 @@ def _seed_semantic_layer(mem_engine) -> Dict[str, List[str]]:
         "DEPARTMENT_8",
     ]
 
+    payload = {
+        "ns": NAMESPACE,
+        "key": "contract_value_gross",
+        "name": "Contract Value (Gross)",
+        "desc": "Gross value = net + VAT",
+        "calc": "NVL(CONTRACT_VALUE_NET_OF_VAT,0) + NVL(VAT,0)",
+        "rt": json.dumps(required_tables),
+        "rc": json.dumps(required_columns),
+    }
+    metric_sql = text(
+        """
+        INSERT INTO mem_metrics(namespace, metric_key, metric_name, description,
+                                calculation_sql, required_tables, required_columns,
+                                category, owner, is_active)
+        VALUES(:ns, :key, :name, :desc, :calc,
+               CAST(:rt AS jsonb), CAST(:rc AS jsonb),
+               'contracts','dw', true)
+        ON CONFLICT (namespace, metric_key, version) DO UPDATE
+          SET calculation_sql = EXCLUDED.calculation_sql,
+              description      = EXCLUDED.description,
+              updated_at       = NOW()
+        """
+    )
+
     seeded = {"metrics": [], "mappings": []}
 
     with mem_engine.begin() as conn:
-        conn.execute(
-            text(
-                """
-                INSERT INTO mem_metrics(namespace, metric_key, metric_name, description,
-                                        calculation_sql, required_tables, required_columns,
-                                        category, owner, is_active)
-                VALUES (:ns, :key, :name, :desc, :calc,
-                        CAST(:rt AS jsonb), CAST(:rc AS jsonb),
-                        'contracts', 'dw', true)
-                ON CONFLICT (namespace, metric_key, version) DO UPDATE
-                  SET calculation_sql = EXCLUDED.calculation_sql,
-                      description      = EXCLUDED.description,
-                      updated_at       = NOW()
-                """
-            ),
-            {
-                "ns": NAMESPACE,
-                "key": "contract_value_gross",
-                "name": "Contract Value (Gross)",
-                "desc": "Gross value = NVL(CONTRACT_VALUE_NET_OF_VAT,0) + NVL(VAT,0)",
-                "calc": "NVL(CONTRACT_VALUE_NET_OF_VAT,0) + NVL(VAT,0)",
-                "rt": json.dumps(required_tables),
-                "rc": json.dumps(required_columns),
-            },
-        )
-        seeded["metrics"].append("contract_value_gross")
+        conn.execute(metric_sql, payload)
+        seeded["metrics"].append(payload["key"])
 
         for slot in range(1, 9):
             conn.execute(
@@ -183,7 +204,7 @@ def _upsert_namespace_setting(conn, key: str, value: Any, *, value_type: str = "
 @dw_bp.route("/ingest", methods=["POST"])
 def ingest():
     settings = Settings(namespace=NAMESPACE)
-    mem = settings.mem_engine()
+    mem_engine = settings.mem_engine()
     registry = DatasourceRegistry(settings, namespace=NAMESPACE)
     engine = registry.engine(None)
 
@@ -195,7 +216,9 @@ def ingest():
     actual_name = table_lookup["CONTRACT"]
     columns = inspector.get_columns(actual_name)
 
-    with mem.begin() as conn:
+    _ensure_mem_snapshot_schema(mem_engine)
+
+    with mem_engine.begin() as conn:
         snapshot_id = conn.execute(
             text(
                 """
@@ -253,7 +276,7 @@ def ingest():
             updated_by="dw_ingest",
         )
 
-    seeded = _seed_semantic_layer(mem)
+    seeded = _seed_semantic_layer(mem_engine)
 
     return jsonify(
         {
@@ -269,23 +292,22 @@ def ingest():
 @dw_bp.route("/seed", methods=["POST"])
 def seed():
     settings = Settings(namespace=NAMESPACE)
-    mem = settings.mem_engine()
-    seeded = _seed_semantic_layer(mem)
+    mem_engine = settings.mem_engine()
+    seeded = _seed_semantic_layer(mem_engine)
     return jsonify({"ok": True, "namespace": NAMESPACE, "seeded": seeded})
 
 
 @dw_bp.route("/metrics", methods=["GET"])
 def metrics():
     settings = Settings(namespace=NAMESPACE)
-    mem = settings.mem_engine()
-    with mem.connect() as conn:
+    mem_engine = settings.mem_engine()
+    with mem_engine.connect() as conn:
         rows = conn.execute(
             text(
                 """
-                SELECT metric_key, metric_name, description, calculation_sql, category, is_active
+                SELECT metric_key, metric_name, description, is_active
                   FROM mem_metrics
                  WHERE namespace = :ns
-                   AND is_active = true
               ORDER BY metric_key
                 """
             ),
