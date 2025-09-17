@@ -1,6 +1,8 @@
 from flask import Flask, jsonify
-from core.settings import Settings
+
 from core.pipeline import Pipeline
+from core.settings import Settings
+from apps.dw import dw_bp
 
 
 def create_app():
@@ -21,15 +23,17 @@ def create_app():
             admin_blueprint = _create_admin_blueprint(settings)
 
     if admin_blueprint is not None:
-        app.register_blueprint(admin_blueprint, url_prefix=getattr(admin_blueprint, "url_prefix", None) or "/admin")
+        app.register_blueprint(
+            admin_blueprint,
+            url_prefix=getattr(admin_blueprint, "url_prefix", None) or "/admin",
+        )
 
     # Build pipeline for DW
     pipeline = Pipeline(settings=settings, namespace="dw::common")
     app.config["pipeline"] = pipeline
 
     # Register DW app
-    from apps.dw import create_dw_blueprint
-    app.register_blueprint(create_dw_blueprint(settings))
+    app.register_blueprint(dw_bp)
 
     # Diagnostics
     @app.get("/health")
