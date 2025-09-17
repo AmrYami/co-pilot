@@ -16,7 +16,11 @@ def create_app():
 
     @app.get("/model/info")
     def model_info():
-        return {"backend": "simplified", "llm": "disabled", "apps": ["dw"]}
+        return {
+            "llm": "disabled",
+            "clarifier": "disabled",
+            "mode": "dw-simplified",
+        }
 
     @app.get("/__routes")
     def list_routes():
@@ -25,6 +29,7 @@ def create_app():
             rows.append(
                 {
                     "rule": str(rule),
+                    "endpoint": rule.endpoint,
                     "methods": sorted(list(rule.methods - {"HEAD", "OPTIONS"})),
                 }
             )

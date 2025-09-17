@@ -16,6 +16,84 @@ NAMESPACE = "dw::common"
 dw_bp = Blueprint("dw", __name__)
 
 
+def _infer_value_type(value):
+    if isinstance(value, bool):
+        return "bool"
+    if isinstance(value, int) and not isinstance(value, bool):
+        return "int"
+    if isinstance(value, float):
+        return "float"
+    if isinstance(value, (list, dict)):
+        return "json"
+    return "string"
+
+
+def _manual_upsert_setting(
+    conn,
+    *,
+    key: str,
+    value,
+    value_type: str | None = None,
+    scope: str = "namespace",
+    scope_id=None,
+    updated_by: str = "dw",
+    is_secret: bool = False,
+):
+    vtype = value_type or _infer_value_type(value)
+    value_json = json.dumps(value, ensure_ascii=False)
+    update_stmt = text(
+        """
+        UPDATE mem_settings
+           SET value = CAST(:val AS jsonb),
+               value_type = :vtype,
+               updated_by = :upd_by,
+               updated_at = NOW(),
+               is_secret  = :secret
+         WHERE namespace = :ns
+           AND key       = :key
+           AND scope     = :scope
+           AND ((:scope_id IS NULL AND scope_id IS NULL) OR scope_id = :scope_id)
+        """
+    )
+    result = conn.execute(
+        update_stmt,
+        {
+            "ns": NAMESPACE,
+            "key": key,
+            "val": value_json,
+            "vtype": vtype,
+            "scope": scope,
+            "scope_id": scope_id,
+            "upd_by": updated_by,
+            "secret": is_secret,
+        },
+    )
+    if result.rowcount and result.rowcount > 0:
+        return
+
+    insert_stmt = text(
+        """
+        INSERT INTO mem_settings(namespace, key, value, value_type, scope, scope_id,
+                                 overridable, updated_by, created_at, updated_at, is_secret)
+        VALUES (:ns, :key, CAST(:val AS jsonb), :vtype, :scope, :scope_id,
+                true, :upd_by, NOW(), NOW(), :secret)
+        """
+    )
+    conn.execute(
+        insert_stmt,
+        {
+            "ns": NAMESPACE,
+            "key": key,
+            "val": value_json,
+            "vtype": vtype,
+            "scope": scope,
+            "scope_id": scope_id,
+            "upd_by": updated_by,
+            "secret": is_secret,
+        },
+    )
+
+
 def _ensure_mem_snapshot_schema(mem_engine) -> None:
     with mem_engine.begin() as conn:
         conn.execute(
@@ -173,34 +251,6 @@ def _seed_semantic_layer(mem_engine) -> Dict[str, List[str]]:
     return seeded
 
 
-def _upsert_namespace_setting(conn, key: str, value: Any, *, value_type: str = "string", updated_by: str = "dw") -> None:
-    stmt = text(
-        """
-        INSERT INTO mem_settings(namespace, key, value, value_type, scope, scope_id,
-                                 overridable, updated_by, created_at, updated_at, is_secret)
-        VALUES (:ns, :key, CAST(:val AS jsonb), :vtype, 'namespace', NULL,
-                true, :upd, NOW(), NOW(), false)
-        ON CONFLICT ON CONSTRAINT ux_settings_ns_key_scope_null
-        DO UPDATE SET
-          value      = EXCLUDED.value,
-          value_type = EXCLUDED.value_type,
-          updated_by = EXCLUDED.updated_by,
-          updated_at = NOW(),
-          is_secret  = EXCLUDED.is_secret
-        """
-    )
-    conn.execute(
-        stmt,
-        {
-            "ns": NAMESPACE,
-            "key": key,
-            "val": json.dumps(value),
-            "vtype": value_type,
-            "upd": updated_by,
-        },
-    )
-
-
 @dw_bp.route("/ingest", methods=["POST"])
 def ingest():
     settings = Settings(namespace=NAMESPACE)
@@ -269,10 +319,16 @@ def ingest():
                 },
             )
 
-        _upsert_namespace_setting(
+        _manual_upsert_setting(
             conn,
             key="DW_CONTRACT_TABLE",
             value=actual_name,
+            updated_by="dw_ingest",
+        )
+        _manual_upsert_setting(
+            conn,
+            key="DEFAULT_DATASOURCE",
+            value="docuware",
             updated_by="dw_ingest",
         )
 
@@ -301,11 +357,11 @@ def seed():
 def metrics():
     settings = Settings(namespace=NAMESPACE)
     mem_engine = settings.mem_engine()
-    with mem_engine.connect() as conn:
+    with mem_engine.begin() as conn:
         rows = conn.execute(
             text(
                 """
-                SELECT metric_key, metric_name, description, is_active
+                SELECT metric_key, metric_name, description, category, is_active, updated_at
                   FROM mem_metrics
                  WHERE namespace = :ns
               ORDER BY metric_key
@@ -313,7 +369,13 @@ def metrics():
             ),
             {"ns": NAMESPACE},
         ).mappings().all()
-    return jsonify({"ok": True, "metrics": [dict(row) for row in rows]})
+    return jsonify(
+        {
+            "ok": True,
+            "namespace": NAMESPACE,
+            "metrics": [dict(row) for row in rows],
+        }
+    )
 
 
 @dw_bp.route("/answer", methods=["POST"])
@@ -344,6 +406,12 @@ def answer():
             "tags": result.tags,
         },
     }
+    if not result.rows:
+        response["hint"] = (
+            "No results for last month. Try a wider window (e.g., last 90 days) or "
+            "use START_DATE/END_DATE filters."
+        )
+
     if result.run_id is not None:
         response["run_id"] = result.run_id
 
