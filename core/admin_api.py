@@ -1,147 +1,116 @@
-from flask import Blueprint, request, jsonify
+from __future__ import annotations
+
+import json
+
+from flask import Blueprint, request
 from sqlalchemy import text
 
-from core.sql_exec import get_mem_engine
 from core.settings import Settings
+from core.sql_exec import get_mem_engine
+
+admin_bp = Blueprint("admin", __name__)
 
 
-def _ensure_mem_settings_conflict_support(conn):
-    """
-    Ensure a unique index exists on (namespace, key, scope) to support the
-    ON CONFLICT clause used by the settings bulk upsert.
-    """
-
+def _ensure_mem_settings_unique_constraint(conn) -> None:
     conn.execute(
         text(
             """
-            CREATE UNIQUE INDEX IF NOT EXISTS ux_mem_settings_ns_key_scope
-            ON mem_settings (namespace, key, scope);
-            """
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_indexes
+                 WHERE tablename = 'mem_settings'
+                   AND indexname = 'ux_settings_ns_key_scope_null'
+            ) THEN
+                CREATE UNIQUE INDEX ux_settings_ns_key_scope_null
+                  ON mem_settings (namespace, key, scope)
+                 WHERE scope_id IS NULL;
+            END IF;
+
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_indexes
+                 WHERE tablename = 'mem_settings'
+                   AND indexname = 'ux_settings_ns_key_scope_id'
+            ) THEN
+                CREATE UNIQUE INDEX ux_settings_ns_key_scope_id
+                  ON mem_settings (namespace, key, scope, scope_id)
+                 WHERE scope_id IS NOT NULL;
+            END IF;
+        END$$;
+        """
         )
     )
 
 
-def create_admin_blueprint(settings: Settings) -> Blueprint:
-    bp = Blueprint("admin", __name__)
+@admin_bp.route("/admin/settings/bulk", methods=["POST"])
+def settings_bulk():
+    payload = request.get_json(force=True)
+    ns = payload.get("namespace", "dw::common")
+    updated_by = payload.get("updated_by", "admin")
+    items = payload.get("settings", [])
 
-    @bp.post("/settings/bulk")
-    def settings_bulk():
-        payload = request.get_json(force=True)
-        ns = payload.get("namespace") or settings.get("ACTIVE_NAMESPACE", "dw::common")
-        updated_by = payload.get("updated_by", "admin")
-        items = payload.get("settings") or []
+    s = Settings(namespace=ns)
+    mem = get_mem_engine(s)
 
-        mem_engine = get_mem_engine(settings)
-        upsert_sql = text(
-            """
-            INSERT INTO mem_settings(namespace, key, value, value_type, scope, scope_id,
-                                     overridable, updated_by, created_at, updated_at, is_secret)
-            VALUES (:ns, :key, CAST(:val AS jsonb), :vtype, :scope, :scope_id,
-                    COALESCE(:ovr, true), :upd_by, NOW(), NOW(), :is_secret)
-            ON CONFLICT (namespace, key, scope)
-            DO UPDATE SET
-              value      = EXCLUDED.value,
-              value_type = EXCLUDED.value_type,
-              updated_by = EXCLUDED.updated_by,
-              updated_at = NOW(),
-              is_secret  = EXCLUDED.is_secret
-            """
-        )
+    with mem.begin() as conn:
+        _ensure_mem_settings_unique_constraint(conn)
+        for item in items:
+            key = item["key"]
+            val = item.get("value")
+            vtype = item.get("value_type")
+            scope = item.get("scope", "namespace")
+            scope_id = item.get("scope_id")
+            is_secret = bool(item.get("is_secret", False))
 
-        upserted = 0
-        with mem_engine.begin() as conn:
-            _ensure_mem_settings_conflict_support(conn)
-            for it in items:
-                key = it["key"]
-                scope = it.get("scope", "namespace")
-                scope_id = it.get("scope_id")
-                vtype = it.get("value_type")
-                is_secret = bool(it.get("is_secret", False))
+            if scope_id in (None, ""):
+                stmt = text(
+                    """
+                    INSERT INTO mem_settings(namespace, key, value, value_type, scope, scope_id,
+                                             overridable, updated_by, created_at, updated_at, is_secret)
+                    VALUES (:ns, :key, CAST(:val AS jsonb), :vtype, :scope, NULL,
+                            true, :upd, NOW(), NOW(), :is_secret)
+                    ON CONFLICT ON CONSTRAINT ux_settings_ns_key_scope_null
+                    DO UPDATE SET
+                      value      = EXCLUDED.value,
+                      value_type = EXCLUDED.value_type,
+                      updated_by = EXCLUDED.updated_by,
+                      updated_at = NOW(),
+                      is_secret  = EXCLUDED.is_secret
+                    """
+                )
+            else:
+                stmt = text(
+                    """
+                    INSERT INTO mem_settings(namespace, key, value, value_type, scope, scope_id,
+                                             overridable, updated_by, created_at, updated_at, is_secret)
+                    VALUES (:ns, :key, CAST(:val AS jsonb), :vtype, :scope, :scope_id,
+                            true, :upd, NOW(), NOW(), :is_secret)
+                    ON CONFLICT ON CONSTRAINT ux_settings_ns_key_scope_id
+                    DO UPDATE SET
+                      value      = EXCLUDED.value,
+                      value_type = EXCLUDED.value_type,
+                      updated_by = EXCLUDED.updated_by,
+                      updated_at = NOW(),
+                      is_secret  = EXCLUDED.is_secret
+                    """
+                )
 
-                val_json = _normalize_setting_value_for_json(it.get("value"), vtype)
-
-                params = {
+            conn.execute(
+                stmt,
+                {
                     "ns": ns,
                     "key": key,
-                    "val": val_json,
+                    "val": json.dumps(val),
                     "vtype": vtype,
                     "scope": scope,
                     "scope_id": scope_id,
-                    "ovr": it.get("overridable"),
-                    "upd_by": updated_by,
+                    "upd": updated_by,
                     "is_secret": is_secret,
-                }
-                conn.execute(upsert_sql, params)
-                upserted += 1
-
-        return jsonify({"ok": True, "namespace": ns, "updated_by": updated_by, "upserted": upserted})
-
-    @bp.get("/settings/get")
-    def settings_get():
-        ns = request.args.get("namespace") or settings.get("ACTIVE_NAMESPACE", "dw::common")
-        keys = request.args.get("keys")
-        keys = [k.strip() for k in (keys or "").split(",") if k.strip()]
-
-        mem = get_mem_engine(settings)
-        sql = text(
-            """
-                SELECT id, key, namespace, scope, scope_id, updated_at, value, value_type
-                  FROM mem_settings
-                 WHERE namespace = :ns
-                   AND (:klen = 0 OR key = ANY(:keys))
-                 ORDER BY key
-            """
-        )
-        with mem.begin() as conn:
-            rows = conn.execute(sql, {"ns": ns, "klen": len(keys), "keys": keys}).mappings().all()
-
-        out = []
-        for r in rows:
-            out.append(
-                {
-                    "id": r["id"],
-                    "key": r["key"],
-                    "namespace": r["namespace"],
-                    "scope": r["scope"],
-                    "scope_id": r["scope_id"],
-                    "updated_at": r["updated_at"],
-                    "value": r["value"],
-                    "value_type": r["value_type"],
-                }
+                },
             )
-        return jsonify(ok=True, items=out)
 
-    @bp.get("/settings/summary")
-    def settings_summary():
-        ns = request.args.get("namespace") or settings.get("ACTIVE_NAMESPACE", "dw::common")
-
-        mem = get_mem_engine(settings)
-        with mem.connect() as conn:
-            rows = conn.execute(
-                text(
-                    """
-                    SELECT key, value, value_type, scope
-                      FROM mem_settings
-                     WHERE namespace = :ns
-                     ORDER BY key
-                    """
-                ),
-                {"ns": ns},
-            ).mappings().all()
-
-        items = [dict(row) for row in rows]
-        return jsonify({"ok": True, "namespace": ns, "items": items})
-
-    return bp
+    return {"ok": True, "namespace": ns, "upserted": len(items)}
 
 
-def _normalize_setting_value_for_json(val, vtype):
-    """
-    Return a JSON string suitable for CAST(:val AS jsonb)
-    """
-
-    import json
-
-    if vtype == "string" or isinstance(val, str):
-        return json.dumps(val, ensure_ascii=False)
-    return json.dumps(val, ensure_ascii=False)
+def create_admin_blueprint(settings: Settings | None = None) -> Blueprint:
+    return admin_bp
