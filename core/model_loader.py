@@ -157,6 +157,39 @@ class ModelHandle:
         )
 
 
+def load_llm_from_settings(settings: Any | None = None):
+    """Load the primary SQL generation model and return (handle, info)."""
+
+    s = _SettingsShim(settings)
+    backend_val = (s.get("MODEL_BACKEND") or "").strip().lower()
+    if backend_val in {"none", "disabled", "off"}:
+        return None, {"name": "disabled"}
+
+    handle = load_model(settings)
+    meta = getattr(handle, "meta", {}) or {}
+
+    model_path = meta.get("model_path") or (s.get("MODEL_PATH") or "").strip()
+    base_name = os.path.basename(model_path) if model_path else "sqlcoder"
+    name = meta.get("model_name") or meta.get("name") or base_name or "sqlcoder"
+
+    info: Dict[str, Any] = {"name": name}
+
+    backend = meta.get("backend") or getattr(handle, "backend", None) or backend_val or None
+    if backend:
+        info["backend"] = backend
+    if model_path:
+        info["path"] = model_path
+
+    max_len_val = meta.get("model_max_seq_len") or s.get("MODEL_MAX_SEQ_LEN")
+    try:
+        if max_len_val:
+            info["max_len"] = int(max_len_val)
+    except Exception:
+        pass
+
+    return handle, info
+
+
 def load_model(settings: Any | None = None) -> ModelHandle:
     s = _SettingsShim(settings)
 

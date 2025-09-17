@@ -9,7 +9,12 @@ from sqlalchemy import text
 from core.agents import PlannerAgent, ValidatorAgent
 from core.datasources import DatasourceRegistry
 from core.intent import IntentRouter
-from core.model_loader import load_model
+from core.inquiries import (
+    create_or_update_inquiry,
+    set_inquiry_status,
+    update_inquiry_status_run,
+)
+from core.model_loader import load_llm_from_settings
 from core.research import load_researcher
 from core.settings import Settings
 from core.snippets import autosave_snippet
@@ -36,6 +41,16 @@ except Exception:  # pragma: no cover - fallback if hints unavailable
 
     def get_date_columns(*args, **kwargs):
         return {}
+
+
+try:  # pragma: no cover - deterministic fallback templates (optional)
+    from apps.dw.answerer import AnswerError, StakeholderAnswerer
+except Exception:  # pragma: no cover - fallback when templates unavailable
+
+    class AnswerError(Exception):
+        pass
+
+    StakeholderAnswerer = None  # type: ignore[assignment]
 
 
 log = logging.getLogger(__name__)
@@ -75,7 +90,11 @@ class Pipeline:
         self.clarifier_llm = None
 
         # Load the SQL generation model (SQLCoder via ExLlama2 or configured backend)
-        self.llm = load_model(self.settings)
+        self.llm, self.llm_info = load_llm_from_settings(self.settings)
+        if not self.llm:
+            log.warning(
+                "Base SQL LLM disabled or unavailable; relying on deterministic fallbacks."
+            )
 
         self.validator = (
             ValidatorAgent(self.app_engine, self.settings) if self.app_engine else None
@@ -89,6 +108,99 @@ class Pipeline:
         self.active_app = (
             (self.settings.get("ACTIVE_APP", scope="namespace") or "dw").strip() or "dw"
         )
+
+    # ------------------------------------------------------------------
+    def model_info(self) -> Dict[str, Any]:
+        info = self.llm_info if isinstance(self.llm_info, dict) else {}
+        name = info.get("name") or "unknown"
+        backend = info.get("backend")
+        if backend:
+            llm_desc = f"{name} ({backend})"
+        else:
+            llm_desc = name
+        return {
+            "mode": "dw-pipeline",
+            "clarifier": "disabled",
+            "llm": llm_desc,
+        }
+
+    # ------------------------------------------------------------------
+    def answer_dw(
+        self,
+        question: str,
+        prefixes: Optional[Sequence[str]] = None,
+        auth_email: Optional[str] = None,
+        datasource: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        prefixes_list = list(prefixes or [])
+        question_text = (question or "").strip()
+        if not question_text:
+            return {"ok": False, "status": "error", "error": "question_empty"}
+
+        datasource_name = datasource or self._default_datasource() or "docuware"
+        inquiry_id = self._record_inquiry(question_text, prefixes_list, auth_email, datasource_name)
+
+        try:
+            result = self.answer(
+                question=question_text,
+                prefixes=prefixes_list,
+                auth_email=auth_email,
+                namespace=self.namespace,
+                datasource=datasource_name,
+                dialect="oracle",
+                app_tag="dw",
+            )
+        except Exception as exc:
+            log.exception("DocuWare pipeline error: %s", exc)
+            fallback = self._deterministic_fallback(question_text)
+            if fallback:
+                self._mark_inquiry_answered(inquiry_id, fallback.get("run_id"), "dw_template")
+                meta = fallback.setdefault("meta", {})
+                meta.setdefault("fallback_reason", "pipeline_exception")
+                fallback["inquiry_id"] = inquiry_id
+                return fallback
+
+            self._mark_inquiry_needs_clarification(inquiry_id, question_text, status="failed")
+            return {
+                "ok": False,
+                "status": "error",
+                "error": str(exc),
+                "inquiry_id": inquiry_id,
+            }
+
+        result = dict(result or {})
+        result["inquiry_id"] = inquiry_id
+
+        if result.get("ok"):
+            self._mark_inquiry_answered(inquiry_id, result.get("run_id"), "pipeline")
+            if result.get("rowcount", 0) == 0:
+                fallback = self._deterministic_fallback(question_text)
+                if fallback:
+                    self._mark_inquiry_answered(
+                        inquiry_id, fallback.get("run_id"), "dw_template"
+                    )
+                    meta = fallback.setdefault("meta", {})
+                    meta.setdefault("fallback_reason", "llm_zero_rows")
+                    fallback["inquiry_id"] = inquiry_id
+                    return fallback
+            return result
+
+        fallback = self._deterministic_fallback(question_text)
+        if fallback:
+            self._mark_inquiry_answered(inquiry_id, fallback.get("run_id"), "dw_template")
+            meta = fallback.setdefault("meta", {})
+            meta.setdefault("fallback_reason", "llm_plan_failed")
+            fallback["inquiry_id"] = inquiry_id
+            return fallback
+
+        status = result.get("status") or "needs_clarification"
+        if status == "needs_clarification" and not result.get("questions"):
+            result["questions"] = [
+                "Could you clarify the tables, filters, or date range you expect in the answer?",
+            ]
+        self._mark_inquiry_needs_clarification(inquiry_id, question_text, status=status)
+        result["status"] = status
+        return result
 
     # ------------------------------------------------------------------
     def answer(
@@ -239,6 +351,109 @@ class Pipeline:
         return response
 
     # ------------------------------------------------------------------
+    def _record_inquiry(
+        self,
+        question: str,
+        prefixes: Sequence[str],
+        auth_email: Optional[str],
+        datasource: str,
+    ) -> Optional[int]:
+        if not getattr(self, "mem_engine", None):
+            return None
+        try:
+            return create_or_update_inquiry(
+                self.mem_engine,
+                namespace=self.namespace,
+                prefixes=list(prefixes),
+                question=question,
+                auth_email=auth_email,
+                run_id=None,
+                research_enabled=bool(self.researcher),
+                datasource=datasource,
+                status="open",
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            log.debug("create_or_update_inquiry failed: %s", exc)
+            return None
+
+    # ------------------------------------------------------------------
+    def _mark_inquiry_answered(
+        self,
+        inquiry_id: Optional[int],
+        run_id: Optional[int],
+        answered_by: str,
+    ) -> None:
+        if not inquiry_id or not getattr(self, "mem_engine", None):
+            return
+        try:
+            update_inquiry_status_run(
+                self.mem_engine,
+                inquiry_id,
+                status="answered",
+                run_id=run_id,
+                answered_by=answered_by,
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            log.debug("update_inquiry_status_run failed: %s", exc)
+
+    # ------------------------------------------------------------------
+    def _mark_inquiry_needs_clarification(
+        self,
+        inquiry_id: Optional[int],
+        question: str,
+        *,
+        status: str = "needs_clarification",
+    ) -> None:
+        if not inquiry_id or not getattr(self, "mem_engine", None):
+            return
+        try:
+            set_inquiry_status(
+                self.mem_engine,
+                inquiry_id,
+                status,
+                last_question=question,
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            log.debug("set_inquiry_status failed: %s", exc)
+
+    # ------------------------------------------------------------------
+    def _deterministic_fallback(self, question: str) -> Optional[Dict[str, Any]]:
+        if StakeholderAnswerer is None or not getattr(self, "mem_engine", None):
+            return None
+        try:
+            answerer = StakeholderAnswerer(self.settings, self.mem_engine, self.ds)
+            result = answerer.answer(question)
+        except AnswerError:
+            return None
+        except Exception as exc:  # pragma: no cover - defensive logging
+            log.debug("Deterministic fallback failed: %s", exc)
+            return None
+
+        rows = list(result.rows)
+        columns = list(rows[0].keys()) if rows else []
+        meta = {
+            "mode": "deterministic_template",
+            "top_n": result.top_n,
+            "date_start": result.date_start.isoformat(),
+            "date_end": result.date_end.isoformat(),
+            "tags": list(result.tags or []),
+        }
+        payload: Dict[str, Any] = {
+            "ok": True,
+            "status": "ok",
+            "sql": result.sql,
+            "rows": rows,
+            "columns": columns,
+            "rowcount": len(rows),
+            "meta": meta,
+        }
+        if not rows:
+            payload["hint"] = self._friendly_empty_hint()
+        if result.run_id is not None:
+            payload["run_id"] = result.run_id
+        return payload
+
+    # ------------------------------------------------------------------
     def _default_datasource(self) -> Optional[str]:
         return self.settings.get_string("DEFAULT_DATASOURCE", scope="namespace")
 
@@ -381,6 +596,15 @@ class Pipeline:
 
     # ------------------------------------------------------------------
     def _plan_sql(self, question: str, context: Dict[str, Any], hints: Dict[str, Any]) -> Dict[str, Any]:
+        if not self.llm:
+            return {
+                "status": "llm_unavailable",
+                "questions": [
+                    "The SQL generator is temporarily unavailable. Please contact an administrator or try again later.",
+                ],
+                "rationale": "Base LLM disabled",
+            }
+
         planner = PlannerAgent(self.llm)
         sql_text, rationale = planner.plan(question, context, hints)
         sql_candidate = extract_sql(sql_text) or sql_text.strip()
