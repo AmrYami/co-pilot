@@ -6,8 +6,6 @@ from typing import Any, Dict, Optional
 
 from sqlalchemy import text
 
-from core.sql_exec import get_mem_engine
-
 
 class Settings:
     """Lightweight accessor for namespace-scoped settings stored in mem_settings."""
@@ -29,7 +27,7 @@ class Settings:
         namespace: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         ns = namespace or self.namespace
-        mem = get_mem_engine(self)
+        mem = self.mem_engine()
         if scope_id is None:
             stmt = text(
                 """
@@ -125,25 +123,107 @@ class Settings:
         return default
 
     # ------------------------------------------------------------------
-    def get_json(
+    def get_string(
         self,
         key: str,
+        default: Optional[str] = None,
         *,
         scope: str = "namespace",
         scope_id: Optional[str] = None,
         namespace: Optional[str] = None,
-        default: Any = None,
-    ) -> Any:
-        rec = self._fetch(key, scope=scope, scope_id=scope_id, namespace=namespace)
-        if rec is None or rec["value"] is None:
+    ) -> Optional[str]:
+        value = self.get(
+            key,
+            default=default,
+            scope=scope,
+            scope_id=scope_id,
+            namespace=namespace,
+        )
+        if isinstance(value, str):
+            return value
+        if value is None:
+            env_val = os.getenv(key)
+            return env_val if env_val is not None else default
+        if isinstance(value, (dict, list)):
+            return json.dumps(value)
+        return str(value)
+
+    # ------------------------------------------------------------------
+    def get_bool(
+        self,
+        key: str,
+        default: Optional[bool] = None,
+        *,
+        scope: str = "namespace",
+        scope_id: Optional[str] = None,
+        namespace: Optional[str] = None,
+    ) -> Optional[bool]:
+        value = self.get(
+            key,
+            default=default,
+            scope=scope,
+            scope_id=scope_id,
+            namespace=namespace,
+        )
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "t", "yes", "y", "on"}
+        if value is None:
             return default
-        val = rec["value"]
-        if isinstance(val, (dict, list)):
-            return val
+        return bool(value)
+
+    # ------------------------------------------------------------------
+    def get_int(
+        self,
+        key: str,
+        default: Optional[int] = None,
+        *,
+        scope: str = "namespace",
+        scope_id: Optional[str] = None,
+        namespace: Optional[str] = None,
+    ) -> Optional[int]:
+        value = self.get(
+            key,
+            default=default,
+            scope=scope,
+            scope_id=scope_id,
+            namespace=namespace,
+        )
+        if value is None:
+            return default
+        if isinstance(value, int):
+            return value
         try:
-            return json.loads(val)
+            return int(value)
         except Exception:
-            return default if val is None else val
+            return default
+
+    # ------------------------------------------------------------------
+    def get_json(
+        self,
+        key: str,
+        default: Any = None,
+        *,
+        scope: str = "namespace",
+        scope_id: Optional[str] = None,
+        namespace: Optional[str] = None,
+    ) -> Any:
+        value = self.get(
+            key,
+            default=default,
+            scope=scope,
+            scope_id=scope_id,
+            namespace=namespace,
+        )
+        if isinstance(value, (dict, list)):
+            return value
+        if isinstance(value, str):
+            try:
+                return json.loads(value)
+            except Exception:
+                return value
+        return default if value is None else value
 
     # ------------------------------------------------------------------
     def get_str(
@@ -155,55 +235,29 @@ class Settings:
         namespace: Optional[str] = None,
         default: Optional[str] = None,
     ) -> Optional[str]:
-        rec = self._fetch(key, scope=scope, scope_id=scope_id, namespace=namespace)
-        if rec is None or rec["value"] is None:
-            env_val = os.getenv(key)
-            return env_val if env_val is not None else default
-        val = rec["value"]
-        if isinstance(val, str):
-            return val
-        if isinstance(val, (dict, list)):
-            return json.dumps(val)
-        return str(val)
-
-    # ------------------------------------------------------------------
-    def get_bool(
-        self,
-        key: str,
-        *,
-        scope: str = "namespace",
-        scope_id: Optional[str] = None,
-        namespace: Optional[str] = None,
-        default: bool = False,
-    ) -> bool:
-        rec = self._fetch(key, scope=scope, scope_id=scope_id, namespace=namespace)
-        if rec is None or rec["value"] is None:
-            env_val = os.getenv(key)
-            if env_val is None:
-                return default
-            return env_val.strip().lower() in {"1", "true", "t", "yes", "y", "on"}
-        val = self._coerce(rec["value"], rec.get("value_type"))
-        if isinstance(val, bool):
-            return val
-        if isinstance(val, str):
-            return val.strip().lower() in {"1", "true", "t", "yes", "y", "on"}
-        return bool(val)
+        return self.get_string(
+            key,
+            default=default,
+            scope=scope,
+            scope_id=scope_id,
+            namespace=namespace,
+        )
 
     # ------------------------------------------------------------------
     def get_app_db_url(self, namespace: Optional[str] = None) -> Optional[str]:
         ns = namespace or self.namespace
-        val = self.get_str("APP_DB_URL", scope="namespace", namespace=ns)
+        val = self.get_string("APP_DB_URL", scope="namespace", namespace=ns)
         if val:
             return val
-        return self.get_str("APP_DB_URL", scope="global")
+        return self.get_string("APP_DB_URL", scope="global")
 
     # ------------------------------------------------------------------
     def default_datasource(self, namespace: Optional[str] = None) -> Optional[str]:
         ns = namespace or self.namespace
-        val = self.get_str("DEFAULT_DATASOURCE", scope="namespace", namespace=ns)
+        val = self.get_string("DEFAULT_DATASOURCE", scope="namespace", namespace=ns)
         if val:
             return val
-        return self.get_str("DEFAULT_DATASOURCE", scope="global")
+        return self.get_string("DEFAULT_DATASOURCE", scope="global")
 
     # ------------------------------------------------------------------
     def research_allowed(self, datasource: str, namespace: Optional[str] = None) -> bool:
@@ -211,4 +265,12 @@ class Settings:
         policy = self.get_json("RESEARCH_POLICY", scope="namespace", namespace=ns, default={})
         if isinstance(policy, dict) and datasource in policy:
             return bool(policy[datasource])
-        return self.get_bool("RESEARCH_MODE", scope="namespace", namespace=ns, default=False)
+        return bool(
+            self.get_bool("RESEARCH_MODE", scope="namespace", namespace=ns, default=False)
+        )
+
+    # ------------------------------------------------------------------
+    def mem_engine(self):
+        from core.sql_exec import get_mem_engine
+
+        return get_mem_engine(self)
