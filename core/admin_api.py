@@ -14,30 +14,25 @@ admin_bp = Blueprint("admin", __name__)
 def _ensure_mem_settings_unique_constraint(conn) -> None:
     conn.execute(
         text(
+            "DROP INDEX IF EXISTS ux_mem_settings_ns_key_scope_coalesced"
+        )
+    )
+    conn.execute(
+        text(
             """
-        DO $$
-        BEGIN
-            IF NOT EXISTS (
-                SELECT 1 FROM pg_indexes
-                 WHERE tablename = 'mem_settings'
-                   AND indexname = 'ux_settings_ns_key_scope_null'
-            ) THEN
-                CREATE UNIQUE INDEX ux_settings_ns_key_scope_null
-                  ON mem_settings (namespace, key, scope)
-                 WHERE scope_id IS NULL;
-            END IF;
-
-            IF NOT EXISTS (
-                SELECT 1 FROM pg_indexes
-                 WHERE tablename = 'mem_settings'
-                   AND indexname = 'ux_settings_ns_key_scope_id'
-            ) THEN
-                CREATE UNIQUE INDEX ux_settings_ns_key_scope_id
-                  ON mem_settings (namespace, key, scope, scope_id)
-                 WHERE scope_id IS NOT NULL;
-            END IF;
-        END$$;
-        """
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_settings_ns_key_scope_null
+              ON mem_settings (namespace, key, scope)
+             WHERE scope_id IS NULL
+            """
+        )
+    )
+    conn.execute(
+        text(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_settings_ns_key_scope_id
+              ON mem_settings (namespace, key, scope, scope_id)
+             WHERE scope_id IS NOT NULL
+            """
         )
     )
 

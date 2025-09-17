@@ -1,48 +1,51 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import os
 from typing import Dict, Optional
 
 from sqlalchemy import create_engine
 
-from core.settings import Settings
 
-
-@dataclass
 class DatasourceRegistry:
-    settings: Settings
-    namespace: str
+    """Registry that builds engines from settings-provided connection details."""
 
-    def __post_init__(self) -> None:
+    def __init__(self, settings, namespace: Optional[str] = None) -> None:
+        self.settings = settings
+        self.namespace = namespace or getattr(settings, "namespace", "default")
         self._engines: Dict[str, any] = {}
 
-        conns = self.settings.get_json("DB_CONNECTIONS", scope="namespace", default=[]) or []
-        if not conns:
-            single = (
-                self.settings.get_str("APP_DB_URL", scope="namespace", default=None)
-                or self.settings.get_str("APP_DB_URL", scope="global", default=None)
-            )
-            if single:
-                self._engines["default"] = create_engine(single, pool_pre_ping=True)
-        else:
-            for c in conns:
-                name = c.get("name") or "default"
-                url = c.get("url")
-                if url:
-                    self._engines[name] = create_engine(url, pool_pre_ping=True)
+        # Primary path: structured DB_CONNECTIONS within the namespace.
+        conns = self.settings.get_json("DB_CONNECTIONS", scope="namespace") or []
+        for conn in conns:
+            name = conn.get("name")
+            url = conn.get("url")
+            if not name:
+                continue
+            if not url:
+                continue
+            self._engines[name] = create_engine(url, pool_pre_ping=True, future=True)
 
+        # Fallback to a simple APP_DB_URL if no named connections exist.
         if not self._engines:
-            print("[datasources] no engines created (check DB_CONNECTIONS or APP_DB_URL).")
+            app_url = self.settings.get_string("APP_DB_URL", scope="namespace")
+            if not app_url:
+                app_url = os.getenv("APP_DB_URL")
+            if app_url:
+                self._engines["default"] = create_engine(app_url, pool_pre_ping=True, future=True)
 
-    def engine(self, which: Optional[str]) -> any:
-        if which and which in self._engines:
-            return self._engines[which]
+    # ------------------------------------------------------------------
+    def engine(self, name: Optional[str]) -> any:
+        if name and name in self._engines:
+            return self._engines[name]
 
-        default_name = self.settings.get_str("DEFAULT_DATASOURCE", scope="namespace", default=None)
-        if default_name and default_name in self._engines:
-            return self._engines[default_name]
+        preferred = self.settings.get_string("DEFAULT_DATASOURCE", scope="namespace")
+        if preferred and preferred in self._engines:
+            return self._engines[preferred]
 
-        if len(self._engines) == 1:
-            return list(self._engines.values())[0]
+        if "default" in self._engines:
+            return self._engines["default"]
+
+        if self._engines:
+            return next(iter(self._engines.values()))
 
         raise RuntimeError("No datasource engine found for requested datasource.")

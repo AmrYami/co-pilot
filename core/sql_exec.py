@@ -11,8 +11,6 @@ from typing import Any, Dict, List, Optional, Tuple
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
-from core.settings import Settings
-
 SAFE_SQL_RE = re.compile(r"(?is)^\s*(with|select)\b")
 
 _ENGINES: Dict[str, Engine] = {}
@@ -69,10 +67,14 @@ def get_app_engine(settings, namespace: str) -> Engine:
     return eng
 
 
-def init_mem_engine(settings: Settings) -> "Engine":
+def init_mem_engine(settings: Any) -> "Engine":
     """Create (or reuse) the global mem engine from settings/env."""
     global _MEM_ENGINE, _MEM_URL
-    url = settings.get("MEMORY_DB_URL", scope="global") or os.getenv("MEMORY_DB_URL")
+    url = None
+    if settings is not None and hasattr(settings, "get"):
+        url = settings.get("MEMORY_DB_URL", scope="global")
+    if not url:
+        url = os.getenv("MEMORY_DB_URL")
     if not url:
         raise RuntimeError("MEMORY_DB_URL not set in settings or environment")
 
@@ -87,13 +89,13 @@ def init_mem_engine(settings: Settings) -> "Engine":
         return _MEM_ENGINE
 
 
-def get_mem_engine(settings: Settings | None = None) -> "Engine":
-    """Return global engine; lazily initialize from provided settings or a default Settings()."""
+def get_mem_engine(settings: Any) -> "Engine":
+    """Return the global memory engine, initialising it with provided settings when needed."""
     global _MEM_ENGINE
     if _MEM_ENGINE is not None:
         return _MEM_ENGINE
     if settings is None:
-        settings = Settings()
+        raise RuntimeError("Settings must be provided to initialise the memory engine")
     return init_mem_engine(settings)
 
 def validate_select(sql: str) -> Tuple[bool, str]:
