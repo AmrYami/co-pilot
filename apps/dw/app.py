@@ -53,6 +53,7 @@ def _fallback_rule_answer(question: str) -> Dict[str, Any] | None:
 
     response: Dict[str, Any] = {
         "ok": True,
+        "status": "ok",
         "sql": result.sql,
         "rows": result.rows,
         "meta": {
@@ -443,22 +444,20 @@ def answer():
     if not question:
         return jsonify({"ok": False, "error": "Question text is required."}), 400
 
-    prefixes = payload.get("prefixes") or []
+    prefixes = list(payload.get("prefixes") or [])
     auth_email = payload.get("auth_email")
+    datasource = payload.get("datasource") or "docuware"
 
     pipeline = _PIPELINE_HANDLE or current_app.config.get("pipeline")
     if pipeline is None:
         return jsonify({"ok": False, "error": "Pipeline not initialized"}), 500
 
     try:
-        result = pipeline.answer(
-            question=question,
+        result = pipeline.answer_dw(
+            question,
             prefixes=prefixes,
             auth_email=auth_email,
-            namespace=NAMESPACE,
-            datasource="docuware",
-            dialect="oracle",
-            app_tag="dw",
+            datasource=datasource,
         )
     except Exception as exc:
         fallback = _fallback_rule_answer(question)

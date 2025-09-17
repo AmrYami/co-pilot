@@ -26,12 +26,7 @@ def create_app():
 
     @app.get("/model/info")
     def model_info():
-        llm_meta = pipeline.llm.meta if getattr(pipeline, "llm", None) else {}
-        return {
-            "llm": llm_meta.get("model_name") or llm_meta.get("path") or "unknown",
-            "clarifier": "disabled",
-            "mode": "dw-pipeline",
-        }
+        return pipeline.model_info()
 
     @app.get("/__routes")
     def list_routes():
