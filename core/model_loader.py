@@ -157,6 +157,72 @@ class ModelHandle:
         )
 
 
+def load_llm(settings: Any | None = None) -> ModelHandle:
+    """Load the primary SQL generation model using environment variables only."""
+
+    shim = _SettingsShim(None)
+
+    _setup_gpu_devices(shim)
+    _check_cuda_compatibility()
+
+    backend = (os.getenv("MODEL_BACKEND", "exllama") or "exllama").strip().lower()
+    model_path = os.getenv("MODEL_PATH")
+    if not model_path:
+        raise ValueError("MODEL_PATH is required")
+    if not os.path.exists(model_path):
+        raise ValueError(f"MODEL_PATH does not exist: {model_path}")
+
+    max_seq_len = int(os.getenv("MODEL_MAX_SEQ_LEN", "4096") or 4096)
+    gen_defaults = {
+        "max_new_tokens": int(os.getenv("GENERATION_MAX_NEW_TOKENS", "256") or 256),
+        "temperature": float(os.getenv("GENERATION_TEMPERATURE", "0.2") or 0.2),
+        "top_p": float(os.getenv("GENERATION_TOP_P", "0.9") or 0.9),
+        "stop": _parse_stop(os.getenv("STOP")),
+    }
+
+    exl_force_base = os.getenv("EXL2_FORCE_BASE", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "y",
+    }
+    exl_cache_len = int(os.getenv("EXL2_CACHE_MAX_SEQ_LEN", str(max_seq_len)) or max_seq_len)
+    llm_gpu_vis = os.getenv("CUDA_VISIBLE_DEVICES") or os.getenv("LLM_GPU") or ""
+    gpu_split_env = (os.getenv("GPU_SPLIT") or "").strip()
+    reserve_gb_key = (os.getenv("RESERVE_VRAM_GB") or "").strip()
+
+    key = (
+        backend,
+        os.path.abspath(model_path),
+        max_seq_len,
+        exl_force_base,
+        exl_cache_len,
+        llm_gpu_vis,
+        gpu_split_env,
+        reserve_gb_key,
+    )
+
+    with _MODEL_LOCK:
+        mh = _MODEL_CACHE.get(key)
+        if mh is not None:
+            return mh
+
+        print(f"Loading model: {model_path}")
+        print(f"Backend: {backend}")
+        print(f"Max sequence length: {max_seq_len}")
+
+        if backend == "exllama":
+            mh = _load_exllama(model_path, max_seq_len, gen_defaults, shim)
+        elif backend in {"hf-fp16", "hf-8bit", "hf-4bit"}:
+            device_map = os.getenv("DEVICE_MAP", "auto")
+            mh = _load_hf(model_path, backend, max_seq_len, gen_defaults, shim, device_map=device_map)
+        else:
+            raise ValueError(f"Unsupported MODEL_BACKEND: {backend}")
+
+        _MODEL_CACHE[key] = mh
+        return mh
+
+
 def load_llm_from_settings(settings: Any | None = None):
     """Load the primary SQL generation model and return (handle, info)."""
 

@@ -1,7 +1,8 @@
 from flask import Flask
 
+from apps.common.admin import admin_bp as admin_common_bp
 from apps.dw.app import create_dw_blueprint
-from core.admin_api import admin_bp
+from core.admin_api import admin_bp as core_admin_bp
 from core.pipeline import Pipeline
 from core.settings import Settings
 
@@ -18,7 +19,8 @@ def create_app():
     dw_bp = create_dw_blueprint(settings=settings, pipeline=pipeline)
 
     app.register_blueprint(dw_bp, url_prefix="/dw")
-    app.register_blueprint(admin_bp, url_prefix="/admin")
+    app.register_blueprint(core_admin_bp, url_prefix="/admin")
+    app.register_blueprint(admin_common_bp)
 
     @app.get("/health")
     def health():
