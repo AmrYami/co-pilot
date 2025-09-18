@@ -12,7 +12,7 @@ from core.datasources import DatasourceRegistry
 from core.settings import Settings
 from core.sql_exec import get_mem_engine
 
-from .llm import nl_to_sql_with_llm
+from .llm import get_llm, nl_to_sql_with_llm
 from .patterns import (
     is_department_rank,
     is_expiry_window,
@@ -34,6 +34,40 @@ if TYPE_CHECKING:  # pragma: no cover
 
 NAMESPACE = "dw::common"
 dw_bp = Blueprint("dw", __name__)
+
+
+_LLM_META: Dict[str, Any] | None = None
+
+
+@dw_bp.route("/model/info", methods=["GET"])
+def model_info():
+    global _LLM_META
+    try:
+        _, meta = get_llm()
+        _LLM_META = meta
+        return jsonify(
+            {
+                "clarifier": "disabled",
+                "llm": {
+                    "backend": meta.get("backend"),
+                    "path": meta.get("path"),
+                    "max_seq_len": meta.get("max_seq_len"),
+                },
+                "mode": "dw-pipeline",
+            }
+        )
+    except Exception as exc:  # pragma: no cover - best effort reporting
+        return (
+            jsonify(
+                {
+                    "clarifier": "disabled",
+                    "llm": "unavailable",
+                    "error": str(exc),
+                    "mode": "dw-pipeline",
+                }
+            ),
+            500,
+        )
 
 
 def create_dw_blueprint(settings: Settings | None = None, pipeline: "Pipeline | None" = None) -> Blueprint:
@@ -596,12 +630,13 @@ def teach():
 def answer():
     payload = request.get_json(force=True) or {}
     question = (payload.get("question") or "").strip()
+    raw_sql = (payload.get("sql") or "").strip()
     prefixes = list(payload.get("prefixes") or [])
     auth_email = payload.get("auth_email")
     datasource = payload.get("datasource")
 
-    if not question:
-        return jsonify({"ok": False, "error": "question is required"}), 400
+    if not question and not raw_sql:
+        return jsonify({"ok": False, "error": "question or sql is required"}), 400
 
     settings = Settings()
     ds_registry = DatasourceRegistry(settings, namespace=NAMESPACE)
@@ -611,6 +646,16 @@ def answer():
         return jsonify({"ok": False, "error": f"no datasource engine: {exc}"}), 500
 
     mem = get_mem_engine(settings)
+
+    if raw_sql:
+        sql = raw_sql
+        try:
+            with engine.connect() as conn:
+                rows = conn.execute(text(sql)).fetchall()
+                data = [dict(row._mapping) for row in rows]
+        except Exception as exc:
+            return jsonify({"ok": False, "error": str(exc), "status": "raw_sql_error"}), 400
+        return jsonify({"ok": True, "rows": data, "sql": sql})
 
     if _is_raw_sql(question):
         sql = question

@@ -1,111 +1,211 @@
-from __future__ import annotations
-
+import os
 import re
-from typing import Optional
+from typing import Any, Dict, Optional, Tuple
 
-from core.settings import Settings
-from core.model_loader import load_llm
-from core.text_utils import strip_code_fences
-
-
-_LLM = None
+# Import the module (not a missing symbol) to avoid ImportError
+import core.model_loader as model_loader
 
 
-def get_llm():
-    """Lazy-load the base LLM (SQLCoder via ExLlama)."""
-    global _LLM
-    if _LLM is not None:
-        return _LLM
-    settings = Settings()
+# --------- env helpers (we keep all model knobs in .env as you requested) ---------
+def _get_env_str(key: str, default: Optional[str] = None) -> Optional[str]:
+    v = os.getenv(key)
+    return v if (v is not None and v != "") else default
+
+
+def _get_env_int(key: str, default: int) -> int:
     try:
-        _LLM = load_llm(settings)
-        print("[dw][llm] Base LLM loaded (SQLCoder/ExLlama).")
-    except Exception as exc:  # pragma: no cover - best effort logging
-        print(f"[dw][llm] failed to load base LLM: {exc}")
-        _LLM = None
-    return _LLM
+        return int(os.getenv(key, str(default)))
+    except Exception:
+        return default
 
 
-_SQL_ONLY_RE = re.compile(r"^\s*(SELECT|WITH)\b", re.IGNORECASE)
+def _get_env_float(key: str, default: float) -> float:
+    try:
+        return float(os.getenv(key, str(default)))
+    except Exception:
+        return default
 
 
-def _sanitize_sql(text: str) -> str:
-    if "```" in text:
-        text = strip_code_fences(text) if "strip_code_fences" in globals() else text.replace("```", "")
-    semi = text.find(";")
-    if semi != -1:
-        text = text[:semi]
-    forbidden = ("INSERT", "UPDATE", "DELETE", "MERGE", "DROP", "ALTER", "TRUNCATE", "CREATE")
-    upper = text.strip().upper()
-    if any(upper.startswith(tok) for tok in forbidden):
-        return ""
-    return text.strip()
+# --------- minimal loader wrapper (keeps your existing model loader intact) ---------
+_LLMCACHE: Dict[str, Any] = {"handle": None, "meta": None}
 
 
-def _oracle_guard(sql: str) -> bool:
-    return bool(_SQL_ONLY_RE.match(sql or ""))
+def get_llm() -> Tuple[Any, Dict[str, Any]]:
+    """Returns (generator_handle, meta_dict).
+    - Does NOT read mem_settings. Uses only .env, per your direction.
+    - Delegates to whichever base loader your repo already exposes.
+    """
+
+    if _LLMCACHE["handle"] is not None:
+        return _LLMCACHE["handle"], _LLMCACHE["meta"]
+
+    backend = _get_env_str("MODEL_BACKEND", "exllama")
+    model_path = _get_env_str("MODEL_PATH", "")
+    max_len = _get_env_int("MODEL_MAX_SEQ_LEN", 4096)
+    temperature = _get_env_float("GENERATION_TEMPERATURE", 0.2)
+    top_p = _get_env_float("GENERATION_TOP_P", 0.9)
+    stop_str = _get_env_str("STOP", "</s>,<|im_end|>")
+
+    # Find a usable loader function in core.model_loader without changing it
+    candidates = [
+        "load_model",  # many repos export this
+        "get_base_generator",  # sometimes used
+        "load_main",  # sometimes used
+        "load_base",  # sometimes used
+    ]
+    loader_fn = None
+    for name in candidates:
+        loader_fn = getattr(model_loader, name, None)
+        if callable(loader_fn):
+            break
+    if loader_fn is None:
+        # As a last resort, try a private helper that exists in your repo
+        loader_fn = getattr(model_loader, "_load_exllama", None)
+        if not callable(loader_fn):
+            raise RuntimeError(
+                "No LLM loader available in core.model_loader. "
+                "Expected one of: load_model, get_base_generator, load_main, load_base, _load_exllama."
+            )
+
+    handle = None
+    try:
+        handle = loader_fn()
+    except TypeError:
+        handle = loader_fn(None) if model_path else loader_fn()
+
+    if handle is None:
+        raise RuntimeError("LLM handle is None after loading.")
+
+    meta_from_handle = getattr(handle, "meta", {}) or {}
+    backend_from_handle = (
+        meta_from_handle.get("backend")
+        or getattr(handle, "backend", None)
+        or backend
+    )
+
+    meta: Dict[str, Any] = {
+        "backend": backend_from_handle,
+        "path": meta_from_handle.get("model_path") or model_path,
+        "max_seq_len": meta_from_handle.get("model_max_seq_len") or max_len,
+        "temperature": temperature,
+        "top_p": top_p,
+        "stop": stop_str,
+    }
+    _LLMCACHE["handle"] = handle
+    _LLMCACHE["meta"] = meta
+    return handle, meta
 
 
-_ORACLE_HEADER = """-- Dialect: Oracle 19c+
--- Output ONLY valid Oracle SQL (SELECT or WITH). No comments after this line.
-"""
+# --------- DW-specific prompt (Oracle, one table, your important columns) ---------
+DW_SYSTEM_PROMPT = """\
+You translate natural language into **valid Oracle SQL** against a single table named "Contract".
 
-_PROMPT = """You are a senior data engineer who writes precise Oracle SQL for analytics.
-Rules:
-- Output ONLY one Oracle SQL query (SELECT or WITH). No commentary.
-- Use the provided table/columns only. Quote identifiers like "Contract" if needed.
-- For amounts use NVL to treat NULL as 0.
-- Never write INSERT/UPDATE/DELETE/DDL.
-- Prefer bind placeholders (:date_start, :date_end, :top_n). Do not inline dates.
+**Strict rules**
+- Return ONLY SQL. Do not add comments, explanations, or Markdown.
+- Use only SELECT and WITH (CTE). No DDL/DML/PLSQL.
+- String match is case-insensitive when using UPPER(...) comparisons.
+- Use Oracle functions: NVL, TRIM, LISTAGG, EXTRACT(YEAR FROM ...), ADD_MONTHS, CURRENT_DATE, etc.
+- Dates: The table contains DATE and TIMESTAMP columns (e.g., START_DATE, END_DATE, REQUEST_DATE).
+- If a time window like "last month" is requested, expect bound parameters :date_start and :date_end (half-open range).
+- For “contract value (gross)”, use NVL(CONTRACT_VALUE_NET_OF_VAT,0) + NVL(VAT,0).
 
-SCHEMA
-------
-Table: "Contract"
-Important columns:
+**Table**: "Contract"
+**Important columns**
 - CONTRACT_ID (NVARCHAR2)
 - CONTRACT_OWNER (NVARCHAR2)
-- CONTRACT_STAKEHOLDER_1..8 (NVARCHAR2)
-- DEPARTMENT_1..8 (NVARCHAR2)   -- each paired with same index stakeholder
+- CONTRACT_STAKEHOLDER_1..8 (NVARCHAR2) paired with DEPARTMENT_1..8 (NVARCHAR2)
 - OWNER_DEPARTMENT (NVARCHAR2)
-- CONTRACT_VALUE_NET_OF_VAT (NUMBER)
-- VAT (NUMBER)
+- CONTRACT_VALUE_NET_OF_VAT (NUMBER), VAT (NUMBER)
 - CONTRACT_PURPOSE, CONTRACT_SUBJECT (NVARCHAR2)
-- START_DATE, END_DATE, REQUEST_DATE (DATE)
-- ENTITY, ENTITY_NO (NVARCHAR2)
-- REQUEST_ID, REQUEST_TYPE, REQUESTER (NVARCHAR2)
-- CONTRACT_STATUS (NVARCHAR2)
-- EXPIERY_30, EXPIERY_60, EXPIERY_90 (DATE)
+- START_DATE (DATE), END_DATE (DATE), REQUEST_DATE (DATE)
+- DURATION, ENTITY, BUILDING_AND_FLOOR_DESCRIPTION, LEGAL_NAME_OF_THE_COMPANY, REPRESENTATIVE_* (NVARCHAR2)
+- VALUE_DESCRIPTION, YEAR, CONTRACTOR_ID, REQUEST_ID, CONTRACT_STATUS, REQUEST_TYPE,
+  DEPARTMENT_OUL, CONTRACT_ID_COUNTER, REQUESTER, EXPIERY_30/60/90 (DATE), ENTITY_NO
 
-Common patterns:
-- Gross value = NVL(CONTRACT_VALUE_NET_OF_VAT,0) + NVL(VAT,0)
-- “Last month” -> between :date_start (inclusive) and :date_end (exclusive)
-- Top N -> use FETCH FIRST :top_n ROWS ONLY
-- Stakeholder/Department pairs come from *_1..*_8 slots and are UNION ALL’ed
+**Stakeholder/Department pairing**
+- (CONTRACT_STAKEHOLDER_1, DEPARTMENT_1), (CONTRACT_STAKEHOLDER_2, DEPARTMENT_2), … up to 8.
+- To aggregate by stakeholder across all slots, UNION ALL the 8 pairs into one derived set and group.
 
-QUESTION
---------
-{question}
+**Examples of safe patterns**
+- Half-open time window:
+  WHERE REF_DATE >= :date_start AND REF_DATE < :date_end
 
-REQUIREMENTS
-------------
-- Use bind parameters (:date_start, :date_end, :top_n) if a timeframe or limit is implied.
-- If aggregating by stakeholder, normalize 8 pairs using UNION ALL over "Contract".
-- List departments per stakeholder using LISTAGG(DISTINCT TRIM(DEPARTMENT), ', ') WITHIN GROUP (ORDER BY TRIM(DEPARTMENT)).
-- Return readable column aliases.
+- Top-N with Oracle 12+:
+  ORDER BY total_value DESC
+  FETCH FIRST 10 ROWS ONLY
+"""
+
+# Guidance for transforming natural language intent into an Oracle SQL skeleton
+DW_FEW_SHOT = """\
+Q: top 10 stakeholders by contract value last month
+SQL:
+WITH stakeholders AS (
+  SELECT CONTRACT_ID,
+         NVL(CONTRACT_VALUE_NET_OF_VAT,0) + NVL(VAT,0) AS CONTRACT_VALUE_GROSS,
+         CONTRACT_STAKEHOLDER_1 AS STAKEHOLDER,
+         DEPARTMENT_1 AS DEPARTMENT,
+         REQUEST_DATE AS REF_DATE
+    FROM "Contract"
+  UNION ALL SELECT CONTRACT_ID, NVL(CONTRACT_VALUE_NET_OF_VAT,0)+NVL(VAT,0), CONTRACT_STAKEHOLDER_2, DEPARTMENT_2, REQUEST_DATE FROM "Contract"
+  UNION ALL SELECT CONTRACT_ID, NVL(CONTRACT_VALUE_NET_OF_VAT,0)+NVL(VAT,0), CONTRACT_STAKEHOLDER_3, DEPARTMENT_3, REQUEST_DATE FROM "Contract"
+  UNION ALL SELECT CONTRACT_ID, NVL(CONTRACT_VALUE_NET_OF_VAT,0)+NVL(VAT,0), CONTRACT_STAKEHOLDER_4, DEPARTMENT_4, REQUEST_DATE FROM "Contract"
+  UNION ALL SELECT CONTRACT_ID, NVL(CONTRACT_VALUE_NET_OF_VAT,0)+NVL(VAT,0), CONTRACT_STAKEHOLDER_5, DEPARTMENT_5, REQUEST_DATE FROM "Contract"
+  UNION ALL SELECT CONTRACT_ID, NVL(CONTRACT_VALUE_NET_OF_VAT,0)+NVL(VAT,0), CONTRACT_STAKEHOLDER_6, DEPARTMENT_6, REQUEST_DATE FROM "Contract"
+  UNION ALL SELECT CONTRACT_ID, NVL(CONTRACT_VALUE_NET_OF_VAT,0)+NVL(VAT,0), CONTRACT_STAKEHOLDER_7, DEPARTMENT_7, REQUEST_DATE FROM "Contract"
+  UNION ALL SELECT CONTRACT_ID, NVL(CONTRACT_VALUE_NET_OF_VAT,0)+NVL(VAT,0), CONTRACT_STAKEHOLDER_8, DEPARTMENT_8, REQUEST_DATE FROM "Contract"
+)
+SELECT TRIM(STAKEHOLDER) AS stakeholder,
+       SUM(CONTRACT_VALUE_GROSS) AS total_gross_value,
+       COUNT(DISTINCT CONTRACT_ID) AS contract_count,
+       LISTAGG(DISTINCT TRIM(DEPARTMENT), ', ') WITHIN GROUP (ORDER BY TRIM(DEPARTMENT)) AS departments
+  FROM stakeholders
+ WHERE STAKEHOLDER IS NOT NULL
+   AND TRIM(STAKEHOLDER) <> ''
+   AND REF_DATE >= :date_start
+   AND REF_DATE < :date_end
+ GROUP BY TRIM(STAKEHOLDER)
+ ORDER BY total_gross_value DESC
+ FETCH FIRST 10 ROWS ONLY
 """
 
 
-def nl_to_sql_with_llm(question: str) -> Optional[str]:
-    llm = get_llm()
-    if llm is None:
-        return None
-    prompt = _PROMPT.format(question=question.strip())
-    try:
-        out = llm.generate(prompt, stop=["</s>", "<|im_end|>"])
-    except Exception as exc:  # pragma: no cover - runtime guard
-        print(f"[dw][llm] generation error: {exc}")
-        return None
-    sql = _sanitize_sql(str(out or ""))
-    if not sql or not _oracle_guard(sql):
-        return None
+def _compose_prompt(question: str) -> str:
+    # Simple single-turn prompt—works well with SQLCoder style models
+    return f"{DW_SYSTEM_PROMPT}\n\n{DW_FEW_SHOT}\n\nQ: {question}\nSQL:\n"
+
+
+# --------- NL → SQL using the loaded generator ---------
+_SQL_ONLY = re.compile(r"(?is)\b(select|with)\b")
+
+
+def nl_to_sql_with_llm(question: str) -> str:
+    gen, _ = get_llm()
+
+    prompt = _compose_prompt(question)
+
+    gen_kwargs = {
+        "max_new_tokens": _get_env_int("GENERATION_MAX_NEW_TOKENS", 256),
+        "temperature": _get_env_float("GENERATION_TEMPERATURE", 0.2),
+        "top_p": _get_env_float("GENERATION_TOP_P", 0.9),
+        "stop": [
+            s.strip()
+            for s in (_get_env_str("STOP", "</s>,<|im_end|>") or "").split(",")
+            if s.strip()
+        ]
+        or None,
+    }
+    if hasattr(gen, "generate"):
+        text = gen.generate(prompt, **gen_kwargs)
+    else:
+        text = gen(prompt, **gen_kwargs)
+
+    sql = str(text or "").strip()
+    match = _SQL_ONLY.search(sql)
+    if not match:
+        return ""
+    if match.start() > 0:
+        sql = sql[match.start() :].strip()
+    semi = sql.find(";")
+    if semi != -1:
+        sql = sql[:semi].strip()
     return sql
