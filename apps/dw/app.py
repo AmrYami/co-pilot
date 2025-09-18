@@ -1,32 +1,20 @@
 from __future__ import annotations
 
+import csv
+import io
 import json
-import re
-from datetime import datetime, timedelta, timezone
+import os
+from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 from flask import Blueprint, jsonify, request
-from sqlalchemy import inspect, text
+from sqlalchemy import create_engine, inspect, text
 
 from core.datasources import DatasourceRegistry
 from core.settings import Settings
 from core.sql_exec import get_mem_engine
 
-from .llm import nl_to_sql_with_llm
-from .patterns import (
-    is_department_rank,
-    is_expiry_window,
-    is_stakeholder_rank,
-    is_status_breakdown,
-    parse_timeframe,
-    parse_topn,
-)
-from .sql_kit import (
-    DEPARTMENT_TOP_SQL,
-    EXPIRY_IN_NEXT_N_SQL,
-    STAKEHOLDER_TOP_SQL,
-    STATUS_BREAKDOWN_SQL,
-)
+from .llm import DWLLM
 
 if TYPE_CHECKING:  # pragma: no cover
     from core.pipeline import Pipeline
@@ -44,7 +32,8 @@ def model_info():
         "mode": "dw-pipeline",
     }
     try:  # pragma: no cover - health check
-        nl_to_sql_with_llm("ping", max_new_tokens=8)
+        settings = Settings(namespace=NAMESPACE)
+        DWLLM(settings).nl_to_sql("ping")
         info["llm"] = "available"
     except Exception:
         info["llm"] = "unavailable"
@@ -61,50 +50,103 @@ def create_dw_blueprint(settings: Settings | None = None, pipeline: "Pipeline | 
     return dw_bp
 
 
-def _is_raw_sql(q: str) -> bool:
-    return bool(re.match(r"^\s*(SELECT|WITH)\b", q or "", re.I))
+def _pg(conn_str: str):
+    return create_engine(conn_str, pool_pre_ping=True, future=True)
 
 
-def _to_naive(dt: datetime):
-    if dt.tzinfo is not None:
-        return dt.astimezone(timezone.utc).replace(tzinfo=None)
-    return dt
+def _calc_window(question: str) -> Tuple[date, date, int]:
+    now = date.today()
+    q = question.lower()
+    top_n = 10
+    if "top " in q:
+        try:
+            toks = q.split()
+            idx = toks.index("top")
+            top_n = int(toks[idx + 1])
+        except Exception:
+            pass
+    if "last month" in q:
+        first_this = now.replace(day=1)
+        last_month_end = first_this
+        last_month_start = (first_this - timedelta(days=1)).replace(day=1)
+        return last_month_start, last_month_end, top_n
+    if "last 90 days" in q:
+        return now - timedelta(days=90), now + timedelta(days=1), top_n
+    if "next 30 days" in q or "in the next 30 days" in q:
+        return now, now + timedelta(days=30), top_n
+    return now - timedelta(days=30), now + timedelta(days=1), top_n
 
 
-def json_dumps(obj):
-    import json as _json
-
-    return _json.dumps(obj, ensure_ascii=False)
-
-
-def _build_heuristic_sql(
+def _insert_inquiry(
+    mem,
+    namespace: str,
     question: str,
-    now: datetime,
-    base_params: Dict[str, Any],
-    *,
-    next_n_days: Optional[int],
-) -> Tuple[Optional[str], Dict[str, Any], Optional[str]]:
-    params = dict(base_params)
-    sql: Optional[str] = None
-    rationale: Optional[str] = None
+    email: Optional[str],
+    prefixes: List[str],
+    status: str,
+) -> int:
+    with mem.begin() as con:
+        result = con.execute(
+            text(
+                """
+                INSERT INTO mem_inquiries(namespace, question, auth_email, prefixes, status, created_at, updated_at)
+                VALUES (:ns, :q, :email, CAST(:pfx AS jsonb), :status, NOW(), NOW())
+                RETURNING id
+                """
+            ),
+            {
+                "ns": namespace,
+                "q": question,
+                "email": email,
+                "pfx": json.dumps(prefixes),
+                "status": status,
+            },
+        )
+        return int(result.scalar_one())
 
-    if is_stakeholder_rank(question):
-        sql = STAKEHOLDER_TOP_SQL
-        rationale = "Used heuristic stakeholder ranking query."
-    elif is_department_rank(question):
-        sql = DEPARTMENT_TOP_SQL
-        rationale = "Used heuristic department ranking query."
-    elif is_expiry_window(question):
-        if next_n_days and not params.get("date_end"):
-            params["date_start"] = _to_naive(now)
-            params["date_end"] = _to_naive(now + timedelta(days=next_n_days))
-        sql = EXPIRY_IN_NEXT_N_SQL
-        rationale = "Used heuristic expiry window query."
-    elif is_status_breakdown(question):
-        sql = STATUS_BREAKDOWN_SQL
-        rationale = "Used heuristic status breakdown query."
 
-    return sql, params, rationale
+def _insert_run(
+    mem,
+    namespace: str,
+    user_id: str,
+    input_query: str,
+    sql: str,
+    status: str,
+    rows: int,
+    sample: Optional[List[Dict[str, Any]]],
+) -> int:
+    with mem.begin() as con:
+        result = con.execute(
+            text(
+                """
+                INSERT INTO mem_runs(namespace, user_id, input_query, sql_generated, sql_final, status, rows_returned, result_sample, created_at)
+                VALUES (:ns, :uid, :iq, :sg, :sf, :st, :rows, CAST(:sample AS jsonb), NOW())
+                RETURNING id
+                """
+            ),
+            {
+                "ns": namespace,
+                "uid": user_id,
+                "iq": input_query,
+                "sg": sql,
+                "sf": sql,
+                "st": status,
+                "rows": rows,
+                "sample": json.dumps(sample or []),
+            },
+        )
+        return int(result.scalar_one())
+
+
+def _csv_bytes(rows: List[Dict[str, Any]]) -> bytes:
+    if not rows:
+        return b""
+    buffer = io.StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=list(rows[0].keys()))
+    writer.writeheader()
+    for row in rows:
+        writer.writerow({key: ("" if value is None else value) for key, value in row.items()})
+    return buffer.getvalue().encode("utf-8")
 
 
 def _learn_snippet(conn, question: str, sql: str, tags):
@@ -120,7 +162,7 @@ def _learn_snippet(conn, question: str, sql: str, tags):
             "title": question[:200],
             "desc": "Auto-learned from successful DW answer",
             "sql": sql,
-            "tags": json_dumps(tags),
+            "tags": json.dumps(tags, ensure_ascii=False),
         },
     )
 
@@ -639,222 +681,125 @@ def teach():
 
 @dw_bp.route("/answer", methods=["POST"])
 def answer():
-    payload = request.get_json(force=True) or {}
-    question = (payload.get("question") or "").strip()
-    raw_sql = (payload.get("sql") or "").strip()
-    prefixes = list(payload.get("prefixes") or [])
-    auth_email = payload.get("auth_email")
-    datasource = payload.get("datasource")
+    data = request.get_json(force=True) or {}
+    question = (data.get("question") or "").strip()
+    prefixes = list(data.get("prefixes") or [])
+    auth_email = data.get("auth_email") or None
+    datasource = data.get("datasource")
 
-    if not question and not raw_sql:
-        return jsonify({"ok": False, "error": "question or sql is required"}), 400
+    if not question:
+        return jsonify({"ok": False, "error": "question is required"}), 400
 
-    settings = Settings()
+    settings = Settings(namespace=NAMESPACE)
     ds_registry = DatasourceRegistry(settings, namespace=NAMESPACE)
     try:
-        engine = ds_registry.engine(datasource)
+        oracle = ds_registry.engine(datasource)
     except Exception as exc:
         return jsonify({"ok": False, "error": f"no datasource engine: {exc}"}), 500
 
-    mem = get_mem_engine(settings)
+    mem = _pg(settings.get("MEMORY_DB_URL", scope="global"))
 
-    if raw_sql:
-        sql = raw_sql
-        try:
-            with engine.connect() as conn:
-                rows = conn.execute(text(sql)).fetchall()
-                data = [dict(row._mapping) for row in rows]
-        except Exception as exc:
-            return jsonify({"ok": False, "error": str(exc), "status": "raw_sql_error"}), 400
-        return jsonify({"ok": True, "rows": data, "sql": sql})
-
-    if _is_raw_sql(question):
-        sql = question
-        try:
-            with engine.connect() as conn:
-                rows = conn.execute(text(sql)).fetchall()
-                data = [dict(row._mapping) for row in rows]
-        except Exception as exc:
-            return jsonify({"ok": False, "error": str(exc), "status": "raw_sql_error"}), 400
-        return jsonify({"ok": True, "rows": data, "sql": sql})
-
-    now = datetime.now(timezone.utc)
-    date_start, date_end, last_n_days, next_n_days = parse_timeframe(question, now)
-    top_n = parse_topn(question, default=10)
-
-    base_params: Dict[str, Any] = {
-        "date_start": _to_naive(date_start) if date_start else None,
-        "date_end": _to_naive(date_end) if date_end else None,
+    start, end, top_n = _calc_window(question)
+    binds = {
+        "date_start": datetime.combine(start, datetime.min.time()),
+        "date_end": datetime.combine(end, datetime.min.time()),
         "top_n": top_n,
     }
 
-    heuristic_sql, heuristic_params, heuristic_rationale = _build_heuristic_sql(
-        question,
-        now,
-        base_params,
-        next_n_days=next_n_days,
-    )
-
-    llm_sql: Optional[str] = None
-    rationale: Optional[str] = None
+    llm = DWLLM(settings)
     try:
-        llm_sql, rationale = nl_to_sql_with_llm(question)
+        sql = llm.nl_to_sql(question)
     except Exception as exc:
-        rationale = f"LLM fallback: {exc}"
-        llm_sql = None
-
-    def execute_sql(sql_text: str, param_source: Dict[str, Any]) -> List[Dict[str, Any]]:
-        stmt = text(sql_text)
-        bind_keys = set(stmt._bindparams.keys())
-        exec_params = {key: param_source.get(key) for key in bind_keys if key in param_source}
-        with engine.connect() as conn:
-            if exec_params:
-                rows = conn.execute(stmt, exec_params).fetchall()
-            else:
-                rows = conn.execute(stmt).fetchall()
-        return [dict(row._mapping) for row in rows]
-
-    final_sql: Optional[str] = None
-    final_rows: Optional[List[Dict[str, Any]]] = None
-    final_params = base_params
-    final_used_llm = False
-    final_rationale = rationale
-    llm_execution_note: Optional[str] = None
-
-    if llm_sql:
-        if not _is_raw_sql(llm_sql):
-            llm_execution_note = "Only SELECT/CTE queries are allowed"
-        else:
-            try:
-                llm_rows = execute_sql(llm_sql, base_params)
-            except Exception as exc:
-                llm_execution_note = str(exc)
-            else:
-                if llm_rows:
-                    final_sql = llm_sql
-                    final_rows = llm_rows
-                    final_used_llm = True
-                else:
-                    llm_execution_note = "No rows returned from LLM SQL."
-    else:
-        llm_execution_note = rationale
-
-    heuristic_error: Optional[str] = None
-    if final_rows is None and heuristic_sql:
-        if not _is_raw_sql(heuristic_sql):
-            heuristic_error = "Only SELECT/CTE queries are allowed"
-        else:
-            try:
-                heuristic_rows = execute_sql(heuristic_sql, heuristic_params)
-            except Exception as exc:
-                heuristic_error = str(exc)
-            else:
-                final_sql = heuristic_sql
-                final_rows = heuristic_rows
-                final_params = heuristic_params
-                final_used_llm = False
-                pieces = [
-                    part
-                    for part in [rationale, llm_execution_note, heuristic_rationale]
-                    if part
-                ]
-                if pieces:
-                    final_rationale = " | ".join(dict.fromkeys(pieces))
-
-    if final_rows is None:
-        if heuristic_sql and heuristic_error:
-            with mem.begin() as conn:
-                conn.execute(
-                    text(
-                        """
-                INSERT INTO mem_inquiries(namespace, question, auth_email, prefixes, status, last_error, created_at, updated_at)
-                VALUES (:ns, :q, :email, :pfx::jsonb, 'awaiting_admin', :err, NOW(), NOW())
-                """
-                    ),
-                    {
-                        "ns": NAMESPACE,
-                        "q": question,
-                        "email": auth_email,
-                        "pfx": json_dumps(prefixes),
-                        "err": heuristic_error,
-                    },
-                )
-            return (
-                jsonify(
-                    {
-                        "ok": False,
-                        "error": "SQL execution failed, escalated for review.",
-                        "details": heuristic_error,
-                    }
-                ),
-                400,
-            )
-
-        with mem.begin() as conn:
-            conn.execute(
-                text(
-                    """
-                INSERT INTO mem_inquiries(namespace, question, auth_email, prefixes, status, created_at, updated_at)
-                VALUES (:ns, :q, :email, :pfx::jsonb, 'needs_clarification', NOW(), NOW())
-                """
-                ),
-                {
-                    "ns": NAMESPACE,
-                    "q": question,
-                    "email": auth_email,
-                    "pfx": json_dumps(prefixes),
-                },
-            )
+        inquiry_id = _insert_inquiry(
+            mem,
+            NAMESPACE,
+            question,
+            auth_email,
+            prefixes,
+            "needs_clarification",
+        )
         return jsonify(
             {
                 "ok": False,
                 "status": "needs_clarification",
                 "questions": [
-                    "I couldn't derive a clean SQL. Can you clarify the tables, filters, or date range?"
+                    "I couldn't derive a clean SQL. Can you clarify the columns or filters?"
                 ],
-                "rationale": final_rationale or llm_execution_note or "<no rationale>",
-                "context": {"namespace": NAMESPACE, "prefixes": prefixes},
+                "error": f"nl_to_sql failed: {exc}",
+                "inquiry_id": inquiry_id,
             }
         )
 
-    if final_rationale is None and final_used_llm:
-        final_rationale = "Generated via SQLCoder with Oracle rules and Contract schema context."
-    elif final_rationale is None:
-        final_rationale = heuristic_rationale or rationale
+    rows: List[Dict[str, Any]] = []
+    try:
+        with oracle.connect() as conn:
+            result = conn.execute(text(sql), binds)
+            columns = result.keys()
+            for record in result.fetchall():
+                rows.append({col: record[idx] for idx, col in enumerate(columns)})
+    except Exception as exc:
+        inquiry_id = _insert_inquiry(
+            mem,
+            NAMESPACE,
+            question,
+            auth_email,
+            prefixes,
+            "needs_clarification",
+        )
+        return jsonify(
+            {
+                "ok": False,
+                "status": "needs_clarification",
+                "error": f"SQL execution error: {exc}",
+                "sql": sql,
+                "inquiry_id": inquiry_id,
+            }
+        )
+
+    run_id = _insert_run(
+        mem,
+        NAMESPACE,
+        auth_email or "dw_user",
+        question,
+        sql,
+        "complete",
+        len(rows),
+        rows[:20],
+    )
 
     meta = {
-        "date_start": final_params.get("date_start").isoformat()
-        if final_params.get("date_start")
-        else None,
-        "date_end": final_params.get("date_end").isoformat()
-        if final_params.get("date_end")
-        else None,
-        "top_n": final_params.get("top_n"),
-        "tags": ["dw"],
-        "used_llm": final_used_llm,
-        "rationale": final_rationale,
+        "date_start": binds["date_start"].isoformat(),
+        "date_end": binds["date_end"].isoformat(),
+        "top_n": top_n,
     }
 
-    if not final_rows:
+    if not rows:
         return jsonify(
             {
                 "ok": True,
                 "rows": [],
-                "sql": final_sql,
+                "sql": sql,
+                "hint": "No results for that window. Try 'last 90 days' or specify START_DATE/END_DATE filters.",
                 "meta": meta,
-                "hint": "No results for last month. Try a wider window (e.g., last 90 days) or specify START_DATE/END_DATE.",
             }
         )
 
+    csv_payload = _csv_bytes(rows)
+    os.makedirs("/tmp/exports", exist_ok=True)
+    csv_path = f"/tmp/exports/dw_run_{run_id}.csv"
+    with open(csv_path, "wb") as handle:
+        handle.write(csv_payload)
+
     with mem.begin() as conn:
-        _learn_snippet(conn, question, final_sql, tags=["dw", "docuware", "contract"])
+        _learn_snippet(conn, question, sql, tags=["dw", "docuware", "contract"])
         _learn_mappings(conn)
 
     return jsonify(
         {
             "ok": True,
-            "rows": final_rows,
-            "sql": final_sql,
+            "rows": rows[:100],
+            "sql": sql,
+            "csv_path": csv_path,
             "meta": meta,
         }
     )
