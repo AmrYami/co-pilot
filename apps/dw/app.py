@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 from flask import Blueprint, jsonify, request
 from sqlalchemy import inspect, text
@@ -36,6 +36,21 @@ NAMESPACE = "dw::common"
 dw_bp = Blueprint("dw", __name__)
 
 
+@dw_bp.route("/model/info", methods=["GET"])
+def model_info():
+    info = {
+        "clarifier": "disabled",
+        "llm": "unknown",
+        "mode": "dw-pipeline",
+    }
+    try:  # pragma: no cover - health check
+        nl_to_sql_with_llm("ping", max_new_tokens=8)
+        info["llm"] = "available"
+    except Exception:
+        info["llm"] = "unavailable"
+    return jsonify(info)
+
+
 def create_dw_blueprint(settings: Settings | None = None, pipeline: "Pipeline | None" = None) -> Blueprint:
     """Return the DocuWare blueprint wired to the provided pipeline/settings."""
     if settings is not None:
@@ -60,6 +75,36 @@ def json_dumps(obj):
     import json as _json
 
     return _json.dumps(obj, ensure_ascii=False)
+
+
+def _build_heuristic_sql(
+    question: str,
+    now: datetime,
+    base_params: Dict[str, Any],
+    *,
+    next_n_days: Optional[int],
+) -> Tuple[Optional[str], Dict[str, Any], Optional[str]]:
+    params = dict(base_params)
+    sql: Optional[str] = None
+    rationale: Optional[str] = None
+
+    if is_stakeholder_rank(question):
+        sql = STAKEHOLDER_TOP_SQL
+        rationale = "Used heuristic stakeholder ranking query."
+    elif is_department_rank(question):
+        sql = DEPARTMENT_TOP_SQL
+        rationale = "Used heuristic department ranking query."
+    elif is_expiry_window(question):
+        if next_n_days and not params.get("date_end"):
+            params["date_start"] = _to_naive(now)
+            params["date_end"] = _to_naive(now + timedelta(days=next_n_days))
+        sql = EXPIRY_IN_NEXT_N_SQL
+        rationale = "Used heuristic expiry window query."
+    elif is_status_breakdown(question):
+        sql = STATUS_BREAKDOWN_SQL
+        rationale = "Used heuristic status breakdown query."
+
+    return sql, params, rationale
 
 
 def _learn_snippet(conn, question: str, sql: str, tags):
@@ -596,12 +641,13 @@ def teach():
 def answer():
     payload = request.get_json(force=True) or {}
     question = (payload.get("question") or "").strip()
+    raw_sql = (payload.get("sql") or "").strip()
     prefixes = list(payload.get("prefixes") or [])
     auth_email = payload.get("auth_email")
     datasource = payload.get("datasource")
 
-    if not question:
-        return jsonify({"ok": False, "error": "question is required"}), 400
+    if not question and not raw_sql:
+        return jsonify({"ok": False, "error": "question or sql is required"}), 400
 
     settings = Settings()
     ds_registry = DatasourceRegistry(settings, namespace=NAMESPACE)
@@ -611,6 +657,16 @@ def answer():
         return jsonify({"ok": False, "error": f"no datasource engine: {exc}"}), 500
 
     mem = get_mem_engine(settings)
+
+    if raw_sql:
+        sql = raw_sql
+        try:
+            with engine.connect() as conn:
+                rows = conn.execute(text(sql)).fetchall()
+                data = [dict(row._mapping) for row in rows]
+        except Exception as exc:
+            return jsonify({"ok": False, "error": str(exc), "status": "raw_sql_error"}), 400
+        return jsonify({"ok": True, "rows": data, "sql": sql})
 
     if _is_raw_sql(question):
         sql = question
@@ -626,29 +682,114 @@ def answer():
     date_start, date_end, last_n_days, next_n_days = parse_timeframe(question, now)
     top_n = parse_topn(question, default=10)
 
-    sql = None
-    params = {
+    base_params: Dict[str, Any] = {
         "date_start": _to_naive(date_start) if date_start else None,
         "date_end": _to_naive(date_end) if date_end else None,
         "top_n": top_n,
     }
 
-    if is_stakeholder_rank(question):
-        sql = STAKEHOLDER_TOP_SQL
-    elif is_department_rank(question):
-        sql = DEPARTMENT_TOP_SQL
-    elif is_expiry_window(question):
-        if next_n_days and not date_end:
-            params["date_start"] = _to_naive(now)
-            params["date_end"] = _to_naive(now + timedelta(days=next_n_days))
-        sql = EXPIRY_IN_NEXT_N_SQL
-    elif is_status_breakdown(question):
-        sql = STATUS_BREAKDOWN_SQL
+    heuristic_sql, heuristic_params, heuristic_rationale = _build_heuristic_sql(
+        question,
+        now,
+        base_params,
+        next_n_days=next_n_days,
+    )
 
-    if sql is None:
-        sql = nl_to_sql_with_llm(question)
+    llm_sql: Optional[str] = None
+    rationale: Optional[str] = None
+    try:
+        llm_sql, rationale = nl_to_sql_with_llm(question)
+    except Exception as exc:
+        rationale = f"LLM fallback: {exc}"
+        llm_sql = None
 
-    if not sql:
+    def execute_sql(sql_text: str, param_source: Dict[str, Any]) -> List[Dict[str, Any]]:
+        stmt = text(sql_text)
+        bind_keys = set(stmt._bindparams.keys())
+        exec_params = {key: param_source.get(key) for key in bind_keys if key in param_source}
+        with engine.connect() as conn:
+            if exec_params:
+                rows = conn.execute(stmt, exec_params).fetchall()
+            else:
+                rows = conn.execute(stmt).fetchall()
+        return [dict(row._mapping) for row in rows]
+
+    final_sql: Optional[str] = None
+    final_rows: Optional[List[Dict[str, Any]]] = None
+    final_params = base_params
+    final_used_llm = False
+    final_rationale = rationale
+    llm_execution_note: Optional[str] = None
+
+    if llm_sql:
+        if not _is_raw_sql(llm_sql):
+            llm_execution_note = "Only SELECT/CTE queries are allowed"
+        else:
+            try:
+                llm_rows = execute_sql(llm_sql, base_params)
+            except Exception as exc:
+                llm_execution_note = str(exc)
+            else:
+                if llm_rows:
+                    final_sql = llm_sql
+                    final_rows = llm_rows
+                    final_used_llm = True
+                else:
+                    llm_execution_note = "No rows returned from LLM SQL."
+    else:
+        llm_execution_note = rationale
+
+    heuristic_error: Optional[str] = None
+    if final_rows is None and heuristic_sql:
+        if not _is_raw_sql(heuristic_sql):
+            heuristic_error = "Only SELECT/CTE queries are allowed"
+        else:
+            try:
+                heuristic_rows = execute_sql(heuristic_sql, heuristic_params)
+            except Exception as exc:
+                heuristic_error = str(exc)
+            else:
+                final_sql = heuristic_sql
+                final_rows = heuristic_rows
+                final_params = heuristic_params
+                final_used_llm = False
+                pieces = [
+                    part
+                    for part in [rationale, llm_execution_note, heuristic_rationale]
+                    if part
+                ]
+                if pieces:
+                    final_rationale = " | ".join(dict.fromkeys(pieces))
+
+    if final_rows is None:
+        if heuristic_sql and heuristic_error:
+            with mem.begin() as conn:
+                conn.execute(
+                    text(
+                        """
+                INSERT INTO mem_inquiries(namespace, question, auth_email, prefixes, status, last_error, created_at, updated_at)
+                VALUES (:ns, :q, :email, :pfx::jsonb, 'awaiting_admin', :err, NOW(), NOW())
+                """
+                    ),
+                    {
+                        "ns": NAMESPACE,
+                        "q": question,
+                        "email": auth_email,
+                        "pfx": json_dumps(prefixes),
+                        "err": heuristic_error,
+                    },
+                )
+            return (
+                jsonify(
+                    {
+                        "ok": False,
+                        "error": "SQL execution failed, escalated for review.",
+                        "details": heuristic_error,
+                    }
+                ),
+                400,
+            )
+
         with mem.begin() as conn:
             conn.execute(
                 text(
@@ -671,71 +812,49 @@ def answer():
                 "questions": [
                     "I couldn't derive a clean SQL. Can you clarify the tables, filters, or date range?"
                 ],
-                "rationale": "<why>",
+                "rationale": final_rationale or llm_execution_note or "<no rationale>",
                 "context": {"namespace": NAMESPACE, "prefixes": prefixes},
             }
         )
 
-    stmt = text(sql)
-    bind_keys = set(stmt._bindparams.keys())
-    exec_params = {key: params[key] for key in bind_keys if key in params}
+    if final_rationale is None and final_used_llm:
+        final_rationale = "Generated via SQLCoder with Oracle rules and Contract schema context."
+    elif final_rationale is None:
+        final_rationale = heuristic_rationale or rationale
 
-    try:
-        with engine.connect() as conn:
-            if exec_params:
-                rows = conn.execute(stmt, exec_params).fetchall()
-            else:
-                rows = conn.execute(stmt).fetchall()
-            data = [dict(row._mapping) for row in rows]
-    except Exception as exc:
-        with mem.begin() as conn:
-            conn.execute(
-                text(
-                    """
-                INSERT INTO mem_inquiries(namespace, question, auth_email, prefixes, status, last_error, created_at, updated_at)
-                VALUES (:ns, :q, :email, :pfx::jsonb, 'awaiting_admin', :err, NOW(), NOW())
-                """
-                ),
-                {
-                    "ns": NAMESPACE,
-                    "q": question,
-                    "email": auth_email,
-                    "pfx": json_dumps(prefixes),
-                    "err": str(exc),
-                },
-            )
-        return jsonify({"ok": False, "error": "SQL execution failed, escalated for review.", "details": str(exc)}), 400
+    meta = {
+        "date_start": final_params.get("date_start").isoformat()
+        if final_params.get("date_start")
+        else None,
+        "date_end": final_params.get("date_end").isoformat()
+        if final_params.get("date_end")
+        else None,
+        "top_n": final_params.get("top_n"),
+        "tags": ["dw"],
+        "used_llm": final_used_llm,
+        "rationale": final_rationale,
+    }
 
-    if not data:
+    if not final_rows:
         return jsonify(
             {
                 "ok": True,
                 "rows": [],
-                "sql": sql,
-                "meta": {
-                    "date_start": params["date_start"].isoformat() if params["date_start"] else None,
-                    "date_end": params["date_end"].isoformat() if params["date_end"] else None,
-                    "top_n": top_n,
-                    "tags": ["dw"],
-                },
+                "sql": final_sql,
+                "meta": meta,
                 "hint": "No results for last month. Try a wider window (e.g., last 90 days) or specify START_DATE/END_DATE.",
             }
         )
 
     with mem.begin() as conn:
-        _learn_snippet(conn, question, sql, tags=["dw", "docuware", "contract"])
+        _learn_snippet(conn, question, final_sql, tags=["dw", "docuware", "contract"])
         _learn_mappings(conn)
 
     return jsonify(
         {
             "ok": True,
-            "rows": data,
-            "sql": sql,
-            "meta": {
-                "date_start": params["date_start"].isoformat() if params["date_start"] else None,
-                "date_end": params["date_end"].isoformat() if params["date_end"] else None,
-                "top_n": top_n,
-                "tags": ["dw"],
-            },
+            "rows": final_rows,
+            "sql": final_sql,
+            "meta": meta,
         }
     )

@@ -1,111 +1,208 @@
 from __future__ import annotations
 
+import os
 import re
-from typing import Optional
-
-from core.settings import Settings
-from core.model_loader import load_llm
-from core.text_utils import strip_code_fences
+import textwrap
+from typing import Any, Dict, Optional, Tuple
 
 
-_LLM = None
-
-
-def get_llm():
-    """Lazy-load the base LLM (SQLCoder via ExLlama)."""
-    global _LLM
-    if _LLM is not None:
-        return _LLM
-    settings = Settings()
+def _load_sql_generator(settings: Optional[Any] = None):
+    """Load the SQL generation model regardless of loader name variations."""
     try:
-        _LLM = load_llm(settings)
-        print("[dw][llm] Base LLM loaded (SQLCoder/ExLlama).")
-    except Exception as exc:  # pragma: no cover - best effort logging
-        print(f"[dw][llm] failed to load base LLM: {exc}")
-        _LLM = None
-    return _LLM
+        import core.model_loader as model_loader
+    except Exception as exc:  # pragma: no cover - critical import
+        raise ImportError(f"Cannot import core.model_loader: {exc}") from exc
+
+    candidates = [
+        "load_llm",
+        "load_primary",
+        "load_base_generator",
+        "load_base",
+        "load_sql_model",
+    ]
+
+    for name in candidates:
+        if hasattr(model_loader, name):
+            loader = getattr(model_loader, name)
+            try:
+                return loader(settings=settings)
+            except TypeError:
+                return loader()
+
+    raise ImportError(
+        "No compatible loader function found in core.model_loader. "
+        "Expected one of: " + ", ".join(candidates)
+    )
 
 
-_SQL_ONLY_RE = re.compile(r"^\s*(SELECT|WITH)\b", re.IGNORECASE)
+def _gen_text(
+    generator: Any,
+    prompt: str,
+    *,
+    stop: Optional[list[str]] = None,
+    max_new_tokens: Optional[int] = None,
+    temperature: Optional[float] = None,
+    top_p: Optional[float] = None,
+) -> str:
+    params: Dict[str, Any] = {}
+    if stop is not None:
+        params["stop"] = stop
+    if max_new_tokens is not None:
+        params["max_new_tokens"] = max_new_tokens
+    if temperature is not None:
+        params["temperature"] = temperature
+    if top_p is not None:
+        params["top_p"] = top_p
+
+    if hasattr(generator, "generate") and callable(generator.generate):
+        return generator.generate(prompt, **params)
+    if callable(generator):
+        return generator(prompt, **params)
+    raise RuntimeError("LLM generator object is not callable and has no .generate().")
 
 
-def _sanitize_sql(text: str) -> str:
-    if "```" in text:
-        text = strip_code_fences(text) if "strip_code_fences" in globals() else text.replace("```", "")
-    semi = text.find(";")
-    if semi != -1:
-        text = text[:semi]
-    forbidden = ("INSERT", "UPDATE", "DELETE", "MERGE", "DROP", "ALTER", "TRUNCATE", "CREATE")
-    upper = text.strip().upper()
-    if any(upper.startswith(tok) for tok in forbidden):
-        return ""
-    return text.strip()
-
-
-def _oracle_guard(sql: str) -> bool:
-    return bool(_SQL_ONLY_RE.match(sql or ""))
-
-
-_ORACLE_HEADER = """-- Dialect: Oracle 19c+
--- Output ONLY valid Oracle SQL (SELECT or WITH). No comments after this line.
-"""
-
-_PROMPT = """You are a senior data engineer who writes precise Oracle SQL for analytics.
+_ORACLE_RULES = """
 Rules:
-- Output ONLY one Oracle SQL query (SELECT or WITH). No commentary.
-- Use the provided table/columns only. Quote identifiers like "Contract" if needed.
-- For amounts use NVL to treat NULL as 0.
-- Never write INSERT/UPDATE/DELETE/DDL.
-- Prefer bind placeholders (:date_start, :date_end, :top_n). Do not inline dates.
+- SQL dialect: Oracle (LISTAGG, NVL, TRUNC, FETCH FIRST ... ROWS ONLY).
+- Output ONLY a single CTE/SELECT statement. No DML/DDL. No comments. No semicolon.
+- Prefer REQUEST_DATE as the default date if user says “last month/last 90 days”.
+- If user asks “next N days” for END_DATE, filter on END_DATE with CURRENT_DATE + N.
+- When aggregating stakeholder/department, normalize the 8 slots (1..8) with UNION ALL.
+- Gross value = NVL(CONTRACT_VALUE_NET_OF_VAT,0) + NVL(VAT,0).
+- Only reference existing columns; if a field is ambiguous, pick the closest match.
+"""
 
-SCHEMA
-------
-Table: "Contract"
-Important columns:
-- CONTRACT_ID (NVARCHAR2)
-- CONTRACT_OWNER (NVARCHAR2)
-- CONTRACT_STAKEHOLDER_1..8 (NVARCHAR2)
-- DEPARTMENT_1..8 (NVARCHAR2)   -- each paired with same index stakeholder
-- OWNER_DEPARTMENT (NVARCHAR2)
-- CONTRACT_VALUE_NET_OF_VAT (NUMBER)
-- VAT (NUMBER)
-- CONTRACT_PURPOSE, CONTRACT_SUBJECT (NVARCHAR2)
-- START_DATE, END_DATE, REQUEST_DATE (DATE)
-- ENTITY, ENTITY_NO (NVARCHAR2)
-- REQUEST_ID, REQUEST_TYPE, REQUESTER (NVARCHAR2)
-- CONTRACT_STATUS (NVARCHAR2)
-- EXPIERY_30, EXPIERY_60, EXPIERY_90 (DATE)
+_CONTRACT_COLUMNS = """
+Table "Contract" (DocuWare):
+- CONTRACT_ID (text): contract identifier (human-friendly).
+- CONTRACT_OWNER (text): owner of the contract.
+- CONTRACT_STAKEHOLDER_1..8 (text): stakeholder names per slot.
+- DEPARTMENT_1..8 (text): department mapped 1:1 with each stakeholder slot.
+- OWNER_DEPARTMENT (text): owner’s department.
+- CONTRACT_VALUE_NET_OF_VAT (number): net value.
+- VAT (number): VAT amount.
+- CONTRACT_PURPOSE, CONTRACT_SUBJECT (text): descriptors.
+- START_DATE, END_DATE, REQUEST_DATE (date): key dates.
+- DURATION (text), ENTITY, BUILDING_AND_FLOOR_DESCRIPTION, LEGAL_NAME_OF_THE_COMPANY,
+  REPRESENTATIVE_NAME/PHONE/EMAIL (text): contextual fields.
+- CONTRACT_STATUS (text), REQUEST_TYPE (text), REQUESTER (text).
+- DEPARTMENT_OUL (text): lead/manager of the departments.
+- EXPIERY_30/60/90 (date): expiry thresholds.
+- ENTITY_NO (text): entity reference.
+"""
 
-Common patterns:
-- Gross value = NVL(CONTRACT_VALUE_NET_OF_VAT,0) + NVL(VAT,0)
-- “Last month” -> between :date_start (inclusive) and :date_end (exclusive)
-- Top N -> use FETCH FIRST :top_n ROWS ONLY
-- Stakeholder/Department pairs come from *_1..*_8 slots and are UNION ALL’ed
+_FEWSHOTS = """
+Q: top 10 stakeholders by contract value last month
+SQL:
+WITH base AS (
+  SELECT
+    CONTRACT_ID,
+    NVL(CONTRACT_VALUE_NET_OF_VAT,0) + NVL(VAT,0) AS CONTRACT_VALUE_GROSS,
+    REQUEST_DATE
+  FROM "Contract"
+  WHERE REQUEST_DATE >= ADD_MONTHS(TRUNC(CURRENT_DATE, 'MM'), -1)
+    AND REQUEST_DATE <  TRUNC(CURRENT_DATE, 'MM')
+), stakeholders AS (
+  SELECT CONTRACT_ID, CONTRACT_VALUE_GROSS, CONTRACT_STAKEHOLDER_1 AS STAKEHOLDER FROM "Contract"
+  UNION ALL SELECT CONTRACT_ID, CONTRACT_VALUE_GROSS, CONTRACT_STAKEHOLDER_2 FROM "Contract"
+  UNION ALL SELECT CONTRACT_ID, CONTRACT_VALUE_GROSS, CONTRACT_STAKEHOLDER_3 FROM "Contract"
+  UNION ALL SELECT CONTRACT_ID, CONTRACT_VALUE_GROSS, CONTRACT_STAKEHOLDER_4 FROM "Contract"
+  UNION ALL SELECT CONTRACT_ID, CONTRACT_VALUE_GROSS, CONTRACT_STAKEHOLDER_5 FROM "Contract"
+  UNION ALL SELECT CONTRACT_ID, CONTRACT_VALUE_GROSS, CONTRACT_STAKEHOLDER_6 FROM "Contract"
+  UNION ALL SELECT CONTRACT_ID, CONTRACT_VALUE_GROSS, CONTRACT_STAKEHOLDER_7 FROM "Contract"
+  UNION ALL SELECT CONTRACT_ID, CONTRACT_VALUE_GROSS, CONTRACT_STAKEHOLDER_8 FROM "Contract"
+)
+SELECT
+  TRIM(STAKEHOLDER) AS stakeholder,
+  SUM(CONTRACT_VALUE_GROSS) AS total_gross_value,
+  COUNT(DISTINCT CONTRACT_ID) AS contract_count
+FROM stakeholders
+WHERE STAKEHOLDER IS NOT NULL AND TRIM(STAKEHOLDER) <> ''
+GROUP BY TRIM(STAKEHOLDER)
+ORDER BY total_gross_value DESC
+FETCH FIRST 10 ROWS ONLY
 
-QUESTION
---------
-{question}
-
-REQUIREMENTS
-------------
-- Use bind parameters (:date_start, :date_end, :top_n) if a timeframe or limit is implied.
-- If aggregating by stakeholder, normalize 8 pairs using UNION ALL over "Contract".
-- List departments per stakeholder using LISTAGG(DISTINCT TRIM(DEPARTMENT), ', ') WITHIN GROUP (ORDER BY TRIM(DEPARTMENT)).
-- Return readable column aliases.
+Q: contracts expiring in the next 30 days
+SQL:
+SELECT
+  CONTRACT_ID,
+  END_DATE,
+  CONTRACT_OWNER,
+  OWNER_DEPARTMENT,
+  NVL(CONTRACT_VALUE_NET_OF_VAT,0) + NVL(VAT,0) AS CONTRACT_VALUE_GROSS
+FROM "Contract"
+WHERE END_DATE >= TRUNC(CURRENT_DATE)
+  AND END_DATE <  TRUNC(CURRENT_DATE) + 30
+ORDER BY END_DATE ASC
 """
 
 
-def nl_to_sql_with_llm(question: str) -> Optional[str]:
-    llm = get_llm()
-    if llm is None:
-        return None
-    prompt = _PROMPT.format(question=question.strip())
-    try:
-        out = llm.generate(prompt, stop=["</s>", "<|im_end|>"])
-    except Exception as exc:  # pragma: no cover - runtime guard
-        print(f"[dw][llm] generation error: {exc}")
-        return None
-    sql = _sanitize_sql(str(out or ""))
-    if not sql or not _oracle_guard(sql):
-        return None
+def _build_prompt(question: str) -> str:
+    header = "You are a senior Oracle SQL analyst. Convert the question to a single valid Oracle SELECT (or CTE + SELECT)."
+    prompt = "\n\n".join(
+        [
+            header,
+            _ORACLE_RULES.strip(),
+            _CONTRACT_COLUMNS.strip(),
+            _FEWSHOTS.strip(),
+            f"Q: {question}\nSQL:",
+        ]
+    )
+    return textwrap.dedent(prompt).strip()
+
+
+_FORBIDDEN = re.compile(
+    r"\b(UPDATE|DELETE|INSERT|MERGE|CREATE|ALTER|DROP|TRUNCATE|GRANT|REVOKE)\b",
+    re.IGNORECASE,
+)
+
+
+def _clean_and_validate(sql_text: str) -> str:
+    sql = sql_text.strip()
+    if "```" in sql:
+        parts = sql.split("```")
+        if len(parts) >= 2:
+            sql = parts[1]
+    sql = sql.strip()
+    if sql.endswith(";"):
+        sql = sql[:-1].strip()
+
+    first_token = sql.split(None, 1)[0].upper() if sql else ""
+    if first_token not in {"SELECT", "WITH"}:
+        raise ValueError(
+            f"Generated SQL must start with SELECT/WITH, got '{first_token or '(empty)'}'."
+        )
+
+    if _FORBIDDEN.search(sql):
+        raise ValueError("Generated SQL contains forbidden statements.")
+
     return sql
+
+
+def nl_to_sql_with_llm(
+    question: str,
+    *,
+    max_new_tokens: Optional[int] = None,
+) -> Tuple[str, str]:
+    generator = _load_sql_generator()
+
+    stop_env = os.getenv("STOP")
+    stop_list = [item.strip() for item in stop_env.split(",") if item.strip()] if stop_env else None
+
+    default_max_new_tokens = int(os.getenv("GENERATION_MAX_NEW_TOKENS", "256"))
+    temperature = float(os.getenv("GENERATION_TEMPERATURE", "0.2"))
+    top_p = float(os.getenv("GENERATION_TOP_P", "0.9"))
+
+    prompt = _build_prompt(question)
+    raw_output = _gen_text(
+        generator,
+        prompt,
+        stop=stop_list,
+        max_new_tokens=max_new_tokens or default_max_new_tokens,
+        temperature=temperature,
+        top_p=top_p,
+    )
+
+    sql = _clean_and_validate(str(raw_output or ""))
+    rationale = "Generated via SQLCoder with Oracle rules and Contract schema context."
+    return sql, rationale
