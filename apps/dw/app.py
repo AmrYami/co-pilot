@@ -54,6 +54,41 @@ def _pg(conn_str: str):
     return create_engine(conn_str, pool_pre_ping=True, future=True)
 
 
+def _load_prompt_snippets(mem_engine, limit: int = 3) -> List[Tuple[str, str]]:
+    shots: List[Tuple[str, str]] = []
+    if mem_engine is None:
+        return shots
+    with mem_engine.connect() as conn:
+        rows = conn.execute(
+            text(
+                """
+                SELECT title, COALESCE(sql_template, sql_raw) AS sql_body
+                  FROM mem_snippets
+                 WHERE namespace = :ns
+                   AND COALESCE(is_verified, false) = true
+                   AND COALESCE(tags, '[]'::jsonb) @> CAST(:tag_dw AS jsonb)
+                   AND COALESCE(tags, '[]'::jsonb) @> CAST(:tag_oracle AS jsonb)
+                   AND COALESCE(tags, '[]'::jsonb) @> CAST(:tag_contracts AS jsonb)
+              ORDER BY updated_at DESC NULLS LAST
+                 LIMIT :limit
+                """
+            ),
+            {
+                "ns": NAMESPACE,
+                "tag_dw": json.dumps(["dw"]),
+                "tag_oracle": json.dumps(["oracle"]),
+                "tag_contracts": json.dumps(["contracts"]),
+                "limit": limit,
+            },
+        ).mappings()
+        for row in rows:
+            sql = row.get("sql_body")
+            title = row.get("title") or "example"
+            if sql:
+                shots.append((title, sql))
+    return shots
+
+
 def _calc_window(question: str) -> Tuple[date, date, int]:
     now = date.today()
     q = question.lower()
@@ -707,8 +742,9 @@ def answer():
     }
 
     llm = DWLLM(settings)
+    prompt_snippets = _load_prompt_snippets(mem)
     try:
-        sql = llm.nl_to_sql(question)
+        sql = llm.nl_to_sql(question, prompt_snippets)
     except Exception as exc:
         inquiry_id = _insert_inquiry(
             mem,

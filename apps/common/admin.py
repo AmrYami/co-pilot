@@ -18,7 +18,9 @@ def teach():
     namespace = data.get("namespace", "dw::common")
     updated_by = data.get("updated_by", "teacher")
     synonyms = data.get("synonyms") or []
-    qna = data.get("qna") or []
+    fewshots = data.get("fewshots")
+    if fewshots is None:
+        fewshots = data.get("qna") or []
 
     settings = Settings()
     mem = create_engine(settings.get("MEMORY_DB_URL", scope="global"), pool_pre_ping=True, future=True)
@@ -53,19 +55,24 @@ def teach():
                     "conf": float(mapping.get("confidence", 0.9)),
                 },
             )
-        for item in qna:
+        for item in fewshots:
+            question = item.get("question") or item.get("q")
+            sql = item.get("sql") or item.get("a")
+            if not question or not sql:
+                continue
+            tags = item.get("tags") or ["dw", "oracle", "contracts"]
             con.execute(
                 ins_snip,
                 {
                     "ns": namespace,
-                    "title": item.get("question", "taught-sql"),
-                    "desc": item.get("description", ""),
-                    "tmpl": item.get("sql"),
-                    "raw": item.get("sql"),
-                    "tables": json.dumps(["Contract"]),
-                    "tags": json.dumps(item.get("tags", ["dw", "teach"])),
+                    "title": question,
+                    "desc": item.get("description") or item.get("doc"),
+                    "tmpl": sql,
+                    "raw": sql,
+                    "tables": json.dumps(item.get("tables") or ["Contract"]),
+                    "tags": json.dumps(tags),
                     "by": updated_by,
                 },
             )
 
-    return jsonify({"ok": True, "synonyms": len(synonyms), "snippets": len(qna)})
+    return jsonify({"ok": True, "synonyms": len(synonyms), "fewshots": len(fewshots)})

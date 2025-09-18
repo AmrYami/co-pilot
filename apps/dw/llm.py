@@ -4,43 +4,56 @@ from __future__ import annotations
 
 import os
 import re
-from typing import Optional
+from typing import Iterable, List, Sequence, Tuple
 
-from core.settings import Settings
 from core.model_loader import load_llm as _load_llm
+from core.settings import Settings
 
-from .prompts import FEWSHOTS, SYSTEM_INSTRUCTIONS
+from .sql_kit import build_nl2sql_prompt
 
 _SQL_ONLY = re.compile(r"(?is)^\s*(?:--.*\n|\s*)*(with|select)\b")
+_LIMIT_END = re.compile(r"(?is)\s+limit\s+([:a-zA-Z0-9_]+)\s*$")
+_CODE_BLOCK = re.compile(r"```(?:sql)?\s*(.*?)```", re.IGNORECASE | re.DOTALL)
 
 
-def _build_prompt(question: str) -> str:
-    """Construct a prompt with optional few-shot guidance."""
-    q_low = question.lower()
-    best: Optional[tuple[str, str]] = None
-    for q, sql in FEWSHOTS:
-        tokens = q.split()
-        if tokens and all(tok in q_low for tok in tokens[:3]):
-            best = (q, sql)
-            break
+def _strip_stop_tokens(text: str, stop: Sequence[str]) -> str:
+    cleaned = text
+    for token in stop:
+        if not token:
+            continue
+        idx = cleaned.find(token)
+        if idx >= 0:
+            cleaned = cleaned[:idx]
+    return cleaned
 
-    shots = ""
-    if best:
-        shots = f"\n-- Example for: {best[0]}\n{best[1]}\n"
 
-    return f"{SYSTEM_INSTRUCTIONS}\n{shots}\n-- User question:\n-- {question}\n"
+def _extract_sql_block(output: str) -> str:
+    for match in _CODE_BLOCK.finditer(output):
+        candidate = match.group(1).strip()
+        if candidate:
+            return candidate
+    return output
+
+
+def _oracleize_limit(sql: str) -> str:
+    match = _LIMIT_END.search(sql)
+    if not match:
+        return sql
+    value = match.group(1)
+    replacement = f" FETCH FIRST {value} ROWS ONLY"
+    start, end = match.span()
+    return sql[: start].rstrip() + replacement
 
 
 def _enforce_select_only(sql: str) -> str:
-    """Ensure generated SQL is a safe SELECT/CTE statement."""
-    s = sql.strip().strip(";")
-    if not _SQL_ONLY.match(s):
-        raise ValueError("Generated SQL is not a SELECT/CTE.")
-    banned = ["insert ", "update ", "delete ", "merge ", "alter ", "drop ", "create "]
-    low = s.lower()
-    if any(b in low for b in banned):
-        raise ValueError("Non-SELECT statement detected.")
-    return s
+    cleaned = sql.strip().strip(";")
+    if not _SQL_ONLY.match(cleaned):
+        raise ValueError("Generated SQL is not a SELECT/CTE statement.")
+    lower = cleaned.lower()
+    for banned in ("insert ", "update ", "delete ", "merge ", "alter ", "drop ", "create "):
+        if banned in lower:
+            raise ValueError("Non-SELECT statement detected.")
+    return cleaned
 
 
 class DWLLM:
@@ -49,23 +62,26 @@ class DWLLM:
     def __init__(self, settings: Settings):
         self.settings = settings
         self.llm = _load_llm(settings)
-
-    def nl_to_sql(self, question: str) -> str:
-        prompt = _build_prompt(question)
-        stop = os.getenv("STOP", "</s>,<|im_end|>").split(",")
-        gen_kwargs = {
+        stop_tokens = os.getenv("STOP", "</s>,<|im_end|>")
+        self.stop: List[str] = [tok for tok in (stop_tokens.split(",") if stop_tokens else []) if tok]
+        self.gen_kwargs = {
             "max_new_tokens": int(os.getenv("GENERATION_MAX_NEW_TOKENS", "256")),
             "temperature": float(os.getenv("GENERATION_TEMPERATURE", "0.2")),
             "top_p": float(os.getenv("GENERATION_TOP_P", "0.9")),
-            "stop": stop,
         }
-        out = self.llm.generate(prompt, **gen_kwargs)
-        code = out
-        if "```" in out:
-            parts = out.split("```")
-            for i in range(1, len(parts), 2):
-                cand = parts[i]
-                if "select" in cand.lower() or "with" in cand.lower():
-                    code = cand
-                    break
-        return _enforce_select_only(code)
+
+    def nl_to_sql(
+        self,
+        question: str,
+        extra_shots: Iterable[Tuple[str, str]] | None = None,
+    ) -> str:
+        prompt = build_nl2sql_prompt(question, extra_shots)
+        generated = self.llm.generate(
+            prompt,
+            stop=self.stop if self.stop else None,
+            **self.gen_kwargs,
+        )
+        trimmed = _strip_stop_tokens(generated, self.stop)
+        sql_candidate = _extract_sql_block(trimmed)
+        sql_candidate = _oracleize_limit(sql_candidate)
+        return _enforce_select_only(sql_candidate)
