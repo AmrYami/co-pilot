@@ -33,10 +33,30 @@ Return ONLY the JSON, no prose.
 """
 
 
-def clarify_intent(question: str, context: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    mdl = get_model("clarifier")
+def _clarifier_fallback(reason: str) -> Dict[str, Any]:
+    return {
+        "intent": "select",
+        "table": "Contract",
+        "metric": "contract_value_gross",
+        "date_window": "auto",
+        "time": {"range": {"type": "auto", "start": None, "end": None}},
+        "filters": [],
+        "group_by": [],
+        "top_n": None,
+        "confidence": 0.0,
+        "reason": reason,
+    }
+
+
+def clarify_intent(question: str, context: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        mdl = get_model("clarifier")
+    except Exception as exc:
+        return _clarifier_fallback(f"clarifier unavailable ({type(exc).__name__})")
+
     if not mdl:
-        return None
+        return _clarifier_fallback("clarifier disabled")
+
     user = f"Question: {question}\nContext: {json.dumps(context, ensure_ascii=False)}"
     try:
         out = mdl.generate(
@@ -44,18 +64,41 @@ def clarify_intent(question: str, context: Dict[str, Any]) -> Optional[Dict[str,
             user_prompt=user,
             max_new_tokens=256,
         )
-    except Exception:
-        return None
+    except Exception as exc:
+        return _clarifier_fallback(f"clarifier error ({type(exc).__name__})")
+
     if not out:
-        return None
+        return _clarifier_fallback("clarifier empty output")
+
     try:
         start = out.find("{")
         end = out.rfind("}")
         if start != -1 and end != -1 and end > start:
-            return json.loads(out[start : end + 1])
+            parsed = json.loads(out[start : end + 1])
+        else:
+            return _clarifier_fallback("clarifier malformed output")
     except Exception:
-        return None
-    return None
+        return _clarifier_fallback("clarifier parse error")
+
+    if not isinstance(parsed, dict):
+        return _clarifier_fallback("clarifier non-dict output")
+
+    try:
+        confidence = float(parsed.get("confidence", 0.0) or 0.0)
+    except Exception:
+        confidence = 0.0
+
+    if confidence < 0.3:
+        return _clarifier_fallback("clarifier low confidence")
+
+    parsed.setdefault("intent", "select")
+    parsed.setdefault("table", "Contract")
+    parsed.setdefault("filters", [])
+    parsed.setdefault("group_by", [])
+    parsed.setdefault("metric", "contract_value_gross")
+    parsed.setdefault("time", {"range": {"type": "auto"}})
+    parsed["confidence"] = confidence
+    return parsed
 
 
 def nl_to_sql_with_llm(
