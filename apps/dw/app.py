@@ -17,7 +17,7 @@ from core.settings import Settings
 from core.sql_exec import get_mem_engine
 
 from apps.dw.clarifier import propose_clarifying_questions
-from apps.dw.llm import clarify_for_sql, nl_to_sql_with_llm
+from apps.dw.llm import generate_sql_oracle
 from apps.dw.patterns import parse_timeframe
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -57,6 +57,17 @@ def _has_dml(sql: str) -> bool:
 
 def _binds_required_in_sql(sql: str) -> List[str]:
     return re.findall(r":([A-Za-z_]\w*)", sql)
+
+
+def _find_named_binds(sql: str) -> set[str]:
+    return set(re.findall(r":([a-zA-Z_][a-zA-Z0-9_]*)", sql or ""))
+
+
+def _window_from_question(question: str) -> tuple[datetime | None, datetime | None]:
+    start, end, _, _ = parse_timeframe(question)
+    if start and end:
+        return start, end
+    return None, None
 
 
 def _pg(conn_str: str):
@@ -295,20 +306,23 @@ def save_learning_artifacts(
 
 
 def save_success_snippet(conn, namespace: str, question: str, sql: str, tags: List[str]):
+    tag_payload = sorted(set(tags) | {"dw", "auto_learn"})
     conn.execute(
         text(
             """
-        INSERT INTO mem_snippets(namespace, title, description, sql_template, sql_raw, input_tables, tags, is_verified, created_at, updated_at)
-        VALUES(:ns, :title, :desc, :tmpl, :raw, '["Contract"]'::jsonb, CAST(:tags AS jsonb), false, NOW(), NOW())
+        INSERT INTO mem_snippets(namespace, title, description, sql_template, sql_raw, input_tables, filters_applied, tags, is_verified, created_at, updated_at)
+        VALUES(:ns, :title, :desc, :tmpl, :raw, :tabs::jsonb, :filters::jsonb, :tags::jsonb, true, NOW(), NOW())
         """
         ),
         {
             "ns": namespace,
-            "title": question[:200],
-            "desc": "Auto-learned from successful run",
+            "title": f"DW answer: {question[:160]}",
+            "desc": "Auto-learned from successful run.",
             "tmpl": sql,
             "raw": sql,
-            "tags": json.dumps(tags, ensure_ascii=False),
+            "tabs": '["Contract"]',
+            "filters": "[]",
+            "tags": json.dumps(tag_payload, ensure_ascii=False),
         },
     )
 
@@ -931,11 +945,6 @@ def answer():
             payload["error"] = error
         return jsonify(payload)
 
-    clarifier_used = False
-
-    def _date_binds_in_sql(sql_text: str) -> bool:
-        return (":date_start" in sql_text) or (":date_end" in sql_text)
-
     def _normalize_dt(value: Any) -> Any:
         if isinstance(value, datetime):
             if value.tzinfo is not None:
@@ -943,59 +952,80 @@ def answer():
             return value
         return value
 
-    def _build_date_binds(source_question: str) -> Dict[str, Any]:
-        start, end, _, _ = parse_timeframe(source_question)
-        binds_payload: Dict[str, Any] = {}
-        if start and end:
-            binds_payload["date_start"] = _normalize_dt(start)
-            binds_payload["date_end"] = _normalize_dt(end)
-        return binds_payload
-
-    sql, _ = nl_to_sql_with_llm(question)
-    rewritten_question = question
+    gen_payload = generate_sql_oracle(question)
+    sql = (gen_payload or {}).get("sql")
 
     if not sql:
-        rewritten_question = clarify_for_sql(question)
-        if rewritten_question != question:
-            clarifier_used = True
-        sql, _ = nl_to_sql_with_llm(rewritten_question)
-
-    if not sql:
-        return _needs_clarification(
-            "I couldn’t derive a safe SELECT statement from your question. Can you clarify the exact columns and filters?",
-            error="not_select",
+        _update_inquiry("needs_clarification")
+        return jsonify(
+            {
+                "ok": False,
+                "status": "needs_clarification",
+                "inquiry_id": inquiry_id,
+                "questions": [
+                    "I couldn’t produce a safe SELECT for that. Do you want a date filter or show all rows?",
+                    "Should we return all matching contracts, or limit to top 100 by REQUEST_DATE?",
+                ],
+                "sql": None,
+            }
         )
 
     sql = sql.strip()
 
-    if not _looks_like_select(sql) or _has_dml(sql):
+    if not re.match(r"^\s*(WITH|SELECT)\b", sql, flags=re.IGNORECASE):
+        _update_inquiry("needs_clarification")
+        return jsonify(
+            {
+                "ok": False,
+                "status": "needs_clarification",
+                "inquiry_id": inquiry_id,
+                "error": "not_select",
+                "questions": [
+                    "Please confirm you want a SELECT-only query; no updates/deletes allowed.",
+                ],
+                "sql": sql,
+            }
+        )
+
+    if _has_dml(sql):
         return _needs_clarification(
             "I drafted SQL that didn't look like a safe SELECT. Could you clarify?",
             sql_text=sql,
             error="not_select",
         )
 
-    required_binds = _binds_required_in_sql(sql)
-    binds: Dict[str, Any] = {}
+    bind_names = _find_named_binds(sql)
+    params: Dict[str, Any] = {}
 
-    if _date_binds_in_sql(sql):
-        binds.update(_build_date_binds(rewritten_question))
-        if not binds:
-            return _needs_clarification(
-                "This query expects :date_start and :date_end. What date range should we use?",
-                sql_text=sql,
-                error="missing_binds",
+    if {"date_start", "date_end"} & bind_names:
+        start, end = _window_from_question(question)
+        if not start or not end:
+            _update_inquiry("needs_clarification")
+            return jsonify(
+                {
+                    "ok": False,
+                    "status": "needs_clarification",
+                    "inquiry_id": inquiry_id,
+                    "error": "missing_binds",
+                    "questions": [
+                        "This query expects :date_start and :date_end. What date range should we use (e.g., last 90 days, 2025-01-01 to 2025-03-31)?",
+                    ],
+                    "sql": sql,
+                }
             )
+        params["date_start"] = _normalize_dt(start)
+        params["date_end"] = _normalize_dt(end)
 
-    missing = [name for name in required_binds if name not in binds]
-    if missing:
+    expected_binds = set(_binds_required_in_sql(sql))
+    missing_binds = sorted(name for name in expected_binds if name not in params)
+    if missing_binds:
         return _needs_clarification(
-            f"Provide values for: {', '.join(missing)} or rephrase with explicit dates.",
+            f"Provide values for: {', '.join(missing_binds)} or rephrase with explicit dates.",
             sql_text=sql,
             error="missing_binds",
         )
 
-    exec_binds = {name: binds[name] for name in required_binds}
+    exec_binds = {name: params[name] for name in expected_binds if name in params}
 
     appended_limit = False
     if "fetch first" not in sql.lower():
@@ -1022,10 +1052,12 @@ def answer():
         else:
             serialized_binds[key] = value
     meta_payload["binds"] = serialized_binds
-    meta_payload["clarifier_used"] = clarifier_used
+    meta_payload["clarifier_used"] = False
     meta_payload["limit_applied"] = appended_limit
     meta_payload["elapsed_ms"] = elapsed_ms
-    meta_payload["rewritten_question"] = rewritten_question if clarifier_used else question
+    meta_payload["rewritten_question"] = question
+    meta_payload["llm_reason"] = (gen_payload or {}).get("reason", "ok")
+    meta_payload["generation_mode"] = "llm"
     meta_payload.setdefault("rowcount", len(rows))
     if "columns" not in meta_payload and rows:
         meta_payload["columns"] = list(rows[0].keys())
