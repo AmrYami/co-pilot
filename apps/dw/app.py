@@ -17,7 +17,12 @@ from core.settings import Settings
 from core.sql_exec import get_mem_engine
 
 from apps.dw.clarifier import propose_clarifying_questions
-from apps.dw.llm import _unexpected_binds, nl_to_sql_with_llm
+from apps.dw.llm import nl_to_sql_with_llm
+from apps.dw.sql_validate import (
+    ensure_allowed_binds,
+    ensure_select_only,
+    forbid_implicit_date_window,
+)
 from apps.dw.patterns import parse_timeframe
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -87,17 +92,8 @@ def _looks_like_select(sql: str) -> bool:
     return snippet.upper().startswith("SELECT") or snippet.upper().startswith("WITH")
 
 
-def _has_dml(sql: str) -> bool:
-    upper = sql.upper()
-    return any(token in upper for token in (" INSERT ", " UPDATE ", " DELETE ", " MERGE ", " DROP ", " ALTER "))
-
-
 def _binds_required_in_sql(sql: str) -> List[str]:
     return re.findall(r":([A-Za-z_]\w*)", sql)
-
-
-def _find_named_binds(sql: str) -> set[str]:
-    return set(re.findall(r":([a-zA-Z_][a-zA-Z0-9_]*)", sql or ""))
 
 
 def _pg(conn_str: str):
@@ -984,65 +980,62 @@ def answer():
             return value
         return value
 
-    sql, gen_meta = nl_to_sql_with_llm(question)
+    allowed_columns = [
+        "CONTRACT_ID",
+        "CONTRACT_OWNER",
+        "CONTRACT_STAKEHOLDER_1",
+        "CONTRACT_STAKEHOLDER_2",
+        "CONTRACT_STAKEHOLDER_3",
+        "CONTRACT_STAKEHOLDER_4",
+        "CONTRACT_STAKEHOLDER_5",
+        "CONTRACT_STAKEHOLDER_6",
+        "CONTRACT_STAKEHOLDER_7",
+        "CONTRACT_STAKEHOLDER_8",
+        "DEPARTMENT_1",
+        "DEPARTMENT_2",
+        "DEPARTMENT_3",
+        "DEPARTMENT_4",
+        "DEPARTMENT_5",
+        "DEPARTMENT_6",
+        "DEPARTMENT_7",
+        "DEPARTMENT_8",
+        "OWNER_DEPARTMENT",
+        "CONTRACT_VALUE_NET_OF_VAT",
+        "VAT",
+        "CONTRACT_PURPOSE",
+        "CONTRACT_SUBJECT",
+        "START_DATE",
+        "END_DATE",
+        "REQUEST_DATE",
+        "REQUEST_TYPE",
+        "CONTRACT_STATUS",
+        "ENTITY_NO",
+        "REQUESTER",
+    ]
+
+    sql_raw, gen_meta = nl_to_sql_with_llm(question, allowed_columns)
     gen_meta = gen_meta or {}
 
-    if not sql:
+    try:
+        sql_clean = ensure_select_only(sql_raw)
+        sql_clean = forbid_implicit_date_window(sql_clean, question)
+        bind_names = ensure_allowed_binds(sql_clean)
+    except ValueError as exc:
         _update_inquiry("needs_clarification")
         return jsonify(
             {
                 "ok": False,
                 "status": "needs_clarification",
                 "inquiry_id": inquiry_id,
-                "error": gen_meta.get("reason", "not_select"),
+                "error": str(exc),
                 "questions": [
                     "I couldn't derive a clean SELECT. Can you rephrase or specify filters (stakeholders, departments, date columns)?"
                 ],
-                "sql": None,
+                "sql": sql_raw,
             }
         )
 
-    sql = sql.strip()
-
-    if not re.match(r"^\s*(WITH|SELECT)\b", sql, flags=re.IGNORECASE):
-        _update_inquiry("needs_clarification")
-        return jsonify(
-            {
-                "ok": False,
-                "status": "needs_clarification",
-                "inquiry_id": inquiry_id,
-                "error": "not_select",
-                "questions": [
-                    "Please confirm you want a SELECT-only query; no updates/deletes allowed.",
-                ],
-                "sql": sql,
-            }
-        )
-
-    bad_binds = _unexpected_binds(sql)
-    if bad_binds:
-        _update_inquiry("needs_clarification")
-        return jsonify(
-            {
-                "ok": False,
-                "status": "needs_clarification",
-                "inquiry_id": inquiry_id,
-                "error": "unexpected_binds",
-                "questions": [
-                    f"The model produced bind(s) {sorted(bad_binds)} which we don't support. Rephrase without those binds, or specify an explicit date window on a named date column to use :date_start/:date_end."
-                ],
-                "sql": sql,
-            }
-        )
-
-    if _has_dml(sql):
-        return _needs_clarification(
-            "I drafted SQL that didn't look like a safe SELECT. Could you clarify?",
-            sql_text=sql,
-            error="not_select",
-        )
-
-    bind_names = _find_named_binds(sql)
+    sql = sql_clean
     params: Dict[str, Any] = {}
 
     if {"date_start", "date_end"} & bind_names:
@@ -1124,8 +1117,8 @@ def answer():
     meta_payload["llm_retries"] = gen_meta.get("retries", 0)
     if "confidence" in gen_meta:
         meta_payload["llm_confidence"] = gen_meta.get("confidence")
-    if "unexpected_binds_first_try" in gen_meta:
-        meta_payload["llm_unexpected_binds_first_try"] = gen_meta.get("unexpected_binds_first_try")
+    if "raw" in gen_meta:
+        meta_payload["llm_raw"] = gen_meta["raw"]
     meta_payload["generation_mode"] = "llm"
     meta_payload.setdefault("rowcount", len(rows))
     if "columns" not in meta_payload and rows:
