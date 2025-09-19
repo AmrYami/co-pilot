@@ -15,7 +15,7 @@ from core.settings import Settings
 from core.sql_exec import get_mem_engine
 
 from apps.dw.clarifier import propose_clarifying_questions
-from apps.dw.llm import nl_to_sql_with_llm
+from apps.dw.llm import clarify_intent, nl_to_sql_with_llm
 
 if TYPE_CHECKING:  # pragma: no cover
     from core.pipeline import Pipeline
@@ -174,6 +174,126 @@ def _csv_bytes(rows: List[Dict[str, Any]]) -> bytes:
     for row in rows:
         writer.writerow({key: ("" if value is None else value) for key, value in row.items()})
     return buffer.getvalue().encode("utf-8")
+
+
+def run_sql_oracle(engine, sql: Optional[str], binds: Dict[str, Any]):
+    if not sql:
+        return False, None, {}, "sql_missing"
+    try:
+        with engine.connect() as conn:
+            result = conn.execute(text(sql), binds or {})
+            columns = list(result.keys())
+            fetched: List[Dict[str, Any]] = []
+            for record in result.fetchall():
+                fetched.append({col: record[idx] for idx, col in enumerate(columns)})
+    except Exception as exc:
+        return False, None, {}, str(exc)
+    meta = {"columns": columns, "rowcount": len(fetched)}
+    return True, fetched, meta, None
+
+
+def rows_suspiciously_empty(rows: List[Dict[str, Any]], question: str) -> bool:
+    if rows:
+        return False
+    lowered = question.lower()
+    safe_keywords = ["count", "how many", "total", "sum", "average", "avg"]
+    if any(keyword in lowered for keyword in safe_keywords):
+        return False
+    return True
+
+
+def _coerce_datetime(value: Any) -> Optional[datetime]:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, date):
+        return datetime.combine(value, datetime.min.time())
+    if isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value)
+            if isinstance(parsed, datetime):
+                return parsed
+        except Exception:
+            try:
+                parsed_date = datetime.strptime(value, "%Y-%m-%d")
+                return parsed_date
+            except Exception:
+                return None
+    return None
+
+
+def intent_to_binds(intent: Dict[str, Any], fallback: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    binds = dict(fallback or {})
+    time_block = (intent or {}).get("time") or {}
+    range_block = time_block.get("range") or {}
+    start = _coerce_datetime(range_block.get("start"))
+    end = _coerce_datetime(range_block.get("end"))
+    if start is not None:
+        binds["date_start"] = start
+    if end is not None:
+        binds["date_end"] = end
+    if "top_n" in intent and intent["top_n"]:
+        try:
+            binds["top_n"] = int(intent["top_n"])
+        except Exception:
+            pass
+    return binds
+
+
+def save_learning_artifacts(
+    namespace: str,
+    question: str,
+    sql: str,
+    rows: List[Dict[str, Any]],
+    *,
+    intent: Optional[Dict[str, Any]] = None,
+    tags: Optional[List[str]] = None,
+    settings: Optional[Settings] = None,
+):
+    mem_settings = settings or Settings(namespace=namespace)
+    mem = get_mem_engine(mem_settings)
+    if mem is None:
+        return None
+    tag_payload = tags or ["dw", "contracts"]
+    with mem.begin() as conn:
+        run_id = conn.execute(
+            text(
+                """
+            INSERT INTO mem_runs(namespace, input_query, interpreted_intent, sql_generated, sql_final, status, rows_returned, result_sample)
+            VALUES (:ns, :q, :intent, :sql, :sql, 'complete', :nrows, :sample)
+            RETURNING id
+            """
+            ),
+            {
+                "ns": namespace,
+                "q": question,
+                "intent": json.dumps(intent) if intent else None,
+                "sql": sql,
+                "nrows": len(rows),
+                "sample": json.dumps(rows[:10]),
+            },
+        ).scalar_one()
+
+        conn.execute(
+            text(
+                """
+            INSERT INTO mem_snippets(namespace, title, description, sql_template, sql_raw, input_tables, parameters, tags, is_verified, usage_count)
+            VALUES (:ns, :title, :desc, :tmpl, :raw, :tables, :params, :tags, TRUE, 1)
+            """
+            ),
+            {
+                "ns": namespace,
+                "title": "DW stakeholder summary",
+                "desc": "Stakeholder/department union pattern with date filters and gross value metric",
+                "tmpl": sql,
+                "raw": sql,
+                "tables": json.dumps(["Contract"]),
+                "params": json.dumps({"time": intent.get("time") if intent else None}),
+                "tags": json.dumps(tag_payload),
+            },
+        )
+    return run_id
 
 
 def _learn_snippet(conn, question: str, sql: str, tags):
@@ -724,14 +844,15 @@ def answer():
     except Exception as exc:
         return jsonify({"ok": False, "error": f"no datasource engine: {exc}"}), 500
 
-    mem = _pg(settings.get("MEMORY_DB_URL", scope="global"))
+    mem = get_mem_engine(settings)
 
     start, end, top_n = _calc_window(question)
-    binds = {
+    default_binds = {
         "date_start": datetime.combine(start, datetime.min.time()),
         "date_end": datetime.combine(end, datetime.min.time()),
         "top_n": top_n,
     }
+    active_binds = dict(default_binds)
 
     dw_table = data.get("dw_table") or "Contract"
 
@@ -742,106 +863,169 @@ def answer():
     except Exception:
         use_llm = True
 
-    llm_result = {"sql": None, "confidence": 0.0, "why": "disabled"}
-
+    llm_result: Dict[str, Any] = {"sql": None, "confidence": 0.0, "why": "disabled"}
     if use_llm:
         try:
-            llm_result = nl_to_sql_with_llm(question, dw_table=dw_table)
+            llm_result = nl_to_sql_with_llm(
+                question=question, dw_table=dw_table, settings=settings
+            )
         except Exception as exc:
             llm_result = {"sql": None, "confidence": 0.0, "why": f"llm_error: {exc}"}
 
     sql = llm_result.get("sql") if isinstance(llm_result, dict) else None
-
-    if not sql:
-        inquiry_id = _insert_inquiry(
-            mem,
-            NAMESPACE,
-            question,
-            auth_email,
-            prefixes,
-            "needs_clarification",
-        )
-        followups = propose_clarifying_questions(question)
-        return jsonify(
-            {
-                "ok": False,
-                "status": "needs_clarification",
-                "questions": followups,
-                "rationale": llm_result.get("why", "") if isinstance(llm_result, dict) else "",
-                "inquiry_id": inquiry_id,
-            }
-        )
-
     rows: List[Dict[str, Any]] = []
-    try:
-        with oracle.connect() as conn:
-            result = conn.execute(text(sql), binds)
-            columns = result.keys()
-            for record in result.fetchall():
-                rows.append({col: record[idx] for idx, col in enumerate(columns)})
-    except Exception as exc:
-        inquiry_id = _insert_inquiry(
-            mem,
-            NAMESPACE,
-            question,
-            auth_email,
-            prefixes,
-            "needs_clarification",
-        )
-        return jsonify(
-            {
-                "ok": False,
-                "status": "needs_clarification",
-                "error": f"SQL execution error: {exc}",
-                "sql": sql,
-                "inquiry_id": inquiry_id,
-            }
-        )
+    meta_exec: Dict[str, Any] = {}
+    intent_used: Optional[Dict[str, Any]] = None
+    ok = False
+    clarifier_needed = False
+    error_message: Optional[str] = None
 
-    run_id = _insert_run(
-        mem,
+    if sql:
+        ok, fetched_rows, meta_exec, exec_error = run_sql_oracle(oracle, sql, active_binds)
+        if ok and fetched_rows is not None:
+            rows = fetched_rows
+        else:
+            error_message = exec_error
+        clarifier_needed = (not ok) or rows_suspiciously_empty(rows, question)
+    else:
+        clarifier_needed = True
+        error_message = llm_result.get("why") if isinstance(llm_result, dict) else "no_sql"
+
+    if clarifier_needed:
+        try:
+            slots = settings.get_int("DW_STAKEHOLDER_SLOTS", default=8, scope="namespace")
+        except Exception:
+            slots = 8
+        context = {
+            "table": dw_table,
+            "date_columns": ["REQUEST_DATE", "START_DATE", "END_DATE"],
+            "stakeholder_slots": slots,
+        }
+        intent = clarify_intent(question, context)
+        if intent:
+            intent_used = intent
+            active_binds = intent_to_binds(intent, fallback=default_binds)
+            try:
+                clarified = nl_to_sql_with_llm(
+                    question=question,
+                    intent=intent,
+                    dw_table=dw_table,
+                    settings=settings,
+                )
+            except Exception as exc:
+                clarified = {"sql": None, "confidence": 0.0, "why": f"llm_error: {exc}"}
+            sql2 = clarified.get("sql") if isinstance(clarified, dict) else None
+            if sql2:
+                ok2, fetched_rows2, meta_exec2, exec_error2 = run_sql_oracle(
+                    oracle, sql2, active_binds
+                )
+                if ok2 and fetched_rows2 is not None:
+                    sql = sql2
+                    rows = fetched_rows2
+                    meta_exec = meta_exec2
+                    ok = True
+                    clarifier_needed = rows_suspiciously_empty(rows, question)
+                    error_message = exec_error2
+                    llm_result = clarified  # adopt clarified rationale
+                else:
+                    error_message = exec_error2 or (
+                        clarified.get("why") if isinstance(clarified, dict) else None
+                    )
+            else:
+                error_message = (
+                    clarified.get("why") if isinstance(clarified, dict) else "clarifier_failed"
+                )
+        else:
+            error_message = error_message or "clarifier_unavailable"
+
+    success = bool(sql) and ok and not clarifier_needed
+
+    if not success:
+        inquiry_id = None
+        if mem is not None:
+            try:
+                inquiry_id = _insert_inquiry(
+                    mem,
+                    NAMESPACE,
+                    question,
+                    auth_email,
+                    prefixes,
+                    "needs_clarification",
+                )
+            except Exception:
+                inquiry_id = None
+        followups = propose_clarifying_questions(question)
+        payload = {
+            "ok": False,
+            "status": "needs_clarification",
+            "questions": followups,
+            "inquiry_id": inquiry_id,
+            "sql": sql,
+        }
+        if isinstance(llm_result, dict):
+            payload["rationale"] = llm_result.get("why", "")
+        if error_message:
+            payload["error"] = error_message
+        return jsonify(payload)
+
+    meta_payload: Dict[str, Any] = dict(meta_exec or {})
+    binds_serialized: Dict[str, Any] = {}
+    for key, value in active_binds.items():
+        if isinstance(value, (datetime, date)):
+            binds_serialized[key] = value.isoformat()
+        else:
+            binds_serialized[key] = value
+    meta_payload["binds"] = binds_serialized
+    meta_payload["top_n"] = active_binds.get("top_n")
+    meta_payload["clarifier_used"] = bool(intent_used)
+    meta_payload.setdefault("rowcount", len(rows))
+    if "columns" not in meta_payload and rows:
+        meta_payload["columns"] = list(rows[0].keys())
+    if isinstance(llm_result, dict):
+        meta_payload["llm_confidence"] = llm_result.get("confidence")
+        meta_payload["llm_reason"] = llm_result.get("why")
+
+    tags = ["dw", "docuware", "contract"]
+    if intent_used:
+        tags.append("clarified")
+    else:
+        tags.append("llm")
+
+    run_id = save_learning_artifacts(
         NAMESPACE,
-        auth_email or "dw_user",
         question,
         sql,
-        "complete",
-        len(rows),
-        rows[:20],
+        rows,
+        intent=intent_used,
+        tags=tags,
+        settings=settings,
     )
 
-    meta = {
-        "date_start": binds["date_start"].isoformat(),
-        "date_end": binds["date_end"].isoformat(),
-        "top_n": top_n,
-    }
-
-    if not rows:
-        return jsonify(
-            {
-                "ok": True,
-                "rows": [],
-                "sql": sql,
-                "hint": "No results for that window. Try 'last 90 days' or specify START_DATE/END_DATE filters.",
-                "meta": meta,
-            }
-        )
+    if mem is not None:
+        try:
+            with mem.begin() as conn:
+                _learn_mappings(conn)
+        except Exception:
+            pass
 
     csv_payload = _csv_bytes(rows)
     os.makedirs("/tmp/exports", exist_ok=True)
-    csv_path = f"/tmp/exports/dw_run_{run_id}.csv"
+    export_id = run_id if run_id is not None else int(datetime.now().timestamp())
+    csv_path = f"/tmp/exports/dw_run_{export_id}.csv"
     with open(csv_path, "wb") as handle:
         handle.write(csv_payload)
 
-    with mem.begin() as conn:
-        _learn_snippet(conn, question, sql, tags=["dw", "docuware", "contract"])
-        _learn_mappings(conn)
+    response_payload: Dict[str, Any] = {
+        "ok": True,
+        "rows": rows[:100],
+        "sql": sql,
+        "csv_path": csv_path,
+        "meta": meta_payload,
+    }
 
-    return jsonify(
-        {
-            "ok": True,
-            "rows": rows[:100],
-            "sql": sql,
-            "csv_path": csv_path,
-            "meta": meta,
-        }
-    )
+    if not rows:
+        response_payload["hint"] = (
+            "No results for that window. Try 'last 90 days' or specify START_DATE/END_DATE filters."
+        )
+
+    return jsonify(response_payload)
