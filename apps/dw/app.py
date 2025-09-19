@@ -5,8 +5,9 @@ import io
 import json
 import os
 import re
-from datetime import date, datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
+import time
+from datetime import date, datetime
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from flask import Blueprint, jsonify, request
 from sqlalchemy import create_engine, inspect, text
@@ -16,11 +17,7 @@ from core.settings import Settings
 from core.sql_exec import get_mem_engine
 
 from apps.dw.clarifier import propose_clarifying_questions
-from apps.dw.llm import (
-    clarify_time_intent,
-    derive_window_from_intent,
-    nl_to_sql_with_llm,
-)
+from apps.dw.llm import clarify_intent, intent_to_sql, nl_to_sql_with_llm
 
 if TYPE_CHECKING:  # pragma: no cover
     from core.pipeline import Pipeline
@@ -45,6 +42,20 @@ def create_dw_blueprint(settings: Settings | None = None, pipeline: "Pipeline | 
         except AttributeError:
             pass
     return dw_bp
+
+
+def _looks_like_select(sql: str) -> bool:
+    snippet = sql.strip().lstrip("(").strip()
+    return snippet.upper().startswith("SELECT") or snippet.upper().startswith("WITH")
+
+
+def _has_dml(sql: str) -> bool:
+    upper = sql.upper()
+    return any(token in upper for token in (" INSERT ", " UPDATE ", " DELETE ", " MERGE ", " DROP ", " ALTER "))
+
+
+def _binds_required_in_sql(sql: str) -> List[str]:
+    return re.findall(r":([A-Za-z_]\w*)", sql)
 
 
 def _pg(conn_str: str):
@@ -221,8 +232,8 @@ def save_learning_artifacts(
     mem = get_mem_engine(mem_settings)
     if mem is None:
         return None
-    tag_payload = list(tags or ["dw", "contracts", "window", "autosave"])
-    if "window" not in tag_payload:
+    tag_payload = list(tags or ["dw", "contracts", "autosave"])
+    if date_column and "window" not in tag_payload:
         tag_payload.append("window")
     if "autosave" not in tag_payload:
         tag_payload.append("autosave")
@@ -251,7 +262,7 @@ def save_learning_artifacts(
                 [date_column, ">=", ":date_start"],
                 [date_column, "<", ":date_end"],
             ]
-        snippet_title = f"Contracts by window: {question[:64]}"
+        snippet_title = f"Contracts NLQ: {question[:64]}"
         snippet_desc = f"Auto-saved from NLQ: {question}"
         if window_label:
             snippet_desc += f" ({window_label})"
@@ -287,7 +298,7 @@ def save_success_snippet(conn, namespace: str, question: str, sql: str, tags: Li
         text(
             """
         INSERT INTO mem_snippets(namespace, title, description, sql_template, sql_raw, input_tables, tags, is_verified, created_at, updated_at)
-        VALUES(:ns, :title, :desc, :tmpl, :raw, '["Contract"]'::jsonb, :tags::jsonb, false, NOW(), NOW())
+        VALUES(:ns, :title, :desc, :tmpl, :raw, '["Contract"]'::jsonb, CAST(:tags AS jsonb), false, NOW(), NOW())
         """
         ),
         {
@@ -306,7 +317,7 @@ def _learn_snippet(conn, question: str, sql: str, tags):
         text(
             """
         INSERT INTO mem_snippets(namespace, title, description, sql_raw, input_tables, tags, is_verified, source)
-        VALUES (:ns, :title, :desc, :sql, '["Contract"]'::jsonb, :tags::jsonb, false, 'dw')
+        VALUES (:ns, :title, :desc, :sql, '["Contract"]'::jsonb, CAST(:tags AS jsonb), false, 'dw')
         """
         ),
         {
@@ -863,53 +874,53 @@ def answer():
     except Exception as exc:
         return jsonify({"ok": False, "error": f"no datasource engine: {exc}"}), 500
 
-    mem = get_mem_engine(settings)
+    mem_engine = settings.mem_engine()
+    inquiry_id: Optional[int] = None
+    if mem_engine is not None:
+        try:
+            inquiry_id = _insert_inquiry(
+                mem_engine,
+                NAMESPACE,
+                question,
+                auth_email,
+                prefixes,
+                "open",
+            )
+        except Exception:
+            inquiry_id = None
 
-    try:
-        default_table = settings.get(
-            "DW_CONTRACT_TABLE", default="Contract", scope="namespace"
-        )
-    except Exception:
-        default_table = "Contract"
-    dw_table = data.get("dw_table") or default_table
-
-    context = {
-        "contract_table": dw_table,
-        "namespace": NAMESPACE,
-    }
-
-    now = datetime.now(timezone.utc)
-
-    time_intent = clarify_time_intent(question)
-    binds, time_notes = derive_window_from_intent(time_intent, now)
-    intent_payload = {"time": time_intent}
+    def _update_inquiry(status: str) -> None:
+        if mem_engine is None or inquiry_id is None:
+            return
+        try:
+            with mem_engine.begin() as conn:
+                conn.execute(
+                    text(
+                        """
+                        UPDATE mem_inquiries
+                           SET status = :st, updated_at = NOW()
+                         WHERE id = :id
+                        """
+                    ),
+                    {"st": status, "id": inquiry_id},
+                )
+        except Exception:
+            pass
 
     def _needs_clarification(
         reason: Optional[str] = None,
         *,
         sql_text: Optional[str] = None,
         error: Optional[str] = None,
+        status: str = "needs_clarification",
     ):
-        inquiry_id = None
-        if mem is not None:
-            try:
-                inquiry_id = _insert_inquiry(
-                    mem,
-                    NAMESPACE,
-                    question,
-                    auth_email,
-                    prefixes,
-                    "needs_clarification",
-                )
-            except Exception:
-                inquiry_id = None
+        _update_inquiry(status)
         followups = propose_clarifying_questions(question)
-        if reason:
-            if reason not in followups:
-                followups = [reason] + followups
+        if reason and reason not in followups:
+            followups = [reason] + followups
         payload = {
             "ok": False,
-            "status": "needs_clarification",
+            "status": status,
             "questions": followups,
             "inquiry_id": inquiry_id,
         }
@@ -919,53 +930,61 @@ def answer():
             payload["error"] = error
         return jsonify(payload)
 
-    try:
-        sql = nl_to_sql_with_llm(question, context=context, intent=intent_payload)
-    except Exception as exc:
-        return _needs_clarification(
-            "I couldn't draft SQL for that yet. Could you clarify the request?",
-            error=str(exc),
-        )
+    intent = clarify_intent(question, {"namespace": NAMESPACE})
+    sql_payload: Dict[str, Any]
+    clarifier_used = False
 
-    sql = (sql or "").strip()
-    if not sql:
+    if intent.get("ok"):
+        clarifier_used = True
+        sql_payload = intent_to_sql(intent)
+    else:
+        sql_payload = {"ok": False, "error": intent.get("error", "clarifier_failed")}
+
+    if not sql_payload.get("ok"):
+        sql_payload = nl_to_sql_with_llm(question, {"namespace": NAMESPACE})
+
+    if not sql_payload.get("ok"):
         return _needs_clarification(
             "I couldn't translate that question into SQL.",
-            error="empty_sql",
+            error=sql_payload.get("error"),
         )
 
-    need_start = bool(re.search(r":date_start\\b", sql))
-    need_end = bool(re.search(r":date_end\\b", sql))
-    exec_binds: Dict[str, Any] = {}
+    sql = (sql_payload.get("sql") or "").strip()
+    binds = sql_payload.get("binds") or {}
 
-    if need_start:
-        if "date_start" not in binds:
-            return _needs_clarification(
-                "Which start date should I use?",
-                sql_text=sql,
-                error="missing_date_start",
-            )
-        exec_binds["date_start"] = binds["date_start"]
-    if need_end:
-        if "date_end" not in binds:
-            return _needs_clarification(
-                "What is the end of the date range?",
-                sql_text=sql,
-                error="missing_date_end",
-            )
-        exec_binds["date_end"] = binds["date_end"]
+    if not sql:
+        return _needs_clarification("I couldn't translate that question into SQL.")
+    if not _looks_like_select(sql) or _has_dml(sql):
+        return _needs_clarification(
+            "I drafted SQL that didn't look like a safe SELECT. Could you clarify?",
+            sql_text=sql,
+            error="not_select",
+        )
+
+    required = _binds_required_in_sql(sql)
+    missing = [name for name in required if name not in binds]
+    if missing:
+        return _needs_clarification(
+            f"Provide values for: {', '.join(missing)} or rephrase with explicit dates.",
+            sql_text=sql,
+            error="missing_binds",
+        )
+    exec_binds = {name: binds[name] for name in required}
 
     appended_limit = False
     if "fetch first" not in sql.lower():
         sql = f"{sql.rstrip(';')}\nFETCH FIRST 500 ROWS ONLY"
         appended_limit = True
 
+    start_time = time.perf_counter()
     ok, fetched_rows, meta_exec, exec_error = run_sql_oracle(oracle, sql, exec_binds)
+    elapsed_ms = int((time.perf_counter() - start_time) * 1000)
     if not ok:
         return _needs_clarification(
             "The generated SQL did not run. Could you clarify the filters or timeframe?",
             sql_text=sql,
             error=exec_error,
+            status="failed",
         )
 
     rows = fetched_rows or []
@@ -977,19 +996,15 @@ def answer():
         else:
             serialized_binds[key] = value
     meta_payload["binds"] = serialized_binds
-    meta_payload["clarifier_used"] = False
-    meta_payload["window_label"] = time_notes.get("window_label")
-    meta_payload["used_date_column"] = time_notes.get("date_column")
-    meta_payload["time_intent"] = time_intent
+    meta_payload["clarifier_used"] = clarifier_used
     meta_payload["limit_applied"] = appended_limit
+    meta_payload["elapsed_ms"] = elapsed_ms
     meta_payload.setdefault("rowcount", len(rows))
     if "columns" not in meta_payload and rows:
         meta_payload["columns"] = list(rows[0].keys())
 
     tags = ["dw", "contracts", "llm"]
-    if time_notes.get("window_label"):
-        tags.append("time_window")
-
+    intent_payload = intent if clarifier_used else None
     run_id = save_learning_artifacts(
         NAMESPACE,
         question,
@@ -998,17 +1013,45 @@ def answer():
         intent=intent_payload,
         tags=tags,
         settings=settings,
-        date_column=time_notes.get("date_column"),
-        window_label=time_notes.get("window_label"),
+        date_column=None,
+        window_label=None,
     )
 
-    if mem is not None:
+    if mem_engine is not None:
         try:
-            with mem.begin() as conn:
+            with mem_engine.begin() as conn:
                 save_success_snippet(conn, NAMESPACE, question, sql, tags)
                 _learn_mappings(conn)
         except Exception:
             pass
+
+    autosave = settings.get_bool("SNIPPETS_AUTOSAVE", default=False, scope="namespace") or False
+    if autosave and rows and mem_engine is not None:
+        try:
+            with mem_engine.begin() as conn:
+                conn.execute(
+                    text(
+                        """
+                        INSERT INTO mem_snippets(namespace, title, description, sql_template, sql_raw,
+                                                 input_tables, output_columns, parameters, tags, is_verified, created_at, updated_at)
+                        VALUES (:ns, :title, :desc, :tmpl, :raw, '["Contract"]'::jsonb, CAST(:cols AS jsonb), CAST(:params AS jsonb),
+                                '["dw","contracts"]'::jsonb, true, NOW(), NOW())
+                        """
+                    ),
+                    {
+                        "ns": NAMESPACE,
+                        "title": question[:200],
+                        "desc": "Saved from successful /dw/answer",
+                        "tmpl": sql,
+                        "raw": sql,
+                        "cols": json.dumps(meta_payload.get("columns", [])),
+                        "params": json.dumps(serialized_binds),
+                    },
+                )
+        except Exception:
+            pass
+
+    _update_inquiry("complete")
 
     csv_payload = _csv_bytes(rows)
     os.makedirs("/tmp/exports", exist_ok=True)
@@ -1023,6 +1066,7 @@ def answer():
         "sql": sql,
         "csv_path": csv_path,
         "meta": meta_payload,
+        "inquiry_id": inquiry_id,
     }
 
     if rows_suspiciously_empty(rows, question):

@@ -1,269 +1,220 @@
-"""DocuWare SQL helpers with temporal intent extraction."""
+"""LLM helpers for DocuWare Oracle analytics."""
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import re
-from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from core.model_loader import get_model
 
-ALLOWED_DATE_COLUMNS = ["REQUEST_DATE", "END_DATE"]
-ALLOWED_COLUMNS = [
-    "CONTRACT_ID",
-    "CONTRACT_OWNER",
-    "CONTRACT_STAKEHOLDER_1",
-    "CONTRACT_STAKEHOLDER_2",
-    "CONTRACT_STAKEHOLDER_3",
-    "CONTRACT_STAKEHOLDER_4",
-    "CONTRACT_STAKEHOLDER_5",
-    "CONTRACT_STAKEHOLDER_6",
-    "CONTRACT_STAKEHOLDER_7",
-    "CONTRACT_STAKEHOLDER_8",
-    "DEPARTMENT_1",
-    "DEPARTMENT_2",
-    "DEPARTMENT_3",
-    "DEPARTMENT_4",
-    "DEPARTMENT_5",
-    "DEPARTMENT_6",
-    "DEPARTMENT_7",
-    "DEPARTMENT_8",
-    "OWNER_DEPARTMENT",
-    "CONTRACT_VALUE_NET_OF_VAT",
-    "VAT",
-    "CONTRACT_PURPOSE",
-    "CONTRACT_SUBJECT",
-    "START_DATE",
-    "END_DATE",
-    "REQUEST_DATE",
-    "REQUEST_TYPE",
-    "CONTRACT_STATUS",
-    "ENTITY_NO",
-    "REQUESTER",
-]
+JSON_TAG_OPEN = "<<JSON>>"
+JSON_TAG_CLOSE = "<<END>>"
 
-_SQL_START_RE = re.compile(r"(?is)\b(with|select)\b")
-
-
-def clarify_time_intent(question: str) -> Dict[str, Any]:
-    """Use the clarifier model to produce structured temporal intent."""
-
-    mdl = get_model("clarifier")
-    if mdl is None:
-        return {"kind": "NONE", "column": None}
-
-    prompt = f"""
-You are a temporal intent extractor for Oracle contracts analytics.
-
-Return ONLY JSON, no prose.
-
-Detect if the question implies any time window. Output:
-- kind: "NONE" | "RELATIVE" | "BETWEEN" | "ABSOLUTE"
-- column: one of {ALLOWED_DATE_COLUMNS} if clear, else null
-- rel: for RELATIVE, one of: "next_7_days","next_30_days","last_7_days","last_30_days","last_month","this_month","last_quarter","this_quarter"
-- start, end: ISO dates for BETWEEN or ABSOLUTE windows
-- note: short human hint (optional)
-
-Examples:
-Q: "Contracts with END_DATE in the next 30 days"
-{{"kind":"RELATIVE","column":"END_DATE","rel":"next_30_days"}}
-
-Q: "contracts created last month"
-{{"kind":"RELATIVE","column":"REQUEST_DATE","rel":"last_month"}}
-
-Q: "Between 2025-01-01 and 2025-03-31"
-{{"kind":"BETWEEN","column":null,"start":"2025-01-01","end":"2025-03-31"}}
-
-Q: "Contracts where VAT is null or zero but net value > 0"
-{{"kind":"NONE","column":null}}
-
-Now the question:
-{question}
+_INTENT_SCHEMA_HINT = """
+Return ONLY a compact JSON between <<JSON>> and <<END>> with this shape:
+{
+  "tables": ["Contract"],
+  "select": ["CONTRACT_ID", "END_DATE", "CONTRACT_STATUS"],
+  "filters": [
+    {"column": "END_DATE", "op": "between", "value": ["{TODAY}", "{TODAY}+30d"]},
+    {"column": "VAT", "op": "is_null"},
+    {"column": "CONTRACT_VALUE_NET_OF_VAT", "op": ">", "value": 0}
+  ],
+  "group_by": [],
+  "order_by": [{"expr": "END_DATE", "dir": "asc"}],
+  "limit": 100
+}
+Date literals allowed in filter values: {TODAY}, {NOW}, {TODAY-7d}, {TODAY+30d}, {START_OF_MONTH}, {END_OF_MONTH}.
+Only include fields you actually need for the question.
 """
 
-    out = mdl.generate(prompt=prompt.strip(), max_new_tokens=256, temperature=0.0)
-    if not out:
-        return {"kind": "NONE", "column": None}
 
-    try:
-        jstart = out.find("{")
-        jend = out.rfind("}") + 1
-        parsed = json.loads(out[jstart:jend])
-    except Exception:
-        return {"kind": "NONE", "column": None}
-
-    kind = (parsed or {}).get("kind")
-    if kind not in {"NONE", "RELATIVE", "BETWEEN", "ABSOLUTE"}:
-        kind = "NONE"
-    column = parsed.get("column")
-    if column:
-        column = str(column).upper()
-        if column not in ALLOWED_DATE_COLUMNS:
-            column = None
-    intent = {
-        "kind": kind,
-        "column": column,
-    }
-    if kind in {"RELATIVE", "BETWEEN", "ABSOLUTE"}:
-        if parsed.get("rel"):
-            intent["rel"] = str(parsed["rel"]).lower()
-        if parsed.get("start"):
-            intent["start"] = str(parsed["start"])
-        if parsed.get("end"):
-            intent["end"] = str(parsed["end"])
-        if parsed.get("note"):
-            intent["note"] = str(parsed["note"])
-    return intent
-
-
-def _normalize_datetime(value: datetime | None) -> Optional[datetime]:
-    if value is None:
-        return None
-    if value.tzinfo is None:
-        return value
-    return value.astimezone(timezone.utc).replace(tzinfo=None)
-
-
-def _parse_iso_date(value: Optional[str]) -> Optional[datetime]:
-    if not value:
-        return None
-    try:
-        parsed = datetime.fromisoformat(value)
-    except ValueError:
-        return None
-    if isinstance(parsed, datetime):
-        return _normalize_datetime(parsed)
+def _extract_json(text: str) -> Optional[str]:
+    match = re.search(
+        re.escape(JSON_TAG_OPEN) + r"(.*)" + re.escape(JSON_TAG_CLOSE), text, re.S
+    )
+    if match:
+        return match.group(1).strip()
+    last_brace = text.rfind("}")
+    first_brace = text.find("{")
+    if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
+        return text[first_brace : last_brace + 1]
     return None
 
 
-def derive_window_from_intent(
-    intent: Optional[Dict[str, Any]], now: Optional[datetime] = None
-) -> Tuple[Dict[str, datetime], Dict[str, Optional[str]]]:
-    """Return binds (date_start/date_end) and metadata notes for the supplied intent."""
+def clarify_intent(user_q: str, context: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    """Ask the clarifier model for structured intent JSON."""
 
-    now = now or datetime.now(timezone.utc)
-    if now.tzinfo is None:
-        now = now.replace(tzinfo=timezone.utc)
+    clarifier = get_model("clarifier")
+    if clarifier is None:
+        return {"ok": False, "error": "clarifier_unavailable"}
 
-    intent = intent or {}
-    kind = intent.get("kind", "NONE")
-    column = intent.get("column") or None
-    notes = {"date_column": column, "window_label": None}
-    binds: Dict[str, datetime] = {}
-
-    if kind == "NONE":
-        return binds, notes
-
-    if kind in {"BETWEEN", "ABSOLUTE"}:
-        start = _parse_iso_date(intent.get("start"))
-        end = _parse_iso_date(intent.get("end"))
-        if start and end:
-            binds["date_start"] = start
-            binds["date_end"] = end
-            notes["window_label"] = f"{start.date()}..{end.date()}"
-        return binds, notes
-
-    if kind == "RELATIVE":
-        rel = str(intent.get("rel", "")).lower()
-        now_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        start: Optional[datetime]
-        end: Optional[datetime]
-        if rel == "next_30_days":
-            start = now_day
-            end = now_day + timedelta(days=30)
-        elif rel == "next_7_days":
-            start = now_day
-            end = now_day + timedelta(days=7)
-        elif rel == "last_30_days":
-            end = now_day
-            start = now_day - timedelta(days=30)
-        elif rel == "last_7_days":
-            end = now_day
-            start = now_day - timedelta(days=7)
-        elif rel == "last_month":
-            first_this = now_day.replace(day=1)
-            last_month_end = first_this - timedelta(days=1)
-            start = last_month_end.replace(day=1)
-            end = first_this
-        elif rel in {"this_month", "last_quarter", "this_quarter"}:
-            end = now_day
-            start = now_day - timedelta(days=30)
-        else:
-            return binds, notes
-        binds["date_start"] = _normalize_datetime(start)
-        binds["date_end"] = _normalize_datetime(end)
-        notes["window_label"] = rel
-        return binds, notes
-
-    return binds, notes
-
-
-def _clean_sql_output(raw: str) -> str:
-    if not raw:
-        return ""
-    text = raw.strip()
-    fence = re.search(r"```(sql)?(.*?)```", text, flags=re.IGNORECASE | re.DOTALL)
-    if fence:
-        text = fence.group(2).strip()
-    match = _SQL_START_RE.search(text)
-    if match:
-        text = text[match.start() :]
-    return text.strip().rstrip(";")
-
-
-def nl_to_sql_with_llm(
-    question: str,
-    context: Optional[Dict[str, Any]] = None,
-    intent: Optional[Dict[str, Any]] = None,
-) -> str:
-    """Prompt SQLCoder to translate natural language into Oracle SQL."""
-
-    sql_mdl = get_model("sql")
-    if sql_mdl is None:
-        raise RuntimeError("SQL model unavailable")
-
-    ctx = dict(context or {})
-    table_name = ctx.get("contract_table") or "Contract"
-    time_block = (intent or {}).get("time") or {}
-    time_kind = time_block.get("kind", "NONE")
-    date_col = time_block.get("column") or None
-
-    rules = [
-        "ONLY Oracle SQL. One SELECT (CTE allowed). No prose.",
-        f'Table name is exactly "{table_name}" (quoted).',
-        f"Allowed columns only: {', '.join(ALLOWED_COLUMNS)}.",
-        "Use Oracle functions such as NVL, LISTAGG ... WITHIN GROUP, TRIM, UPPER, FETCH FIRST N ROWS ONLY.",
-        'If computing gross value, use NVL(CONTRACT_VALUE_NET_OF_VAT,0) + NVL(VAT,0) AS CONTRACT_VALUE_GROSS.',
-        'Do NOT add date filters unless intent.time.kind != "NONE".',
-    ]
-
-    if time_kind != "NONE":
-        target_col = date_col or "REQUEST_DATE"
-        rules.append(
-            f"When a time window is requested, filter on {target_col} using :date_start and :date_end binds."
-        )
-
-    prompt_lines = [
-        "You are a senior SQL analyst. Follow the rules strictly.",
-        "Rules:",
-    ]
-    for rule in rules:
-        prompt_lines.append(f"- {rule}")
-    prompt_lines.append("")
-    prompt_lines.append(f"Question:\n{question.strip()}")
-    if intent:
-        prompt_lines.append("")
-        prompt_lines.append(f"Intent JSON: {json.dumps(intent, ensure_ascii=False)}")
-    prompt_lines.append("")
-    prompt_lines.append("SQL:")
-
-    prompt = "\n".join(prompt_lines).strip() + "\n"
-
-    raw_sql = sql_mdl.generate(
-        prompt,
-        max_new_tokens=512,
-        temperature=0.0,
-        top_p=0.9,
+    sys_prompt = (
+        "You are a careful intent normalizer for DocuWare (Oracle). "
+        "Output STRICT JSON only — no prose, no comments, no markdown.\n"
+        + _INTENT_SCHEMA_HINT
     )
-    return _clean_sql_output(raw_sql)
+    prompt = (
+        f"{sys_prompt}\nUser question:\n{user_q}\n"
+        f"Return JSON only between {JSON_TAG_OPEN} and {JSON_TAG_CLOSE}."
+    )
+    out = clarifier.generate(prompt, max_new_tokens=256, temperature=0.0, stop=[JSON_TAG_CLOSE])
+    js = _extract_json(out or "")
+    if not js:
+        retry_prompt = (
+            "RETURN JSON ONLY. NO PROSE. NO MARKDOWN.\n"
+            + _INTENT_SCHEMA_HINT
+            + f"\nUser question:\n{user_q}\n{JSON_TAG_OPEN}"
+        )
+        out2 = clarifier.generate(
+            retry_prompt, max_new_tokens=256, temperature=0.0, stop=[JSON_TAG_CLOSE]
+        )
+        js = _extract_json(out2 or "")
+        if not js:
+            return {"ok": False, "error": "clarifier_no_json", "raw": out2}
+    try:
+        intent = json.loads(js)
+    except Exception as exc:  # pragma: no cover - defensive
+        return {"ok": False, "error": f"clarifier_bad_json: {exc}", "raw_json": js}
+
+    intent["ok"] = True
+    return intent
+
+
+def _resolve_date_literal(token: str) -> dt.datetime:
+    today = dt.datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    if token.startswith("{TODAY"):
+        base = today
+        match = re.match(r"\{TODAY([+-]\d+)d\}", token)
+        if match:
+            return base + dt.timedelta(days=int(match.group(1)))
+        return base
+    if token.startswith("{NOW"):
+        base = dt.datetime.now()
+        match = re.match(r"\{NOW([+-]\d+)d\}", token)
+        if match:
+            return base + dt.timedelta(days=int(match.group(1)))
+        return base
+    if token == "{START_OF_MONTH}":
+        return today.replace(day=1)
+    if token == "{END_OF_MONTH}":
+        next_month = (today.replace(day=28) + dt.timedelta(days=4)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        return next_month - dt.timedelta(days=next_month.day)
+    raise ValueError(f"unknown date literal {token}")
+
+
+def _compile_filters(filters: List[Dict[str, Any]] | None) -> Tuple[List[str], Dict[str, Any]]:
+    where: List[str] = []
+    binds: Dict[str, Any] = {}
+    bind_i = 1
+
+    for item in filters or []:
+        column = item.get("column")
+        op = (item.get("op") or "=").lower()
+        value = item.get("value")
+        if not column:
+            continue
+        if op in {"is_null", "is null"}:
+            where.append(f"{column} IS NULL")
+            continue
+        if op in {"is_not_null", "is not null"}:
+            where.append(f"{column} IS NOT NULL")
+            continue
+        if op in {"=", "eq", "==", "!=", "<>", ">", ">=", "<", "<=", "like"}:
+            bind_name = f"b{bind_i}"
+            bind_i += 1
+            if isinstance(value, str) and value.startswith("{") and value.endswith("}"):
+                bind_value = _resolve_date_literal(value)
+            else:
+                bind_value = value
+            binds[bind_name] = bind_value
+            actual_op = op if op not in {"eq", "=="} else "="
+            where.append(f"{column} {actual_op} :{bind_name}")
+            continue
+        if op == "between" and isinstance(value, (list, tuple)) and len(value) == 2:
+            bind_name_1 = f"b{bind_i}"
+            bind_name_2 = f"b{bind_i + 1}"
+            bind_i += 2
+            start, end = value
+            if isinstance(start, str) and start.startswith("{"):
+                start = _resolve_date_literal(start)
+            if isinstance(end, str) and end.startswith("{"):
+                end = _resolve_date_literal(end)
+            binds[bind_name_1] = start
+            binds[bind_name_2] = end
+            where.append(f"{column} BETWEEN :{bind_name_1} AND :{bind_name_2}")
+            continue
+        if op == "in" and isinstance(value, (list, tuple)) and value:
+            names: List[str] = []
+            for entry in value:
+                bind_name = f"b{bind_i}"
+                bind_i += 1
+                binds[bind_name] = entry
+                names.append(f":{bind_name}")
+            where.append(f"{column} IN ({', '.join(names)})")
+            continue
+
+    return where, binds
+
+
+def intent_to_sql(intent: Dict[str, Any]) -> Dict[str, Any]:
+    """Compile structured intent JSON into Oracle SQL."""
+
+    if not intent.get("ok"):
+        return {"ok": False, "error": intent.get("error", "intent_missing")}
+
+    tables = intent.get("tables") or ["Contract"]
+    select = intent.get("select") or ["CONTRACT_ID"]
+    filters = intent.get("filters") or []
+    group_by = intent.get("group_by") or []
+    order_by = intent.get("order_by") or []
+    limit = intent.get("limit")
+
+    if len(tables) != 1 or tables[0] != "Contract":
+        return {"ok": False, "error": "only_Contract_supported_now"}
+
+    where_sql, binds = _compile_filters(filters)
+    columns = ", ".join(select)
+    sql = 'SELECT ' + columns + ' FROM "Contract"'
+
+    if where_sql:
+        sql += "\nWHERE " + "\n  AND ".join(where_sql)
+    if group_by:
+        sql += "\nGROUP BY " + ", ".join(group_by)
+    if order_by:
+        clauses: List[str] = []
+        for ob in order_by:
+            expr = ob.get("expr")
+            if not expr:
+                continue
+            direction = (ob.get("dir") or "asc").upper()
+            clauses.append(f"{expr} {direction}")
+        if clauses:
+            sql += "\nORDER BY " + ", ".join(clauses)
+    if isinstance(limit, int) and limit > 0:
+        sql += f"\nFETCH FIRST {limit} ROWS ONLY"
+
+    return {"ok": True, "sql": sql, "binds": binds}
+
+
+def nl_to_sql_with_llm(user_q: str, context: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    """Ask SQLCoder for direct SQL when structured intent is unavailable."""
+
+    mdl = get_model("sql")
+    if mdl is None:
+        return {"ok": False, "error": "sql_model_unavailable"}
+
+    sys = (
+        "Return ONLY Oracle SQL. No prose. No comments. SELECT/CTE only.\n"
+        'Use table "Contract". Use Oracle functions: NVL, LISTAGG WITHIN GROUP, TRIM, UPPER.\n'
+        "If filtering by date is requested (e.g., 'next 30 days'), filter on the explicit column mentioned (END_DATE) with binds.\n"
+        "Use named binds like :b1, :b2, ... never positional.\n"
+    )
+    prompt = f"{sys}\nUser question:\n{user_q}\nSQL:"
+    sql = mdl.generate(prompt, max_new_tokens=256, temperature=0.0)
+    sql = re.sub(r"^```sql|^```|```$", "", sql.strip(), flags=re.I | re.M)
+    return {"ok": True, "sql": sql.strip()}
