@@ -16,7 +16,12 @@ from core.settings import Settings
 from core.sql_exec import get_mem_engine
 
 from apps.dw.clarifier import propose_clarifying_questions
-from apps.dw.llm import clarify_intent, choose_date_column, nl_to_sql_with_llm
+from apps.dw.llm import (
+    clarify_intent,
+    choose_date_column,
+    ensure_date_window,
+    nl_to_sql_with_llm,
+)
 
 if TYPE_CHECKING:  # pragma: no cover
     from core.pipeline import Pipeline
@@ -964,6 +969,7 @@ def answer():
         "top_n": top_n,
     }
     active_binds = dict(default_binds)
+    need_window = all(key in active_binds for key in ("date_start", "date_end"))
 
     try:
         use_llm = settings.get_bool("DW_USE_LLM", scope="namespace")
@@ -990,6 +996,10 @@ def answer():
         context["date_column"] = used_date_column
 
     sql = llm_result.get("sql") if isinstance(llm_result, dict) else None
+    if sql:
+        sql = ensure_date_window(sql, used_date_column, need_window)
+        if isinstance(llm_result, dict):
+            llm_result["sql"] = sql
     if not sql:
         fallback_mode = True
         raw_text = llm_result.get("raw") if isinstance(llm_result, dict) else None
@@ -1075,6 +1085,13 @@ def answer():
                 used_date_column = clarified.get("used_date_column") or used_date_column
                 clarifier_ctx["date_column"] = used_date_column
             if sql2:
+                date_col2 = clarifier_ctx.get("date_column") or used_date_column
+                need_window2 = all(
+                    key in active_binds for key in ("date_start", "date_end")
+                )
+                sql2 = ensure_date_window(sql2, date_col2, need_window2)
+                if isinstance(clarified, dict):
+                    clarified["sql"] = sql2
                 ok2, fetched_rows2, meta_exec2, exec_error2 = run_sql_oracle(
                     oracle, sql2, active_binds
                 )
@@ -1083,6 +1100,7 @@ def answer():
                     rows = fetched_rows2
                     meta_exec = meta_exec2
                     ok = True
+                    used_date_column = date_col2 or used_date_column
                     clarifier_needed = rows_suspiciously_empty(rows, question)
                     error_message = exec_error2
                     llm_result = clarified  # adopt clarified rationale
