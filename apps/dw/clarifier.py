@@ -7,17 +7,16 @@ from typing import List
 from core.model_loader import load_llm
 
 SYS = (
-    "You're a concise assistant that writes at most 2 short clarifying questions "
+    "You're a concise assistant that writes at most 2 short yes/no clarifying questions "
     "to help convert a business request into SQL over a single table named Contract. "
-    "Prefer asking about date range, filters, and which people fields to use. "
-    "Return plain text bullet points, no extra prose."
+    "Each bullet must end with a question mark."
 )
 
 EXAMPLE = (
     "User: top stakeholders by contract value\n"
     "Assistant:\n"
-    "- Do you mean gross value (net + VAT) and which date field (REQUEST_DATE vs END_DATE)?\n"
-    "- What time window (last month, this quarter, or a specific range)?"
+    "- Should we use REQUEST_DATE or END_DATE for the time filter?\n"
+    "- Do you want gross contract value (net + VAT)?"
 )
 
 
@@ -33,7 +32,7 @@ def propose_clarifying_questions(user_question: str) -> List[str]:
 
     prompt = f"{SYS}\n\n{EXAMPLE}\n\nUser: {user_question}\nAssistant:\n"
     if handle is not None:
-        text = handle.generate(prompt, max_new_tokens=96, temperature=0.0, top_p=1.0)
+        text = handle.generate(prompt, max_new_tokens=96, temperature=0.2, top_p=0.9)
     else:
         tokenizer = clar.get("tokenizer")
         model = clar.get("model")
@@ -55,15 +54,29 @@ def propose_clarifying_questions(user_question: str) -> List[str]:
                 outputs = model.generate(
                     **inputs,
                     max_new_tokens=96,
-                    do_sample=False,
-                    temperature=0.0,
+                    do_sample=True,
+                    temperature=0.2,
+                    top_p=0.9,
                     pad_token_id=tokenizer.eos_token_id,
                 )
             text = tokenizer.decode(outputs[0], skip_special_tokens=True)
 
     tail = text.split("Assistant:")[-1].strip()
-    lines = [ln.strip("-• ").strip() for ln in tail.splitlines() if ln.strip()]
-    return lines[:2] if lines else [
-        "Which date field should we use (REQUEST_DATE or END_DATE) and what time window?"
+    lines = []
+    for raw_line in tail.splitlines():
+        cleaned = raw_line.strip()
+        if not cleaned:
+            continue
+        cleaned = cleaned.lstrip("-• ").strip()
+        if not cleaned.endswith("?"):
+            cleaned = f"{cleaned}?"
+        lines.append(cleaned)
+
+    if lines:
+        return lines[:2]
+
+    return [
+        "Should we use REQUEST_DATE or END_DATE for the time filter?",
+        "Do you need gross contract value (net + VAT)?",
     ]
 

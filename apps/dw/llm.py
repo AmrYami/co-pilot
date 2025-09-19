@@ -8,6 +8,9 @@ from typing import Any, Dict, Optional
 
 from core.model_loader import get_model, load_llm
 
+_SENTINEL_START = "BEGIN_SQL"
+_SENTINEL_END = "END_SQL"
+
 
 # ---------------------------------------------------------------------------
 # Clarifier helpers
@@ -64,7 +67,7 @@ def clarify_intent(question: str, context: Dict[str, Any]) -> Dict[str, Any]:
         out = mdl.generate(
             system_prompt=CLARIFIER_SYSTEM,
             user_prompt=user,
-            max_new_tokens=256,
+            max_new_tokens=96,
         )
     except Exception as exc:
         return _clarifier_fallback(f"clarifier error ({type(exc).__name__})")
@@ -111,43 +114,67 @@ _EXPIRY_HINTS = re.compile(
     r"\b(expir|expiry|expiring|end[-\s]?date|ending|renew(al|ing)?)\b", re.IGNORECASE
 )
 
-_SQL_FENCE = re.compile(r"```(?:sql)?\s*([\s\S]*?)```", re.IGNORECASE)
-_SQL_BLOCK = re.compile(r"(?is)\b(with|select)\b[\s\S]+")
-
-
 def choose_date_column(user_text: str, default_col: str) -> str:
     """Return END_DATE when the question clearly refers to expirations."""
 
-    return "END_DATE" if _EXPIRY_HINTS.search(user_text or "") else default_col
+    lowered = (user_text or "").lower()
+    if "end_date" in lowered:
+        return "END_DATE"
+    if "start_date" in lowered:
+        return "START_DATE"
+    return "END_DATE" if _EXPIRY_HINTS.search(lowered) else default_col
 
 
-def extract_sql_only(text: str) -> Optional[str]:
-    """Extract the first SELECT/CTE statement from raw LLM output."""
+def extract_sql_from_llm(raw: str) -> Optional[str]:
+    """Extract SQL from the LLM output using sentinels or SELECT/WITH heuristics."""
 
-    if not text:
+    if not raw:
         return None
 
-    candidate = text
-    fence = _SQL_FENCE.search(candidate)
-    if fence:
-        candidate = fence.group(1)
+    sql = raw
 
-    candidate = candidate.strip()
-    if candidate.lower().startswith("sql:"):
-        candidate = candidate[4:].strip()
+    if _SENTINEL_START in raw and _SENTINEL_END in raw:
+        sql = raw.split(_SENTINEL_START, 1)[1].split(_SENTINEL_END, 1)[0]
+    elif _SENTINEL_START in raw:
+        sql = raw.split(_SENTINEL_START, 1)[1]
+    else:
+        match = re.search(r"(?is)\b(SELECT|WITH)\b.*", raw)
+        sql = match.group(0) if match else ""
 
-    block = _SQL_BLOCK.search(candidate)
-    if not block:
+    if not sql:
         return None
 
-    sql = block.group(0).strip()
-    sql = sql.split("```", 1)[0].strip()
-    sql = sql.rstrip(";")
+    sql = re.sub(r"```.*?```", "", sql, flags=re.S)
+    lines = []
+    for line in sql.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("--"):
+            continue
+        lines.append(line)
+    sql = "\n".join(lines).strip().rstrip(";")
+    return sql or None
 
-    upper = sql.lstrip().upper()
-    if upper.startswith("WITH") or upper.startswith("SELECT"):
+
+def ensure_date_window(sql: str, date_col: Optional[str], need_window: bool) -> str:
+    """Ensure the generated SQL applies the expected date window binds."""
+
+    if not sql or not need_window or not date_col:
         return sql
-    return None
+    if ":date_start" in sql or ":date_end" in sql:
+        return sql
+
+    clause = f"{date_col} >= :date_start AND {date_col} < :date_end"
+    where_pattern = re.compile(r"(?is)\bWHERE\b")
+    if where_pattern.search(sql):
+        return where_pattern.sub(lambda m: f"{m.group(0)} {clause} AND", sql, count=1)
+
+    insert_pattern = re.compile(r"(?is)\b(ORDER\s+BY|GROUP\s+BY|FETCH\s+FIRST|OFFSET|LIMIT)\b")
+    match = insert_pattern.search(sql)
+    insertion = f" WHERE {clause} "
+    if match:
+        idx = match.start()
+        return sql[:idx].rstrip() + insertion + sql[idx:]
+    return sql.rstrip() + insertion
 
 
 def _default_columns() -> list[str]:
@@ -187,40 +214,46 @@ def _default_columns() -> list[str]:
 
 def build_dw_prompt(
     question: str,
-    ctx: Dict[str, Any],
+    table: str,
+    allowed_cols: list[str],
+    date_hint: Optional[str],
     *,
     intent: Optional[Dict[str, Any]] = None,
 ) -> str:
-    """Return an Oracle-specific instruction prompt for SQLCoder."""
+    """Construct a compact instruction prompt that yields SQL only."""
 
-    table = ctx.get("contract_table", "Contract")
-    date_col = ctx.get("date_column", "REQUEST_DATE")
-    columns = ctx.get("columns") or _default_columns()
-    cols = ", ".join(columns)
+    lowered = (question or "").lower()
+    if "end_date" in lowered:
+        date_hint = "END_DATE"
+    elif "start_date" in lowered:
+        date_hint = "START_DATE"
 
-    prompt_lines = [
-        "-- ROLE: Convert natural language into a single valid Oracle SQL query.",
-        "-- RULES:",
-        "-- 1) Output ONLY one SELECT/CTE statement (no comments, no explanations, no prose).",
-        f"-- 2) Use table \"{table}\" and these columns only: {cols}.",
-        f"-- 3) If a time window is implied, filter using this column: {date_col}.",
-        "-- 4) Use named binds :date_start and :date_end for time windows (BETWEEN :date_start AND :date_end or >= :date_start AND < :date_end).",
-        "-- 5) Use Oracle syntax: NVL(), LISTAGG(... WITHIN GROUP (...)), FETCH FIRST N ROWS ONLY, TRIM(), UPPER(), etc.",
-        "-- 6) Never modify data. No DML/DDL. SELECT/CTE only.",
-        "",
-        "-- QUESTION:",
-        question,
+    cols_csv = ", ".join(allowed_cols)
+    if date_hint:
+        date_rule = (
+            f"Filter time windows using {date_hint} with :date_start and :date_end binds."
+        )
+    else:
+        date_rule = (
+            "If a time window is implied, use :date_start and :date_end binds on the most relevant date column."
+        )
+
+    lines = [
+        f"Return only valid Oracle SQL between {_SENTINEL_START} and {_SENTINEL_END}.",
+        f"Table: \"{table}\".",
+        f"Allowed columns: {cols_csv}.",
+        date_rule,
+        "Use Oracle SELECT or WITH statements only.",
+        "Never include comments or explanations.",
+        f"Question: {question}",
     ]
 
     if intent:
         intent_json = json.dumps(intent, ensure_ascii=False)
-        prompt_lines.extend(
-            ["", "-- CLARIFIED INTENT:"]
-            + [f"-- {line}" for line in intent_json.splitlines()]
-        )
+        lines.append(f"Intent: {intent_json}")
 
-    prompt_lines.append("-- SQL:")
-    return "\n".join(prompt_lines)
+    lines.append(_SENTINEL_START)
+    return "\n".join(lines) + "\n"
 
 
 def nl_to_sql_with_llm(
@@ -267,10 +300,17 @@ def nl_to_sql_with_llm(
 
     ctx["date_column"] = choose_date_column(question or "", default_col)
 
-    prompt = build_dw_prompt(question or "", ctx, intent=intent)
+    columns = ctx.get("columns") or _default_columns()
+    prompt = build_dw_prompt(
+        question or "",
+        ctx.get("contract_table", "Contract"),
+        columns,
+        ctx.get("date_column"),
+        intent=intent,
+    )
 
     try:
-        raw_text = generator.generate(prompt)
+        raw_text = generator.generate(prompt, stop=[_SENTINEL_END])
     except Exception as exc:
         return {
             "sql": None,
@@ -280,7 +320,7 @@ def nl_to_sql_with_llm(
             "used_date_column": ctx.get("date_column"),
         }
 
-    sql = extract_sql_only(raw_text)
+    sql = extract_sql_from_llm(raw_text)
     if not sql:
         return {
             "sql": None,
