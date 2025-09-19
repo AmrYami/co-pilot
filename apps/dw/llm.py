@@ -2,6 +2,26 @@ import re
 
 from core.model_loader import get_model
 
+_SQL_STRIP_PATTERNS = [
+    r"(?is)^sql\s*:\s*",
+    r"(?is)^--.*?$",
+    r"(?is)^/\*.*?\*/\s*",
+]
+
+
+def _normalize_sql(sql_text: str) -> str:
+    if not sql_text:
+        return ""
+    s = sql_text.strip()
+    for pat in _SQL_STRIP_PATTERNS:
+        s = re.sub(pat, "", s).strip()
+    match = re.search(r"(?is)\b(with|select)\b", s)
+    if match:
+        s = s[match.start() :].strip()
+    if ";" in s:
+        s = s.split(";", 1)[0].strip()
+    return s
+
 _SQL_SYSTEM_PROMPT = """Return ONLY Oracle SQL. No prose. No comments. SELECT or WITH only.
 Use only table "Contract".
 Allowed columns:
@@ -54,7 +74,14 @@ def nl_to_sql_with_llm(question: str, context: dict) -> str | None:
         max_new_tokens=256,
         stop=[],
     )
-    return _sanitize_oracle_select(raw)
+    normalized = _normalize_sql(raw)
+    return _sanitize_oracle_select(normalized)
 
 
-__all__ = ["_SQL_SYSTEM_PROMPT", "_sanitize_oracle_select", "nl_to_sql_with_llm"]
+__all__ = [
+    "_SQL_SYSTEM_PROMPT",
+    "_SQL_STRIP_PATTERNS",
+    "_normalize_sql",
+    "_sanitize_oracle_select",
+    "nl_to_sql_with_llm",
+]

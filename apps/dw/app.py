@@ -139,6 +139,24 @@ def _choose_date_column(q: str) -> str | None:
     return None
 
 
+_WINDOW_PATTERNS = [
+    r"(?i)\bnext\s+\d+\s+(day|days|week|weeks|month|months|quarter|quarters|year|years)\b",
+    r"(?i)\blast\s+(month|quarter|year|week|7\s*days|30\s*days|90\s*days)\b",
+    r"(?i)\bbetween\s+\d{4}-\d{2}-\d{2}\s+and\s+\d{4}-\d{2}-\d{2}\b",
+    r"(?i)\bsince\s+\d{4}-\d{2}-\d{2}\b",
+    r"(?i)\bthis\s+(month|quarter|year)\b",
+    r"(?i)\btoday\b|\btomorrow\b|\byesterday\b",
+]
+
+
+def _window_requested(text: str) -> bool:
+    t = (text or "").strip()
+    for pat in _WINDOW_PATTERNS:
+        if re.search(pat, t):
+            return True
+    return False
+
+
 _BIND_WHITELIST = {
     "date_start",
     "date_end",
@@ -155,12 +173,36 @@ def _find_binds(sql: str) -> set[str]:
     return set(re.findall(r":([A-Za-z_][A-Za-z0-9_]*)", sql or ""))
 
 
-def _validate_binds_subset_only(sql: str) -> tuple[bool, list[str]]:
-    """True if all binds are from whitelist; list of offending binds otherwise."""
+def _validate_sql(
+    sql: str,
+    *,
+    allow_binds: set[str],
+    need_window: bool,
+    date_col_hint: str | None,
+) -> tuple[bool, str, set[str]]:
+    normalized = (sql or "").strip()
+    if not normalized:
+        return False, "empty_sql", set()
+    lowered = normalized.lstrip().lower()
+    if not (lowered.startswith("select") or lowered.startswith("with")):
+        return False, "not_select", set()
 
     binds = _find_binds(sql)
-    bad = sorted(b for b in binds if b not in _BIND_WHITELIST)
-    return len(bad) == 0, bad
+    bad = {b for b in binds if b not in allow_binds}
+    if bad:
+        return False, "forbidden_bind", bad
+
+    has_window_binds = {"date_start", "date_end"}.issubset(binds)
+    any_window_binds = bool({"date_start", "date_end"} & binds)
+
+    if need_window:
+        if not has_window_binds:
+            return False, "missing_date_context", binds
+    else:
+        if any_window_binds and not date_col_hint:
+            return False, "unexpected_date_filter", binds
+
+    return True, "ok", binds
 
 
 def _pg(conn_str: str):
@@ -1045,27 +1087,21 @@ def answer():
             return value
         return value
 
+    date_col_hint = _choose_date_column(question)
+    need_window = _window_requested(question)
+
     sql = nl_to_sql_with_llm(question, context={})
     if not sql:
         return _needs_clarification(
             "I couldn't derive a clean SELECT. Could you rephrase or specify filters (stakeholders, departments, date columns)?"
         )
 
-    ok_subset, bad_binds = _validate_binds_subset_only(sql)
-    if not ok_subset:
-        return _needs_clarification(
-            f"Your query used unsupported bind(s): {', '.join(':'+b for b in bad_binds)}. "
-            f"Allowed binds: {', '.join(':'+b for b in sorted(_BIND_WHITELIST))}.",
-            sql_text=sql,
-            error="bad_binds",
-        )
-
     binds: Dict[str, Any] = {}
     window_label: Optional[str] = None
     date_column_used: Optional[str] = None
-    win = _infer_window_from_question(question)
+    win = _infer_window_from_question(question) if need_window else None
     if win:
-        date_col = _choose_date_column(question) or "REQUEST_DATE"
+        date_col = date_col_hint or "REQUEST_DATE"
         wants_date_binds = ":date_start" in sql or ":date_end" in sql
         start_dt = _normalize_dt(win["start"]) if "start" in win else None
         end_dt = _normalize_dt(win["end"]) if "end" in win else None
@@ -1086,7 +1122,40 @@ def answer():
             binds.pop("date_start", None)
             binds.pop("date_end", None)
 
-    expected_binds = _find_binds(sql)
+    ok_sql, reason, bind_info = _validate_sql(
+        sql,
+        allow_binds=_BIND_WHITELIST,
+        need_window=need_window,
+        date_col_hint=date_col_hint,
+    )
+    if not ok_sql:
+        if reason == "forbidden_bind":
+            bad_binds = sorted(f":{name}" for name in bind_info)
+            return _needs_clarification(
+                f"Your query used unsupported bind(s): {', '.join(bad_binds)}. "
+                f"Allowed binds: {', '.join(':'+b for b in sorted(_BIND_WHITELIST))}.",
+                sql_text=sql,
+                error="bad_binds",
+            )
+        if reason == "missing_date_context":
+            return _needs_clarification(
+                "This question needs a start and end date. Please provide the timeframe you have in mind.",
+                sql_text=sql,
+                error=reason,
+            )
+        if reason == "unexpected_date_filter":
+            return _needs_clarification(
+                "No timeframe was requested, but the SQL added date filters. Please clarify the desired dates or rephrase without them.",
+                sql_text=sql,
+                error=reason,
+            )
+        return _needs_clarification(
+            "I couldn't derive a clean SELECT. Could you rephrase or specify filters?",
+            sql_text=sql,
+            error=reason,
+        )
+
+    expected_binds = bind_info
     missing_binds = sorted(name for name in expected_binds if name not in binds)
     if missing_binds:
         return _needs_clarification(
