@@ -6,7 +6,7 @@ import json
 import os
 import re
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from flask import Blueprint, jsonify, request
@@ -17,7 +17,7 @@ from core.settings import Settings
 from core.sql_exec import get_mem_engine
 
 from apps.dw.clarifier import propose_clarifying_questions
-from apps.dw.llm import generate_sql_oracle
+from apps.dw.llm import _unexpected_binds, nl_to_sql_with_llm
 from apps.dw.patterns import parse_timeframe
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -45,6 +45,43 @@ def create_dw_blueprint(settings: Settings | None = None, pipeline: "Pipeline | 
     return dw_bp
 
 
+DATE_WINDOW_PAT = re.compile(
+    r"(?i)\b(last|next|past|coming)\s+\d+\s+(day|days|week|weeks|month|months|year|years)|"
+    r"between\s+\d{4}-\d{2}-\d{2}\s+(?:and|to)\s+\d{4}-\d{2}-\d{2}|"
+    r"from\s+\d{4}-\d{2}-\d{2}\s+(?:and|to)\s+\d{4}-\d{2}-\d{2}"
+)
+
+
+def _wants_time_window(question: str) -> bool:
+    return bool(DATE_WINDOW_PAT.search(question or ""))
+
+
+def _compute_window(question: str, now: datetime) -> Dict[str, datetime]:
+    reference = now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
+    start, end, _, _ = parse_timeframe(question, now=reference)
+    if start and end:
+        return {"date_start": start, "date_end": end}
+
+    direct = re.search(
+        r"(?i)(?:between|from)\s+(\d{4}-\d{2}-\d{2})\s+(?:and|to)\s+(\d{4}-\d{2}-\d{2})",
+        question or "",
+    )
+    if direct:
+        try:
+            start_dt = datetime.fromisoformat(direct.group(1))
+            end_dt = datetime.fromisoformat(direct.group(2))
+        except ValueError:
+            return {}
+        if end_dt < start_dt:
+            start_dt, end_dt = end_dt, start_dt
+        return {
+            "date_start": start_dt,
+            "date_end": end_dt + timedelta(days=1),
+        }
+
+    return {}
+
+
 def _looks_like_select(sql: str) -> bool:
     snippet = sql.strip().lstrip("(").strip()
     return snippet.upper().startswith("SELECT") or snippet.upper().startswith("WITH")
@@ -61,13 +98,6 @@ def _binds_required_in_sql(sql: str) -> List[str]:
 
 def _find_named_binds(sql: str) -> set[str]:
     return set(re.findall(r":([a-zA-Z_][a-zA-Z0-9_]*)", sql or ""))
-
-
-def _window_from_question(question: str) -> tuple[datetime | None, datetime | None]:
-    start, end, _, _ = parse_timeframe(question)
-    if start and end:
-        return start, end
-    return None, None
 
 
 def _pg(conn_str: str):
@@ -882,6 +912,8 @@ def answer():
     if not question:
         return jsonify({"ok": False, "error": "question is required"}), 400
 
+    wants_window = _wants_time_window(question)
+
     settings = Settings(namespace=NAMESPACE)
     ds_registry = DatasourceRegistry(settings, namespace=NAMESPACE)
     try:
@@ -952,8 +984,8 @@ def answer():
             return value
         return value
 
-    gen_payload = generate_sql_oracle(question)
-    sql = (gen_payload or {}).get("sql")
+    sql, gen_meta = nl_to_sql_with_llm(question)
+    gen_meta = gen_meta or {}
 
     if not sql:
         _update_inquiry("needs_clarification")
@@ -962,9 +994,9 @@ def answer():
                 "ok": False,
                 "status": "needs_clarification",
                 "inquiry_id": inquiry_id,
+                "error": gen_meta.get("reason", "not_select"),
                 "questions": [
-                    "I couldn’t produce a safe SELECT for that. Do you want a date filter or show all rows?",
-                    "Should we return all matching contracts, or limit to top 100 by REQUEST_DATE?",
+                    "I couldn't derive a clean SELECT. Can you rephrase or specify filters (stakeholders, departments, date columns)?"
                 ],
                 "sql": None,
             }
@@ -987,6 +1019,22 @@ def answer():
             }
         )
 
+    bad_binds = _unexpected_binds(sql)
+    if bad_binds:
+        _update_inquiry("needs_clarification")
+        return jsonify(
+            {
+                "ok": False,
+                "status": "needs_clarification",
+                "inquiry_id": inquiry_id,
+                "error": "unexpected_binds",
+                "questions": [
+                    f"The model produced bind(s) {sorted(bad_binds)} which we don't support. Rephrase without those binds, or specify an explicit date window on a named date column to use :date_start/:date_end."
+                ],
+                "sql": sql,
+            }
+        )
+
     if _has_dml(sql):
         return _needs_clarification(
             "I drafted SQL that didn't look like a safe SELECT. Could you clarify?",
@@ -998,23 +1046,39 @@ def answer():
     params: Dict[str, Any] = {}
 
     if {"date_start", "date_end"} & bind_names:
-        start, end = _window_from_question(question)
-        if not start or not end:
+        if not wants_window:
             _update_inquiry("needs_clarification")
             return jsonify(
                 {
                     "ok": False,
                     "status": "needs_clarification",
                     "inquiry_id": inquiry_id,
-                    "error": "missing_binds",
+                    "error": "missing_date_context",
                     "questions": [
-                        "This query expects :date_start and :date_end. What date range should we use (e.g., last 90 days, 2025-01-01 to 2025-03-31)?",
+                        "Your query expects a date window (:date_start/:date_end). Which date column and what window should we use (e.g., END_DATE next 30 days)?"
                     ],
                     "sql": sql,
                 }
             )
-        params["date_start"] = _normalize_dt(start)
-        params["date_end"] = _normalize_dt(end)
+
+        window_params = _compute_window(question, now=datetime.now(timezone.utc))
+        if "date_start" not in window_params or "date_end" not in window_params:
+            _update_inquiry("needs_clarification")
+            return jsonify(
+                {
+                    "ok": False,
+                    "status": "needs_clarification",
+                    "inquiry_id": inquiry_id,
+                    "error": "date_parse_failed",
+                    "questions": [
+                        "We couldn't parse the requested time window. Please specify explicit dates or a relative window on a named date column."
+                    ],
+                    "sql": sql,
+                }
+            )
+
+        params["date_start"] = _normalize_dt(window_params["date_start"])
+        params["date_end"] = _normalize_dt(window_params["date_end"])
 
     expected_binds = set(_binds_required_in_sql(sql))
     missing_binds = sorted(name for name in expected_binds if name not in params)
@@ -1056,7 +1120,12 @@ def answer():
     meta_payload["limit_applied"] = appended_limit
     meta_payload["elapsed_ms"] = elapsed_ms
     meta_payload["rewritten_question"] = question
-    meta_payload["llm_reason"] = (gen_payload or {}).get("reason", "ok")
+    meta_payload["llm_reason"] = gen_meta.get("reason", "ok")
+    meta_payload["llm_retries"] = gen_meta.get("retries", 0)
+    if "confidence" in gen_meta:
+        meta_payload["llm_confidence"] = gen_meta.get("confidence")
+    if "unexpected_binds_first_try" in gen_meta:
+        meta_payload["llm_unexpected_binds_first_try"] = gen_meta.get("unexpected_binds_first_try")
     meta_payload["generation_mode"] = "llm"
     meta_payload.setdefault("rowcount", len(rows))
     if "columns" not in meta_payload and rows:
