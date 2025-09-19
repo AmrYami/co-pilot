@@ -14,7 +14,7 @@ from core.inquiries import (
     set_inquiry_status,
     update_inquiry_status_run,
 )
-from core.model_loader import load_llm_from_settings
+from core.model_loader import load_llm_from_settings, model_info as loader_model_info
 from core.research import load_researcher
 from core.settings import Settings
 from core.snippets import autosave_snippet
@@ -111,18 +111,7 @@ class Pipeline:
 
     # ------------------------------------------------------------------
     def model_info(self) -> Dict[str, Any]:
-        info = self.llm_info if isinstance(self.llm_info, dict) else {}
-        name = info.get("name") or "unknown"
-        backend = info.get("backend")
-        if backend:
-            llm_desc = f"{name} ({backend})"
-        else:
-            llm_desc = name
-        return {
-            "mode": "dw-pipeline",
-            "clarifier": "disabled",
-            "llm": llm_desc,
-        }
+        return loader_model_info()
 
     # ------------------------------------------------------------------
     def answer_dw(

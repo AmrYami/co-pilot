@@ -147,9 +147,30 @@ def _load_clarifier_model() -> Optional[Dict[str, Any]]:
             self.defaults = defaults
             self.device = device
 
+        def _prepare_prompt(
+            self,
+            prompt: Optional[str] = None,
+            *,
+            system_prompt: Optional[str] = None,
+            user_prompt: Optional[str] = None,
+        ) -> str:
+            if prompt:
+                return prompt
+            parts = []
+            if system_prompt:
+                parts.append(system_prompt.strip())
+            if user_prompt:
+                parts.append(user_prompt.strip())
+            if not parts:
+                raise ValueError("prompt or system/user prompts required")
+            return "\n\n".join(parts).strip()
+
         def generate(
             self,
-            prompt: str,
+            prompt: Optional[str] = None,
+            *,
+            system_prompt: Optional[str] = None,
+            user_prompt: Optional[str] = None,
             max_new_tokens: Optional[int] = None,
             temperature: Optional[float] = None,
             top_p: Optional[float] = None,
@@ -164,7 +185,11 @@ def _load_clarifier_model() -> Optional[Dict[str, Any]]:
                 cfg["top_p"] = float(top_p)
             stops = stop if stop is not None else cfg.get("stop")
 
-            inputs = self.tokenizer(prompt, return_tensors="pt")
+            full_prompt = self._prepare_prompt(
+                prompt, system_prompt=system_prompt, user_prompt=user_prompt
+            )
+
+            inputs = self.tokenizer(full_prompt, return_tensors="pt")
             if self.device is not None:
                 inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
@@ -214,33 +239,66 @@ def load_llm(role: str) -> Optional[Dict[str, Any]]:
         return _MODELS[role]
 
 
+def ensure_model(role: str) -> Optional[Any]:
+    """Ensure a model for the role is loaded and return the handle."""
+
+    payload = load_llm(role)
+    if not payload:
+        return None
+    return payload.get("handle")
+
+
+def get_model(role: str) -> Optional[Any]:
+    """Return the cached model handle for the given role if available."""
+
+    with _LOCK:
+        payload = _MODELS.get(role)
+    if payload is None:
+        return ensure_model(role)
+    if isinstance(payload, dict):
+        return payload.get("handle")
+    return None
+
+
 def model_info() -> Dict[str, Any]:
-    sql = _MODELS.get("sql")
-    clar = _MODELS.get("clarifier")
+    def _ensure_payload(role: str) -> Optional[Dict[str, Any]]:
+        payload = _MODELS.get(role)
+        if payload is None:
+            try:
+                payload = load_llm(role)
+            except Exception:
+                payload = None
+        return payload if isinstance(payload, dict) else None
 
-    if sql is None:
-        try:
-            sql = load_llm("sql")
-        except Exception:
-            sql = None
+    sql = _ensure_payload("sql")
+    clar = _ensure_payload("clarifier")
 
-    if clar is None:
-        try:
-            clar = load_llm("clarifier")
-        except Exception:
-            clar = None
+    def _describe(role: str, payload: Optional[Dict[str, Any]]) -> str:
+        if not payload:
+            return "disabled" if role == "clarifier" else "unavailable"
+        env_key = "MODEL_NAME" if role == "sql" else "CLARIFIER_MODEL_NAME"
+        name = os.getenv(env_key)
+        if not name:
+            path = payload.get("path") or ""
+            name = os.path.basename(path.rstrip("/")) or path or "unknown"
+        backend = payload.get("backend")
+        suffix = ""
+        if role == "clarifier":
+            device = payload.get("device_map")
+            if backend and device:
+                suffix = f" ({backend}, {device})"
+            elif backend:
+                suffix = f" ({backend})"
+            elif device:
+                suffix = f" ({device})"
+        elif backend:
+            suffix = f" ({backend})"
+        return f"{name}{suffix}" if suffix else name
 
     return {
         "mode": "dw-pipeline",
-        "llm": {
-            "backend": (sql or {}).get("backend") if sql else "unknown",
-            "path": (sql or {}).get("path") if sql else None,
-        },
-        "clarifier": {
-            "backend": (clar or {}).get("backend") if clar else "disabled",
-            "path": (clar or {}).get("path") if clar else None,
-            "device_map": (clar or {}).get("device_map") if clar else None,
-        },
+        "llm": _describe("sql", sql),
+        "clarifier": _describe("clarifier", clar),
     }
 
 
