@@ -17,7 +17,8 @@ from core.settings import Settings
 from core.sql_exec import get_mem_engine
 
 from apps.dw.clarifier import propose_clarifying_questions
-from apps.dw.llm import clarify_intent, intent_to_sql, nl_to_sql_with_llm
+from apps.dw.llm import clarify_for_sql, nl_to_sql_with_llm
+from apps.dw.patterns import parse_timeframe
 
 if TYPE_CHECKING:  # pragma: no cover
     from core.pipeline import Pipeline
@@ -930,30 +931,43 @@ def answer():
             payload["error"] = error
         return jsonify(payload)
 
-    intent = clarify_intent(question, {"namespace": NAMESPACE})
-    sql_payload: Dict[str, Any]
     clarifier_used = False
 
-    if intent.get("ok"):
-        clarifier_used = True
-        sql_payload = intent_to_sql(intent)
-    else:
-        sql_payload = {"ok": False, "error": intent.get("error", "clarifier_failed")}
+    def _date_binds_in_sql(sql_text: str) -> bool:
+        return (":date_start" in sql_text) or (":date_end" in sql_text)
 
-    if not sql_payload.get("ok"):
-        sql_payload = nl_to_sql_with_llm(question, {"namespace": NAMESPACE})
+    def _normalize_dt(value: Any) -> Any:
+        if isinstance(value, datetime):
+            if value.tzinfo is not None:
+                return value.replace(tzinfo=None)
+            return value
+        return value
 
-    if not sql_payload.get("ok"):
-        return _needs_clarification(
-            "I couldn't translate that question into SQL.",
-            error=sql_payload.get("error"),
-        )
+    def _build_date_binds(source_question: str) -> Dict[str, Any]:
+        start, end, _, _ = parse_timeframe(source_question)
+        binds_payload: Dict[str, Any] = {}
+        if start and end:
+            binds_payload["date_start"] = _normalize_dt(start)
+            binds_payload["date_end"] = _normalize_dt(end)
+        return binds_payload
 
-    sql = (sql_payload.get("sql") or "").strip()
-    binds = sql_payload.get("binds") or {}
+    sql, _ = nl_to_sql_with_llm(question)
+    rewritten_question = question
 
     if not sql:
-        return _needs_clarification("I couldn't translate that question into SQL.")
+        rewritten_question = clarify_for_sql(question)
+        if rewritten_question != question:
+            clarifier_used = True
+        sql, _ = nl_to_sql_with_llm(rewritten_question)
+
+    if not sql:
+        return _needs_clarification(
+            "I couldn’t derive a safe SELECT statement from your question. Can you clarify the exact columns and filters?",
+            error="not_select",
+        )
+
+    sql = sql.strip()
+
     if not _looks_like_select(sql) or _has_dml(sql):
         return _needs_clarification(
             "I drafted SQL that didn't look like a safe SELECT. Could you clarify?",
@@ -961,15 +975,27 @@ def answer():
             error="not_select",
         )
 
-    required = _binds_required_in_sql(sql)
-    missing = [name for name in required if name not in binds]
+    required_binds = _binds_required_in_sql(sql)
+    binds: Dict[str, Any] = {}
+
+    if _date_binds_in_sql(sql):
+        binds.update(_build_date_binds(rewritten_question))
+        if not binds:
+            return _needs_clarification(
+                "This query expects :date_start and :date_end. What date range should we use?",
+                sql_text=sql,
+                error="missing_binds",
+            )
+
+    missing = [name for name in required_binds if name not in binds]
     if missing:
         return _needs_clarification(
             f"Provide values for: {', '.join(missing)} or rephrase with explicit dates.",
             sql_text=sql,
             error="missing_binds",
         )
-    exec_binds = {name: binds[name] for name in required}
+
+    exec_binds = {name: binds[name] for name in required_binds}
 
     appended_limit = False
     if "fetch first" not in sql.lower():
@@ -999,12 +1025,13 @@ def answer():
     meta_payload["clarifier_used"] = clarifier_used
     meta_payload["limit_applied"] = appended_limit
     meta_payload["elapsed_ms"] = elapsed_ms
+    meta_payload["rewritten_question"] = rewritten_question if clarifier_used else question
     meta_payload.setdefault("rowcount", len(rows))
     if "columns" not in meta_payload and rows:
         meta_payload["columns"] = list(rows[0].keys())
 
     tags = ["dw", "contracts", "llm"]
-    intent_payload = intent if clarifier_used else None
+    intent_payload = None
     run_id = save_learning_artifacts(
         NAMESPACE,
         question,

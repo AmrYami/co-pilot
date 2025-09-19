@@ -1,6 +1,6 @@
 import os
 import threading
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterable, Optional
 
 import torch
 
@@ -275,6 +275,56 @@ def get_model(role: str) -> Optional[Any]:
     if isinstance(payload, dict):
         return payload.get("handle")
     return None
+
+
+def llm_complete(
+    *,
+    role: str,
+    prompt: str,
+    max_new_tokens: Optional[int] = None,
+    temperature: Optional[float] = None,
+    top_p: Optional[float] = None,
+    stop: Optional[Iterable[str]] = None,
+) -> str:
+    """Generate text using the requested LLM role with sane defaults."""
+
+    payload = load_llm(role)
+    if not payload:
+        return ""
+
+    handle = payload.get("handle")
+    if handle is None:
+        return ""
+
+    cfg = payload.get("gen_cfg") or {}
+
+    kwargs: Dict[str, Any] = {}
+
+    max_tokens = cfg.get("max_new_tokens") if max_new_tokens is None else max_new_tokens
+    if max_tokens is not None:
+        kwargs["max_new_tokens"] = int(max_tokens)
+
+    temp = cfg.get("temperature") if temperature is None else temperature
+    if temp is not None:
+        kwargs["temperature"] = float(temp)
+
+    nucleus = cfg.get("top_p") if top_p is None else top_p
+    if nucleus is not None:
+        kwargs["top_p"] = float(nucleus)
+
+    stop_tokens = stop if stop is not None else cfg.get("stop")
+    if stop_tokens:
+        kwargs["stop"] = list(stop_tokens)
+
+    try:
+        text = handle.generate(prompt, **kwargs)
+    except TypeError:
+        kwargs.pop("stop", None)
+        text = handle.generate(prompt, **kwargs)
+    except Exception:
+        return ""
+
+    return text.strip() if isinstance(text, str) else ""
 
 
 def model_info() -> Dict[str, Any]:
