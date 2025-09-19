@@ -657,6 +657,20 @@ def ingest():
             value="docuware",
             updated_by="dw_ingest",
         )
+        _manual_upsert_setting(
+            conn,
+            key="RESEARCH_MODE",
+            value=True,
+            scope="namespace",
+            updated_by="dw_ingest",
+        )
+        _manual_upsert_setting(
+            conn,
+            key="RESEARCHER_CLASS",
+            value="apps.dw.research.DWResearcher",
+            scope="global",
+            updated_by="dw_ingest",
+        )
 
     seeded = _seed_semantic_layer(mem_engine)
 
