@@ -5,7 +5,7 @@ import io
 import json
 import os
 import re
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 from flask import Blueprint, jsonify, request
@@ -17,9 +17,8 @@ from core.sql_exec import get_mem_engine
 
 from apps.dw.clarifier import propose_clarifying_questions
 from apps.dw.llm import (
-    clarify_intent,
-    choose_date_column,
-    ensure_date_window,
+    clarify_time_intent,
+    derive_window_from_intent,
     nl_to_sql_with_llm,
 )
 
@@ -29,11 +28,6 @@ if TYPE_CHECKING:  # pragma: no cover
 
 NAMESPACE = "dw::common"
 dw_bp = Blueprint("dw", __name__)
-
-
-_SIMPLE_NEXT_N_DAYS = re.compile(r"\bnext\s+(\d{1,4})\s+days?\b", re.IGNORECASE)
-_LAST_N_DAYS = re.compile(r"\blast\s+(\d{1,4})\s+days?\b", re.IGNORECASE)
-_LAST_MONTH = re.compile(r"\blast\s+month\b", re.IGNORECASE)
 
 
 @dw_bp.route("/model/info", methods=["GET"])
@@ -90,56 +84,6 @@ def _load_prompt_snippets(mem_engine, limit: int = 3) -> List[Tuple[str, str]]:
             if sql:
                 shots.append((title, sql))
     return shots
-
-
-def _calc_window(question: str) -> Tuple[date, date, int, str, bool]:
-    now = date.today()
-    lowered = question.lower()
-    top_n = 10
-    if "top " in lowered:
-        try:
-            tokens = lowered.split()
-            idx = tokens.index("top")
-            top_n = int(tokens[idx + 1])
-        except Exception:
-            pass
-
-    label = "last 30 days"
-    simple = False
-
-    match_next = _SIMPLE_NEXT_N_DAYS.search(question)
-    if match_next:
-        try:
-            days = int(match_next.group(1))
-        except Exception:
-            days = 30
-        label = f"next {days} days"
-        simple = True
-        return now, now + timedelta(days=days), top_n, label, simple
-
-    match_last = _LAST_N_DAYS.search(question)
-    if match_last:
-        try:
-            days = int(match_last.group(1))
-        except Exception:
-            days = 30
-        label = f"last {days} days"
-        simple = True
-        return now - timedelta(days=days), now + timedelta(days=1), top_n, label, simple
-
-    if _LAST_MONTH.search(question):
-        first_this = now.replace(day=1)
-        last_month_end = first_this
-        last_month_start = (first_this - timedelta(days=1)).replace(day=1)
-        label = "last month"
-        simple = True
-        return last_month_start, last_month_end, top_n, label, simple
-
-    if "last 90 days" in lowered:
-        label = "last 90 days"
-        return now - timedelta(days=90), now + timedelta(days=1), top_n, label, simple
-
-    return now - timedelta(days=30), now + timedelta(days=1), top_n, label, simple
 
 
 def _insert_inquiry(
@@ -214,24 +158,6 @@ def _csv_bytes(rows: List[Dict[str, Any]]) -> bytes:
     return buffer.getvalue().encode("utf-8")
 
 
-def _fallback_sql(contract_table: str, date_column: str) -> str:
-    return (
-        f"""
-SELECT
-  CONTRACT_ID,
-  CONTRACT_OWNER,
-  OWNER_DEPARTMENT,
-  {date_column} AS REF_DATE,
-  CONTRACT_STATUS,
-  NVL(CONTRACT_VALUE_NET_OF_VAT,0) + NVL(VAT,0) AS CONTRACT_VALUE_GROSS
-FROM "{contract_table}"
-WHERE {date_column} >= :date_start
-  AND {date_column} < :date_end
-ORDER BY {date_column} ASC
-"""
-    ).strip()
-
-
 def run_sql_oracle(engine, sql: Optional[str], binds: Dict[str, Any]):
     if not sql:
         return False, None, {}, "sql_missing"
@@ -277,24 +203,6 @@ def _coerce_datetime(value: Any) -> Optional[datetime]:
             except Exception:
                 return None
     return None
-
-
-def intent_to_binds(intent: Dict[str, Any], fallback: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    binds = dict(fallback or {})
-    time_block = (intent or {}).get("time") or {}
-    range_block = time_block.get("range") or {}
-    start = _coerce_datetime(range_block.get("start"))
-    end = _coerce_datetime(range_block.get("end"))
-    if start is not None:
-        binds["date_start"] = start
-    if end is not None:
-        binds["date_end"] = end
-    if "top_n" in intent and intent["top_n"]:
-        try:
-            binds["top_n"] = int(intent["top_n"])
-        except Exception:
-            pass
-    return binds
 
 
 def save_learning_artifacts(
@@ -370,8 +278,27 @@ def save_learning_artifacts(
                 ),
                 "tags": json.dumps(tag_payload),
             },
-        )
+    )
     return run_id
+
+
+def save_success_snippet(conn, namespace: str, question: str, sql: str, tags: List[str]):
+    conn.execute(
+        text(
+            """
+        INSERT INTO mem_snippets(namespace, title, description, sql_template, sql_raw, input_tables, tags, is_verified, created_at, updated_at)
+        VALUES(:ns, :title, :desc, :tmpl, :raw, '["Contract"]'::jsonb, :tags::jsonb, false, NOW(), NOW())
+        """
+        ),
+        {
+            "ns": namespace,
+            "title": question[:200],
+            "desc": "Auto-learned from successful run",
+            "tmpl": sql,
+            "raw": sql,
+            "tags": json.dumps(tags, ensure_ascii=False),
+        },
+    )
 
 
 def _learn_snippet(conn, question: str, sql: str, tags):
@@ -938,10 +865,6 @@ def answer():
 
     mem = get_mem_engine(settings)
 
-    window_start, window_end, top_n, window_label, simple_window = _calc_window(question)
-    date_start_dt = datetime.combine(window_start, datetime.min.time())
-    date_end_dt = datetime.combine(window_end, datetime.min.time())
-
     try:
         default_table = settings.get(
             "DW_CONTRACT_TABLE", default="Contract", scope="namespace"
@@ -950,175 +873,23 @@ def answer():
         default_table = "Contract"
     dw_table = data.get("dw_table") or default_table
 
-    try:
-        default_date_column = settings.get(
-            "DW_DATE_COLUMN", default="REQUEST_DATE", scope="namespace"
-        )
-    except Exception:
-        default_date_column = "REQUEST_DATE"
-
-    used_date_column = choose_date_column(question, default_date_column)
     context = {
         "contract_table": dw_table,
-        "date_column": used_date_column,
+        "namespace": NAMESPACE,
     }
 
-    default_binds = {
-        "date_start": date_start_dt,
-        "date_end": date_end_dt,
-        "top_n": top_n,
-    }
-    active_binds = dict(default_binds)
-    need_window = all(key in active_binds for key in ("date_start", "date_end"))
+    now = datetime.now(timezone.utc)
 
-    try:
-        use_llm = settings.get_bool("DW_USE_LLM", scope="namespace")
-        if use_llm is None:
-            use_llm = True
-    except Exception:
-        use_llm = True
+    time_intent = clarify_time_intent(question)
+    binds, time_notes = derive_window_from_intent(time_intent, now)
+    intent_payload = {"time": time_intent}
 
-    llm_result: Dict[str, Any] = {"sql": None, "confidence": 0.0, "why": "disabled"}
-    fallback_mode = False
-    if use_llm:
-        try:
-            llm_result = nl_to_sql_with_llm(
-                question=question,
-                dw_table=dw_table,
-                settings=settings,
-                context=context,
-            )
-        except Exception as exc:
-            llm_result = {"sql": None, "confidence": 0.0, "why": f"llm_error: {exc}"}
-
-    if isinstance(llm_result, dict) and llm_result.get("used_date_column"):
-        used_date_column = llm_result.get("used_date_column") or used_date_column
-        context["date_column"] = used_date_column
-
-    sql = llm_result.get("sql") if isinstance(llm_result, dict) else None
-    if sql:
-        sql = ensure_date_window(sql, used_date_column, need_window)
-        if isinstance(llm_result, dict):
-            llm_result["sql"] = sql
-    if not sql:
-        fallback_mode = True
-        raw_text = llm_result.get("raw") if isinstance(llm_result, dict) else None
-        sql = _fallback_sql(context["contract_table"], used_date_column)
-        llm_result = {
-            "sql": sql,
-            "confidence": 0.0,
-            "why": "llm_non_sql_fallback",
-            "raw": raw_text,
-            "used_date_column": used_date_column,
-        }
-    else:
-        upper_sql = sql.lstrip().upper()
-        if not (upper_sql.startswith("SELECT") or upper_sql.startswith("WITH")):
-            fallback_mode = True
-            sql = _fallback_sql(context["contract_table"], used_date_column)
-            llm_result = {
-                "sql": sql,
-                "confidence": 0.0,
-                "why": "forced_fallback_select",
-                "raw": llm_result.get("raw") if isinstance(llm_result, dict) else None,
-                "used_date_column": used_date_column,
-            }
-
-    rows: List[Dict[str, Any]] = []
-    meta_exec: Dict[str, Any] = {}
-    intent_used: Optional[Dict[str, Any]] = None
-    ok = False
-    clarifier_needed = False
-    error_message: Optional[str] = None
-
-    if sql:
-        ok, fetched_rows, meta_exec, exec_error = run_sql_oracle(oracle, sql, active_binds)
-        if ok and fetched_rows is not None:
-            rows = fetched_rows
-        else:
-            error_message = exec_error
-        clarifier_needed = (not ok) or rows_suspiciously_empty(rows, question)
-        if fallback_mode:
-            clarifier_needed = False
-    else:
-        clarifier_needed = True
-        error_message = llm_result.get("why") if isinstance(llm_result, dict) else "no_sql"
-
-    if clarifier_needed and simple_window:
-        clarifier_needed = False
-
-    if clarifier_needed:
-        try:
-            slots = settings.get_int("DW_STAKEHOLDER_SLOTS", default=8, scope="namespace")
-        except Exception:
-            slots = 8
-        context = {
-            "table": dw_table,
-            "date_columns": ["REQUEST_DATE", "START_DATE", "END_DATE"],
-            "stakeholder_slots": slots,
-        }
-        intent = clarify_intent(question, context)
-        if intent:
-            intent_used = intent
-            active_binds = intent_to_binds(intent, fallback=default_binds)
-            clarifier_ctx = dict(context)
-            time_block = (intent or {}).get("time") or {}
-            clarified_column = time_block.get("column")
-            if clarified_column:
-                clarifier_ctx["date_column"] = clarified_column
-            clarifier_ctx["contract_table"] = context["table"]
-            clarifier_ctx["date_column"] = choose_date_column(
-                question, clarifier_ctx.get("date_column", default_date_column)
-            )
-            try:
-                clarified = nl_to_sql_with_llm(
-                    question=question,
-                    intent=intent,
-                    dw_table=dw_table,
-                    settings=settings,
-                    context=clarifier_ctx,
-                )
-            except Exception as exc:
-                clarified = {"sql": None, "confidence": 0.0, "why": f"llm_error: {exc}"}
-            sql2 = clarified.get("sql") if isinstance(clarified, dict) else None
-            if isinstance(clarified, dict) and clarified.get("used_date_column"):
-                used_date_column = clarified.get("used_date_column") or used_date_column
-                clarifier_ctx["date_column"] = used_date_column
-            if sql2:
-                date_col2 = clarifier_ctx.get("date_column") or used_date_column
-                need_window2 = all(
-                    key in active_binds for key in ("date_start", "date_end")
-                )
-                sql2 = ensure_date_window(sql2, date_col2, need_window2)
-                if isinstance(clarified, dict):
-                    clarified["sql"] = sql2
-                ok2, fetched_rows2, meta_exec2, exec_error2 = run_sql_oracle(
-                    oracle, sql2, active_binds
-                )
-                if ok2 and fetched_rows2 is not None:
-                    sql = sql2
-                    rows = fetched_rows2
-                    meta_exec = meta_exec2
-                    ok = True
-                    used_date_column = date_col2 or used_date_column
-                    clarifier_needed = rows_suspiciously_empty(rows, question)
-                    error_message = exec_error2
-                    llm_result = clarified  # adopt clarified rationale
-                    context = clarifier_ctx
-                else:
-                    error_message = exec_error2 or (
-                        clarified.get("why") if isinstance(clarified, dict) else None
-                    )
-            else:
-                error_message = (
-                    clarified.get("why") if isinstance(clarified, dict) else "clarifier_failed"
-                )
-        else:
-            error_message = error_message or "clarifier_unavailable"
-
-    success = bool(sql) and ok and not clarifier_needed
-
-    if not success:
+    def _needs_clarification(
+        reason: Optional[str] = None,
+        *,
+        sql_text: Optional[str] = None,
+        error: Optional[str] = None,
+    ):
         inquiry_id = None
         if mem is not None:
             try:
@@ -1133,60 +904,108 @@ def answer():
             except Exception:
                 inquiry_id = None
         followups = propose_clarifying_questions(question)
+        if reason:
+            if reason not in followups:
+                followups = [reason] + followups
         payload = {
             "ok": False,
             "status": "needs_clarification",
             "questions": followups,
             "inquiry_id": inquiry_id,
-            "sql": sql,
         }
-        if isinstance(llm_result, dict):
-            payload["rationale"] = llm_result.get("why", "")
-        if error_message:
-            payload["error"] = error_message
+        if sql_text:
+            payload["sql"] = sql_text
+        if error:
+            payload["error"] = error
         return jsonify(payload)
 
+    try:
+        sql = nl_to_sql_with_llm(question, context=context, intent=intent_payload)
+    except Exception as exc:
+        return _needs_clarification(
+            "I couldn't draft SQL for that yet. Could you clarify the request?",
+            error=str(exc),
+        )
+
+    sql = (sql or "").strip()
+    if not sql:
+        return _needs_clarification(
+            "I couldn't translate that question into SQL.",
+            error="empty_sql",
+        )
+
+    need_start = bool(re.search(r":date_start\\b", sql))
+    need_end = bool(re.search(r":date_end\\b", sql))
+    exec_binds: Dict[str, Any] = {}
+
+    if need_start:
+        if "date_start" not in binds:
+            return _needs_clarification(
+                "Which start date should I use?",
+                sql_text=sql,
+                error="missing_date_start",
+            )
+        exec_binds["date_start"] = binds["date_start"]
+    if need_end:
+        if "date_end" not in binds:
+            return _needs_clarification(
+                "What is the end of the date range?",
+                sql_text=sql,
+                error="missing_date_end",
+            )
+        exec_binds["date_end"] = binds["date_end"]
+
+    appended_limit = False
+    if "fetch first" not in sql.lower():
+        sql = f"{sql.rstrip(';')}\nFETCH FIRST 500 ROWS ONLY"
+        appended_limit = True
+
+    ok, fetched_rows, meta_exec, exec_error = run_sql_oracle(oracle, sql, exec_binds)
+    if not ok:
+        return _needs_clarification(
+            "The generated SQL did not run. Could you clarify the filters or timeframe?",
+            sql_text=sql,
+            error=exec_error,
+        )
+
+    rows = fetched_rows or []
     meta_payload: Dict[str, Any] = dict(meta_exec or {})
-    binds_serialized: Dict[str, Any] = {}
-    for key, value in active_binds.items():
+    serialized_binds: Dict[str, Any] = {}
+    for key, value in exec_binds.items():
         if isinstance(value, (datetime, date)):
-            binds_serialized[key] = value.isoformat()
+            serialized_binds[key] = value.isoformat()
         else:
-            binds_serialized[key] = value
-    meta_payload["binds"] = binds_serialized
-    meta_payload["top_n"] = active_binds.get("top_n")
-    meta_payload["clarifier_used"] = bool(intent_used)
-    meta_payload["window_label"] = window_label
-    meta_payload["used_date_column"] = used_date_column
+            serialized_binds[key] = value
+    meta_payload["binds"] = serialized_binds
+    meta_payload["clarifier_used"] = False
+    meta_payload["window_label"] = time_notes.get("window_label")
+    meta_payload["used_date_column"] = time_notes.get("date_column")
+    meta_payload["time_intent"] = time_intent
+    meta_payload["limit_applied"] = appended_limit
     meta_payload.setdefault("rowcount", len(rows))
     if "columns" not in meta_payload and rows:
         meta_payload["columns"] = list(rows[0].keys())
-    if isinstance(llm_result, dict):
-        meta_payload["llm_confidence"] = llm_result.get("confidence")
-        meta_payload["llm_reason"] = llm_result.get("why")
-        meta_payload["generation_mode"] = llm_result.get("why")
 
-    tags = ["dw", "docuware", "contract"]
-    if intent_used:
-        tags.append("clarified")
-    else:
-        tags.append("llm")
+    tags = ["dw", "contracts", "llm"]
+    if time_notes.get("window_label"):
+        tags.append("time_window")
 
     run_id = save_learning_artifacts(
         NAMESPACE,
         question,
         sql,
         rows,
-        intent=intent_used,
+        intent=intent_payload,
         tags=tags,
         settings=settings,
-        date_column=used_date_column,
-        window_label=window_label,
+        date_column=time_notes.get("date_column"),
+        window_label=time_notes.get("window_label"),
     )
 
     if mem is not None:
         try:
             with mem.begin() as conn:
+                save_success_snippet(conn, NAMESPACE, question, sql, tags)
                 _learn_mappings(conn)
         except Exception:
             pass
@@ -1206,9 +1025,9 @@ def answer():
         "meta": meta_payload,
     }
 
-    if not rows:
+    if rows_suspiciously_empty(rows, question):
         response_payload["hint"] = (
-            f"No results for {window_label}. Try a wider window (e.g., last 90 days) or choose a different date anchor."
+            "No rows matched. Try adjusting the filters or timeframe."
         )
 
     return jsonify(response_payload)
