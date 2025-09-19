@@ -1,868 +1,270 @@
-"""
-Model loader for local (4‑bit EXL2 via ExLlamaV2) and server (FP16 via HF Transformers).
-
-Single source of truth, driven by environment variables (or an injected `settings` shim
-with a `.get(key, default=None)` API). Returns a lightweight handle you can call like:
-
-    from core.model_loader import load_model
-    llm = load_model()
-    text = llm.generate(prompt, max_new_tokens=256)
-
-Env keys (examples):
-  ENVIRONMENT=local|server                # chooses sensible defaults
-  MODEL_BACKEND=exllama|hf-fp16|hf-8bit|hf-4bit
-  MODEL_PATH=/models/SQLCoder-70B-EXL2
-  MODEL_MAX_SEQ_LEN=4096
-  MODEL_TRUST_REMOTE_CODE=true
-  DEVICE_MAP=auto                         # for HF; or omit to let HF decide
-  MAX_MEMORY=cuda:0=22GiB,cuda:1=8GiB     # optional HF per-device memory map
-  TORCH_DTYPE=float16|bfloat16            # HF dtype override (server)
-  GENERATION_MAX_NEW_TOKENS=256
-  GENERATION_TEMPERATURE=0.2
-  GENERATION_TOP_P=0.9
-  STOP=</s>,<|im_end|>                    # comma separated stop sequences
-  LLM_GPU=0,1                             # GPU devices to use (comma separated)
-  CUDA_VISIBLE_DEVICES=0,1                # Alternative GPU specification
-"""
-
-from __future__ import annotations
-import os, time
-import torch
-from typing import Any, Callable, Dict, Iterable, Optional
-
+import os
 import threading
+from typing import Any, Dict, Optional
 
-_MODEL_CACHE: dict[tuple, "ModelHandle"] = {}
-_MODEL_LOCK = threading.Lock()
-
-
-class _SettingsShim:
-    """Optional shim so we can read from a settings service; falls back to os.environ."""
-
-    def __init__(self, settings: Any | None = None):
-        self.settings = settings
-
-    def get(self, key: str, default: Optional[str] = None) -> Optional[str]:
-        if self.settings is not None:
-            try:
-                return self.settings.get(key)  # type: ignore[attr-defined]
-            except Exception:
-                pass
-        return os.getenv(key, default)
+_MODELS: Dict[str, Optional[Dict[str, Any]]] = {}
+_LOCK = threading.Lock()
 
 
-def _parse_bool(v: Optional[str], default: bool) -> bool:
-    if v is None:
+def _env_bool(name: str, default: bool = False) -> bool:
+    val = os.getenv(name)
+    if val is None:
         return default
-    return v.strip().lower() in {"1", "true", "t", "yes", "y"}
+    return str(val).strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _parse_stop(v: Optional[str]) -> Optional[Iterable[str]]:
-    if not v:
-        return None
-    return [s.strip() for s in v.split(",") if s.strip()]
-
-
-def _parse_max_memory(v: Optional[str]) -> Optional[Dict[str, str]]:
-    # e.g. "cuda:0=22GiB,cuda:1=8GiB,cpu=64GiB"
-    if not v:
-        return None
-    mm: Dict[str, str] = {}
-    for part in v.split(","):
-        if "=" in part:
-            k, val = part.split("=", 1)
-            mm[k.strip()] = val.strip()
-    return mm or None
-
-
-def _dtype_from_str(s: Optional[str], default: torch.dtype) -> torch.dtype:
-    if not s:
+def _env_int(name: str, default: int) -> int:
+    val = os.getenv(name)
+    if val is None:
         return default
-    s = s.strip().lower()
-    if s in ("fp32", "float32"):
-        return torch.float32
-    if s in ("bf16", "bfloat16"):
-        return torch.bfloat16
-    if s in ("fp16", "float16", "half"):
-        return torch.float16
-    return default
+    try:
+        return int(val)
+    except Exception:
+        return default
 
 
-def _env_true(val: Optional[str]) -> bool:
-    return str(val or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+def _log(msg: str) -> None:
+    print(msg, flush=True)
 
 
-def _setup_gpu_devices(s: _SettingsShim) -> None:
-    """Setup GPU device ordering and visibility"""
-    llm_gpu = s.get("LLM_GPU")
-    cuda_visible = s.get("CUDA_VISIBLE_DEVICES")
+# ---------------------------
+# SQLCoder (ExLlamaV2) loader
+# ---------------------------
 
-    # Priority: LLM_GPU > CUDA_VISIBLE_DEVICES > default
-    if llm_gpu:
-        os.environ["CUDA_VISIBLE_DEVICES"] = llm_gpu
-        print(f"Set CUDA_VISIBLE_DEVICES to: {llm_gpu}")
-    elif cuda_visible:
-        print(f"Using existing CUDA_VISIBLE_DEVICES: {cuda_visible}")
-    else:
-        # Default to first available GPU
-        if torch.cuda.is_available():
-            os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-            print("Set CUDA_VISIBLE_DEVICES to: 0 (default)")
+def _load_sql_model() -> Optional[Dict[str, Any]]:
+    backend = os.getenv("MODEL_BACKEND", "exllama")
+    path = os.getenv("MODEL_PATH")
+    if not path:
+        raise RuntimeError("MODEL_PATH not set for SQL model")
+    if backend != "exllama":
+        raise RuntimeError(f"Unsupported MODEL_BACKEND={backend} for SQL model")
+
+    from core.sqlcoder_exllama import load_exllama_generator
+
+    cfg = {
+        "max_seq_len": _env_int("MODEL_MAX_SEQ_LEN", 4096),
+        "max_new_tokens": _env_int("GENERATION_MAX_NEW_TOKENS", 256),
+        "temperature": float(os.getenv("GENERATION_TEMPERATURE", "0.2")),
+        "top_p": float(os.getenv("GENERATION_TOP_P", "0.9")),
+        "stop": [tok for tok in os.getenv("STOP", "</s>,<|im_end|>").split(",") if tok],
+    }
+
+    handle = load_exllama_generator(model_path=path, config=cfg)
+    _log("SQL model (SQLCoder/ExLlamaV2) ready")
+    return {
+        "role": "sql",
+        "backend": backend,
+        "path": path,
+        "handle": handle,
+        "gen_cfg": cfg,
+    }
 
 
-def _check_cuda_compatibility() -> bool:
-    """Check if CUDA is available and compatible"""
-    if not torch.cuda.is_available():
-        print("WARNING: CUDA not available, falling back to CPU")
-        return False
+# --------------------------------------
+# Clarifier (HuggingFace 4-bit/FP16) loader
+# --------------------------------------
 
-    print(f"CUDA available: {torch.cuda.is_available()}")
-    print(f"CUDA devices: {torch.cuda.device_count()}")
-    for i in range(torch.cuda.device_count()):
-        props = torch.cuda.get_device_properties(i)
-        print(f"  GPU {i}: {props.name} ({props.total_memory // 1024**3} GB)")
+def _resolve_device_for_inputs(model: Any, device_map: str | None) -> Any:
+    if device_map and device_map not in {"auto", "balanced"}:
+        import torch
 
-    return True
+        try:
+            return torch.device(device_map)
+        except Exception:
+            pass
+    if hasattr(model, "device"):
+        return model.device
+    try:
+        import torch
+
+        return next(model.parameters()).device
+    except Exception:
+        return None
 
 
-class ModelHandle:
-    def __init__(
-        self,
-        backend: str,
-        model: Any,
-        tokenizer: Any,
-        generate_fn: Callable[..., str],
-        meta: Optional[Dict[str, Any]] = None,
-    ):
-        self.meta = meta or {}
-        self.backend = backend
-        self.model = model
-        self.tokenizer = tokenizer
-        self._generate = generate_fn
+def _load_clarifier_model() -> Optional[Dict[str, Any]]:
+    backend = os.getenv("CLARIFIER_MODEL_BACKEND", "off").lower()
+    if backend in {"off", "none", "disabled"}:
+        _log("[clarifier] disabled by config")
+        return None
 
-    def generate(
-        self,
-        prompt: str,
-        max_new_tokens: Optional[int] = None,
-        temperature: Optional[float] = None,
-        top_p: Optional[float] = None,
-        stop: Optional[Iterable[str]] = None,
-    ) -> str:
-        return self._generate(
-            prompt,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            stop=stop,
+    path = os.getenv("CLARIFIER_MODEL_PATH")
+    if not path:
+        raise RuntimeError("CLARIFIER_MODEL_PATH not set")
+
+    device_map = os.getenv("CLARIFIER_DEVICE_MAP", "cuda:0")
+    quant_type = os.getenv("CLARIFIER_QUANT_TYPE", "nf4")
+    low_cpu_mem = _env_bool("CLARIFIER_LOW_CPU_MEM", True)
+    dtype = os.getenv("CLARIFIER_COMPUTE_DTYPE", "float16")
+
+    if backend not in {"hf-4bit", "hf-fp16"}:
+        raise RuntimeError(f"Unsupported CLARIFIER_MODEL_BACKEND={backend}")
+
+    _log(f"[clarifier] loading HF model: {path} ({backend}) on {device_map}")
+
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    try:
+        from transformers import BitsAndBytesConfig
+    except ImportError:
+        BitsAndBytesConfig = None  # type: ignore[assignment]
+
+    load_kwargs: Dict[str, Any] = {"trust_remote_code": True}
+    if backend == "hf-4bit":
+        if BitsAndBytesConfig is None:
+            raise RuntimeError("bitsandbytes is required for hf-4bit clarifier backend")
+        load_kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type=quant_type,
+            bnb_4bit_compute_dtype=getattr(torch, dtype, torch.float16),
         )
+    else:
+        load_kwargs["torch_dtype"] = getattr(torch, dtype, torch.float16)
 
+    if device_map:
+        load_kwargs["device_map"] = device_map
+    if low_cpu_mem:
+        load_kwargs["low_cpu_mem_usage"] = True
 
-def load_llm(settings: Any | None = None) -> ModelHandle:
-    """Load the primary SQL generation model using environment variables only."""
+    tokenizer = AutoTokenizer.from_pretrained(path, use_fast=True, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(path, trust_remote_code=True, **load_kwargs)
+    model.eval()
 
-    shim = _SettingsShim(None)
-
-    _setup_gpu_devices(shim)
-    _check_cuda_compatibility()
-
-    backend = (os.getenv("MODEL_BACKEND", "exllama") or "exllama").strip().lower()
-    model_path = os.getenv("MODEL_PATH")
-    if not model_path:
-        raise ValueError("MODEL_PATH is required")
-    if not os.path.exists(model_path):
-        raise ValueError(f"MODEL_PATH does not exist: {model_path}")
-
-    max_seq_len = int(os.getenv("MODEL_MAX_SEQ_LEN", "4096") or 4096)
-    gen_defaults = {
-        "max_new_tokens": int(os.getenv("GENERATION_MAX_NEW_TOKENS", "256") or 256),
-        "temperature": float(os.getenv("GENERATION_TEMPERATURE", "0.2") or 0.2),
-        "top_p": float(os.getenv("GENERATION_TOP_P", "0.9") or 0.9),
-        "stop": _parse_stop(os.getenv("STOP")),
+    default_cfg = {
+        "max_new_tokens": _env_int("CLARIFIER_MAX_NEW_TOKENS", 128),
+        "temperature": float(os.getenv("CLARIFIER_TEMPERATURE", "0.0")),
+        "top_p": float(os.getenv("CLARIFIER_TOP_P", "0.9")),
+        "stop": [tok for tok in os.getenv("CLARIFIER_STOP", "").split(",") if tok],
     }
 
-    exl_force_base = os.getenv("EXL2_FORCE_BASE", "0").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "y",
+    target_device = _resolve_device_for_inputs(model, device_map)
+
+    class _HFGenerator:
+        def __init__(self, mdl, tok, defaults, device):
+            self.model = mdl
+            self.tokenizer = tok
+            self.defaults = defaults
+            self.device = device
+
+        def generate(
+            self,
+            prompt: str,
+            max_new_tokens: Optional[int] = None,
+            temperature: Optional[float] = None,
+            top_p: Optional[float] = None,
+            stop: Optional[list[str]] = None,
+        ) -> str:
+            cfg = dict(self.defaults)
+            if max_new_tokens is not None:
+                cfg["max_new_tokens"] = int(max_new_tokens)
+            if temperature is not None:
+                cfg["temperature"] = float(temperature)
+            if top_p is not None:
+                cfg["top_p"] = float(top_p)
+            stops = stop if stop is not None else cfg.get("stop")
+
+            inputs = self.tokenizer(prompt, return_tensors="pt")
+            if self.device is not None:
+                inputs = {k: v.to(self.device) for k, v in inputs.items()}
+
+            with torch.inference_mode():
+                outputs = self.model.generate(
+                    **inputs,
+                    max_new_tokens=cfg["max_new_tokens"],
+                    do_sample=cfg["temperature"] > 0,
+                    temperature=cfg["temperature"],
+                    top_p=cfg["top_p"],
+                    pad_token_id=self.tokenizer.eos_token_id,
+                )
+            text = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+            for token in stops or []:
+                idx = text.find(token)
+                if idx >= 0:
+                    text = text[:idx]
+            return text.strip()
+
+    handle = _HFGenerator(model, tokenizer, default_cfg, target_device)
+    _log("[clarifier] model ready")
+    return {
+        "role": "clarifier",
+        "backend": backend,
+        "path": path,
+        "handle": handle,
+        "tokenizer": tokenizer,
+        "model": model,
+        "device_map": device_map,
     }
-    exl_cache_len = int(os.getenv("EXL2_CACHE_MAX_SEQ_LEN", str(max_seq_len)) or max_seq_len)
-    llm_gpu_vis = os.getenv("CUDA_VISIBLE_DEVICES") or os.getenv("LLM_GPU") or ""
-    gpu_split_env = (os.getenv("GPU_SPLIT") or "").strip()
-    reserve_gb_key = (os.getenv("RESERVE_VRAM_GB") or "").strip()
 
-    key = (
-        backend,
-        os.path.abspath(model_path),
-        max_seq_len,
-        exl_force_base,
-        exl_cache_len,
-        llm_gpu_vis,
-        gpu_split_env,
-        reserve_gb_key,
-    )
 
-    with _MODEL_LOCK:
-        mh = _MODEL_CACHE.get(key)
-        if mh is not None:
-            return mh
+def load_llm(role: str) -> Optional[Dict[str, Any]]:
+    """Load a model for the given role ("sql" or "clarifier")."""
 
-        print(f"Loading model: {model_path}")
-        print(f"Backend: {backend}")
-        print(f"Max sequence length: {max_seq_len}")
+    with _LOCK:
+        if role in _MODELS and _MODELS[role] is not None:
+            _log(f"Reusing cached model for role={role}")
+            return _MODELS[role]
 
-        if backend == "exllama":
-            mh = _load_exllama(model_path, max_seq_len, gen_defaults, shim)
-        elif backend in {"hf-fp16", "hf-8bit", "hf-4bit"}:
-            device_map = os.getenv("DEVICE_MAP", "auto")
-            mh = _load_hf(model_path, backend, max_seq_len, gen_defaults, shim, device_map=device_map)
+        if role == "sql":
+            _MODELS[role] = _load_sql_model()
+        elif role == "clarifier":
+            _MODELS[role] = _load_clarifier_model()
         else:
-            raise ValueError(f"Unsupported MODEL_BACKEND: {backend}")
+            raise ValueError(f"Unknown model role: {role}")
+        return _MODELS[role]
 
-        _MODEL_CACHE[key] = mh
-        return mh
+
+def model_info() -> Dict[str, Any]:
+    sql = _MODELS.get("sql")
+    clar = _MODELS.get("clarifier")
+
+    if sql is None:
+        try:
+            sql = load_llm("sql")
+        except Exception:
+            sql = None
+
+    if clar is None:
+        try:
+            clar = load_llm("clarifier")
+        except Exception:
+            clar = None
+
+    return {
+        "mode": "dw-pipeline",
+        "llm": {
+            "backend": (sql or {}).get("backend") if sql else "unknown",
+            "path": (sql or {}).get("path") if sql else None,
+        },
+        "clarifier": {
+            "backend": (clar or {}).get("backend") if clar else "disabled",
+            "path": (clar or {}).get("path") if clar else None,
+            "device_map": (clar or {}).get("device_map") if clar else None,
+        },
+    }
+
+
+# ------------------------------------------------------------------
+# Backwards-compatible helpers
+# ------------------------------------------------------------------
+
+def load_model(settings: Any | None = None) -> Optional[Any]:
+    payload = load_llm("sql")
+    return payload.get("handle") if payload else None
+
+
+def load_clarifier(settings: Any | None = None) -> Optional[Any]:
+    payload = load_llm("clarifier")
+    return payload.get("handle") if payload else None
 
 
 def load_llm_from_settings(settings: Any | None = None):
-    """Load the primary SQL generation model and return (handle, info)."""
-
-    s = _SettingsShim(settings)
-    backend_val = (s.get("MODEL_BACKEND") or "").strip().lower()
-    if backend_val in {"none", "disabled", "off"}:
-        return None, {"name": "disabled"}
-
-    handle = load_model(settings)
-    meta = getattr(handle, "meta", {}) or {}
-
-    model_path = meta.get("model_path") or (s.get("MODEL_PATH") or "").strip()
-    base_name = os.path.basename(model_path) if model_path else "sqlcoder"
-    name = meta.get("model_name") or meta.get("name") or base_name or "sqlcoder"
-
-    info: Dict[str, Any] = {"name": name}
-
-    backend = meta.get("backend") or getattr(handle, "backend", None) or backend_val or None
-    if backend:
-        info["backend"] = backend
-    if model_path:
-        info["path"] = model_path
-
-    max_len_val = meta.get("model_max_seq_len") or s.get("MODEL_MAX_SEQ_LEN")
-    try:
-        if max_len_val:
-            info["max_len"] = int(max_len_val)
-    except Exception:
-        pass
-
-    return handle, info
-
-
-def load_model(settings: Any | None = None) -> ModelHandle:
-    s = _SettingsShim(settings)
-
-    # Setup GPU order before any CUDA import
-    _setup_gpu_devices(s)
-    _check_cuda_compatibility()
-
-    env = (s.get("ENVIRONMENT", "local") or "local").lower()
-    default_backend = "exllama" if env == "local" else "hf-fp16"
-
-    backend = (s.get("MODEL_BACKEND", default_backend) or default_backend).lower()
-    model_path = s.get("MODEL_PATH")
-    if not model_path:
-        raise ValueError("MODEL_PATH is required")
-    if not os.path.exists(model_path):
-        raise ValueError(f"MODEL_PATH does not exist: {model_path}")
-
-    max_seq_len = int(s.get("MODEL_MAX_SEQ_LEN", "4096") or 4096)
-    stop = _parse_stop(s.get("STOP"))
-    gen_defaults = {
-        "max_new_tokens": int(s.get("GENERATION_MAX_NEW_TOKENS", "256") or 256),
-        "temperature": float(s.get("GENERATION_TEMPERATURE", "0.2") or 0.2),
-        "top_p": float(s.get("GENERATION_TOP_P", "0.9") or 0.9),
-        "stop": stop,
+    payload = load_llm("sql")
+    if not payload:
+        return None, {}
+    info = {
+        "backend": payload.get("backend"),
+        "path": payload.get("path"),
+        "name": os.getenv("MODEL_NAME") or os.path.basename(payload.get("path", "")) or "sqlcoder",
     }
-
-    # Build a cache key that captures backend-critical knobs
-    # (For EXL2, include base/dynamic and cache length knobs)
-    exl_force_base = os.getenv("EXL2_FORCE_BASE", "0").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "y",
-    }
-    exl_cache_len = int(
-        os.getenv("EXL2_CACHE_MAX_SEQ_LEN", str(max_seq_len)) or max_seq_len
-    )
-    llm_gpu_vis = os.getenv("CUDA_VISIBLE_DEVICES") or os.getenv("LLM_GPU") or ""
-    gpu_split_env = (os.getenv("GPU_SPLIT") or "").strip()
-
-    reserve_gb_key = (os.getenv("RESERVE_VRAM_GB") or "").strip()
-
-    key = (
-        backend,
-        os.path.abspath(model_path),
-        max_seq_len,
-        exl_force_base,
-        exl_cache_len,
-        llm_gpu_vis,
-        gpu_split_env,
-        reserve_gb_key,
-    )
-
-    with _MODEL_LOCK:
-        mh = _MODEL_CACHE.get(key)
-        if mh is not None:
-            print("Reusing cached model handle")
-            return mh
-
-        print(f"Loading model: {model_path}")
-        print(f"Backend: {backend}")
-        print(f"Max sequence length: {max_seq_len}")
-
-        if backend == "exllama":
-            mh = _load_exllama(model_path, max_seq_len, gen_defaults, s)
-        elif backend in {"hf-fp16", "hf-8bit", "hf-4bit"}:
-            mh = _load_hf(model_path, backend, max_seq_len, gen_defaults, s)
-        else:
-            raise ValueError(f"Unknown MODEL_BACKEND: {backend}")
-
-        _MODEL_CACHE[key] = mh
-        return mh
-
-
-# ------------------------------
-# Clarifier model loader
-# ------------------------------
-
-
-def load_clarifier_model(settings: Any | None = None) -> ModelHandle:
-    """ENV-only loader for a small clarifier/chat model.
-    Falls back to the primary LLM if CLARIFIER_* envs are missing."""
-    s = _SettingsShim(settings)
-    be = (os.getenv("CLARIFIER_MODEL_BACKEND") or "").strip().lower()
-    mp = (os.getenv("CLARIFIER_MODEL_PATH") or "").strip()
-    if not be or not mp:
-        return load_model(settings)
-
-    key = (
-        "clarifier",
-        be,
-        os.path.abspath(mp),
-        os.getenv("CUDA_VISIBLE_DEVICES") or "",
-    )
-    with _MODEL_LOCK:
-        mh = _MODEL_CACHE.get(key)
-        if mh is not None:
-            return mh
-
-        max_seq_len = int(s.get("MODEL_MAX_SEQ_LEN", "4096") or 4096)
-        gen_defaults = {
-            "max_new_tokens": 64,
-            "temperature": 0.0,
-            "top_p": 1.0,
-            "stop": None,
-        }
-        if be == "exllama":
-            mh = _load_exllama(mp, max_seq_len, gen_defaults, s)
-        elif be in {"hf-fp16", "hf-8bit", "hf-4bit"}:
-            mh = _load_hf(mp, be, max_seq_len, gen_defaults, s)
-        else:
-            mh = load_model(settings)
-
-        _MODEL_CACHE[key] = mh
-        return mh
-
-
-# ------------------------------
-# Backends
-# ------------------------------
-
-
-def _load_exllama(
-    model_path: str, max_seq_len: int, gen_defaults: Dict[str, Any], s: _SettingsShim
-) -> ModelHandle:
-    """Load ExLlamaV2 with robust autosplit/manual split, lazy cache, and Dynamic→Base fallback."""
-
-    import os, time
-    import torch
-
-    # ---------- Imports ----------
-    try:
-        print("Importing ExLlamaV2...")
-        from exllamav2 import (
-            ExLlamaV2Config,
-            ExLlamaV2,
-            ExLlamaV2Tokenizer,
-            ExLlamaV2Cache,
-        )
-        from exllamav2.generator import ExLlamaV2Sampler
-
-        print("ExLlamaV2 imported successfully")
-    except Exception as e:
-        raise RuntimeError(
-            "ExLlamaV2 import failed (JIT/toolchain likely). " f"Original error: {e}"
-        )
-
-    # ---------- Flags / policy ----------
-    force_base = str(os.getenv("EXL2_FORCE_BASE", "0")).lower() in {
-        "1",
-        "true",
-        "yes",
-        "y",
-    }
-
-    # If we force Base, proactively disable use of flash-attn inside EXL2 load path
-    if force_base:
-        try:
-            import exllamav2.attn as _attn
-
-            _attn.has_flash_attn = False
-            print("FlashAttention disabled for load (EXL2_FORCE_BASE=1)")
-        except Exception:
-            pass
-
-    dyn_available = False
-    if not force_base:
-        try:
-            from exllamav2.generator.dynamic import ExLlamaV2DynamicGenerator  # noqa
-
-            dyn_available = True
-            print("Dynamic generator available")
-        except Exception as e:
-            print(f"Dynamic generator not available: {e}")
-
-    # ---------- Config ----------
-    print("Creating ExLlamaV2 config...")
-    cfg = ExLlamaV2Config(model_path)
-    cfg.max_seq_len = max_seq_len
-    if torch.cuda.is_available():
-        cfg.set_low_mem()
-        cfg.gpu_peer_fix = True
-        print("Enabled low memory mode and peer fix")
-
-    print("Preparing config...")
-    cfg.prepare()
-    print("Config prepared successfully")
-
-    # ---------- Model / tokenizer / cache ----------
-    print("Loading model...")
-    model = ExLlamaV2(cfg)
-    print("Model created")
-
-    print("Loading tokenizer...")
-    tok = ExLlamaV2Tokenizer(cfg)
-    print("Tokenizer loaded")
-
-    cache_len = int(os.getenv("EXL2_CACHE_MAX_SEQ_LEN", str(max_seq_len)))
-    print(f"Creating lazy cache (max_seq_len={cache_len})...")
-    cache = ExLlamaV2Cache(model, lazy=True, max_seq_len=cache_len)
-    print("Cache created")
-
-    # ---------- Split parsing (settings → env), GiB or fractions ----------
-    split: list[float] | None = None
-    split_cfg = (s.get("GPU_SPLIT") or os.getenv("GPU_SPLIT", "")).strip()
-    if split_cfg and not force_base:
-        vals = [float(x) for x in split_cfg.split(",") if x.strip()]
-        if vals:
-            if max(vals) > 1.5:
-                # GiB input (e.g., "30,10") → normalize to fractions that sum ≈ 1.0
-                total = sum(vals)
-                if total <= 0:
-                    raise ValueError("GPU_SPLIT total must be > 0")
-                split = [v / total for v in vals]
-            else:
-                # Already fractions; normalize defensively
-                total = sum(vals)
-                split = [v / total for v in vals] if total > 0 else None
-        if split:
-            print(f"Manual split normalized from '{split_cfg}' → {split}")
-
-    reserve = None
-    try:
-        reserve_gb = float(os.getenv("RESERVE_VRAM_GB", "0") or 0)
-        if torch.cuda.device_count() > 1 and reserve_gb > 0:
-            reserve = [0, int(reserve_gb * (1 << 30))]
-            print(f"Reserve VRAM on secondary GPU: {reserve_gb} GiB")
-    except Exception:
-        reserve = None
-
-    # ---------- Load weights with fallback ----------
-
-    def _try_load(split_f, cache_f) -> None:
-        t0 = time.time()
-        if split_f:
-            model.load(split_f, cache_f)
-            print(
-                f"Model weights loaded with manual split={split_f} in {time.time() - t0:.2f}s"
-            )
-        else:
-            model.load_autosplit(cache_f, progress=True, reserve_vram=reserve)
-            print(f"Model weights loaded (autosplit) in {time.time() - t0:.2f}s")
-
-    try:
-        _try_load(split, cache)
-    except Exception as e:
-        msg = str(e)
-        print(f"Initial load failed: {msg}")
-
-        # If FlashAttention is the culprit (or any OOM-ish issue), disable flash and retry autosplit with smaller cache
-        flash_fail = ("FlashAttention" in msg) or ("flash_attn" in msg)
-        oomish = any(
-            k in msg
-            for k in (
-                "Insufficient space",
-                "Insufficient VRAM",
-                "Insufficient VRAM for model and cache",
-                "out of memory",
-                "CUDA error",
-            )
-        )
-
-        if flash_fail:
-            try:
-                import exllamav2.attn as _attn
-
-                _attn.has_flash_attn = False
-                print("Disabled FlashAttention after failure; retrying load…")
-            except Exception:
-                pass
-
-        if flash_fail or oomish:
-            smaller = max(1024, cache_len // 2)
-            if smaller < cache_len:
-                print(f"Retrying load with smaller cache_len={smaller} and autosplit…")
-                cache = ExLlamaV2Cache(model, lazy=True, max_seq_len=smaller)
-                _try_load(None, cache)
-            else:
-                print("No smaller cache_len possible; rethrowing.")
-                raise
-        else:
-            raise
-
-    # ---------- Generator selection ----------
-    gen_is_dynamic = False
-    gen = None
-
-    if dyn_available and not force_base:
-        try:
-            print("Attempting Dynamic generator…")
-            from exllamav2.generator.dynamic import ExLlamaV2DynamicGenerator
-
-            gen = ExLlamaV2DynamicGenerator(model=model, tokenizer=tok, cache=cache)
-            gen_is_dynamic = True
-            print("Dynamic generator created successfully")
-        except Exception as e:
-            print(f"Dynamic generator failed: {e}. Falling back to Base.")
-
-    if gen is None:
-        from exllamav2.generator.base import ExLlamaV2BaseGenerator
-
-        gen = ExLlamaV2BaseGenerator(model=model, tokenizer=tok, cache=cache)
-        print("Base generator created successfully")
-
-    # ---------- Generation wrapper ----------
-    def _generate(prompt: str, **kw: Any) -> str:
-        args = {**gen_defaults, **{k: v for k, v in kw.items() if v is not None}}
-        max_new = int(args["max_new_tokens"])
-        temp = float(args["temperature"])
-        top_p = float(args["top_p"])
-
-        if gen_is_dynamic:
-            try:
-                text = gen.generate_simple(
-                    prompt,
-                    max_new_tokens=max_new,
-                    temperature=temp,
-                    top_p=top_p,
-                )
-            except TypeError:
-                pass
-            else:
-                for stop_tok in args.get("stop") or []:
-                    if stop_tok and stop_tok in text:
-                        text = text.split(stop_tok, 1)[0]
-                return text
-
-        settings = ExLlamaV2Sampler.Settings()
-        settings.temperature, settings.top_p = temp, top_p
-        try:
-            out = gen.generate_simple(prompt, settings, max_new)
-        except TypeError:
-            try:
-                out = gen.generate_simple(prompt, max_new, settings)
-            except TypeError:
-                out = gen.generate_simple(
-                    prompt, settings=settings, max_new_tokens=max_new
-                )
-
-        text = out[0] if isinstance(out, (tuple, list)) else out
-        for stop_tok in args.get("stop") or []:
-            if stop_tok and stop_tok in text:
-                text = text.split(stop_tok, 1)[0]
-        return text
-
-    print("ExLlamaV2 model loaded successfully!")
-    try:
-        import exllamav2 as _exl
-
-        exl_version = getattr(_exl, "__version__", "unknown")
-        from exllamav2 import attn as _exl_attn
-
-        flash_enabled = bool(getattr(_exl_attn, "has_flash_attn", False))
-    except Exception:
-        exl_version, flash_enabled = "unknown", False
-
-    visible = os.getenv("CUDA_VISIBLE_DEVICES") or os.getenv("LLM_GPU") or ""
-    gpu_info = []
-    if torch.cuda.is_available():
-        for i in range(torch.cuda.device_count()):
-            p = torch.cuda.get_device_properties(i)
-            gpu_info.append(
-                {
-                    "index": i,
-                    "name": p.name,
-                    "total_gib": round(p.total_memory / (1 << 30), 2),
-                }
-            )
-
-    meta = {
-        "backend": "exllama",
-        "generator": "dynamic" if gen_is_dynamic else "base",
-        "force_base": force_base,
-        "flash_attn_enabled": flash_enabled,
-        "model_path": model_path,
-        "torch_version": torch.__version__,
-        "exllama_version": exl_version,
-        "model_max_seq_len": max_seq_len,
-        "cache_max_seq_len": cache_len,
-        "placement": "manual" if split else "autosplit",
-        "split_fractions": [round(x, 4) for x in (split or [])],
-        "reserve_vram_gb": float(os.getenv("RESERVE_VRAM_GB", "0") or 0),
-        "visible_devices": visible,
-        "gpus": gpu_info,
-        "arches": os.getenv("TORCH_CUDA_ARCH_LIST", ""),
-        "loaded_at": time.time(),
-    }
-    return ModelHandle("exllama", model, tok, _generate, meta=meta)
-
-
-def _load_hf(
-    model_path: str,
-    backend: str,
-    max_seq_len: int,
-    gen_defaults: Dict[str, Any],
-    s: Any,
-    *,
-    device_map: Optional[str] = None,
-    hf_kwargs: Optional[Dict[str, Any]] = None,
-) -> ModelHandle:
-
-    from transformers import AutoTokenizer, AutoModelForCausalLM
-    try:
-        from transformers import BitsAndBytesConfig
-    except Exception:
-        BitsAndBytesConfig = None  # type: ignore[assignment]
-
-    if hf_kwargs is None:
-        hf_kwargs = {"trust_remote_code": True}
-        if device_map:
-            hf_kwargs["device_map"] = device_map
-
-        if _env_true(os.getenv("CLARIFIER_LOW_CPU_MEM", str(s.get("CLARIFIER_LOW_CPU_MEM", "1")))):
-            hf_kwargs["low_cpu_mem_usage"] = True
-
-        if backend in {"hf-4bit", "hf-8bit"}:
-            if BitsAndBytesConfig is None:
-                raise RuntimeError("bitsandbytes not available but hf-{4,8}bit requested")
-
-            offload_fp32 = _env_true(os.getenv("CLARIFIER_OFFLOAD_FP32", str(s.get("CLARIFIER_OFFLOAD_FP32", "0"))))
-            dm = (device_map or "").strip().lower()
-            on_cpu = dm == "cpu"
-
-            if backend == "hf-4bit":
-                default_quant_type = "nf4" if on_cpu else "fp4"
-                qt_env = os.getenv("CLARIFIER_QUANT_TYPE")
-                quant_type = "nf4" if on_cpu else (qt_env or default_quant_type)
-                compute_dtype = _dtype_from_str(
-                    os.getenv("CLARIFIER_COMPUTE_DTYPE", "float32" if on_cpu else "bfloat16"),
-                    torch.float32 if on_cpu else torch.bfloat16,
-                )
-                bnb_cfg = BitsAndBytesConfig(
-                    load_in_4bit=True,
-                    bnb_4bit_quant_type=quant_type,
-                    bnb_4bit_compute_dtype=compute_dtype,
-                    llm_int8_enable_fp32_cpu_offload=offload_fp32,
-                )
-                hf_kwargs["quantization_config"] = bnb_cfg
-
-            elif backend == "hf-8bit":
-                bnb_cfg = BitsAndBytesConfig(
-                    load_in_8bit=True,
-                    llm_int8_enable_fp32_cpu_offload=offload_fp32,
-                )
-                hf_kwargs["quantization_config"] = bnb_cfg
-
-        elif backend in {"hf-fp16", "hf-bf16"}:
-            hf_kwargs["torch_dtype"] = torch.bfloat16 if backend == "hf-bf16" else torch.float16
-    else:
-        hf_kwargs.setdefault("trust_remote_code", True)
-        if device_map and "device_map" not in hf_kwargs:
-            hf_kwargs["device_map"] = device_map
-
-    # (Optional) print debug
-    print("Loading HF model with backend:", backend)
-    dbg_q = hf_kwargs.get("quantization_config")
-    print(
-        "Load kwargs:",
-        {k: (str(v) if k != "quantization_config" else f"BitsAndBytesConfig {{...}}") for k, v in hf_kwargs.items()},
-    )
-
-    # ---- Actually load
-    tok = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(model_path, **hf_kwargs)
-
-    # Build generator function (minimal; you can reuse your existing one)
-    def _generate(prompt: str, **kw: Any) -> str:
-        from transformers import TextStreamer
-        max_new = int(kw.get("max_new_tokens", gen_defaults["max_new_tokens"]))
-        temperature = float(kw.get("temperature", gen_defaults["temperature"]))
-        top_p = float(kw.get("top_p", gen_defaults["top_p"]))
-
-        inputs = tok(prompt, return_tensors="pt")
-        # Move to device if not CPU map
-        if device_map and device_map != "cpu":
-            inputs = {k: v.to(model.device) for k, v in inputs.items()}
-
-        out = model.generate(
-            **inputs,
-            max_new_tokens=max_new,
-            do_sample=True,
-            temperature=temperature,
-            top_p=top_p,
-            pad_token_id=tok.eos_token_id,
-        )
-        text = tok.decode(out[0], skip_special_tokens=True)
-        # stop handling
-        for s_ in kw.get("stop", []) or gen_defaults.get("stop", []) or []:
-            if s_ and s_ in text:
-                text = text.split(s_, 1)[0]
-        return text
-
-    return ModelHandle(backend, model, tok, _generate)
-
-
-def load_clarifier(settings: Any | None = None) -> Optional[ModelHandle]:
-    """Load the optional clarifier model unless explicitly disabled."""
-    s = _SettingsShim(settings)
-    backend = (s.get("CLARIFIER_MODEL_BACKEND") or "").strip().lower()
-    model_path = (s.get("CLARIFIER_MODEL_PATH") or "").strip()
-
-    if backend in {"", "off", "disabled", "none"} or not model_path:
-        print("[clarifier] disabled")
-        return None
-
-    max_len = int(
-        s.get("CLARIFIER_MAX_SEQ_LEN", s.get("MODEL_MAX_SEQ_LEN", "4096"))
-        or 4096
-    )
-    gen_defaults = {
-        "max_new_tokens": int(s.get("CLARIFIER_MAX_NEW_TOKENS", "128") or 128),
-        "temperature": float(
-            s.get("CLARIFIER_TEMPERATURE", s.get("GENERATION_TEMPERATURE", "0.2"))
-            or 0.2
-        ),
-        "top_p": float(
-            s.get("CLARIFIER_TOP_P", s.get("GENERATION_TOP_P", "0.9")) or 0.9
-        ),
-        "stop": _parse_stop(s.get("CLARIFIER_STOP", s.get("STOP"))),
-    }
-
-    hf_kwargs: Dict[str, Any] = {"trust_remote_code": True}
-    if _env_true(s.get("CLARIFIER_LOW_CPU_MEM")):
-        hf_kwargs["low_cpu_mem_usage"] = True
-    device_map_env = s.get("CLARIFIER_DEVICE_MAP") or s.get("CLARIFIER_DEVICE") or "auto"
-    hf_kwargs["device_map"] = device_map_env
-
-    if backend == "hf-cpu":
-        import torch
-
-        hf_kwargs["torch_dtype"] = torch.float32
-        hf_kwargs["device_map"] = "cpu"
-        backend = "hf-fp16"
-
-    if backend == "hf-4bit":
-        from transformers import BitsAndBytesConfig
-        import torch
-
-        qtype = (s.get("CLARIFIER_QUANT_TYPE") or "nf4").lower()
-        comp = (s.get("CLARIFIER_COMPUTE_DTYPE") or "bfloat16").lower()
-        comp_dt = {
-            "bfloat16": torch.bfloat16,
-            "float16": torch.float16,
-            "float32": torch.float32,
-        }[comp]
-        hf_kwargs["quantization_config"] = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type=qtype,
-            bnb_4bit_compute_dtype=comp_dt,
-            llm_int8_enable_fp32_cpu_offload=_env_true(s.get("CLARIFIER_OFFLOAD_FP32")),
-        )
-    elif backend == "hf-8bit":
-        from transformers import BitsAndBytesConfig
-
-        hf_kwargs["quantization_config"] = BitsAndBytesConfig(
-            load_in_8bit=True,
-            llm_int8_enable_fp32_cpu_offload=_env_true(s.get("CLARIFIER_OFFLOAD_FP32")),
-        )
-    elif backend == "hf-fp16":
-        import torch
-
-        hf_kwargs.setdefault("torch_dtype", torch.float16)
-
-    print("Loading HF model with backend:", backend)
-    print("Load kwargs:", hf_kwargs)
-    return _load_hf(model_path, backend, max_len, gen_defaults, s, hf_kwargs=hf_kwargs)
-
-
-def load_clarifier_model(settings: Any | None = None) -> "ModelHandle | None":
-    """
-    Optional small assistant model (e.g., Meta-Llama-3.1-8B-Instruct) for
-    fast intent classification / short clarifications. If not configured,
-    returns None and the system will use rules only.
-    """
-    s = _SettingsShim(settings)
-    path = s.get("CLARIFIER_MODEL_PATH")
-    if not path:
-        return None
-    backend = (s.get("CLARIFIER_MODEL_BACKEND", "hf-4bit") or "hf-4bit").lower()
-    os.environ.setdefault("GENERATION_MAX_NEW_TOKENS", "32")
-    try:
-        if backend in {"hf-fp16", "hf-8bit", "hf-4bit"}:
-            return _load_hf(
-                path,
-                backend,
-                int(s.get("MODEL_MAX_SEQ_LEN", "4096") or 4096),
-                {
-                    "max_new_tokens": 32,
-                    "temperature": 0.0,
-                    "top_p": 1.0,
-                    "stop": ["\n"],
-                },
-                s,
-            )
-        if backend == "exllama":
-            return _load_exllama(
-                path,
-                int(s.get("MODEL_MAX_SEQ_LEN", "4096") or 4096),
-                {
-                    "max_new_tokens": 32,
-                    "temperature": 0.0,
-                    "top_p": 1.0,
-                    "stop": ["\n"],
-                },
-                s,
-            )
-    except Exception as e:
-        print(f"[clarifier] failed to load {backend} at {path}: {e}")
-    return None
-
+    return payload.get("handle"), info

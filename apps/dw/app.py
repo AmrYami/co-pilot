@@ -14,7 +14,8 @@ from core.datasources import DatasourceRegistry
 from core.settings import Settings
 from core.sql_exec import get_mem_engine
 
-from .llm import DWLLM
+from apps.dw.clarifier import propose_clarifying_questions
+from apps.dw.llm import nl_to_sql_with_llm
 
 if TYPE_CHECKING:  # pragma: no cover
     from core.pipeline import Pipeline
@@ -25,19 +26,10 @@ dw_bp = Blueprint("dw", __name__)
 
 
 @dw_bp.route("/model/info", methods=["GET"])
-def model_info():
-    info = {
-        "clarifier": "disabled",
-        "llm": "unknown",
-        "mode": "dw-pipeline",
-    }
-    try:  # pragma: no cover - health check
-        settings = Settings(namespace=NAMESPACE)
-        DWLLM(settings).nl_to_sql("ping")
-        info["llm"] = "available"
-    except Exception:
-        info["llm"] = "unavailable"
-    return jsonify(info)
+def model_info_route():
+    from core.model_loader import model_info as _model_info
+
+    return jsonify(_model_info())
 
 
 def create_dw_blueprint(settings: Settings | None = None, pipeline: "Pipeline | None" = None) -> Blueprint:
@@ -741,11 +733,26 @@ def answer():
         "top_n": top_n,
     }
 
-    llm = DWLLM(settings)
-    prompt_snippets = _load_prompt_snippets(mem)
+    dw_table = data.get("dw_table") or "Contract"
+
     try:
-        sql = llm.nl_to_sql(question, prompt_snippets)
-    except Exception as exc:
+        use_llm = settings.get_bool("DW_USE_LLM", scope="namespace")
+        if use_llm is None:
+            use_llm = True
+    except Exception:
+        use_llm = True
+
+    llm_result = {"sql": None, "confidence": 0.0, "why": "disabled"}
+
+    if use_llm:
+        try:
+            llm_result = nl_to_sql_with_llm(question, dw_table=dw_table)
+        except Exception as exc:
+            llm_result = {"sql": None, "confidence": 0.0, "why": f"llm_error: {exc}"}
+
+    sql = llm_result.get("sql") if isinstance(llm_result, dict) else None
+
+    if not sql:
         inquiry_id = _insert_inquiry(
             mem,
             NAMESPACE,
@@ -754,14 +761,13 @@ def answer():
             prefixes,
             "needs_clarification",
         )
+        followups = propose_clarifying_questions(question)
         return jsonify(
             {
                 "ok": False,
                 "status": "needs_clarification",
-                "questions": [
-                    "I couldn't derive a clean SQL. Can you clarify the columns or filters?"
-                ],
-                "error": f"nl_to_sql failed: {exc}",
+                "questions": followups,
+                "rationale": llm_result.get("why", "") if isinstance(llm_result, dict) else "",
                 "inquiry_id": inquiry_id,
             }
         )
