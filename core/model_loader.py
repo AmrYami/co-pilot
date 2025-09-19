@@ -2,6 +2,8 @@ import os
 import threading
 from typing import Any, Dict, Optional
 
+import torch
+
 _MODELS: Dict[str, Optional[Dict[str, Any]]] = {}
 _LOCK = threading.Lock()
 
@@ -92,43 +94,57 @@ def _load_clarifier_model() -> Optional[Dict[str, Any]]:
     if not path:
         raise RuntimeError("CLARIFIER_MODEL_PATH not set")
 
-    device_map = os.getenv("CLARIFIER_DEVICE_MAP", "cuda:0")
-    quant_type = os.getenv("CLARIFIER_QUANT_TYPE", "nf4")
+    device_map_env = os.getenv("CLARIFIER_DEVICE_MAP", "auto").strip()
+    device_map = device_map_env if device_map_env else "auto"
     low_cpu_mem = _env_bool("CLARIFIER_LOW_CPU_MEM", True)
-    dtype = os.getenv("CLARIFIER_COMPUTE_DTYPE", "float16")
+    compute_dtype_str = os.getenv("CLARIFIER_COMPUTE_DTYPE", "float16")
+    compute_dtype = getattr(torch, compute_dtype_str, torch.float16)
+    quant_type = os.getenv("CLARIFIER_QUANT_TYPE", "nf4").lower()
 
-    if backend not in {"hf-4bit", "hf-fp16"}:
+    _log(
+        f"[clarifier] loading HF model: {path} ({backend}) on {device_map}"
+    )
+
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    load_kwargs: Dict[str, Any] = {
+        "device_map": device_map,
+        "low_cpu_mem_usage": low_cpu_mem,
+        "torch_dtype": compute_dtype,
+    }
+
+    if backend == "hf-4bit":
+        try:
+            from transformers import BitsAndBytesConfig
+        except ImportError as exc:  # pragma: no cover - import guard
+            raise RuntimeError(
+                "bitsandbytes is required for hf-4bit clarifier backend"
+            ) from exc
+
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_use_double_quant=False,
+            bnb_4bit_quant_type=quant_type,
+            bnb_4bit_compute_dtype=compute_dtype,
+        )
+        load_kwargs["quantization_config"] = bnb_config
+    elif backend in {"hf-fp16", "hf-fp8", "hf-fp32"}:
+        pass
+    else:
         raise RuntimeError(f"Unsupported CLARIFIER_MODEL_BACKEND={backend}")
 
-    _log(f"[clarifier] loading HF model: {path} ({backend}) on {device_map}")
+    load_kwargs.pop("trust_remote_code", None)
 
-    import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-    try:
-        from transformers import BitsAndBytesConfig
-    except ImportError:
-        BitsAndBytesConfig = None  # type: ignore[assignment]
-
-    load_kwargs: Dict[str, Any] = {"trust_remote_code": True}
-    if backend == "hf-4bit":
-        if BitsAndBytesConfig is None:
-            raise RuntimeError("bitsandbytes is required for hf-4bit clarifier backend")
-        load_kwargs["quantization_config"] = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_quant_type=quant_type,
-            bnb_4bit_compute_dtype=getattr(torch, dtype, torch.float16),
-        )
-    else:
-        load_kwargs["torch_dtype"] = getattr(torch, dtype, torch.float16)
-
-    if device_map:
-        load_kwargs["device_map"] = device_map
-    if low_cpu_mem:
-        load_kwargs["low_cpu_mem_usage"] = True
-
-    tokenizer = AutoTokenizer.from_pretrained(path, use_fast=True, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(path, trust_remote_code=True, **load_kwargs)
+    model = AutoModelForCausalLM.from_pretrained(
+        path,
+        trust_remote_code=True,
+        **load_kwargs,
+    )
+    tokenizer = AutoTokenizer.from_pretrained(
+        path,
+        trust_remote_code=True,
+        use_fast=True,
+    )
     model.eval()
 
     default_cfg = {
@@ -215,6 +231,7 @@ def _load_clarifier_model() -> Optional[Dict[str, Any]]:
         "role": "clarifier",
         "backend": backend,
         "path": path,
+        "name": os.path.basename(path.rstrip("/")) or path,
         "handle": handle,
         "tokenizer": tokenizer,
         "model": model,
