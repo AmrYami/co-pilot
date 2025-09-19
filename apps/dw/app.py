@@ -4,6 +4,7 @@ import csv
 import io
 import json
 import os
+import re
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
@@ -15,7 +16,7 @@ from core.settings import Settings
 from core.sql_exec import get_mem_engine
 
 from apps.dw.clarifier import propose_clarifying_questions
-from apps.dw.llm import clarify_intent, nl_to_sql_with_llm
+from apps.dw.llm import clarify_intent, choose_date_column, nl_to_sql_with_llm
 
 if TYPE_CHECKING:  # pragma: no cover
     from core.pipeline import Pipeline
@@ -23,6 +24,11 @@ if TYPE_CHECKING:  # pragma: no cover
 
 NAMESPACE = "dw::common"
 dw_bp = Blueprint("dw", __name__)
+
+
+_SIMPLE_NEXT_N_DAYS = re.compile(r"\bnext\s+(\d{1,4})\s+days?\b", re.IGNORECASE)
+_LAST_N_DAYS = re.compile(r"\blast\s+(\d{1,4})\s+days?\b", re.IGNORECASE)
+_LAST_MONTH = re.compile(r"\blast\s+month\b", re.IGNORECASE)
 
 
 @dw_bp.route("/model/info", methods=["GET"])
@@ -81,27 +87,54 @@ def _load_prompt_snippets(mem_engine, limit: int = 3) -> List[Tuple[str, str]]:
     return shots
 
 
-def _calc_window(question: str) -> Tuple[date, date, int]:
+def _calc_window(question: str) -> Tuple[date, date, int, str, bool]:
     now = date.today()
-    q = question.lower()
+    lowered = question.lower()
     top_n = 10
-    if "top " in q:
+    if "top " in lowered:
         try:
-            toks = q.split()
-            idx = toks.index("top")
-            top_n = int(toks[idx + 1])
+            tokens = lowered.split()
+            idx = tokens.index("top")
+            top_n = int(tokens[idx + 1])
         except Exception:
             pass
-    if "last month" in q:
+
+    label = "last 30 days"
+    simple = False
+
+    match_next = _SIMPLE_NEXT_N_DAYS.search(question)
+    if match_next:
+        try:
+            days = int(match_next.group(1))
+        except Exception:
+            days = 30
+        label = f"next {days} days"
+        simple = True
+        return now, now + timedelta(days=days), top_n, label, simple
+
+    match_last = _LAST_N_DAYS.search(question)
+    if match_last:
+        try:
+            days = int(match_last.group(1))
+        except Exception:
+            days = 30
+        label = f"last {days} days"
+        simple = True
+        return now - timedelta(days=days), now + timedelta(days=1), top_n, label, simple
+
+    if _LAST_MONTH.search(question):
         first_this = now.replace(day=1)
         last_month_end = first_this
         last_month_start = (first_this - timedelta(days=1)).replace(day=1)
-        return last_month_start, last_month_end, top_n
-    if "last 90 days" in q:
-        return now - timedelta(days=90), now + timedelta(days=1), top_n
-    if "next 30 days" in q or "in the next 30 days" in q:
-        return now, now + timedelta(days=30), top_n
-    return now - timedelta(days=30), now + timedelta(days=1), top_n
+        label = "last month"
+        simple = True
+        return last_month_start, last_month_end, top_n, label, simple
+
+    if "last 90 days" in lowered:
+        label = "last 90 days"
+        return now - timedelta(days=90), now + timedelta(days=1), top_n, label, simple
+
+    return now - timedelta(days=30), now + timedelta(days=1), top_n, label, simple
 
 
 def _insert_inquiry(
@@ -174,6 +207,24 @@ def _csv_bytes(rows: List[Dict[str, Any]]) -> bytes:
     for row in rows:
         writer.writerow({key: ("" if value is None else value) for key, value in row.items()})
     return buffer.getvalue().encode("utf-8")
+
+
+def _fallback_sql(contract_table: str, date_column: str) -> str:
+    return (
+        f"""
+SELECT
+  CONTRACT_ID,
+  CONTRACT_OWNER,
+  OWNER_DEPARTMENT,
+  {date_column} AS REF_DATE,
+  CONTRACT_STATUS,
+  NVL(CONTRACT_VALUE_NET_OF_VAT,0) + NVL(VAT,0) AS CONTRACT_VALUE_GROSS
+FROM "{contract_table}"
+WHERE {date_column} >= :date_start
+  AND {date_column} < :date_end
+ORDER BY {date_column} ASC
+"""
+    ).strip()
 
 
 def run_sql_oracle(engine, sql: Optional[str], binds: Dict[str, Any]):
@@ -250,12 +301,18 @@ def save_learning_artifacts(
     intent: Optional[Dict[str, Any]] = None,
     tags: Optional[List[str]] = None,
     settings: Optional[Settings] = None,
+    date_column: Optional[str] = None,
+    window_label: Optional[str] = None,
 ):
     mem_settings = settings or Settings(namespace=namespace)
     mem = get_mem_engine(mem_settings)
     if mem is None:
         return None
-    tag_payload = tags or ["dw", "contracts"]
+    tag_payload = list(tags or ["dw", "contracts", "window", "autosave"])
+    if "window" not in tag_payload:
+        tag_payload.append("window")
+    if "autosave" not in tag_payload:
+        tag_payload.append("autosave")
     with mem.begin() as conn:
         run_id = conn.execute(
             text(
@@ -275,6 +332,16 @@ def save_learning_artifacts(
             },
         ).scalar_one()
 
+        filters_payload = None
+        if date_column:
+            filters_payload = [
+                [date_column, ">=", ":date_start"],
+                [date_column, "<", ":date_end"],
+            ]
+        snippet_title = f"Contracts by window: {question[:64]}"
+        snippet_desc = f"Auto-saved from NLQ: {question}"
+        if window_label:
+            snippet_desc += f" ({window_label})"
         conn.execute(
             text(
                 """
@@ -284,12 +351,18 @@ def save_learning_artifacts(
             ),
             {
                 "ns": namespace,
-                "title": "DW stakeholder summary",
-                "desc": "Stakeholder/department union pattern with date filters and gross value metric",
+                "title": snippet_title,
+                "desc": snippet_desc,
                 "tmpl": sql,
                 "raw": sql,
                 "tables": json.dumps(["Contract"]),
-                "params": json.dumps({"time": intent.get("time") if intent else None}),
+                "params": json.dumps(
+                    {
+                        "time": intent.get("time") if intent else None,
+                        "filters": filters_payload,
+                        "date_column": date_column,
+                    }
+                ),
                 "tags": json.dumps(tag_payload),
             },
         )
@@ -860,15 +933,37 @@ def answer():
 
     mem = get_mem_engine(settings)
 
-    start, end, top_n = _calc_window(question)
+    window_start, window_end, top_n, window_label, simple_window = _calc_window(question)
+    date_start_dt = datetime.combine(window_start, datetime.min.time())
+    date_end_dt = datetime.combine(window_end, datetime.min.time())
+
+    try:
+        default_table = settings.get(
+            "DW_CONTRACT_TABLE", default="Contract", scope="namespace"
+        )
+    except Exception:
+        default_table = "Contract"
+    dw_table = data.get("dw_table") or default_table
+
+    try:
+        default_date_column = settings.get(
+            "DW_DATE_COLUMN", default="REQUEST_DATE", scope="namespace"
+        )
+    except Exception:
+        default_date_column = "REQUEST_DATE"
+
+    used_date_column = choose_date_column(question, default_date_column)
+    context = {
+        "contract_table": dw_table,
+        "date_column": used_date_column,
+    }
+
     default_binds = {
-        "date_start": datetime.combine(start, datetime.min.time()),
-        "date_end": datetime.combine(end, datetime.min.time()),
+        "date_start": date_start_dt,
+        "date_end": date_end_dt,
         "top_n": top_n,
     }
     active_binds = dict(default_binds)
-
-    dw_table = data.get("dw_table") or "Contract"
 
     try:
         use_llm = settings.get_bool("DW_USE_LLM", scope="namespace")
@@ -878,15 +973,47 @@ def answer():
         use_llm = True
 
     llm_result: Dict[str, Any] = {"sql": None, "confidence": 0.0, "why": "disabled"}
+    fallback_mode = False
     if use_llm:
         try:
             llm_result = nl_to_sql_with_llm(
-                question=question, dw_table=dw_table, settings=settings
+                question=question,
+                dw_table=dw_table,
+                settings=settings,
+                context=context,
             )
         except Exception as exc:
             llm_result = {"sql": None, "confidence": 0.0, "why": f"llm_error: {exc}"}
 
+    if isinstance(llm_result, dict) and llm_result.get("used_date_column"):
+        used_date_column = llm_result.get("used_date_column") or used_date_column
+        context["date_column"] = used_date_column
+
     sql = llm_result.get("sql") if isinstance(llm_result, dict) else None
+    if not sql:
+        fallback_mode = True
+        raw_text = llm_result.get("raw") if isinstance(llm_result, dict) else None
+        sql = _fallback_sql(context["contract_table"], used_date_column)
+        llm_result = {
+            "sql": sql,
+            "confidence": 0.0,
+            "why": "llm_non_sql_fallback",
+            "raw": raw_text,
+            "used_date_column": used_date_column,
+        }
+    else:
+        upper_sql = sql.lstrip().upper()
+        if not (upper_sql.startswith("SELECT") or upper_sql.startswith("WITH")):
+            fallback_mode = True
+            sql = _fallback_sql(context["contract_table"], used_date_column)
+            llm_result = {
+                "sql": sql,
+                "confidence": 0.0,
+                "why": "forced_fallback_select",
+                "raw": llm_result.get("raw") if isinstance(llm_result, dict) else None,
+                "used_date_column": used_date_column,
+            }
+
     rows: List[Dict[str, Any]] = []
     meta_exec: Dict[str, Any] = {}
     intent_used: Optional[Dict[str, Any]] = None
@@ -901,9 +1028,14 @@ def answer():
         else:
             error_message = exec_error
         clarifier_needed = (not ok) or rows_suspiciously_empty(rows, question)
+        if fallback_mode:
+            clarifier_needed = False
     else:
         clarifier_needed = True
         error_message = llm_result.get("why") if isinstance(llm_result, dict) else "no_sql"
+
+    if clarifier_needed and simple_window:
+        clarifier_needed = False
 
     if clarifier_needed:
         try:
@@ -919,16 +1051,29 @@ def answer():
         if intent:
             intent_used = intent
             active_binds = intent_to_binds(intent, fallback=default_binds)
+            clarifier_ctx = dict(context)
+            time_block = (intent or {}).get("time") or {}
+            clarified_column = time_block.get("column")
+            if clarified_column:
+                clarifier_ctx["date_column"] = clarified_column
+            clarifier_ctx["contract_table"] = context["table"]
+            clarifier_ctx["date_column"] = choose_date_column(
+                question, clarifier_ctx.get("date_column", default_date_column)
+            )
             try:
                 clarified = nl_to_sql_with_llm(
                     question=question,
                     intent=intent,
                     dw_table=dw_table,
                     settings=settings,
+                    context=clarifier_ctx,
                 )
             except Exception as exc:
                 clarified = {"sql": None, "confidence": 0.0, "why": f"llm_error: {exc}"}
             sql2 = clarified.get("sql") if isinstance(clarified, dict) else None
+            if isinstance(clarified, dict) and clarified.get("used_date_column"):
+                used_date_column = clarified.get("used_date_column") or used_date_column
+                clarifier_ctx["date_column"] = used_date_column
             if sql2:
                 ok2, fetched_rows2, meta_exec2, exec_error2 = run_sql_oracle(
                     oracle, sql2, active_binds
@@ -941,6 +1086,7 @@ def answer():
                     clarifier_needed = rows_suspiciously_empty(rows, question)
                     error_message = exec_error2
                     llm_result = clarified  # adopt clarified rationale
+                    context = clarifier_ctx
                 else:
                     error_message = exec_error2 or (
                         clarified.get("why") if isinstance(clarified, dict) else None
@@ -992,12 +1138,15 @@ def answer():
     meta_payload["binds"] = binds_serialized
     meta_payload["top_n"] = active_binds.get("top_n")
     meta_payload["clarifier_used"] = bool(intent_used)
+    meta_payload["window_label"] = window_label
+    meta_payload["used_date_column"] = used_date_column
     meta_payload.setdefault("rowcount", len(rows))
     if "columns" not in meta_payload and rows:
         meta_payload["columns"] = list(rows[0].keys())
     if isinstance(llm_result, dict):
         meta_payload["llm_confidence"] = llm_result.get("confidence")
         meta_payload["llm_reason"] = llm_result.get("why")
+        meta_payload["generation_mode"] = llm_result.get("why")
 
     tags = ["dw", "docuware", "contract"]
     if intent_used:
@@ -1013,6 +1162,8 @@ def answer():
         intent=intent_used,
         tags=tags,
         settings=settings,
+        date_column=used_date_column,
+        window_label=window_label,
     )
 
     if mem is not None:
@@ -1039,7 +1190,7 @@ def answer():
 
     if not rows:
         response_payload["hint"] = (
-            "No results for that window. Try 'last 90 days' or specify START_DATE/END_DATE filters."
+            f"No results for {window_label}. Try a wider window (e.g., last 90 days) or choose a different date anchor."
         )
 
     return jsonify(response_payload)

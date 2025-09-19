@@ -9,7 +9,9 @@ from typing import Any, Dict, Optional
 from core.model_loader import get_model, load_llm
 
 
-_CODE_BLOCK = re.compile(r"```(?:sql)?\s*(.*?)```", re.IGNORECASE | re.DOTALL)
+# ---------------------------------------------------------------------------
+# Clarifier helpers
+# ---------------------------------------------------------------------------
 
 CLARIFIER_SYSTEM = """You are a careful analyst. 
 Return a single compact JSON object describing the user's requested intent over the DocuWare `Contract` table.
@@ -101,12 +103,133 @@ def clarify_intent(question: str, context: Dict[str, Any]) -> Dict[str, Any]:
     return parsed
 
 
+# ---------------------------------------------------------------------------
+# SQL generation helpers
+# ---------------------------------------------------------------------------
+
+_EXPIRY_HINTS = re.compile(
+    r"\b(expir|expiry|expiring|end[-\s]?date|ending|renew(al|ing)?)\b", re.IGNORECASE
+)
+
+_SQL_FENCE = re.compile(r"```(?:sql)?\s*([\s\S]*?)```", re.IGNORECASE)
+_SQL_BLOCK = re.compile(r"(?is)\b(with|select)\b[\s\S]+")
+
+
+def choose_date_column(user_text: str, default_col: str) -> str:
+    """Return END_DATE when the question clearly refers to expirations."""
+
+    return "END_DATE" if _EXPIRY_HINTS.search(user_text or "") else default_col
+
+
+def extract_sql_only(text: str) -> Optional[str]:
+    """Extract the first SELECT/CTE statement from raw LLM output."""
+
+    if not text:
+        return None
+
+    candidate = text
+    fence = _SQL_FENCE.search(candidate)
+    if fence:
+        candidate = fence.group(1)
+
+    candidate = candidate.strip()
+    if candidate.lower().startswith("sql:"):
+        candidate = candidate[4:].strip()
+
+    block = _SQL_BLOCK.search(candidate)
+    if not block:
+        return None
+
+    sql = block.group(0).strip()
+    sql = sql.split("```", 1)[0].strip()
+    sql = sql.rstrip(";")
+
+    upper = sql.lstrip().upper()
+    if upper.startswith("WITH") or upper.startswith("SELECT"):
+        return sql
+    return None
+
+
+def _default_columns() -> list[str]:
+    return [
+        "CONTRACT_ID",
+        "CONTRACT_OWNER",
+        "CONTRACT_STAKEHOLDER_1",
+        "CONTRACT_STAKEHOLDER_2",
+        "CONTRACT_STAKEHOLDER_3",
+        "CONTRACT_STAKEHOLDER_4",
+        "CONTRACT_STAKEHOLDER_5",
+        "CONTRACT_STAKEHOLDER_6",
+        "CONTRACT_STAKEHOLDER_7",
+        "CONTRACT_STAKEHOLDER_8",
+        "DEPARTMENT_1",
+        "DEPARTMENT_2",
+        "DEPARTMENT_3",
+        "DEPARTMENT_4",
+        "DEPARTMENT_5",
+        "DEPARTMENT_6",
+        "DEPARTMENT_7",
+        "DEPARTMENT_8",
+        "OWNER_DEPARTMENT",
+        "CONTRACT_VALUE_NET_OF_VAT",
+        "VAT",
+        "CONTRACT_PURPOSE",
+        "CONTRACT_SUBJECT",
+        "START_DATE",
+        "END_DATE",
+        "REQUEST_DATE",
+        "REQUEST_TYPE",
+        "CONTRACT_STATUS",
+        "ENTITY_NO",
+        "REQUESTER",
+    ]
+
+
+def build_dw_prompt(
+    question: str,
+    ctx: Dict[str, Any],
+    *,
+    intent: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Return an Oracle-specific instruction prompt for SQLCoder."""
+
+    table = ctx.get("contract_table", "Contract")
+    date_col = ctx.get("date_column", "REQUEST_DATE")
+    columns = ctx.get("columns") or _default_columns()
+    cols = ", ".join(columns)
+
+    prompt_lines = [
+        "-- ROLE: Convert natural language into a single valid Oracle SQL query.",
+        "-- RULES:",
+        "-- 1) Output ONLY one SELECT/CTE statement (no comments, no explanations, no prose).",
+        f"-- 2) Use table \"{table}\" and these columns only: {cols}.",
+        f"-- 3) If a time window is implied, filter using this column: {date_col}.",
+        "-- 4) Use named binds :date_start and :date_end for time windows (BETWEEN :date_start AND :date_end or >= :date_start AND < :date_end).",
+        "-- 5) Use Oracle syntax: NVL(), LISTAGG(... WITHIN GROUP (...)), FETCH FIRST N ROWS ONLY, TRIM(), UPPER(), etc.",
+        "-- 6) Never modify data. No DML/DDL. SELECT/CTE only.",
+        "",
+        "-- QUESTION:",
+        question,
+    ]
+
+    if intent:
+        intent_json = json.dumps(intent, ensure_ascii=False)
+        prompt_lines.extend(
+            ["", "-- CLARIFIED INTENT:"]
+            + [f"-- {line}" for line in intent_json.splitlines()]
+        )
+
+    prompt_lines.append("-- SQL:")
+    return "\n".join(prompt_lines)
+
+
 def nl_to_sql_with_llm(
     question: Optional[str] = None,
     *,
     intent: Optional[Dict[str, Any]] = None,
     settings: Optional[Any] = None,
     dw_table: str = "Contract",
+    context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, object]:
     """Use SQLCoder to translate natural language or structured intent into Oracle SQL."""
 
@@ -121,59 +244,70 @@ def nl_to_sql_with_llm(
     if not question and not intent:
         return {"sql": None, "confidence": 0.0, "why": "missing_prompt"}
 
-    # Baseline system instructions for SQLCoder in DocuWare/Oracle environment.
-    sys_prompt = (
-        f"You are SQLCoder generating Oracle SQL for the DocuWare `{dw_table}` table.\n"
-        "Requirements:\n"
-        "- Output SELECT statements only (CTEs allowed), never DML/DDL.\n"
-        "- Oracle dialect: use NVL, FETCH FIRST :top_n ROWS ONLY, LISTAGG ... WITHIN GROUP.\n"
-        "- Available tables: Contract.\n"
-        "- Gross value = NVL(CONTRACT_VALUE_NET_OF_VAT,0) + NVL(VAT,0).\n"
-        "- Time filters must bind :date_start and :date_end.\n"
-        "- Stakeholder/department slots 1..8 require UNION ALL across slots with matching departments.\n"
-        "- Never create or reference views.\n"
-        "Return only SQL (no commentary)."
-    )
+    ctx: Dict[str, Any] = dict(context or {})
+    if dw_table:
+        ctx.setdefault("contract_table", dw_table)
+    else:
+        ctx.setdefault("contract_table", "Contract")
 
-    prompt_parts = [sys_prompt]
-
-    context_hints: Dict[str, Any] = {}
-    if settings is not None:
+    default_col = ctx.get("date_column") or "REQUEST_DATE"
+    if settings is not None and "date_column" not in ctx:
         try:
-            context_hints = settings.get("DW_PROMPT_HINTS", scope="namespace") or {}
+            default_col = settings.get(
+                "DW_DATE_COLUMN", default=default_col, scope="namespace"
+            )
         except Exception:
-            context_hints = {}
-    if context_hints:
-        hint_text = "Additional context hints:\n" + json.dumps(
-            context_hints, ensure_ascii=False, indent=2
-        )
-        prompt_parts.append(hint_text)
-    if intent:
-        intent_json = json.dumps(intent, ensure_ascii=False, indent=2)
-        prompt_parts.append(f"Structured intent JSON:\n```json\n{intent_json}\n```")
-    if question:
-        prompt_parts.append(f"Question: {question}")
+            default_col = default_col
 
-    prompt = "\n\n".join(prompt_parts) + "\nGenerate Oracle SQL now.\nSQL:"
+    if intent:
+        time_block = (intent or {}).get("time") or {}
+        column = time_block.get("column")
+        if column:
+            default_col = column
+
+    ctx["date_column"] = choose_date_column(question or "", default_col)
+
+    prompt = build_dw_prompt(question or "", ctx, intent=intent)
 
     try:
         raw_text = generator.generate(prompt)
     except Exception as exc:
-        return {"sql": None, "confidence": 0.0, "why": f"generator_error: {exc}"}
+        return {
+            "sql": None,
+            "confidence": 0.0,
+            "why": f"generator_error: {exc}",
+            "raw": None,
+            "used_date_column": ctx.get("date_column"),
+        }
 
-    candidate = (raw_text or "").strip()
-    match = _CODE_BLOCK.search(candidate)
-    if match:
-        candidate = match.group(1).strip()
-    candidate = candidate.rstrip(";")
-    if not candidate.lower().startswith(("with", "select")):
-        return {"sql": None, "confidence": 0.2, "why": "not_select"}
+    sql = extract_sql_only(raw_text)
+    if not sql:
+        return {
+            "sql": None,
+            "confidence": 0.0,
+            "why": "non_sql_output",
+            "raw": raw_text or "",
+            "used_date_column": ctx.get("date_column"),
+        }
 
-    lowered = candidate.lower()
-    if any(word in lowered for word in (" delete ", " update ", " insert ", " drop ", " alter ", " truncate ")):
-        return {"sql": None, "confidence": 0.0, "why": "unsafe_sql"}
+    lowered = sql.lower()
+    if any(
+        token in lowered
+        for token in (" delete ", " update ", " insert ", " drop ", " alter ", " truncate ")
+    ):
+        return {
+            "sql": None,
+            "confidence": 0.0,
+            "why": "unsafe_sql",
+            "raw": raw_text or "",
+            "used_date_column": ctx.get("date_column"),
+        }
 
-    confidence = 0.72
-    if intent:
-        confidence = 0.82
-    return {"sql": candidate, "confidence": confidence, "why": "ok"}
+    confidence = 0.82 if intent else 0.75
+    return {
+        "sql": sql,
+        "confidence": confidence,
+        "why": "ok",
+        "raw": raw_text or "",
+        "used_date_column": ctx.get("date_column"),
+    }
