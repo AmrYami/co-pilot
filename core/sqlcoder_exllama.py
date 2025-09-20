@@ -37,6 +37,38 @@ class SQLCoderExLlama:
         self._generator = generator
         self._tokenizer = tokenizer
 
+    def _trim_prompt(self, prompt: str, reserve_tokens: int = 256) -> str:
+        """Left-truncate prompt to avoid cache overflow."""
+
+        try:
+            max_len = int(os.getenv("EXL2_CACHE_MAX_SEQ_LEN", "2048"))
+        except Exception:
+            max_len = 2048
+
+        try:
+            ids = self._tokenizer.encode(prompt, add_bos=True)
+            if len(ids) + reserve_tokens > max_len:
+                keep = max(max_len - reserve_tokens, 128)
+                ids = ids[-keep:]
+                prompt = self._tokenizer.decode(ids)
+        except Exception:
+            if len(prompt) > 8000:
+                prompt = prompt[-8000:]
+        return prompt
+
+    @staticmethod
+    def _truncate_on_stop(text: str, stops: Optional[Iterable[str]]) -> str:
+        if not stops:
+            return text
+        cut = len(text)
+        for s in stops:
+            if not s:
+                continue
+            idx = text.find(s)
+            if idx != -1 and idx < cut:
+                cut = idx
+        return text[:cut]
+
     def generate(
         self,
         prompt: str,
@@ -51,34 +83,34 @@ class SQLCoderExLlama:
         settings.temperature = float(temperature) if temperature is not None else 0.2
         settings.top_p = float(top_p) if top_p is not None else 0.9
 
-        if stop:
-            try:
-                settings.stop_sequences = list(stop)
-            except Exception as exc:  # pragma: no cover - compatibility shim
-                logger.debug("[dw] exllama: stop_sequences not supported on settings (%s)", exc)
-
         max_new = int(max_new_tokens or 256)
-        if max_new > 256:
-            max_new = 256
+        if max_new > 512:
+            max_new = 512
+
+        try:
+            reserve = int(os.getenv("EXL2_INPUT_RESERVE_TOKENS", "64") or 64)
+        except Exception:
+            reserve = 64
+        prompt = self._trim_prompt(prompt, reserve_tokens=reserve)
 
         try:
             output = self._generator.generate_simple(prompt, settings, max_new)
             text = output[0] if isinstance(output, (list, tuple)) else output
             if not isinstance(text, str):
                 text = str(text)
-            return text
         except AssertionError as err:
             logger.warning("[dw] exllama overflow; retrying with reduced context/new tokens: %s", err)
-            prompt_tail = prompt[-4000:]
+            prompt_tail = self._trim_prompt(prompt, reserve_tokens=reserve + 128)
             try:
-                output = self._generator.generate_simple(prompt_tail, settings, 128)
+                output = self._generator.generate_simple(prompt_tail, settings, min(128, max_new))
                 text = output[0] if isinstance(output, (list, tuple)) else output
                 if not isinstance(text, str):
                     text = str(text)
-                return text
             except Exception as exc:  # pragma: no cover - secondary failure
                 logger.error("[dw] exllama second attempt failed: %s", exc, exc_info=True)
                 raise
+
+        return self._truncate_on_stop(text, stop)
 
 
 def load_exllama_generator(model_path: str, config: Dict[str, Any]) -> SQLCoderExLlama:

@@ -1,11 +1,13 @@
-import os, json, logging
-from datetime import datetime, timedelta
+import json
+import logging
+import os
+from datetime import datetime
 from flask import Blueprint, request, jsonify, current_app
 from logging.handlers import TimedRotatingFileHandler
 
 from .llm import nl_to_sql_with_llm
-from .validator import validate_sql, find_named_binds
-from core.sql_exec import get_oracle_engine, get_mem_engine
+from .validator import analyze_sql
+from core.sql_exec import get_oracle_engine
 
 dw_bp = Blueprint("dw", __name__, url_prefix="/dw")
 
@@ -75,52 +77,67 @@ def answer():
     llm_out = nl_to_sql_with_llm(q, ctx)
 
     # 4) Decide final SQL & validate (again)
-    final_sql = (llm_out.get("final_sql") or "").strip()
-    allow_binds = {"date_start","date_end","top_n","owner_name","dept","entity_no","contract_id_pattern","request_type"}
-    val = validate_sql(final_sql, allow_binds)
+    final_sql = (llm_out.get("sql") or "").strip()
 
-    _log("final_sql", {
-        "pass": llm_out.get("pass"),
-        "ok": val["ok"],
-        "errors": val["errors"],
-        "binds": val["binds"],
-        "sql_preview": final_sql[:4000]
+    _log("llm_outcome", {
+        "used_repair": llm_out.get("used_repair"),
+        "intent": llm_out.get("intent"),
     })
 
-    if not val["ok"] or not final_sql:
+    validation = analyze_sql(final_sql)
+    _log("final_sql", {
+        "size": len(final_sql),
+        "used_repair": llm_out.get("used_repair"),
+        "sql_preview": final_sql[:4000],
+    })
+
+    llm_binds = llm_out.get("binds") or {}
+    _log("binds_detected", {
+        "sql_binds": validation.get("binds", []),
+        "intent_binds": {k: (v.isoformat() if hasattr(v, "isoformat") else v) for k, v in llm_binds.items()},
+        "validation_errors": validation.get("errors", []),
+    })
+
+    if not validation["ok"] or not final_sql:
+        first_pass_debug = llm_out.get("first_pass") or {}
+        if first_pass_debug:
+            first_pass_debug = {
+                "sql": first_pass_debug.get("sql"),
+                "validation": first_pass_debug.get("validation"),
+                "raw_len": len(first_pass_debug.get("raw") or ""),
+            }
         return jsonify({
             "ok": False,
             "status": "needs_clarification",
-            "error": (val["errors"][0] if val["errors"] else "empty_sql"),
+            "error": (validation["errors"][0] if validation["errors"] else "empty_sql"),
             "sql": final_sql or None,
             "questions": ["I couldn't derive a clean SELECT. Please rephrase or specify the filters/window clearly."],
             "debug": {
-                "prompt": llm_out.get("prompt"),
-                "raw1_len": len(llm_out.get("raw1") or ""),
-                "raw2_len": len(llm_out.get("raw2") or ""),
-                "sql1": llm_out.get("sql1"),
-                "sql2": llm_out.get("sql2"),
-                "val1": llm_out.get("val1"),
-                "val2": llm_out.get("val2"),
+                "intent": llm_out.get("intent"),
+                "raw_len": len(llm_out.get("raw") or ""),
+                "validation": validation,
+                "first_pass": first_pass_debug,
             }
         }), 200
 
-    # 5) Resolve binds (you can expand this as needed)
-    bind_names = set(val["binds"])
+    # 5) Resolve binds using intent-derived defaults with fallbacks
+    bind_names = list(dict.fromkeys(validation.get("binds", [])))
     binds = {}
-
-    # Heuristic windows for demo; you can extend with clarifier intent
-    if "date_start" in bind_names or "date_end" in bind_names:
-        ds, de = last_month_window()  # because your example asks "last month"
-        binds["date_start"] = ds
-        binds["date_end"] = de
-
-    if "top_n" in bind_names:
-        # many queries hard-code FETCH FIRST N, but if model used :top_n we populate 10
-        binds["top_n"] = 10
+    for name in bind_names:
+        if name in llm_binds and llm_binds[name] is not None:
+            binds[name] = llm_binds[name]
+            continue
+        if name in {"date_start", "date_end"}:
+            ds, de = last_month_window()
+            if "date_start" in bind_names and "date_start" not in binds:
+                binds["date_start"] = ds
+            if "date_end" in bind_names and "date_end" not in binds:
+                binds["date_end"] = de
+        elif name == "top_n":
+            binds[name] = 10
 
     # Just log binds chosen for execution
-    _log("execution_binds", {k: (str(v) if hasattr(v, "isoformat") else v) for k, v in binds.items()})
+    _log("execution_binds", {k: (v.isoformat() if hasattr(v, "isoformat") else v) for k, v in binds.items()})
 
     # 6) Execute
     rows = []
@@ -139,7 +156,7 @@ def answer():
             "rows": len(rows),
             "cols": cols,
             "ms": elapsed_ms,
-            "sample": rows[:3]
+            "sample": [list(r) for r in rows[:3]],
         })
     except Exception as e:
         _log("oracle_error", {"error": str(e), "sql": final_sql}, level="error")
