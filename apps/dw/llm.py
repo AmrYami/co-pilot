@@ -1,14 +1,17 @@
-import json, os, re
+import json, os, re, logging
 from typing import List, Optional
 
+from flask import current_app
+
 from core.model_loader import get_model
+from core.logging_setup import log_kv
 
 STOP_TOKENS = os.environ.get("SQL_STOP", "</s>,<|im_end|").split(",")
 if "```" not in STOP_TOKENS:
     STOP_TOKENS.append("```")
 
 CLARIFIER_JSON_MARKER_START = "<<JSON>>"
-CLARIFIER_JSON_MARKER_END = "<<END_JSON>>"
+CLARIFIER_JSON_MARKER_END = "<</JSON>>"
 
 _FENCE_RE = re.compile(r"```(?:sql)?\s*(.*?)```", re.IGNORECASE | re.DOTALL)
 _TAG_RE = re.compile(r"<SQL>(.*?)</SQL>", re.IGNORECASE | re.DOTALL)
@@ -159,49 +162,98 @@ def extract_sql(generated_text: str) -> Optional[str]:
     return cleaned if cleaned else None
 
 
-def clarify_intent(question: str) -> dict:
-    """
-    Ask the clarifier to return structured JSON inside <<JSON>> ... <<END_JSON>>:
-    { "has_time_window": bool,
-      "date_column": "REQUEST_DATE" | "END_DATE" | null,
-      "top_n": int | null,
-      "explicit_dates": {"date_start":"YYYY-MM-DD","date_end":"YYYY-MM-DD"} | null
-    }
-    """
+def clarify_intent(question: str, context: Optional[dict] = None) -> dict:
+    """Call the clarifier model to extract structured hints about the question."""
     try:
         mdl = get_model("clarifier")
-    except Exception as e:
-        return {"ok": False, "used": False, "raw": None, "error": str(e)}
+    except Exception as exc:
+        return {"ok": False, "used": False, "raw": None, "error": str(exc)}
 
-    prompt = f"""You are a precise NLU clarifier. Analyze the user's question and output JSON only.
-Extract:
-- has_time_window (bool): whether the question requests a time window (e.g., last month, next 30 days, in 2024, between ...).
-- date_column (string|null): which date field to use if implied or stated explicitly (END_DATE, REQUEST_DATE, START_DATE). null if unspecified.
-- top_n (int|null): number for "top N" requests; null if not requested.
-- explicit_dates (object|null): ISO dates if explicit like "between 2024-01-01 and 2024-03-01".
+    context = context or {}
+    system_prompt = (
+        "You are a precise NLU clarifier. Analyze the user's question and output JSON only.\n"
+        "Extract keys exactly as follows:\n"
+        "  has_time_window: boolean\n"
+        "  date_column: string|null (one of END_DATE, REQUEST_DATE, START_DATE)\n"
+        "  top_n: integer|null\n"
+        "  explicit_dates: object|null with keys {start: ISO-8601 date, end: ISO-8601 date}\n"
+        f"Return JSON only between {CLARIFIER_JSON_MARKER_START} and {CLARIFIER_JSON_MARKER_END}.\n"
+    )
+    prompt = (
+        f"{system_prompt}\n"
+        f"Question: {question}\n\n"
+        f"{CLARIFIER_JSON_MARKER_START}\n{{}}\n{CLARIFIER_JSON_MARKER_END}\n"
+    )
 
-Return JSON only between {CLARIFIER_JSON_MARKER_START} and {CLARIFIER_JSON_MARKER_END}.
+    raw = mdl.generate(prompt, max_new_tokens=256)
+    text = raw if isinstance(raw, str) else str(raw)
 
-Question:
-{question}
-
-{CLARIFIER_JSON_MARKER_START}
-{{}}
-{CLARIFIER_JSON_MARKER_END}
-"""
-    raw = mdl.generate(prompt, stop=[CLARIFIER_JSON_MARKER_END])
-    # Extract between markers
-    m = re.search(re.escape(CLARIFIER_JSON_MARKER_START) + r"(.*)", raw, re.S)
-    intent = {}
-    if m:
-        payload = m.group(1).strip()
-        # Cut trailing marker if present
-        payload = payload.split(CLARIFIER_JSON_MARKER_END)[0].strip()
+    pattern = re.escape(CLARIFIER_JSON_MARKER_START) + r"(.*?)" + re.escape(CLARIFIER_JSON_MARKER_END)
+    match = re.search(pattern, text, re.S)
+    intent: dict = {}
+    if match:
+        payload = match.group(1).strip()
         try:
             intent = json.loads(payload)
         except Exception:
             intent = {}
-    return {"ok": True, "used": True, "raw": raw, "intent": intent}
+
+    if not intent:
+        # Heuristic fallback in case the model returns malformed JSON
+        ql = (question or "").lower()
+        has_window = any(
+            kw in ql
+            for kw in [
+                "last month",
+                "next 30",
+                "last 30",
+                "last 90",
+                "between",
+                "in 20",
+                "since",
+            ]
+        )
+        date_col = None
+        if "end date" in ql or "expiry" in ql or "expires" in ql:
+            date_col = "END_DATE"
+        elif "start date" in ql:
+            date_col = "START_DATE"
+        elif "request date" in ql:
+            date_col = "REQUEST_DATE"
+        top_n = None
+        m_top = re.search(r"\btop\s+(\d+)\b", ql)
+        if m_top:
+            try:
+                top_n = int(m_top.group(1))
+            except Exception:
+                top_n = None
+        explicit_dates = None
+        m_between = re.search(
+            r"between\s+(\d{4}-\d{2}-\d{2})\s+and\s+(\d{4}-\d{2}-\d{2})",
+            ql,
+        )
+        if m_between:
+            explicit_dates = {"start": m_between.group(1), "end": m_between.group(2)}
+        intent = {
+            "has_time_window": has_window,
+            "date_column": date_col,
+            "top_n": top_n,
+            "explicit_dates": explicit_dates,
+        }
+
+    logger = current_app.logger if current_app else logging.getLogger(__name__)
+    log_kv(
+        logger,
+        "[clarifier]",
+        {
+            "prompt_tail": prompt[-800:],
+            "raw_head": text[:800],
+            "intent": intent,
+            "context": context,
+        },
+    )
+
+    return {"ok": True, "used": True, "raw": text, "intent": intent}
 
 
 __all__ = [

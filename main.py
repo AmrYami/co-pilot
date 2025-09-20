@@ -3,6 +3,7 @@ from flask import Flask, jsonify
 from apps.common.admin import admin_bp as admin_common_bp
 from apps.dw.app import create_dw_blueprint
 from core.admin_api import admin_bp as core_admin_bp
+from core.logging_setup import init_logging
 from core.model_loader import ensure_model, model_info
 from core.pipeline import Pipeline
 from core.settings import Settings
@@ -10,6 +11,9 @@ from core.settings import Settings
 
 def create_app():
     app = Flask(__name__)
+
+    # Initialize logging before other components emit logs
+    init_logging(app)
 
     # Warm up SQL model (already works)
     ensure_model(role="sql")

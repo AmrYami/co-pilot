@@ -1,10 +1,11 @@
 from flask import Blueprint, request, jsonify, current_app
 from sqlalchemy import text
 from datetime import datetime, date, timedelta
-import os, json, csv, pathlib, re
+import os, json, csv, pathlib, re, logging
 from core.settings import Settings
 from core.datasources import DatasourceRegistry
 from core.sql_exec import get_mem_engine
+from core.logging_setup import log_kv
 from .llm import (
     clarify_intent,
     build_sql_prompt,
@@ -12,7 +13,7 @@ from .llm import (
     nl_to_sql_raw,
     extract_sql,
 )
-from .validator import validate_sql
+from .validator import validate_sql, analyze_binds
 
 
 dw_bp = Blueprint("dw", __name__, url_prefix="/dw")
@@ -39,13 +40,12 @@ def _get_allowed_columns() -> list:
 
 
 def _log(tag, payload):
-    """Safe logging from inside blueprint routes."""
-    try:
-        msg = f"[dw] {tag}: {json.dumps(payload, default=str)[:4000]}"
-        current_app.logger.info(msg)
-    except Exception as e:
-        # Fallback in case we're outside an application context
-        print(f"[dw] {tag}: {payload}  [log-fallback: {e}]")
+    """Structured logging helper scoped to DW blueprint."""
+    logger = current_app.logger if current_app else None
+    if logger is None:
+        # Fallback to root logger to avoid losing important traces
+        logger = logging.getLogger(__name__)
+    log_kv(logger, f"[dw] {tag}", payload)
 
 
 def _question_has_window(q: str) -> bool:
@@ -269,16 +269,22 @@ def answer():
     # ---------- Prepare binds ----------
     binds = {}
     if question_has_window:
-        if "date_start" in v_final["binds"] and "date_end" in v_final["binds"]:
+        found_binds = set(v_final["binds"])
+        if {"date_start", "date_end"}.issubset(found_binds):
             if window_binds.get("date_start") and window_binds.get("date_end"):
                 binds.update(window_binds)
             else:
                 with mem.begin() as conn:
-                    conn.execute(text("""
+                    conn.execute(
+                        text(
+                            """
                         UPDATE mem_inquiries
                            SET status='needs_clarification', last_sql=:sql, last_error='missing_window_values', updated_at=NOW()
                          WHERE id=:id
-                    """), {"sql": sql_final, "id": inq_id})
+                    """
+                        ),
+                        {"sql": sql_final, "id": inq_id},
+                    )
                 res = {
                     "ok": False,
                     "status": "needs_clarification",
@@ -300,13 +306,17 @@ def answer():
                     }
                 return jsonify(res)
         else:
-            # The SQL omitted binds even though the question had a window: fallback hint to user
             with mem.begin() as conn:
-                conn.execute(text("""
+                conn.execute(
+                    text(
+                        """
                     UPDATE mem_inquiries
                        SET status='needs_clarification', last_sql=:sql, last_error='missing_binds', updated_at=NOW()
                      WHERE id=:id
-                """), {"sql": sql_final, "id": inq_id})
+                """
+                    ),
+                    {"sql": sql_final, "id": inq_id},
+                )
             res = {
                 "ok": False,
                 "status": "needs_clarification",
@@ -315,18 +325,80 @@ def answer():
                 "sql": sql_final,
                 "questions": [
                     "The question implies a time window. Provide :date_start/:date_end or rephrase with explicit dates."
-                ]
+                ],
             }
             if include_debug:
                 res["debug"] = {
                     "clarifier": intent,
                     "prompt": prompt,
-                    "raw1": raw1, "sql1": sql1, "validation1": v1,
+                    "raw1": raw1,
+                    "sql1": sql1,
+                    "validation1": v1,
                     "used_repair": used_repair,
                 }
             return jsonify(res)
 
-    _log("execution_binds", {k: str(v) for k,v in binds.items()})
+    bind_info = analyze_binds(sql_final, allow_binds, provided=binds)
+    _log("bind_analysis", bind_info)
+    if bind_info["unknown"]:
+        with mem.begin() as conn:
+            conn.execute(
+                text(
+                    """
+                UPDATE mem_inquiries
+                   SET status='needs_clarification', last_sql=:sql, last_error='illegal_bind', updated_at=NOW()
+                 WHERE id=:id
+            """
+                ),
+                {"sql": sql_final, "id": inq_id},
+            )
+        return jsonify(
+            {
+                "ok": False,
+                "status": "needs_clarification",
+                "inquiry_id": inq_id,
+                "error": "illegal_bind",
+                "sql": sql_final,
+                "questions": [
+                    "Unsupported bind(s) detected. Please rephrase or remove custom binds."
+                ],
+            }
+        )
+
+    if bind_info["missing"]:
+        with mem.begin() as conn:
+            conn.execute(
+                text(
+                    """
+                UPDATE mem_inquiries
+                   SET status='needs_clarification', last_sql=:sql, last_error='missing_bind_values', updated_at=NOW()
+                 WHERE id=:id
+            """
+                ),
+                {"sql": sql_final, "id": inq_id},
+            )
+        res = {
+            "ok": False,
+            "status": "needs_clarification",
+            "inquiry_id": inq_id,
+            "error": "missing_bind_values",
+            "sql": sql_final,
+            "questions": [
+                f"Provide values for: {', '.join(bind_info['missing'])} or rephrase with explicit filters."
+            ],
+        }
+        if include_debug:
+            res["debug"] = {
+                "clarifier": intent,
+                "prompt": prompt,
+                "raw1": raw1,
+                "sql1": sql1,
+                "validation1": v1,
+                "used_repair": used_repair,
+            }
+        return jsonify(res)
+
+    _log("execution_binds", {k: str(v) for k, v in binds.items()})
 
     # ---------- Execute on Oracle ----------
     oracle_engine = ds_registry.engine(None)
