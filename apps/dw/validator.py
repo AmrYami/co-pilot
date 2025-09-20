@@ -69,6 +69,7 @@ def validate_sql(
             pass
 
     # Bind whitelist
+    # cleaned should already contain only extracted SQL to avoid binds from guardrail text.
     binds = _BIND_RE.findall(cleaned)
     bad_binds = [b for b in binds if b not in allow_binds]
     if bad_binds:
