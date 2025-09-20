@@ -195,6 +195,9 @@ def answer():
         "allowed_columns": ALLOWED_COLUMNS,
         "allowed_binds": ALLOWED_BINDS,
         "default_date_col": default_date_col,
+        "allowed_columns_clause": ", ".join(ALLOWED_COLUMNS),
+        "binds_whitelist": ", ".join(ALLOWED_BINDS),
+        "unpivot_hint": "SELECT CONTRACT_ID, NVL(CONTRACT_VALUE_NET_OF_VAT,0)+NVL(VAT,0) AS CONTRACT_VALUE_GROSS, CONTRACT_STAKEHOLDER_i AS STAKEHOLDER, REQUEST_DATE AS REF_DATE (UNION ALL slots 1..8)",
     }
 
     with mem.begin() as conn:

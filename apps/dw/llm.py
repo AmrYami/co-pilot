@@ -1,12 +1,14 @@
 import re
 import json
-import datetime as dt
 from typing import Dict, Any, Optional, Tuple
 
 from core.model_loader import get_model
 
-_SQL_FENCE = re.compile(r"```sql\s*(.*?)```", re.IGNORECASE | re.DOTALL)
+_SQL_MARKER = re.compile(r"<<SQL>>\s*(.*?)\s*<<ENDSQL>>", re.IGNORECASE | re.DOTALL)
+_SQL_FENCE = re.compile(r"```sql\s*(.*?)\s*```", re.IGNORECASE | re.DOTALL)
 _SQL_START = re.compile(r"\b(SELECT|WITH)\b", re.IGNORECASE)
+
+STOP_SEQUENCES = ["```", "<<ENDSQL>>"]
 
 
 def _extract_json_between(
@@ -53,6 +55,33 @@ def _clarifier_heuristics(q: str) -> Dict[str, Any]:
     }
 
 
+def normalize_intent(intent: Optional[Dict[str, Any]], question: str) -> Dict[str, Any]:
+    out = dict(intent or {})
+    q = (question or "").lower()
+
+    if out.get("has_time_window") is None:
+        tokens = ["last month", "next", "between", "in 20", "since"]
+        out["has_time_window"] = any(token in q for token in tokens)
+
+    if out.get("top_n") is None:
+        match = re.search(r"\btop\s+(\d+)\b", q)
+        out["top_n"] = int(match.group(1)) if match else None
+
+    if out.get("date_column") is None:
+        if "end date" in q or "end_date" in q:
+            out["date_column"] = "END_DATE"
+        elif "start date" in q or "start_date" in q:
+            out["date_column"] = "START_DATE"
+        elif "request date" in q or "request_date" in q:
+            out["date_column"] = "REQUEST_DATE"
+
+    out.setdefault("has_time_window", False)
+    out.setdefault("top_n", None)
+    out.setdefault("date_column", None)
+    out.setdefault("explicit_dates", None)
+    return out
+
+
 def clarify_intent(question: str, context: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     mdl = get_model("clarifier")
     prompt = (
@@ -82,10 +111,7 @@ def clarify_intent(question: str, context: Dict[str, Any]) -> Tuple[Dict[str, An
     obj = _extract_json_between(raw or "")
     if not obj or not isinstance(obj, dict) or all(v is None for v in obj.values()):
         obj = _clarifier_heuristics(question)
-    obj.setdefault("has_time_window", False)
-    obj.setdefault("date_column", None)
-    obj.setdefault("top_n", None)
-    obj.setdefault("explicit_dates", None)
+    obj = normalize_intent(obj, question)
     dbg = {
         "ok": True,
         "used": True,
@@ -95,125 +121,237 @@ def clarify_intent(question: str, context: Dict[str, Any]) -> Tuple[Dict[str, An
     return obj, dbg
 
 
-def _build_sql_prompt(question: str, date_hint: Dict[str, Any]) -> str:
-    lines = []
-    lines.append("Return Oracle SQL only inside ```sql fenced block.")
-    lines.append('Table: "Contract"')
-    lines.append(
-        "Allowed columns: CONTRACT_ID, CONTRACT_OWNER, CONTRACT_STAKEHOLDER_1, CONTRACT_STAKEHOLDER_2, "
-        "CONTRACT_STAKEHOLDER_3, CONTRACT_STAKEHOLDER_4, CONTRACT_STAKEHOLDER_5, CONTRACT_STAKEHOLDER_6, "
-        "CONTRACT_STAKEHOLDER_7, CONTRACT_STAKEHOLDER_8, DEPARTMENT_1, DEPARTMENT_2, DEPARTMENT_3, DEPARTMENT_4, "
-        "DEPARTMENT_5, DEPARTMENT_6, DEPARTMENT_7, DEPARTMENT_8, OWNER_DEPARTMENT, CONTRACT_VALUE_NET_OF_VAT, VAT, "
-        "CONTRACT_PURPOSE, CONTRACT_SUBJECT, START_DATE, END_DATE, REQUEST_DATE, REQUEST_TYPE, CONTRACT_STATUS, "
-        "ENTITY_NO, REQUESTER"
+def _build_sql_prompt(
+    question: str,
+    llm_context: Dict[str, Any],
+    use_window: bool,
+    default_date_col: str,
+    top_n_hint: Optional[int],
+) -> str:
+    table = llm_context.get("table") or "Contract"
+    allowed_clause = llm_context.get("allowed_columns_clause")
+    if not allowed_clause:
+        allowed_cols = llm_context.get("allowed_columns")
+        if isinstance(allowed_cols, (list, tuple)):
+            allowed_clause = ", ".join(allowed_cols)
+        elif allowed_cols:
+            allowed_clause = str(allowed_cols)
+        else:
+            allowed_clause = ""
+
+    binds_clause = llm_context.get("binds_whitelist")
+    if not binds_clause:
+        binds = llm_context.get("allowed_binds")
+        if isinstance(binds, (list, tuple)):
+            binds_clause = ", ".join(binds)
+        elif binds:
+            binds_clause = str(binds)
+        else:
+            binds_clause = ""
+
+    pattern_hint = llm_context.get("unpivot_hint", "")
+
+    lines = [
+        "You are a SQL generator for Oracle. Return SQL only between <<SQL>> and <<ENDSQL>>.",
+        f'- Use only table "{table}".',
+    ]
+    if allowed_clause:
+        lines.append(f"- Allowed columns only: {allowed_clause}")
+    else:
+        lines.append("- Use only documented Contract columns.")
+    lines.extend(
+        [
+            "Oracle syntax only (NVL, TRIM, UPPER, LISTAGG ... WITHIN GROUP, FETCH FIRST N ROWS ONLY).",
+            "SELECT / CTE only. No DML. No comments. No prose.",
+            f"- Allowed named binds only: {binds_clause}" if binds_clause else "- Use only the approved bind names.",
+            "- Do not add a date filter unless the user explicitly asks for a window.",
+            "- When a window IS requested, use :date_start and :date_end on the correct column.",
+            f"- If user doesn’t name a date column, use {default_date_col} for the window.",
+        ]
     )
-    lines.append(
-        "Oracle only: NVL, TRIM, UPPER, LISTAGG ... WITHIN GROUP, FETCH FIRST N ROWS ONLY. SELECT/CTE only."
-    )
-    lines.append(
-        "Allowed binds: contract_id_pattern, date_end, date_start, dept, entity_no, owner_name, request_type, top_n"
-    )
-    lines.append(
-        "Add date filter ONLY if user asks; when used, bind :date_start, :date_end. If no column named, default REQUEST_DATE."
-    )
-    lines.append("")
-    lines.append("Question:")
-    lines.append(question)
-    lines.append("")
-    lines.append("```sql")
+    if pattern_hint:
+        lines.append(
+            f"- If aggregating by stakeholder, unpivot slots 1..8 via UNION ALL. Pattern: {pattern_hint}"
+        )
+    if top_n_hint is not None:
+        try:
+            top_n_value = int(top_n_hint)
+        except (TypeError, ValueError):
+            top_n_value = None
+        if top_n_value:
+            lines.append(
+                f"- A TOP clause is implied; prefer a literal FETCH FIRST {top_n_value} ROWS ONLY."
+            )
+    if use_window:
+        lines.append("- The user requested a date window; ensure the SQL filters using binds.")
+    lines.extend([
+        "",
+        "Question:",
+        question,
+        "",
+        "<<SQL>>",
+    ])
     return "\n".join(lines)
 
 
-def _extract_sql_only(text: str) -> str:
+def _build_repair_prompt(
+    question: str,
+    sql_prev: str,
+    errors: Any,
+    llm_context: Dict[str, Any],
+    default_date_col: str,
+    top_n_hint: Optional[int],
+) -> str:
+    table = llm_context.get("table") or "Contract"
+    allowed_clause = llm_context.get("allowed_columns_clause")
+    if not allowed_clause:
+        allowed_cols = llm_context.get("allowed_columns")
+        if isinstance(allowed_cols, (list, tuple)):
+            allowed_clause = ", ".join(allowed_cols)
+        elif allowed_cols:
+            allowed_clause = str(allowed_cols)
+        else:
+            allowed_clause = ""
+
+    binds_clause = llm_context.get("binds_whitelist")
+    if not binds_clause:
+        binds = llm_context.get("allowed_binds")
+        if isinstance(binds, (list, tuple)):
+            binds_clause = ", ".join(binds)
+        elif binds:
+            binds_clause = str(binds)
+        else:
+            binds_clause = ""
+
+    pattern_hint = llm_context.get("unpivot_hint", "")
+    errors_blob = json.dumps(errors, ensure_ascii=False)
+
+    lines = [
+        "Previous SQL had validation errors:",
+        errors_blob,
+        "",
+        "Repair the SQL. Return Oracle SQL only between <<SQL>> and <<ENDSQL>>. No prose. No comments.",
+        "Rules:",
+        f'- Table: "{table}"',
+    ]
+    if allowed_clause:
+        lines.append(f"- Allowed columns only: {allowed_clause}")
+    else:
+        lines.append("- Use only documented Contract columns.")
+    lines.extend(
+        [
+            "- Oracle syntax: NVL(), TRIM(), UPPER(), LISTAGG ... WITHIN GROUP, FETCH FIRST N ROWS ONLY.",
+            f"- Allowed binds: {binds_clause}" if binds_clause else "- Use only the approved bind names.",
+            "- When a time window is requested, use :date_start and :date_end on the correct date column.",
+            f"- Default date column: {default_date_col}.",
+        ]
+    )
+    if pattern_hint:
+        lines.append(
+            f"- If aggregating by stakeholder, unpivot slots 1..8 via UNION ALL. Pattern: {pattern_hint}"
+        )
+    if top_n_hint is not None:
+        try:
+            top_n_value = int(top_n_hint)
+        except (TypeError, ValueError):
+            top_n_value = None
+        if top_n_value:
+            lines.append(
+                f"- A TOP clause is implied; prefer a literal FETCH FIRST {top_n_value} ROWS ONLY."
+            )
+    lines.extend(
+        [
+            "",
+            "Question:",
+            question,
+            "",
+            "Previous SQL to repair:",
+            "<<SQL>>",
+            sql_prev,
+            "<<ENDSQL>>",
+            "",
+            "<<SQL>>",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _extract_sql(text: str) -> str:
     if not text:
         return ""
-    match = _SQL_FENCE.search(text)
-    if match:
-        sql = match.group(1).strip()
-    else:
-        match2 = _SQL_START.search(text)
-        if not match2:
-            return ""
-        sql = text[match2.start() :].strip()
-    cleaned_lines = []
-    for line in sql.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            continue
-        if stripped.startswith("--"):
-            continue
-        lowered = stripped.lower()
-        if any(
-            tag in lowered
-            for tag in [
-                "return oracle sql",
-                "allowed columns",
-                "allowed binds",
-                "fenced block",
-                "question:",
-            ]
-        ):
-            continue
-        cleaned_lines.append(stripped)
-    return "\n".join(cleaned_lines).strip().strip("`")
+    marker = _SQL_MARKER.search(text)
+    if marker:
+        return marker.group(1).strip()
+    fence = _SQL_FENCE.search(text)
+    if fence:
+        return fence.group(1).strip()
+    start = _SQL_START.search(text)
+    if start:
+        return text[start.start() :].strip()
+    return ""
 
 
 def nl_to_sql_with_llm(question: str, ctx: Dict[str, Any]) -> Dict[str, Any]:
     debug: Dict[str, Any] = {}
-    intent, clar_dbg = clarify_intent(question, ctx)
+    llm_ctx = dict(ctx or {})
+    intent, clar_dbg = clarify_intent(question, llm_ctx)
     debug["clarifier"] = clar_dbg
+    intent = clar_dbg.get("intent", intent)
 
-    prompt = _build_sql_prompt(question, intent)
-    debug["prompt"] = "sql_prompt_compact"
+    default_date_col = llm_ctx.get("default_date_col") or "REQUEST_DATE"
+    top_n_hint = intent.get("top_n") if isinstance(intent, dict) else None
+    use_window = bool(intent.get("has_time_window")) if isinstance(intent, dict) else False
+
+    prompt = _build_sql_prompt(question, llm_ctx, use_window, default_date_col, top_n_hint)
+    debug["prompt"] = "sql_prompt_v2"
 
     mdl = get_model("sql")
     if mdl is None:
         return {"ok": False, "sql": "", "debug": debug, "error": "model_unavailable"}
 
-    raw1 = mdl.generate(
-        prompt,
-        max_new_tokens=192,
-        temperature=0.05,
-        top_p=0.9,
-        stop=["```"]
-    )
+    raw1 = mdl.generate(prompt, max_new_tokens=480, stop=STOP_SEQUENCES)
     debug["raw1"] = raw1[:1500] if raw1 else ""
-    sql1 = _extract_sql_only(raw1)
+    sql1 = _extract_sql(raw1)
     debug["sql1"] = sql1
 
     from .validator import validate_sql
 
     validation1 = validate_sql(sql1)
     debug["validation1"] = validation1
+    v1_ok = bool(sql1) and bool(validation1.get("ok"))
+    v1_errors = validation1.get("errors", [])
 
-    if not validation1.get("ok") or not sql1:
-        repair_prompt = (
-            "Previous SQL had validation errors:\n"
-            f"{json.dumps(validation1.get('errors', []))}\n\n"
-            "Repair the SQL. Return Oracle SQL only inside a fenced block. No prose. No comments.\n"
-            'Table: "Contract"\n'
-            "Use only allowed columns and binds. Use :date_start/:date_end only when a window is asked.\n\n"
-            f"Question:\n{question}\n\n"
-            "```sql\n"
+    if not v1_ok:
+        repair_prompt = _build_repair_prompt(
+            question,
+            sql1,
+            v1_errors,
+            llm_ctx,
+            default_date_col,
+            top_n_hint,
         )
-        debug["sql_repair_prompt"] = "sql_prompt_compact"
-        raw2 = mdl.generate(
-            repair_prompt,
-            max_new_tokens=160,
-            temperature=0.05,
-            top_p=0.9,
-            stop=["```"]
-        )
+        debug["sql_repair_prompt"] = "sql_prompt_v2"
+        raw2 = mdl.generate(repair_prompt, max_new_tokens=480, stop=STOP_SEQUENCES)
         debug["raw2"] = raw2[:1500] if raw2 else ""
-        sql2 = _extract_sql_only(raw2)
+        sql2 = _extract_sql(raw2)
         debug["sql2"] = sql2
         validation2 = validate_sql(sql2)
         debug["validation2"] = validation2
-        if validation2.get("ok") and sql2:
-            return {"ok": True, "sql": sql2, "debug": debug}
-        return {"ok": False, "sql": sql2, "debug": debug, "error": "validation_failed"}
+        v2_ok = bool(sql2) and bool(validation2.get("ok"))
+        if v2_ok:
+            return {"ok": True, "sql": sql2, "debug": debug, "used_repair": True}
+        if v1_ok:
+            return {"ok": True, "sql": sql1, "debug": debug, "used_repair": False}
+        return {
+            "ok": False,
+            "sql": sql2,
+            "debug": debug,
+            "error": "validation_failed",
+            "used_repair": True,
+            "errors": validation2.get("errors", []),
+        }
 
-    return {"ok": True, "sql": sql1, "debug": debug}
+    return {"ok": True, "sql": sql1, "debug": debug, "used_repair": False}
 
 
 __all__ = ["clarify_intent", "nl_to_sql_with_llm"]
