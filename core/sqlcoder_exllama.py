@@ -36,6 +36,7 @@ class SQLCoderExLlama:
     def __init__(self, generator, tokenizer):
         self._generator = generator
         self._tokenizer = tokenizer
+        self._settings = ExLlamaV2Sampler.Settings()
 
     def _trim_prompt(self, prompt: str, reserve_tokens: int = 256) -> str:
         """Left-truncate prompt to avoid cache overflow."""
@@ -79,11 +80,13 @@ class SQLCoderExLlama:
     ) -> str:
         """Generate text with safe defaults and robust stopping."""
 
-        settings = ExLlamaV2Sampler.Settings()
+        settings = self._settings.clone() if hasattr(self._settings, "clone") else ExLlamaV2Sampler.Settings()
         settings.temperature = float(temperature) if temperature is not None else 0.2
         settings.top_p = float(top_p) if top_p is not None else 0.9
 
         max_new = int(max_new_tokens or 256)
+        if max_new < 1:
+            max_new = 1
         if max_new > 512:
             max_new = 512
 
@@ -95,22 +98,25 @@ class SQLCoderExLlama:
 
         try:
             output = self._generator.generate_simple(prompt, settings, max_new)
-            text = output[0] if isinstance(output, (list, tuple)) else output
-            if not isinstance(text, str):
-                text = str(text)
         except AssertionError as err:
             logger.warning("[dw] exllama overflow; retrying with reduced context/new tokens: %s", err)
             prompt_tail = self._trim_prompt(prompt, reserve_tokens=reserve + 128)
-            try:
-                output = self._generator.generate_simple(prompt_tail, settings, min(128, max_new))
-                text = output[0] if isinstance(output, (list, tuple)) else output
-                if not isinstance(text, str):
-                    text = str(text)
-            except Exception as exc:  # pragma: no cover - secondary failure
-                logger.error("[dw] exllama second attempt failed: %s", exc, exc_info=True)
-                raise
+            output = self._generator.generate_simple(prompt_tail, settings, min(128, max_new))
+        text = output if isinstance(output, str) else output[0] if isinstance(output, (list, tuple)) else str(output)
+        if not isinstance(text, str):
+            text = str(text)
 
-        return self._truncate_on_stop(text, stop)
+        if stop:
+            cut = len(text)
+            for s in stop:
+                if not s:
+                    continue
+                idx = text.find(s)
+                if idx != -1:
+                    cut = min(cut, idx)
+            text = text[:cut]
+
+        return text.strip()
 
 
 def load_exllama_generator(model_path: str, config: Dict[str, Any]) -> SQLCoderExLlama:

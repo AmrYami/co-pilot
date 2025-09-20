@@ -1,179 +1,185 @@
 import json
 import logging
 import os
-from datetime import datetime
-from flask import Blueprint, request, jsonify, current_app
-from logging.handlers import TimedRotatingFileHandler
+from datetime import datetime, timedelta
 
+from flask import Blueprint, current_app, jsonify, request
+from logging.handlers import TimedRotatingFileHandler
+from sqlalchemy import text
+
+from core.sql_exec import get_mem_engine, get_oracle_engine
 from .llm import nl_to_sql_with_llm
-from .validator import analyze_sql
-from core.sql_exec import get_oracle_engine
+
 
 dw_bp = Blueprint("dw", __name__, url_prefix="/dw")
 
-# ---------- logging helpers ----------
-def _ensure_file_logging():
-    app = current_app
-    if app.config.get("DW_LOGGING_READY"):
+
+def _setup_logging(app):
+    if any(getattr(handler, "_dw_log", False) for handler in app.logger.handlers):
         return
-    os.makedirs("logs", exist_ok=True)
-    log_path = os.path.join("logs", f"dw-{datetime.now().strftime('%Y%m%d')}.log")
-    fh = TimedRotatingFileHandler(log_path, when="midnight", backupCount=14, encoding="utf-8")
+    log_dir = os.path.join(os.getcwd(), "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    fh = TimedRotatingFileHandler(os.path.join(log_dir, "dw.log"), when="midnight", backupCount=7, encoding="utf-8")
     fh.setLevel(logging.INFO)
-    fmt = logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s")
-    fh.setFormatter(fmt)
-    # Avoid duplicate handlers
-    names = [type(h).__name__ for h in app.logger.handlers]
-    if "TimedRotatingFileHandler" not in names:
-        app.logger.addHandler(fh)
-    app.config["DW_LOGGING_READY"] = True
+    fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s"))
+    fh._dw_log = True
+    app.logger.addHandler(fh)
     app.logger.info("[dw] logging initialized")
 
+
 @dw_bp.before_app_request
-def _setup_logging():
-    _ensure_file_logging()
+def _before():
+    _setup_logging(current_app)
 
-def _log(tag: str, payload=None, level="info"):
-    msg = f"[dw] {tag}"
-    if payload is not None:
-        try:
-            msg += ": " + json.dumps(payload, default=str)
-        except Exception:
-            msg += f": {payload}"
-    getattr(current_app.logger, level, current_app.logger.info)(msg)
 
-# ---------- tiny date helpers ----------
-def last_month_window(today=None):
-    d = today or datetime.utcnow()
-    first_this = d.replace(day=1)
-    last_month_end = first_this
-    # previous month start
-    if first_this.month == 1:
-        start = first_this.replace(year=first_this.year - 1, month=12)
-    else:
-        start = first_this.replace(month=first_this.month - 1)
-    return start, last_month_end
+def _log(tag: str, payload):
+    try:
+        current_app.logger.info(f"[dw] {tag}: {json.dumps(payload, default=str)[:4000]}")
+    except Exception:
+        current_app.logger.info(f"[dw] {tag}: {payload}")
 
-# ---------- main endpoint ----------
+
 @dw_bp.route("/answer", methods=["POST"])
 def answer():
-    _ensure_file_logging()
+    body = request.get_json(force=True, silent=True) or {}
+    question = (body.get("question") or "").strip()
+    auth_email = body.get("auth_email") or ""
+    prefixes = body.get("prefixes") or []
+    namespace = "dw::common"
 
-    j = request.get_json(force=True, silent=True) or {}
-    q = j.get("question", "").strip()
-    auth_email = j.get("auth_email")
-    prefixes = j.get("prefixes", [])
+    settings = current_app.config.get("SETTINGS")
+    if not settings:
+        raise RuntimeError("Application settings are not configured")
 
-    # 1) Log inquiry
-    # (You already insert to mem_inquiries elsewhere; this is just logging)
-    _log("inquiry_start", {"q": q, "email": auth_email})
+    mem = get_mem_engine(settings)
+    with mem.begin() as conn:
+        stmt = text(
+            """
+            INSERT INTO mem_inquiries(namespace, question, auth_email, prefixes, status, created_at, updated_at)
+            VALUES (:ns, :q, :auth, :pfx::jsonb, 'open', NOW(), NOW())
+            RETURNING id
+            """
+        )
+        inq_id = conn.execute(
+            stmt,
+            {"ns": namespace, "q": question, "auth": auth_email, "pfx": json.dumps(prefixes)},
+        ).scalar_one()
 
-    # 2) Clarify intent (already done inside LLM context by you; keep context lightweight here)
-    #    You may have a dedicated clarifier – or pass minimal hints.
-    #    We’ll add the common hint: if question mentions “last month” we compute binds.
-    ctx = {}
+    _log("inquiry_start", {"id": inq_id, "q": question, "email": auth_email})
 
-    # 3) Call two-pass generator (returns all debug)
-    llm_out = nl_to_sql_with_llm(q, ctx)
+    llm_context = {"namespace": namespace, "table": "Contract"}
 
-    # 4) Decide final SQL & validate (again)
-    final_sql = (llm_out.get("sql") or "").strip()
+    out = nl_to_sql_with_llm(question, llm_context)
+    debug = out.get("debug") or {}
+    intent = out.get("intent") or {}
 
-    _log("llm_outcome", {
-        "used_repair": llm_out.get("used_repair"),
-        "intent": llm_out.get("intent"),
-    })
+    clarifier_dbg = debug.get("clarifier") or {}
+    if clarifier_dbg.get("raw") is not None:
+        _log(
+            "clarifier_raw",
+            {
+                "used": clarifier_dbg.get("used"),
+                "ok": clarifier_dbg.get("ok"),
+                "raw": (clarifier_dbg.get("raw") or "")[:1200],
+            },
+        )
+    if clarifier_dbg.get("intent") is not None:
+        _log("clarifier_intent", clarifier_dbg.get("intent"))
 
-    validation = analyze_sql(final_sql)
-    _log("final_sql", {
-        "size": len(final_sql),
-        "used_repair": llm_out.get("used_repair"),
-        "sql_preview": final_sql[:4000],
-    })
+    if debug.get("prompt"):
+        _log("sql_prompt", {"prompt": debug["prompt"][:1200]})
+    if debug.get("raw1") is not None:
+        _log("llm_raw_pass1", {"size": len(debug.get("raw1") or "")})
+    if debug.get("raw2") is not None:
+        _log("llm_raw_pass2", {"size": len(debug.get("raw2") or "")})
 
-    llm_binds = llm_out.get("binds") or {}
-    _log("binds_detected", {
-        "sql_binds": validation.get("binds", []),
-        "intent_binds": {k: (v.isoformat() if hasattr(v, "isoformat") else v) for k, v in llm_binds.items()},
-        "validation_errors": validation.get("errors", []),
-    })
+    sql = out.get("sql") or ""
 
-    if not validation["ok"] or not final_sql:
-        first_pass_debug = llm_out.get("first_pass") or {}
-        if first_pass_debug:
-            first_pass_debug = {
-                "sql": first_pass_debug.get("sql"),
-                "validation": first_pass_debug.get("validation"),
-                "raw_len": len(first_pass_debug.get("raw") or ""),
-            }
-        return jsonify({
-            "ok": False,
-            "status": "needs_clarification",
-            "error": (validation["errors"][0] if validation["errors"] else "empty_sql"),
-            "sql": final_sql or None,
-            "questions": ["I couldn't derive a clean SELECT. Please rephrase or specify the filters/window clearly."],
-            "debug": {
-                "intent": llm_out.get("intent"),
-                "raw_len": len(llm_out.get("raw") or ""),
-                "validation": validation,
-                "first_pass": first_pass_debug,
-            }
-        }), 200
+    if not sql:
+        _log("validation", {"ok": False, "errors": ["empty_sql"], "binds": []})
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "status": "needs_clarification",
+                    "questions": [
+                        "I couldn't derive a clean SELECT. Can you rephrase or specify filters (stakeholders, departments, date columns)?"
+                    ],
+                    "error": "empty_sql",
+                    "debug": debug,
+                }
+            ),
+            200,
+        )
 
-    # 5) Resolve binds using intent-derived defaults with fallbacks
-    bind_names = list(dict.fromkeys(validation.get("binds", [])))
-    binds = {}
-    for name in bind_names:
-        if name in llm_binds and llm_binds[name] is not None:
-            binds[name] = llm_binds[name]
-            continue
-        if name in {"date_start", "date_end"}:
-            ds, de = last_month_window()
-            if "date_start" in bind_names and "date_start" not in binds:
-                binds["date_start"] = ds
-            if "date_end" in bind_names and "date_end" not in binds:
-                binds["date_end"] = de
-        elif name == "top_n":
-            binds[name] = 10
+    binds: dict[str, object] = {}
+    question_lower = question.lower()
+    if intent.get("has_time_window"):
+        now = datetime.utcnow().date()
+        if "last month" in question_lower:
+            first_this_month = now.replace(day=1)
+            date_end = first_this_month
+            date_start = (first_this_month - timedelta(days=1)).replace(day=1)
+        else:
+            date_end = now
+            date_start = now - timedelta(days=30)
+        binds["date_start"] = datetime.combine(date_start, datetime.min.time())
+        binds["date_end"] = datetime.combine(date_end, datetime.min.time())
 
-    # Just log binds chosen for execution
-    _log("execution_binds", {k: (v.isoformat() if hasattr(v, "isoformat") else v) for k, v in binds.items()})
+    _log("final_sql", {"size": len(sql), "sql": sql[:1200]})
+    _log(
+        "execution_binds",
+        {k: (v.isoformat() if hasattr(v, "isoformat") else v) for k, v in binds.items()},
+    )
 
-    # 6) Execute
-    rows = []
-    cols = []
-    elapsed_ms = 0
+    engine = get_oracle_engine()
+    rows: list[list[object]] = []
+    cols: list[str] = []
+    started = datetime.utcnow()
     try:
-        oracle = get_oracle_engine()
-        t0 = datetime.utcnow()
-        with oracle.begin() as c:
-            res = c.exec_driver_sql(final_sql, binds)
-            cols = list(res.keys() or [])
-            rows = res.fetchall()
-        elapsed_ms = int((datetime.utcnow() - t0).total_seconds() * 1000)
+        with engine.begin() as conn:
+            result = conn.exec_driver_sql(sql, binds)
+            cols = list(result.keys())
+            rows = [list(row) for row in result.fetchall()]
+        elapsed_ms = int((datetime.utcnow() - started).total_seconds() * 1000)
+        _log("execution_result", {"rows": len(rows), "cols": cols, "ms": elapsed_ms})
+    except Exception as exc:  # pragma: no cover - surface database errors
+        _log("oracle_error", {"error": str(exc)})
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "status": "failed",
+                    "error": str(exc),
+                    "sql": sql,
+                    "binds": binds,
+                    "debug": debug,
+                }
+            ),
+            200,
+        )
 
-        _log("execution_result", {
-            "rows": len(rows),
-            "cols": cols,
-            "ms": elapsed_ms,
-            "sample": [list(r) for r in rows[:3]],
-        })
-    except Exception as e:
-        _log("oracle_error", {"error": str(e), "sql": final_sql}, level="error")
-        return jsonify({
-            "ok": False,
-            "status": "failed",
-            "error": str(e),
-            "sql": final_sql
-        }), 200
+    return (
+        jsonify(
+            {
+                "ok": True,
+                "rows": rows,
+                "columns": cols,
+                "sql": sql,
+                "binds": {k: (v.isoformat() if hasattr(v, "isoformat") else v) for k, v in binds.items()},
+                "intent": intent,
+                "debug": {
+                    "sizes": {
+                        "prompt": len(debug.get("prompt") or ""),
+                        "raw1": len(debug.get("raw1") or ""),
+                        "raw2": len(debug.get("raw2") or ""),
+                    }
+                },
+            }
+        ),
+        200,
+    )
 
-    return jsonify({
-        "ok": True,
-        "sql": final_sql,
-        "meta": {
-            "binds": {k: (v.isoformat() if hasattr(v, "isoformat") else v) for k, v in binds.items()},
-            "rowcount": len(rows),
-            "columns": cols,
-        },
-        "rows": [list(r) for r in rows]
-    }), 200
+
+def create_dw_blueprint(**_kwargs):
+    return dw_bp
