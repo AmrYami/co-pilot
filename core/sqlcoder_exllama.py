@@ -1,248 +1,130 @@
-"""Utility for loading SQLCoder (ExLlamaV2) as a simple text generator."""
-
-from __future__ import annotations
-
-import logging
 import os
-import time
-from typing import Any, Dict, Iterable, Optional
+import logging
+from typing import List, Optional
 
-import torch
+from exllamav2 import ExLlamaV2, ExLlamaV2Config
+from exllamav2.tokenizer import ExLlamaV2Tokenizer
+from exllamav2.generator import ExLlamaV2Generator, ExLlamaV2Sampler
 
-try:  # exllamav2 >= 0.1.5
-    from exllamav2.generator.sampler import ExLlamaV2Sampler  # type: ignore
-except Exception:  # pragma: no cover - fallback for older versions
-    try:
-        from exllamav2.generator import ExLlamaV2Sampler  # type: ignore
-    except Exception:  # pragma: no cover - sampler unavailable
-        ExLlamaV2Sampler = None  # type: ignore
+LOG = logging.getLogger("main")
 
+class SQLCoderExL2:
+    """
+    Thin, robust wrapper around ExLlamaV2 to generate SQL with safe prompt truncation
+    and consistent sampler settings across exllamav2 versions.
+    """
 
-logger = logging.getLogger("dw")
-
-
-def _parse_gpu_split(env_value: str | None) -> Optional[list[float]]:
-    if not env_value:
-        return None
-    parts = [p.strip() for p in env_value.split(",") if p.strip()]
-    if not parts:
-        return None
-    try:
-        numbers = [float(p) for p in parts]
-    except Exception:
-        return None
-    total = sum(numbers)
-    if total <= 0:
-        return None
-    if max(numbers) > 1.5:
-        return [n / total for n in numbers]
-    return [n / total for n in numbers]
-
-
-class SQLCoderExLlama:
-    def __init__(self, generator, tokenizer, cache_max_seq_len: int, input_reserve_tokens: int = 64):
-        self._generator = generator
+    def __init__(self, model: ExLlamaV2, tokenizer: ExLlamaV2Tokenizer, generator: ExLlamaV2Generator):
+        self._model = model
         self._tokenizer = tokenizer
-        self._cache_max_seq_len = cache_max_seq_len
-        self._input_reserve_tokens = input_reserve_tokens
+        self._generator = generator
 
-    def _truncate_prompt(self, prompt: str, max_new_tokens: int) -> str:
-        """Ensure the prompt fits within the KV cache budget."""
+        # Env knobs
+        self._max_new_default = int(os.getenv("GENERATION_MAX_NEW_TOKENS", os.getenv("LLM_MAX_NEW", "192")))
+        self._reserve_tokens = int(os.getenv("EXL2_INPUT_RESERVE_TOKENS", "64"))
 
-        reserve_env = os.getenv("EXL2_INPUT_RESERVE_TOKENS")
+        # Detect cache length
+        cache_len = None
         try:
-            reserve_tokens = int(reserve_env) if reserve_env is not None else self._input_reserve_tokens
+            cache_len = getattr(generator, "max_seq_len", None)
+            if cache_len is None and hasattr(generator, "cache"):
+                cache_len = getattr(generator.cache, "max_seq_len", None)
         except Exception:
-            reserve_tokens = self._input_reserve_tokens
-        reserve_tokens = max(0, reserve_tokens)
+            cache_len = None
+        if cache_len is None:
+            cache_len = int(os.getenv("EXL2_CACHE_MAX_SEQ_LEN", "2048"))
+        self._cache_max_len = int(cache_len)
 
-        try:
-            ids = self._tokenizer.encode(prompt, add_bos=True)
-        except Exception:
-            if len(prompt) > 8000:
-                tail = prompt[-8000:]
-                logger.debug("[dw] prompt truncated to last 8000 characters (encode fallback)")
-                return tail
-            return prompt
+        if os.getenv("DW_DEBUG", "0") == "1":
+            LOG.info("[sql] exllamav2: cache_max_len=%s, reserve=%s", self._cache_max_len, self._reserve_tokens)
 
-        if hasattr(ids, "tolist"):
-            tokens = ids.tolist()
-            if tokens and isinstance(tokens[0], list):
-                tokens = tokens[0]
-        else:
-            tokens = list(ids)
+    # ---------- internals ----------
 
-        token_count = len(tokens)
+    def _build_settings(self) -> ExLlamaV2Sampler.Settings:
+        s = ExLlamaV2Sampler.Settings()
+        # Sampling
+        s.temperature = float(os.getenv("GENERATION_TEMPERATURE", "0.2"))
+        s.top_p = float(os.getenv("GENERATION_TOP_P", "0.9"))
+        s.top_k = int(os.getenv("GENERATION_TOP_K", "0"))
+        # Optional stabilizers
+        s.min_p = float(os.getenv("GENERATION_MIN_P", "0.05"))
+        s.token_repetition_penalty = float(os.getenv("GENERATION_REPEAT_PENALTY", "1.08"))
+        return s
 
-        max_new = max(0, int(max_new_tokens or 0))
-        max_input_tokens = max(1, self._cache_max_seq_len - max_new - reserve_tokens)
-        if token_count > max_input_tokens:
-            tokens = tokens[-max_input_tokens:]
-            prompt = self._tokenizer.decode(tokens)
-            logger.debug(
-                "[dw] prompt truncated to %d tokens (max_input_tokens=%d)",
-                len(tokens),
-                max_input_tokens,
-            )
+    def _truncate_prompt(self, prompt: str, max_new: int) -> str:
+        """Token-level truncate so prompt + new tokens fit inside cache window."""
+        ids = self._tokenizer.encode(prompt)
+        max_input = max(8, self._cache_max_len - max_new - self._reserve_tokens)
+        if len(ids) > max_input:
+            ids = ids[-max_input:]
+            truncated = self._tokenizer.decode(ids)
+            if os.getenv("DW_DEBUG", "0") == "1":
+                LOG.info("[sql] prompt truncated: tokens=%s -> %s (max_input=%s)", len(self._tokenizer.encode(prompt)), len(ids), max_input)
+            return truncated
         return prompt
 
-    @staticmethod
-    def _apply_stops(text: str, stops: Optional[Iterable[str]]) -> str:
-        if not text:
+    def _manual_stop(self, text: str, stop: Optional[List[str]] = None) -> str:
+        if not stop:
             return text
-
         cut = len(text)
-        for fence in ("```sql", "```"):
-            idx = text.find(fence)
-            if idx != -1:
-                cut = min(cut, idx)
-
-        if stops:
-            for stop in stops:
-                if not stop:
-                    continue
-                idx = text.find(stop)
-                if idx != -1:
-                    cut = min(cut, idx)
-
+        for s in stop:
+            i = text.find(s)
+            if i != -1:
+                cut = min(cut, i)
         return text[:cut]
 
-    def _call_generate_simple(self, prompt: str, max_new_tokens: int):
+    def _call_generate_simple(self, prompt: str, settings: ExLlamaV2Sampler.Settings, max_new: int) -> str:
+        """
+        Handle both exllamav2 signatures:
+          - new: generate_simple(prompt, settings, num_tokens)
+          - old: generate_simple(prompt, num_tokens)
+        """
         try:
-            return self._generator.generate_simple(prompt, max_new_tokens)
+            return self._generator.generate_simple(prompt, settings, max_new)
         except TypeError:
-            return self._generator.generate_simple(prompt, None, max_new_tokens)
+            # Fallback for older API: (prompt, num_tokens)
+            return self._generator.generate_simple(prompt, max_new)
 
-    def generate(
-        self,
-        prompt: str,
-        max_new_tokens: int = 256,
-        stop: Optional[Iterable[str]] = None,
-        temperature: float | None = None,
-        top_p: float | None = None,
-    ) -> str:
-        """Generate text with safe defaults and robust stopping."""
+    # ---------- public ----------
 
-        try:
-            max_new = int(os.getenv("GENERATION_MAX_NEW_TOKENS", max_new_tokens))
-        except Exception:
-            max_new = int(max_new_tokens or 256)
-        max_new = max(1, max_new)
+    def generate(self, prompt: str, max_new_tokens: Optional[int] = None, stop: Optional[List[str]] = None) -> str:
+        max_new = int(max_new_tokens or self._max_new_default)
+        prompt2 = self._truncate_prompt(prompt, max_new)
+        settings = self._build_settings()
 
-        prompt = self._truncate_prompt(prompt, max_new)
+        if os.getenv("DW_DEBUG", "0") == "1":
+            LOG.info("[sql] gen.begin max_new=%s prompt_len=%s", max_new, len(prompt2))
 
-        try:
-            output = self._call_generate_simple(prompt, max_new)
-        except AssertionError as err:
-            logger.warning("[dw] exllama overflow; retrying with truncated context: %s", err)
-            prompt = self._truncate_prompt(prompt, max_new)
-            output = self._call_generate_simple(prompt, min(max_new, 128))
+        out = self._call_generate_simple(prompt2, settings, max_new)
+        text = out if isinstance(out, str) else str(out)
+        text = self._manual_stop(text, stop)
 
-        text = output if isinstance(output, str) else output[0] if isinstance(output, (list, tuple)) else str(output)
-        if not isinstance(text, str):
-            text = str(text)
+        if os.getenv("DW_DEBUG", "0") == "1":
+            LOG.info("[sql] gen.end out_size=%s", len(text))
 
-        text = self._apply_stops(text, stop)
-        return text.strip()
+        return text
 
 
-def load_exllama_generator(model_path: str, config: Dict[str, Any]) -> SQLCoderExLlama:
-    """Load ExLlamaV2 for SQLCoder and return a lightweight generator wrapper."""
+# -------- loader --------
 
-    from exllamav2 import ExLlamaV2, ExLlamaV2Cache, ExLlamaV2Config, ExLlamaV2Tokenizer
-
-    force_base = str(os.getenv("EXL2_FORCE_BASE", "0")).lower() in {"1", "true", "yes", "on"}
-    if force_base:
-        try:
-            import exllamav2.attn as _attn
-
-            _attn.has_flash_attn = False
-        except Exception:
-            pass
-
-    dyn_available = False
-    if not force_base:
-        try:
-            from exllamav2.generator.dynamic import ExLlamaV2DynamicGenerator  # noqa: F401
-
-            dyn_available = True
-        except Exception:
-            dyn_available = False
-
-    cfg = ExLlamaV2Config(model_path)
-    cfg.max_seq_len = int(config.get("max_seq_len", 4096))
-    if torch.cuda.is_available():
-        cfg.set_low_mem()
-        cfg.gpu_peer_fix = True
+def load_exllama_generator(path: str) -> SQLCoderExL2:
+    """
+    Create model/tokenizer/generator and wrap them in SQLCoderExL2
+    """
+    LOG.info("Loading model: %s", path)
+    cfg = ExLlamaV2Config()
+    cfg.model_path = path
+    # Lower VRAM / safer defaults if env suggests
+    if os.getenv("EXL2_FORCE_BASE", "0") == "1":
+        cfg.max_input_len = int(os.getenv("EXL2_CACHE_MAX_SEQ_LEN", "2048"))
     cfg.prepare()
 
     model = ExLlamaV2(cfg)
-    tokenizer = ExLlamaV2Tokenizer(cfg)
+    tok = ExLlamaV2Tokenizer(cfg)
 
-    cache_len = int(os.getenv("EXL2_CACHE_MAX_SEQ_LEN", cfg.max_seq_len))
-    cache = ExLlamaV2Cache(model, lazy=True, max_seq_len=cache_len)
+    cache_len = int(os.getenv("EXL2_CACHE_MAX_SEQ_LEN", "2048"))
+    gen = ExLlamaV2Generator(model, tok, max_seq_len=cache_len)
+    gen.warmup()
 
-    split = _parse_gpu_split(os.getenv("EXL2_GPU_SPLIT_GB") or os.getenv("GPU_SPLIT"))
-
-    reserve: Optional[list[int]] = None
-    try:
-        reserve_gb = float(os.getenv("RESERVE_VRAM_GB", "0") or 0)
-    except Exception:
-        reserve_gb = 0.0
-    if torch.cuda.device_count() > 1 and reserve_gb > 0:
-        reserve = [0, int(reserve_gb * (1 << 30))]
-
-    def _load_weights(split_hint: Optional[list[float]], cache_obj: ExLlamaV2Cache) -> None:
-        t0 = time.time()
-        if split_hint:
-            model.load(split_hint, cache_obj)
-        else:
-            model.load_autosplit(cache_obj, progress=True, reserve_vram=reserve)
-        print(f"ExLlamaV2 weights ready in {time.time() - t0:.2f}s")
-
-    current_cache = cache
-
-    try:
-        _load_weights(split, current_cache)
-    except Exception as exc:
-        msg = str(exc).lower()
-        flash_fail = "flashatt" in msg or "flash_attn" in msg
-        if flash_fail:
-            try:
-                import exllamav2.attn as _attn
-
-                _attn.has_flash_attn = False
-            except Exception:
-                pass
-        smaller = max(1024, cache_len // 2)
-        if smaller < cache_len:
-            current_cache = ExLlamaV2Cache(model, lazy=True, max_seq_len=smaller)
-        else:
-            current_cache = ExLlamaV2Cache(model, lazy=True, max_seq_len=cache_len)
-        if split:
-            _load_weights(None, current_cache)
-        else:
-            _load_weights(split, current_cache)
-
-    cache = current_cache
-
-    try:
-        reserve_tokens = int(os.getenv("EXL2_INPUT_RESERVE_TOKENS", "64") or 64)
-    except Exception:
-        reserve_tokens = 64
-
-    gen = None
-    if dyn_available and not force_base:
-        try:
-            from exllamav2.generator.dynamic import ExLlamaV2DynamicGenerator
-
-            gen = ExLlamaV2DynamicGenerator(model=model, tokenizer=tokenizer, cache=cache)
-        except Exception:
-            gen = None
-
-    if gen is None:
-        from exllamav2.generator.base import ExLlamaV2BaseGenerator
-
-        gen = ExLlamaV2BaseGenerator(model=model, tokenizer=tokenizer, cache=cache)
-
-    return SQLCoderExLlama(gen, tokenizer, cache.max_seq_len, reserve_tokens)
+    LOG.info("ExLlamaV2 ready (cache=%s)", cache_len)
+    return SQLCoderExL2(model, tok, gen)

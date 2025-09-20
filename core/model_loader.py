@@ -49,12 +49,10 @@ def _load_sql_model() -> Optional[Dict[str, Any]]:
     cfg = {
         "max_seq_len": _env_int("MODEL_MAX_SEQ_LEN", 4096),
         "max_new_tokens": _env_int("GENERATION_MAX_NEW_TOKENS", 256),
-        "temperature": float(os.getenv("GENERATION_TEMPERATURE", "0.2")),
-        "top_p": float(os.getenv("GENERATION_TOP_P", "0.9")),
         "stop": stop_tokens,
     }
 
-    handle = load_exllama_generator(model_path=path, config=cfg)
+    handle = load_exllama_generator(path)
     _log("SQL model (SQLCoder/ExLlamaV2) ready")
     return {
         "role": "sql",

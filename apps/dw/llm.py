@@ -199,21 +199,21 @@ def nl_to_sql_with_llm(question: str, ctx: dict) -> dict:
     # --- PASS 1: fenced prompt
     prompt1 = _build_prompt_fenced(question, intent, allow_binds)
     logger("sql_prompt_pass1", {"preview": prompt1[:400]})
-    raw1 = sql_mdl.generate(prompt1, max_new_tokens=max_new_tokens)
+    raw1 = sql_mdl.generate(prompt1, max_new_tokens=max_new_tokens, stop=["```"])
     sql1 = extract_sql(raw1)
     logger(
         "llm_raw_pass1",
         {
             "size": len(raw1 or ""),
-            "head": (raw1 or "")[:120],
-            "tail": (raw1 or "")[-120:],
+            "head": (raw1 or "")[:40],
+            "tail": (raw1 or "")[-40:],
         },
     )
     logger(
         "llm_sql_pass1",
         {
             "size": len(sql1 or ""),
-            "preview": (sql1 or "")[:200],
+            "preview": (sql1 or "")[:80],
         },
     )
     ok1, errs1, binds1 = validate_sql(sql1, allow_tables=("Contract",), allow_binds=allow_binds)
@@ -234,21 +234,21 @@ def nl_to_sql_with_llm(question: str, ctx: dict) -> dict:
     # --- PASS 2: plain prompt
     prompt2 = _build_prompt_plain(question, intent, allow_binds)
     logger("sql_prompt_pass2", {"preview": prompt2[:400]})
-    raw2 = sql_mdl.generate(prompt2, max_new_tokens=max_new_tokens)
+    raw2 = sql_mdl.generate(prompt2, max_new_tokens=max_new_tokens, stop=["```"])
     sql2 = extract_sql(raw2)
     logger(
         "llm_raw_pass2",
         {
             "size": len(raw2 or ""),
-            "head": (raw2 or "")[:120],
-            "tail": (raw2 or "")[-120:],
+            "head": (raw2 or "")[:40],
+            "tail": (raw2 or "")[-40:],
         },
     )
     logger(
         "llm_sql_pass2",
         {
             "size": len(sql2 or ""),
-            "preview": (sql2 or "")[:200],
+            "preview": (sql2 or "")[:80],
         },
     )
     ok2, errs2, binds2 = validate_sql(sql2, allow_tables=("Contract",), allow_binds=allow_binds)
