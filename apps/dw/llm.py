@@ -84,15 +84,17 @@ def build_sql_prompt(question: str, intent: dict) -> str:
     top_n = intent.get("top_n")
 
     head = (
-        "Return Oracle SQL only inside ```sql fenced block.\n"
+        "Return Oracle SQL only inside a fenced block:\n"
+        "```sql\n"
+        "-- SQL starts on next line\n"
         'Table: "Contract"\n'
         f"Allowed columns: {_ALLOWED_COLS}\n"
         "Oracle syntax only (NVL, TRIM, LISTAGG WITHIN GROUP, FETCH FIRST N ROWS ONLY). SELECT/CTE only.\n"
         f"Allowed binds: {_WHITELIST_BINDS}\n"
         "Add date filter ONLY if user asks. For windows use :date_start and :date_end.\n"
         f"Default window column: {date_col}.\n"
-        "No prose, comments, or explanations.\n\n"
-        f"Question:\n{question}\n\n```sql\n"
+        "No prose, comments, or explanations.\n"
+        f"Question:\n{question}\n```sql\n"
     )
 
     tail_hint = ""
