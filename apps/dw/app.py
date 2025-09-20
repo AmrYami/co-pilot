@@ -1,19 +1,13 @@
 from flask import Blueprint, request, jsonify, current_app
 from sqlalchemy import text
 from datetime import datetime, date, timedelta
-import os, json, csv, pathlib, re, logging
+import os, json, csv, pathlib, re
+from logging.handlers import TimedRotatingFileHandler
 from core.settings import Settings
 from core.datasources import DatasourceRegistry
 from core.sql_exec import get_mem_engine
-from core.logging_setup import log_kv
-from .llm import (
-    clarify_intent,
-    build_sql_prompt,
-    build_sql_repair_prompt,
-    nl_to_sql_raw,
-    extract_sql,
-)
-from .validator import validate_sql, analyze_binds
+from .llm import nl_to_sql_with_llm, _extract_sql
+from .validator import validate_sql
 
 
 dw_bp = Blueprint("dw", __name__, url_prefix="/dw")
@@ -27,25 +21,29 @@ def _settings():
     return Settings()
 
 
-def _get_allowed_columns() -> list:
-    # The minimal set we agreed to start with
-    return [
-        "CONTRACT_ID", "CONTRACT_OWNER",
-        "CONTRACT_STAKEHOLDER_1","CONTRACT_STAKEHOLDER_2","CONTRACT_STAKEHOLDER_3","CONTRACT_STAKEHOLDER_4",
-        "CONTRACT_STAKEHOLDER_5","CONTRACT_STAKEHOLDER_6","CONTRACT_STAKEHOLDER_7","CONTRACT_STAKEHOLDER_8",
-        "DEPARTMENT_1","DEPARTMENT_2","DEPARTMENT_3","DEPARTMENT_4","DEPARTMENT_5","DEPARTMENT_6","DEPARTMENT_7","DEPARTMENT_8",
-        "OWNER_DEPARTMENT","CONTRACT_VALUE_NET_OF_VAT","VAT","CONTRACT_PURPOSE","CONTRACT_SUBJECT",
-        "START_DATE","END_DATE","REQUEST_DATE","REQUEST_TYPE","CONTRACT_STATUS","ENTITY_NO","REQUESTER"
-    ]
+def _ensure_daily_log():
+    """Attach a daily rotating file handler for DW logs."""
 
+    log_dir = os.path.join(os.getcwd(), "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    fname = os.path.join(log_dir, "dw.log")
+    if not any(isinstance(h, TimedRotatingFileHandler) for h in current_app.logger.handlers):
+        handler = TimedRotatingFileHandler(fname, when="midnight", backupCount=14, encoding="utf-8")
+        handler.setLevel(current_app.logger.level)
+        current_app.logger.addHandler(handler)
 
 def _log(tag, payload):
     """Structured logging helper scoped to DW blueprint."""
-    logger = current_app.logger if current_app else None
-    if logger is None:
-        # Fallback to root logger to avoid losing important traces
-        logger = logging.getLogger(__name__)
-    log_kv(logger, f"[dw] {tag}", payload)
+
+    try:
+        current_app.logger.info(f"[dw] {tag}: {payload}")
+    except Exception:
+        pass
+
+
+@dw_bp.before_app_first_request
+def _init_dw_logging():
+    _ensure_daily_log()
 
 
 def _question_has_window(q: str) -> bool:
@@ -53,18 +51,6 @@ def _question_has_window(q: str) -> bool:
     return any(k in ql for k in [
         "last month", "next ", "last ", "between ", "in ", "since ", "days", "months", "year", "quarter"
     ])
-
-
-def _guess_explicit_date_col(q: str) -> str | None:
-    ql = (q or "").lower()
-    if "end date" in ql or "expiry" in ql or "expires" in ql:
-        return "END_DATE"
-    if "start date" in ql:
-        return "START_DATE"
-    if "request date" in ql:
-        return "REQUEST_DATE"
-    return None
-
 
 def _derive_dates_for_question(q: str) -> dict:
     """Compute :date_start/:date_end for common phrases. Return {} if not applicable."""
@@ -125,7 +111,6 @@ def answer():
 
     table_name = s.get("DW_CONTRACT_TABLE", scope="namespace") or "Contract"
     default_date_col = s.get("DW_DATE_COLUMN", scope="namespace") or "REQUEST_DATE"
-    allowed_cols = _get_allowed_columns()
     allow_binds = ["date_start","date_end","top_n","owner_name","dept","entity_no","contract_id_pattern","request_type"]
 
     # Create inquiry row (status open)
@@ -138,70 +123,19 @@ def answer():
 
     _log("inquiry_start", {"id": inq_id, "q": q, "email": auth_email})
 
-    # ---------- Clarify (non-blocking but useful) ----------
-    intent = clarify_intent(q)
-    _log("clarifier_raw", intent)
-    intent_ok = bool(intent.get("ok")) and isinstance(intent.get("intent"), dict)
-    has_window_by_clarifier = intent_ok and bool(intent["intent"].get("has_time_window"))
-    explicit_dates = intent_ok and intent["intent"].get("explicit_dates") or None
-    date_col_hint = intent_ok and intent["intent"].get("date_column") or None
-    top_n_hint = intent_ok and intent["intent"].get("top_n") or None
-
-    # ---------- Derive binds from question (or clarifier) ----------
-    window_binds = {}
-    phrase_window_hint = _question_has_window(q)
-    has_time_window = bool(explicit_dates) or has_window_by_clarifier
-    if explicit_dates and "date_start" in explicit_dates and "date_end" in explicit_dates:
-        try:
-            window_binds = {
-                "date_start": datetime.fromisoformat(explicit_dates["date_start"]),
-                "date_end": datetime.fromisoformat(explicit_dates["date_end"]),
-            }
-        except Exception:
-            window_binds = {}
-    if not window_binds and has_time_window:
-        window_binds = _derive_dates_for_question(q)
-
-    # Which date column should be used if a window is requested?
-    suggested_date_col = _guess_explicit_date_col(q) or date_col_hint
-    question_has_window = has_time_window
-
-    # TOP N literal to avoid bind oddities in FETCH FIRST
-    top_n_literal = None
-    m_top = re.search(r"top\s+(\d+)", q.lower())
-    if m_top:
-        top_n_literal = int(m_top.group(1))
-    elif isinstance(top_n_hint, int):
-        top_n_literal = top_n_hint
-
-    # ---------- Build prompt & first pass ----------
-    time_window_hint = {
-        "has_time_window": question_has_window,
-        "date_column": (suggested_date_col or default_date_col) if question_has_window else None,
+    # ---------- LLM first pass ----------
+    llm_context = {
+        "contract_table": table_name,
+        "default_date_col": default_date_col,
     }
-
-    prompt = build_sql_prompt(
-        q,
-        table_name=table_name,
-        allowed_columns=allowed_cols,
-        allow_binds=allow_binds,
-        time_window_hint=time_window_hint,
-        top_n_literal=top_n_literal,
-    )
-    _log("sql_prompt", {"prompt": prompt})
-    raw1 = nl_to_sql_raw(prompt)
-    _log("llm_raw_pass1", {"text": raw1})
-    sql1 = extract_sql(raw1) or ""
+    llm_out = nl_to_sql_with_llm(q, llm_context)
+    intent = llm_out.get("intent") or {}
+    _log("clarifier_intent", intent)
+    sql1 = (llm_out.get("sql1") or "").strip()
     _log("llm_sql_pass1", {"sql": sql1})
 
     # ---------- Validate ----------
-    v1 = validate_sql(
-        sql1,
-        allow_tables=[table_name],
-        allow_columns=allowed_cols,
-        bind_whitelist=allow_binds,
-        time_window_required=question_has_window,
-    )
+    v1 = validate_sql(sql1, allow_binds=allow_binds)
     _log("validation_pass1", v1)
 
     # ---------- Repair pass if needed ----------
@@ -209,31 +143,28 @@ def answer():
     v_final = v1
     used_repair = False
     if not v1["ok"]:
-        used_repair = True
-        repair_prompt = build_sql_repair_prompt(
-            q, sql1, v1["errors"],
-            table_name=table_name,
-            allowed_columns=allowed_cols,
-            allow_binds=allow_binds,
-            time_window_hint=time_window_hint,
-            top_n_literal=top_n_literal,
+        from core.model_loader import get_model
+
+        repair_prompt = (
+            "Previous SQL had validation errors:\n"
+            f"{json.dumps(v1['errors'])}\n\n"
+            "Repair the SQL. Return Oracle SQL only. Output must begin with SELECT or WITH. No prose. No comments.\n"
+            f"Question:\n{q}\n\n"
+            "Previous SQL to repair:\n"
+            f"{sql1}\n"
         )
         _log("sql_repair_prompt", {"prompt": repair_prompt})
-        raw2 = nl_to_sql_raw(repair_prompt)
-        _log("llm_raw_pass2", {"text": raw2})
-        sql2 = extract_sql(raw2) or ""
+        sql_model = get_model("sql")
+        raw2 = sql_model.generate(repair_prompt, max_new_tokens=384, stop=[])
+        _log("llm_raw_pass2", {"text": raw2[:1200]})
+        sql2 = _extract_sql(raw2)
         _log("llm_sql_pass2", {"sql": sql2})
-        v2 = validate_sql(
-            sql2,
-            allow_tables=[table_name],
-            allow_columns=allowed_cols,
-            bind_whitelist=allow_binds,
-            time_window_required=question_has_window,
-        )
+        v2 = validate_sql(sql2, allow_binds=allow_binds)
         _log("validation_pass2", v2)
         if v2["ok"]:
-            sql_final = sql2
+            sql_final = (sql2 or "").strip()
             v_final = v2
+            used_repair = True
 
     # ---------- If still not ok → needs clarification ----------
     if not v_final["ok"]:
@@ -251,16 +182,16 @@ def answer():
             "status": "needs_clarification",
             "inquiry_id": inq_id,
             "error": v_final["errors"][0] if v_final["errors"] else "error",
-            "sql": sql_final or prompt,  # show what we tried
+            "sql": sql_final or llm_out.get("sql1"),
             "questions": [
                 "I couldn't derive a clean SELECT. Can you rephrase or specify filters (stakeholders, departments, date columns)?"
             ],
         }
         if include_debug:
             res["debug"] = {
-                "clarifier": intent,
-                "prompt": prompt,
-                "raw1": raw1,
+                "intent": intent,
+                "prompt": llm_out.get("prompt"),
+                "raw1": llm_out.get("raw1"),
                 "sql1": sql1,
                 "validation1": v1,
                 "used_repair": used_repair,
@@ -268,21 +199,30 @@ def answer():
         return jsonify(res)
 
     # ---------- Prepare binds ----------
+    binds_used = set(v_final["binds"])
     binds = {}
-    sql_binds = set(v_final["binds"])
-    requires_date_binds = {"date_start", "date_end"}.issubset(sql_binds)
+    phrase_window_hint = _question_has_window(q)
+    explicit_dates = intent.get("explicit_dates") if isinstance(intent.get("explicit_dates"), dict) else None
+    needs_window = {"date_start", "date_end"} & binds_used
+    wants_window = bool(intent.get("has_time_window")) or phrase_window_hint
+    question_has_window = wants_window
 
-    if requires_date_binds:
-        candidate_window = window_binds.copy()
-        if not (candidate_window.get("date_start") and candidate_window.get("date_end")):
-            # Attempt a fallback derivation using natural language cues if available
-            fallback_window = _derive_dates_for_question(q) if phrase_window_hint else {}
-            if fallback_window:
-                candidate_window.update(fallback_window)
-
+    if needs_window or wants_window:
+        candidate_window = {}
+        if explicit_dates and explicit_dates.get("start") and explicit_dates.get("end"):
+            try:
+                candidate_window = {
+                    "date_start": datetime.fromisoformat(explicit_dates["start"]),
+                    "date_end": datetime.fromisoformat(explicit_dates["end"]),
+                }
+            except Exception:
+                candidate_window = {}
+        if not candidate_window:
+            candidate_window = _derive_dates_for_question(q) if wants_window else {}
         if candidate_window.get("date_start") and candidate_window.get("date_end"):
-            binds.update(candidate_window)
-        else:
+            binds["date_start"] = candidate_window["date_start"]
+            binds["date_end"] = candidate_window["date_end"]
+        elif needs_window:
             with mem.begin() as conn:
                 conn.execute(
                     text(
@@ -306,43 +246,28 @@ def answer():
             }
             if include_debug:
                 res["debug"] = {
-                    "clarifier": intent,
-                    "prompt": prompt,
-                    "raw1": raw1,
+                    "intent": intent,
+                    "prompt": llm_out.get("prompt"),
+                    "raw1": llm_out.get("raw1"),
                     "sql1": sql1,
                     "validation1": v1,
                     "used_repair": used_repair,
                 }
             return jsonify(res)
 
-    bind_info = analyze_binds(sql_final, allow_binds, provided=binds)
-    _log("bind_analysis", bind_info)
-    if bind_info["illegal"]:
-        with mem.begin() as conn:
-            conn.execute(
-                text(
-                    """
-                UPDATE mem_inquiries
-                   SET status='needs_clarification', last_sql=:sql, last_error='illegal_bind', updated_at=NOW()
-             WHERE id=:id
-            """
-                ),
-                {"sql": sql_final, "id": inq_id},
-            )
-        return jsonify(
-            {
-                "ok": False,
-                "status": "needs_clarification",
-                "inquiry_id": inq_id,
-                "error": "illegal_bind",
-                "sql": sql_final,
-                "questions": [
-                    "Unsupported bind(s) detected. Please rephrase or remove custom binds."
-                ],
-            }
-        )
+    if "top_n" in binds_used:
+        top_n_val = intent.get("top_n")
+        if not isinstance(top_n_val, int):
+            m_top = re.search(r"top\s+(\d+)", q.lower())
+            if m_top:
+                try:
+                    top_n_val = int(m_top.group(1))
+                except Exception:
+                    top_n_val = None
+        binds["top_n"] = top_n_val or 10
 
-    if bind_info["missing_values"]:
+    missing_binds = [b for b in binds_used if b not in binds]
+    if missing_binds:
         with mem.begin() as conn:
             conn.execute(
                 text(
@@ -361,14 +286,14 @@ def answer():
             "error": "missing_bind_values",
             "sql": sql_final,
             "questions": [
-                f"Provide values for: {', '.join(bind_info['missing_values'])} or rephrase with explicit filters."
+                f"Provide values for: {', '.join(missing_binds)} or rephrase with explicit filters."
             ],
         }
         if include_debug:
             res["debug"] = {
-                "clarifier": intent,
-                "prompt": prompt,
-                "raw1": raw1,
+                "intent": intent,
+                "prompt": llm_out.get("prompt"),
+                "raw1": llm_out.get("raw1"),
                 "sql1": sql1,
                 "validation1": v1,
                 "used_repair": used_repair,
@@ -453,7 +378,7 @@ def answer():
         "duration_ms": duration_ms,
         "used_repair": used_repair,
         "question_has_window": question_has_window,
-        "suggested_date_column": suggested_date_col or default_date_col,
+        "suggested_date_column": intent.get("date_column") or default_date_col,
     }
     csv_path_str = str(csv_path) if csv_path else None
     resp = {
@@ -466,9 +391,9 @@ def answer():
     }
     if include_debug:
         resp["debug"] = {
-            "clarifier": intent,
-            "prompt": prompt,
-            "raw1": raw1,
+            "intent": intent,
+            "prompt": llm_out.get("prompt"),
+            "raw1": llm_out.get("raw1"),
             "validation1": v1,
             "used_repair": used_repair,
         }
