@@ -148,8 +148,9 @@ def answer():
     top_n_hint = intent_ok and intent["intent"].get("top_n") or None
 
     # ---------- Derive binds from question (or clarifier) ----------
-    has_window_by_phrase = _question_has_window(q)
     window_binds = {}
+    phrase_window_hint = _question_has_window(q)
+    has_time_window = bool(explicit_dates) or has_window_by_clarifier
     if explicit_dates and "date_start" in explicit_dates and "date_end" in explicit_dates:
         try:
             window_binds = {
@@ -158,12 +159,12 @@ def answer():
             }
         except Exception:
             window_binds = {}
-    if not window_binds and (has_window_by_phrase or has_window_by_clarifier):
+    if not window_binds and has_time_window:
         window_binds = _derive_dates_for_question(q)
 
     # Which date column should be used if a window is requested?
     suggested_date_col = _guess_explicit_date_col(q) or date_col_hint
-    question_has_window = bool(explicit_dates) or has_window_by_phrase or has_window_by_clarifier
+    question_has_window = has_time_window
 
     # TOP N literal to avoid bind oddities in FETCH FIRST
     top_n_literal = None
@@ -174,14 +175,17 @@ def answer():
         top_n_literal = top_n_hint
 
     # ---------- Build prompt & first pass ----------
+    time_window_hint = {
+        "has_time_window": question_has_window,
+        "date_column": (suggested_date_col or default_date_col) if question_has_window else None,
+    }
+
     prompt = build_sql_prompt(
         q,
         table_name=table_name,
         allowed_columns=allowed_cols,
-        allowed_binds=allow_binds,
-        default_date_column=default_date_col,
-        force_date_binds=question_has_window,
-        suggested_date_column=suggested_date_col,
+        allow_binds=allow_binds,
+        time_window_hint=time_window_hint,
         top_n_literal=top_n_literal,
     )
     _log("sql_prompt", {"prompt": prompt})
@@ -195,9 +199,8 @@ def answer():
         sql1,
         allow_tables=[table_name],
         allow_columns=allowed_cols,
-        allow_binds=allow_binds,
-        question_has_window=question_has_window,
-        required_date_column=(suggested_date_col or default_date_col) if question_has_window else None,
+        bind_whitelist=allow_binds,
+        time_window_required=question_has_window,
     )
     _log("validation_pass1", v1)
 
@@ -211,9 +214,8 @@ def answer():
             q, sql1, v1["errors"],
             table_name=table_name,
             allowed_columns=allowed_cols,
-            allowed_binds=allow_binds,
-            default_date_column=default_date_col,
-            suggested_date_column=suggested_date_col,
+            allow_binds=allow_binds,
+            time_window_hint=time_window_hint,
             top_n_literal=top_n_literal,
         )
         _log("sql_repair_prompt", {"prompt": repair_prompt})
@@ -225,9 +227,8 @@ def answer():
             sql2,
             allow_tables=[table_name],
             allow_columns=allowed_cols,
-            allow_binds=allow_binds,
-            question_has_window=question_has_window,
-            required_date_column=(suggested_date_col or default_date_col) if question_has_window else None,
+            bind_whitelist=allow_binds,
+            time_window_required=question_has_window,
         )
         _log("validation_pass2", v2)
         if v2["ok"]:
@@ -268,50 +269,26 @@ def answer():
 
     # ---------- Prepare binds ----------
     binds = {}
-    if question_has_window:
-        found_binds = set(v_final["binds"])
-        if {"date_start", "date_end"}.issubset(found_binds):
-            if window_binds.get("date_start") and window_binds.get("date_end"):
-                binds.update(window_binds)
-            else:
-                with mem.begin() as conn:
-                    conn.execute(
-                        text(
-                            """
-                        UPDATE mem_inquiries
-                           SET status='needs_clarification', last_sql=:sql, last_error='missing_window_values', updated_at=NOW()
-                         WHERE id=:id
-                    """
-                        ),
-                        {"sql": sql_final, "id": inq_id},
-                    )
-                res = {
-                    "ok": False,
-                    "status": "needs_clarification",
-                    "inquiry_id": inq_id,
-                    "error": "missing_window_values",
-                    "sql": sql_final,
-                    "questions": [
-                        "I couldn't determine the time window values. Please specify start and end dates explicitly."
-                    ],
-                }
-                if include_debug:
-                    res["debug"] = {
-                        "clarifier": intent,
-                        "prompt": prompt,
-                        "raw1": raw1,
-                        "sql1": sql1,
-                        "validation1": v1,
-                        "used_repair": used_repair,
-                    }
-                return jsonify(res)
+    sql_binds = set(v_final["binds"])
+    requires_date_binds = {"date_start", "date_end"}.issubset(sql_binds)
+
+    if requires_date_binds:
+        candidate_window = window_binds.copy()
+        if not (candidate_window.get("date_start") and candidate_window.get("date_end")):
+            # Attempt a fallback derivation using natural language cues if available
+            fallback_window = _derive_dates_for_question(q) if phrase_window_hint else {}
+            if fallback_window:
+                candidate_window.update(fallback_window)
+
+        if candidate_window.get("date_start") and candidate_window.get("date_end"):
+            binds.update(candidate_window)
         else:
             with mem.begin() as conn:
                 conn.execute(
                     text(
                         """
                     UPDATE mem_inquiries
-                       SET status='needs_clarification', last_sql=:sql, last_error='missing_binds', updated_at=NOW()
+                       SET status='needs_clarification', last_sql=:sql, last_error='missing_window_values', updated_at=NOW()
                      WHERE id=:id
                 """
                     ),
@@ -321,10 +298,10 @@ def answer():
                 "ok": False,
                 "status": "needs_clarification",
                 "inquiry_id": inq_id,
-                "error": "missing_binds",
+                "error": "missing_window_values",
                 "sql": sql_final,
                 "questions": [
-                    "The question implies a time window. Provide :date_start/:date_end or rephrase with explicit dates."
+                    "I couldn't determine the time window values. Please specify start and end dates explicitly."
                 ],
             }
             if include_debug:
@@ -340,14 +317,14 @@ def answer():
 
     bind_info = analyze_binds(sql_final, allow_binds, provided=binds)
     _log("bind_analysis", bind_info)
-    if bind_info["unknown"]:
+    if bind_info["illegal"]:
         with mem.begin() as conn:
             conn.execute(
                 text(
                     """
                 UPDATE mem_inquiries
                    SET status='needs_clarification', last_sql=:sql, last_error='illegal_bind', updated_at=NOW()
-                 WHERE id=:id
+             WHERE id=:id
             """
                 ),
                 {"sql": sql_final, "id": inq_id},
@@ -365,14 +342,14 @@ def answer():
             }
         )
 
-    if bind_info["missing"]:
+    if bind_info["missing_values"]:
         with mem.begin() as conn:
             conn.execute(
                 text(
                     """
                 UPDATE mem_inquiries
                    SET status='needs_clarification', last_sql=:sql, last_error='missing_bind_values', updated_at=NOW()
-                 WHERE id=:id
+             WHERE id=:id
             """
                 ),
                 {"sql": sql_final, "id": inq_id},
@@ -384,7 +361,7 @@ def answer():
             "error": "missing_bind_values",
             "sql": sql_final,
             "questions": [
-                f"Provide values for: {', '.join(bind_info['missing'])} or rephrase with explicit filters."
+                f"Provide values for: {', '.join(bind_info['missing_values'])} or rephrase with explicit filters."
             ],
         }
         if include_debug:

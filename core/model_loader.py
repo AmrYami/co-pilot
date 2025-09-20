@@ -43,12 +43,15 @@ def _load_sql_model() -> Optional[Dict[str, Any]]:
 
     from core.sqlcoder_exllama import load_exllama_generator
 
+    stop_tokens = [tok for tok in os.getenv("STOP", "</s>,<|im_end|>").split(",") if tok]
+    stop_tokens = [tok for tok in stop_tokens if "```" not in tok]
+
     cfg = {
         "max_seq_len": _env_int("MODEL_MAX_SEQ_LEN", 4096),
         "max_new_tokens": _env_int("GENERATION_MAX_NEW_TOKENS", 256),
         "temperature": float(os.getenv("GENERATION_TEMPERATURE", "0.2")),
         "top_p": float(os.getenv("GENERATION_TOP_P", "0.9")),
-        "stop": [tok for tok in os.getenv("STOP", "</s>,<|im_end|>").split(",") if tok],
+        "stop": stop_tokens,
     }
 
     handle = load_exllama_generator(model_path=path, config=cfg)
@@ -147,11 +150,14 @@ def _load_clarifier_model() -> Optional[Dict[str, Any]]:
     )
     model.eval()
 
+    clarifier_stop = [tok for tok in os.getenv("CLARIFIER_STOP", "").split(",") if tok]
+    clarifier_stop = [tok for tok in clarifier_stop if "```" not in tok]
+
     default_cfg = {
         "max_new_tokens": _env_int("CLARIFIER_MAX_NEW_TOKENS", 128),
         "temperature": float(os.getenv("CLARIFIER_TEMPERATURE", "0.0")),
         "top_p": float(os.getenv("CLARIFIER_TOP_P", "0.9")),
-        "stop": [tok for tok in os.getenv("CLARIFIER_STOP", "").split(",") if tok],
+        "stop": clarifier_stop,
     }
 
     target_device = _resolve_device_for_inputs(model, device_map)

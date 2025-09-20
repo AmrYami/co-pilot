@@ -1,3 +1,7 @@
+import logging
+import os
+from logging.handlers import TimedRotatingFileHandler
+
 from flask import Flask, jsonify
 
 from apps.common.admin import admin_bp as admin_common_bp
@@ -14,6 +18,21 @@ def create_app():
 
     # Initialize logging before other components emit logs
     init_logging(app)
+
+    os.makedirs("logs", exist_ok=True)
+    file_handler = TimedRotatingFileHandler(
+        "logs/dw.log", when="midnight", backupCount=14, encoding="utf-8"
+    )
+    file_handler.setLevel(logging.INFO)
+    formatter = logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s")
+    file_handler.setFormatter(formatter)
+    app.logger.addHandler(file_handler)
+    app.logger.setLevel(logging.INFO)
+
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.DEBUG if os.getenv("DW_DEBUG") == "1" else logging.INFO)
+    console_handler.setFormatter(formatter)
+    app.logger.addHandler(console_handler)
 
     # Warm up SQL model (already works)
     ensure_model(role="sql")

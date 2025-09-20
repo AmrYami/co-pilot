@@ -31,9 +31,8 @@ def validate_sql(
     *,
     allow_tables: List[str],
     allow_columns: List[str],
-    allow_binds: List[str],
-    question_has_window: bool,
-    required_date_column: str | None,   # e.g., "END_DATE" if user said "end date", else default or None
+    bind_whitelist: List[str],
+    time_window_required: bool,
 ) -> Dict:
     errs: List[str] = []
     cleaned = (sql or "").strip()
@@ -68,30 +67,34 @@ def validate_sql(
             # Heuristic: don't scream on obvious aliases; we only guard binds strictly.
             pass
 
-    binds = _BIND_RE.findall(cleaned)
+    bind_info = analyze_binds(cleaned, bind_whitelist)
+    if bind_info["illegal"]:
+        errs.append(f"illegal_binds:{','.join(bind_info['illegal'])}")
 
-    # Window logic
-    if question_has_window:
-        if required_date_column and not _mentions_column(cleaned, required_date_column):
-            errs.append(f"date_column_mismatch:{required_date_column}")
-    else:
-        if "date_start" in binds or "date_end" in binds:
-            errs.append("unexpected_date_filter")
+    used_binds = set(bind_info["used"])
+    has_date_start = "date_start" in used_binds
+    has_date_end = "date_end" in used_binds
 
-    return {"ok": len(errs) == 0, "errors": errs, "binds": binds}
+    if time_window_required and not ({"date_start", "date_end"} <= used_binds):
+        errs.append("missing_date_binds")
+
+    if (has_date_start or has_date_end) and not ({"date_start", "date_end"} <= used_binds):
+        errs.append("missing_date_binds_pair")
+
+    return {"ok": len(errs) == 0, "errors": errs, "binds": bind_info["used"]}
 
 
 def analyze_binds(sql: str, allow: Sequence[str], provided: Dict[str, object] | None = None) -> Dict:
     """Inspect bind usage ensuring only allowed binds appear and required values exist."""
 
     provided = provided or {}
-    found = set(_BIND_RE.findall(sql or ""))
+    found = sorted(set(_BIND_RE.findall(sql or "")))
     allowed = set(allow)
-    unknown = sorted(b for b in found if b not in allowed)
-    missing = sorted(b for b in found if b not in provided)
+    illegal = sorted(b for b in found if b not in allowed)
+    missing_values = sorted(b for b in found if b not in provided)
     return {
-        "found": sorted(found),
-        "unknown": unknown,
-        "missing": missing,
-        "ok": not unknown and not missing,
+        "used": found,
+        "illegal": illegal,
+        "missing_values": missing_values,
+        "ok": not illegal and not missing_values,
     }
