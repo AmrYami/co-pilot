@@ -133,6 +133,8 @@ def answer():
         binds["date_end"] = datetime.combine(date_end, datetime.min.time())
 
     exec_binds = {k: (v.isoformat() if hasattr(v, "isoformat") else v) for k, v in binds.items()}
+    _log("sql_final", {"sql": sql})
+    _log("sql_binds", exec_binds)
     _log("choose_sql", {"pass": out.get("pass"), "preview": (sql or "")[:240], "binds": exec_binds})
 
     engine = get_oracle_engine()
