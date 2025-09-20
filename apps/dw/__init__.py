@@ -1,3 +1,3 @@
-from .app import NAMESPACE, dw_bp
+from .app import NAMESPACE, create_dw_blueprint, dw_bp
 
-__all__ = ["dw_bp", "NAMESPACE"]
+__all__ = ["dw_bp", "create_dw_blueprint", "NAMESPACE"]

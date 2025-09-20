@@ -422,3 +422,8 @@ def answer():
             "used_repair": used_repair,
         }
     return jsonify(resp)
+
+
+def create_dw_blueprint(*args, **kwargs):
+    """Factory function returning the DocuWare blueprint."""
+    return dw_bp
