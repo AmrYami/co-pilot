@@ -45,7 +45,7 @@ def _insert_inquiry(conn, namespace: str, question: str, auth_email: str, prefix
     stmt = text(
         """
         INSERT INTO mem_inquiries(namespace, question, auth_email, prefixes, status, created_at, updated_at)
-        VALUES (:ns, :q, :auth, CAST(:pfx AS jsonb), 'open', NOW(), NOW())
+        VALUES (:ns, :q, :auth, CAST(:pfx AS JSONB), 'open', NOW(), NOW())
         RETURNING id
         """
     )
@@ -76,36 +76,17 @@ def answer():
 
     _log("inquiry_start", {"id": inq_id, "q": question, "email": auth_email})
 
-    llm_context = {"namespace": namespace, "table": "Contract"}
+    llm_context = {"namespace": namespace, "table": "Contract", "log": _log}
 
     out = nl_to_sql_with_llm(question, llm_context)
-    debug = out.get("debug") or {}
     intent = out.get("intent") or {}
-
-    clarifier_dbg = debug.get("clarifier") or {}
-    if clarifier_dbg.get("raw") is not None:
-        _log(
-            "clarifier_raw",
-            {
-                "used": clarifier_dbg.get("used"),
-                "ok": clarifier_dbg.get("ok"),
-                "raw": (clarifier_dbg.get("raw") or "")[:1200],
-            },
-        )
-    if clarifier_dbg.get("intent") is not None:
-        _log("clarifier_intent", clarifier_dbg.get("intent"))
-
-    if debug.get("prompt"):
-        _log("sql_prompt", {"prompt": debug["prompt"][:1200]})
-    if debug.get("raw1") is not None:
-        _log("llm_raw_pass1", {"size": len(debug.get("raw1") or "")})
-    if debug.get("raw2") is not None:
-        _log("llm_raw_pass2", {"size": len(debug.get("raw2") or "")})
-
     sql = out.get("sql") or ""
 
-    if not sql:
-        _log("validation", {"ok": False, "errors": ["empty_sql"], "binds": []})
+    if not out.get("ok") or not sql:
+        _log(
+            "validation",
+            {"ok": False, "errors": out.get("errors") or ["empty_sql"], "binds": out.get("binds") or []},
+        )
         return (
             jsonify(
                 {
@@ -114,8 +95,18 @@ def answer():
                     "questions": [
                         "I couldn't derive a clean SELECT. Can you rephrase or specify filters (stakeholders, departments, date columns)?"
                     ],
-                    "error": "empty_sql",
-                    "debug": debug,
+                    "error": ",".join(out.get("errors") or ["empty_sql"]),
+                    "debug": {
+                        "llm": {
+                            "pass": out.get("pass"),
+                            "ok": out.get("ok"),
+                            "errors": out.get("errors"),
+                            "binds": out.get("binds"),
+                            "prompt_size": len(out.get("prompt") or ""),
+                            "raw_size": len(out.get("raw") or ""),
+                        },
+                        "clarifier": out.get("clarifier"),
+                    },
                 }
             ),
             200,
@@ -135,33 +126,16 @@ def answer():
         binds["date_start"] = datetime.combine(date_start, datetime.min.time())
         binds["date_end"] = datetime.combine(date_end, datetime.min.time())
 
-    try:
-        chosen = "pass2" if debug.get("used_repair") else "pass1"
-        current_app.logger.info("[dw] chosen_sql: %s", (sql[:2000] if sql else ""))
-        current_app.logger.info(
-            "[dw] execution_binds: %s",
-            json.dumps(
-                {
-                    "chosen": chosen,
-                    "binds": {
-                        k: (v.isoformat() if hasattr(v, "isoformat") else v)
-                        for k, v in binds.items()
-                    },
-                },
-                default=str,
-            ),
-        )
-    except Exception:
-        pass
+    exec_binds = {k: (v.isoformat() if hasattr(v, "isoformat") else v) for k, v in binds.items()}
+    _log("choose_sql", {"pass": out.get("pass"), "preview": (sql or "")[:240], "binds": exec_binds})
 
     engine = get_oracle_engine()
     rows: list[list[object]] = []
     cols: list[str] = []
     started = datetime.utcnow()
     try:
-        bind_params_log = {k: (v.isoformat() if hasattr(v, "isoformat") else v) for k, v in binds.items()}
         _log("execution_sql", {"sql": sql[:1800]})
-        _log("execution_binds", bind_params_log)
+        _log("execution_binds", exec_binds)
         with engine.begin() as conn:
             result = conn.exec_driver_sql(sql, binds)
             cols = list(result.keys())
@@ -178,7 +152,17 @@ def answer():
                     "error": str(exc),
                     "sql": sql,
                     "binds": binds,
-                    "debug": debug,
+                    "debug": {
+                        "llm": {
+                            "pass": out.get("pass"),
+                            "ok": out.get("ok"),
+                            "errors": out.get("errors"),
+                            "binds": out.get("binds"),
+                            "prompt_size": len(out.get("prompt") or ""),
+                            "raw_size": len(out.get("raw") or ""),
+                        },
+                        "clarifier": out.get("clarifier"),
+                    },
                 }
             ),
             200,
@@ -194,11 +178,15 @@ def answer():
                 "binds": {k: (v.isoformat() if hasattr(v, "isoformat") else v) for k, v in binds.items()},
                 "intent": intent,
                 "debug": {
-                    "sizes": {
-                        "prompt": len(debug.get("prompt") or ""),
-                        "raw1": len(debug.get("raw1") or ""),
-                        "raw2": len(debug.get("raw2") or ""),
-                    }
+                    "llm": {
+                        "pass": out.get("pass"),
+                        "ok": out.get("ok"),
+                        "errors": out.get("errors"),
+                        "binds": out.get("binds"),
+                        "prompt_size": len(out.get("prompt") or ""),
+                        "raw_size": len(out.get("raw") or ""),
+                    },
+                    "clarifier": out.get("clarifier"),
                 },
             }
         ),

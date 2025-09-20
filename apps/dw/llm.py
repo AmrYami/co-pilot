@@ -1,10 +1,26 @@
+"""LLM utilities for the DW application."""
+
+from __future__ import annotations
+
 import json
 import os
 import re
-
-from flask import current_app
+from typing import Callable
 
 from core.model_loader import get_model
+from .validator import extract_sql, validate_sql
+
+DEFAULT_BINDS = [
+    "date_start",
+    "date_end",
+    "top_n",
+    "owner_name",
+    "dept",
+    "entity_no",
+    "contract_id_pattern",
+    "request_type",
+]
+
 
 # ------------- Clarifier -------------
 
@@ -13,15 +29,27 @@ _JSON_RE = re.compile(r"<<JSON>>\s*(\{.*?\})\s*<</JSON>>", re.S)
 
 def _heuristic_intent(question: str) -> dict:
     q = (question or "").lower()
-    has_window = any(w in q for w in ["last month", "next 30 days", "in 2024", "between", "since "])
+    has_window = any(
+        w in q for w in ["last month", "next 30 days", "in 2024", "between", "since "]
+    )
     date_col = "END_DATE" if any(w in q for w in ["expire", "expiry", "end date"]) else "REQUEST_DATE"
     top_n = None
     m = re.search(r"\btop\s+(\d+)\b", q)
     if m:
-        top_n = int(m.group(1))
+        try:
+            top_n = int(m.group(1))
+        except Exception:
+            top_n = None
     return {
         "has_time_window": bool(has_window),
-        "date_column": date_col if has_window or "end date" in q or "request date" in q or "start date" in q else None,
+        "date_column": (
+            date_col
+            if has_window
+            or "end date" in q
+            or "request date" in q
+            or "start date" in q
+            else None
+        ),
         "top_n": top_n,
         "explicit_dates": None,
     }
@@ -65,203 +93,226 @@ def clarify_intent(question: str, ctx: dict) -> dict:
         return {"intent": _heuristic_intent(question), "ok": True, "used": False, "raw": raw}
 
 
-# ------------- SQL Prompt -------------
-
-ALLOWED_COLUMNS = [
-    "CONTRACT_ID",
-    "CONTRACT_OWNER",
-    "CONTRACT_STAKEHOLDER_1",
-    "CONTRACT_STAKEHOLDER_2",
-    "CONTRACT_STAKEHOLDER_3",
-    "CONTRACT_STAKEHOLDER_4",
-    "CONTRACT_STAKEHOLDER_5",
-    "CONTRACT_STAKEHOLDER_6",
-    "CONTRACT_STAKEHOLDER_7",
-    "CONTRACT_STAKEHOLDER_8",
-    "DEPARTMENT_1",
-    "DEPARTMENT_2",
-    "DEPARTMENT_3",
-    "DEPARTMENT_4",
-    "DEPARTMENT_5",
-    "DEPARTMENT_6",
-    "DEPARTMENT_7",
-    "DEPARTMENT_8",
-    "OWNER_DEPARTMENT",
-    "CONTRACT_VALUE_NET_OF_VAT",
-    "VAT",
-    "CONTRACT_PURPOSE",
-    "CONTRACT_SUBJECT",
-    "START_DATE",
-    "END_DATE",
-    "REQUEST_DATE",
-    "REQUEST_TYPE",
-    "CONTRACT_STATUS",
-    "ENTITY_NO",
-    "REQUESTER",
-]
-
-ALLOWED_BINDS = [
-    "contract_id_pattern",
-    "date_end",
-    "date_start",
-    "dept",
-    "entity_no",
-    "owner_name",
-    "request_type",
-    "top_n",
-]
+# ------------- SQL Prompt Builders -------------
 
 
-def build_sql_prompt(question: str, intent: dict) -> str:
-    has_window = intent.get("has_time_window", False)
-    date_col = intent.get("date_column") or "REQUEST_DATE"
-    top_n = intent.get("top_n")
-
-    allowed_cols = ", ".join(ALLOWED_COLUMNS)
-    allowed_binds = ", ".join(ALLOWED_BINDS)
-
-    prompt = (
-        "Return Oracle SQL only inside ```sql fenced block. No prose.\n\n"
-        'Table: "Contract"\n'
-        f"Allowed columns only: {allowed_cols}\n"
-        "Use Oracle syntax: NVL, TRIM, LISTAGG WITHIN GROUP, FETCH FIRST N ROWS ONLY.\n"
-        "Use SELECT or WITH queries only.\n"
-        f"Allowed binds: {allowed_binds}\n"
-        f"Default date column: {date_col}.\n"
-        "Use :date_start and :date_end only when the question asks for a time window.\n"
+def _columns_whitelist() -> str:
+    return (
+        "CONTRACT_ID, CONTRACT_OWNER, "
+        "CONTRACT_STAKEHOLDER_1, CONTRACT_STAKEHOLDER_2, CONTRACT_STAKEHOLDER_3, CONTRACT_STAKEHOLDER_4, "
+        "CONTRACT_STAKEHOLDER_5, CONTRACT_STAKEHOLDER_6, CONTRACT_STAKEHOLDER_7, CONTRACT_STAKEHOLDER_8, "
+        "DEPARTMENT_1, DEPARTMENT_2, DEPARTMENT_3, DEPARTMENT_4, DEPARTMENT_5, DEPARTMENT_6, DEPARTMENT_7, DEPARTMENT_8, "
+        "OWNER_DEPARTMENT, CONTRACT_VALUE_NET_OF_VAT, VAT, CONTRACT_PURPOSE, CONTRACT_SUBJECT, "
+        "START_DATE, END_DATE, REQUEST_DATE, REQUEST_TYPE, CONTRACT_STATUS, ENTITY_NO, REQUESTER"
     )
 
-    if has_window:
-        prompt += "Add an appropriate BETWEEN filter on the requested date column.\n"
-    if top_n and isinstance(top_n, int):
-        prompt += f"If a TOP clause is implied, prefer FETCH FIRST {top_n} ROWS ONLY.\n"
 
-    prompt += f"\nQuestion:\n{question}\n\n```sql\n"
-    return prompt
-
-
-# ------------- SQL Extractor -------------
-
-_FENCE_RE = re.compile(r"```sql\s*(.*?)```", re.S | re.I)
-
-
-def extract_sql_fenced(text: str) -> str:
-    if not text:
-        return ""
-    m = _FENCE_RE.search(text)
-    if m:
-        sql = m.group(1).strip()
-        if re.match(r"^\s*(SELECT|WITH)\b", sql, re.I):
-            return sql
-        return ""
-    m2 = re.search(r"\b(SELECT|WITH)\b.*", text, re.S | re.I)
-    return m2.group(0).strip() if m2 else ""
+def _build_prompt_fenced(question: str, intent: dict, allow_binds) -> str:
+    cols = _columns_whitelist()
+    default_date_col = intent.get("date_column") or "REQUEST_DATE"
+    has_window = bool(intent.get("has_time_window"))
+    window_line = (
+        "Use :date_start and :date_end on the appropriate date column."
+        if has_window
+        else "Do not add any date filter."
+    )
+    return (
+        "Return Oracle SQL only inside ```sql fenced block. No prose.\n\n"
+        'Table: "Contract"\n'
+        f"Allowed columns only: {cols}\n"
+        "Use Oracle syntax: NVL, TRIM, LISTAGG WITHIN GROUP, FETCH FIRST N ROWS ONLY.\n"
+        "Use SELECT or WITH queries only.\n"
+        f"Allowed binds: {', '.join(allow_binds)}\n"
+        f"Default date column: {default_date_col}.\n"
+        f"{window_line}\n\n"
+        "Question:\n"
+        f"{question}\n\n"
+        "```sql\n"
+    )
 
 
-# ------------- NL → SQL (two-pass with repair) -------------
+def _build_prompt_plain(question: str, intent: dict, allow_binds) -> str:
+    cols = _columns_whitelist()
+    default_date_col = intent.get("date_column") or "REQUEST_DATE"
+    has_window = bool(intent.get("has_time_window"))
+    window_line = (
+        "When a time window is asked, use :date_start and :date_end."
+        if has_window
+        else "Do not add any date filter."
+    )
+    return (
+        "Output only Oracle SQL. No code fences. No prose. Start with SELECT or WITH.\n\n"
+        'Table: "Contract"\n'
+        f"Allowed columns only: {cols}\n"
+        "Oracle syntax only: NVL, TRIM, LISTAGG WITHIN GROUP, FETCH FIRST N ROWS ONLY.\n"
+        f"Allowed binds: {', '.join(allow_binds)}\n"
+        f"Default date column: {default_date_col}.\n"
+        f"{window_line}\n\n"
+        "Question:\n"
+        f"{question}\n\n"
+        "SQL:\n"
+    )
+
+
+def _build_prompt_prefix_select(question: str, intent: dict, allow_binds) -> str:
+    base = _build_prompt_plain(question, intent, allow_binds)
+    return base + "SELECT "
+
+
+def _get_logger(ctx: dict | None) -> Callable[[str, object], None]:
+    if not ctx:
+        return lambda *_args, **_kwargs: None
+    fn = ctx.get("log") if isinstance(ctx, dict) else None
+    if callable(fn):
+        return fn  # type: ignore[return-value]
+    return lambda *_args, **_kwargs: None
+
+
+# ------------- NL → SQL (three-pass) -------------
+
 
 def nl_to_sql_with_llm(question: str, ctx: dict) -> dict:
-    dbg = {
-        "prompt": None,
-        "raw1": None,
-        "sql1": None,
-        "validation1": None,
-        "raw2": None,
-        "sql2": None,
-        "used_repair": False,
-    }
     sql_mdl = get_model("sql")
     if not sql_mdl:
         raise RuntimeError("SQL model not available")
 
+    allow_binds = ctx.get("allow_binds") or DEFAULT_BINDS
+    logger = _get_logger(ctx)
+
     intent_out = clarify_intent(question, ctx)
-    intent = intent_out["intent"]
-    dbg["clarifier"] = intent_out
+    intent = intent_out.get("intent") or {}
 
-    prompt = build_sql_prompt(question, intent)
-    dbg["prompt"] = prompt[:1000]
-
-    raw1 = sql_mdl.generate(prompt, max_new_tokens=int(os.getenv("SQL_MAX_NEW_TOKENS", "384")), stop=["```"])
-    try:
-        current_app.logger.info(
-            "[dw] llm_raw_pass1: %s",
-            json.dumps(
-                {
-                    "size": len(raw1 or ""),
-                    "head": (raw1 or "")[:240],
-                    "tail": (raw1 or "")[-240:],
-                },
-                default=str,
-            ),
+    raw_clarifier = intent_out.get("raw")
+    if raw_clarifier is not None:
+        logger(
+            "clarifier_raw",
+            {
+                "used": intent_out.get("used"),
+                "ok": intent_out.get("ok"),
+                "raw": (raw_clarifier or "")[:400],
+            },
         )
-    except Exception:
-        pass
-    dbg["raw1"] = raw1[:1000] if raw1 else ""
-    sql1 = extract_sql_fenced(raw1)
-    try:
-        current_app.logger.info(
-            "[dw] llm_sql_pass1: %s",
-            json.dumps(
-                {
-                    "size": len(sql1 or ""),
-                    "preview": (sql1 or "")[:400],
-                },
-                default=str,
-            ),
-        )
-    except Exception:
-        pass
-    dbg["sql1"] = sql1
+    logger("clarifier_intent", intent)
 
-    ok1 = bool(sql1) and re.match(r"^\s*(SELECT|WITH)\b", sql1, re.I)
-    dbg["validation1"] = {"ok": bool(ok1), "errors": [] if ok1 else ["empty_sql"], "binds": []}
+    max_new_tokens = int(os.getenv("SQL_MAX_NEW_TOKENS", "384"))
 
-    if ok1:
-        dbg["used_repair"] = False
-        return {"sql": sql1, "intent": intent, "debug": dbg}
-
-    errors = dbg["validation1"].get("errors") if dbg.get("validation1") else ["unknown"]
-    repair = (
-        "Fix the SQL. Return only Oracle SQL in ```sql fenced block. No prose.\n\n"
-        f"Errors: {errors}\n\n"
-        f"Question:\n{question}\n\n"
-        "```sql\n"
+    # --- PASS 1: fenced prompt
+    prompt1 = _build_prompt_fenced(question, intent, allow_binds)
+    logger("sql_prompt_pass1", {"preview": prompt1[:400]})
+    raw1 = sql_mdl.generate(prompt1, max_new_tokens=max_new_tokens)
+    sql1 = extract_sql(raw1)
+    logger(
+        "llm_raw_pass1",
+        {
+            "size": len(raw1 or ""),
+            "head": (raw1 or "")[:120],
+            "tail": (raw1 or "")[-120:],
+        },
     )
-    raw2 = sql_mdl.generate(repair, max_new_tokens=int(os.getenv("SQL_MAX_NEW_TOKENS", "256")), stop=["```"])
-    try:
-        current_app.logger.info(
-            "[dw] llm_raw_pass2: %s",
-            json.dumps(
-                {
-                    "size": len(raw2 or ""),
-                    "head": (raw2 or "")[:240],
-                    "tail": (raw2 or "")[-240:],
-                },
-                default=str,
-            ),
-        )
-    except Exception:
-        pass
-    dbg["raw2"] = raw2[:1000] if raw2 else ""
-    sql2 = extract_sql_fenced(raw2)
-    try:
-        current_app.logger.info(
-            "[dw] llm_sql_pass2: %s",
-            json.dumps(
-                {
-                    "size": len(sql2 or ""),
-                    "preview": (sql2 or "")[:400],
-                },
-                default=str,
-            ),
-        )
-    except Exception:
-        pass
-    dbg["sql2"] = sql2
+    logger(
+        "llm_sql_pass1",
+        {
+            "size": len(sql1 or ""),
+            "preview": (sql1 or "")[:200],
+        },
+    )
+    ok1, errs1, binds1 = validate_sql(sql1, allow_tables=("Contract",), allow_binds=allow_binds)
+    logger("validation_pass1", {"ok": ok1, "errors": errs1, "binds": binds1})
+    if ok1:
+        return {
+            "prompt": prompt1,
+            "raw": raw1,
+            "sql": sql1,
+            "binds": binds1,
+            "pass": 1,
+            "ok": True,
+            "errors": [],
+            "intent": intent,
+            "clarifier": intent_out,
+        }
 
-    if sql2 and re.match(r"^\s*(SELECT|WITH)\b", sql2, re.I):
-        dbg["used_repair"] = True
-        return {"sql": sql2, "intent": intent, "debug": dbg}
+    # --- PASS 2: plain prompt
+    prompt2 = _build_prompt_plain(question, intent, allow_binds)
+    logger("sql_prompt_pass2", {"preview": prompt2[:400]})
+    raw2 = sql_mdl.generate(prompt2, max_new_tokens=max_new_tokens)
+    sql2 = extract_sql(raw2)
+    logger(
+        "llm_raw_pass2",
+        {
+            "size": len(raw2 or ""),
+            "head": (raw2 or "")[:120],
+            "tail": (raw2 or "")[-120:],
+        },
+    )
+    logger(
+        "llm_sql_pass2",
+        {
+            "size": len(sql2 or ""),
+            "preview": (sql2 or "")[:200],
+        },
+    )
+    ok2, errs2, binds2 = validate_sql(sql2, allow_tables=("Contract",), allow_binds=allow_binds)
+    logger("validation_pass2", {"ok": ok2, "errors": errs2, "binds": binds2})
+    if ok2:
+        return {
+            "prompt": prompt2,
+            "raw": raw2,
+            "sql": sql2,
+            "binds": binds2,
+            "pass": 2,
+            "ok": True,
+            "errors": [],
+            "intent": intent,
+            "clarifier": intent_out,
+        }
 
-    dbg["used_repair"] = True
-    return {"sql": "", "intent": intent, "debug": dbg}
+    # --- PASS 3: prefix-primed SELECT
+    prompt3 = _build_prompt_prefix_select(question, intent, allow_binds)
+    logger("sql_prompt_pass3", {"preview": prompt3[:400]})
+    raw3 = sql_mdl.generate(prompt3, max_new_tokens=max_new_tokens)
+    text3 = raw3 or ""
+    if not text3.strip().lower().startswith("select"):
+        text3 = "SELECT " + text3.lstrip()
+    sql3 = extract_sql(text3)
+    logger(
+        "llm_raw_pass3",
+        {
+            "size": len(raw3 or ""),
+            "head": (raw3 or "")[:160],
+            "tail": (raw3 or "")[-160:],
+        },
+    )
+    logger(
+        "llm_sql_pass3",
+        {
+            "size": len(sql3 or ""),
+            "preview": (sql3 or "")[:240],
+        },
+    )
+    ok3, errs3, binds3 = validate_sql(sql3, allow_tables=("Contract",), allow_binds=allow_binds)
+    logger("validation_pass3", {"ok": ok3, "errors": errs3, "binds": binds3})
+    if ok3:
+        return {
+            "prompt": prompt3,
+            "raw": text3,
+            "sql": sql3,
+            "binds": binds3,
+            "pass": 3,
+            "ok": True,
+            "errors": [],
+            "intent": intent,
+            "clarifier": intent_out,
+        }
+
+    # Give up with the last attempt
+    return {
+        "prompt": prompt3,
+        "raw": text3,
+        "sql": sql3,
+        "binds": binds3,
+        "pass": 3,
+        "ok": False,
+        "errors": errs3,
+        "intent": intent,
+        "clarifier": intent_out,
+    }
