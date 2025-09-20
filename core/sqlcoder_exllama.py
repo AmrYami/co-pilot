@@ -4,7 +4,15 @@ from typing import List, Optional
 
 from exllamav2 import ExLlamaV2, ExLlamaV2Config
 from exllamav2.tokenizer import ExLlamaV2Tokenizer
-from exllamav2.generator import ExLlamaV2Generator, ExLlamaV2Sampler
+from exllamav2.generator import ExLlamaV2Generator
+
+try:  # pragma: no cover - depends on exllamav2 version
+    from exllamav2.generator.sampler import ExLlamaV2Sampler  # type: ignore[attr-defined]
+except Exception:  # pragma: no cover - fallback for older builds
+    try:
+        from exllamav2.generator import ExLlamaV2Sampler  # type: ignore[attr-defined]
+    except Exception:  # pragma: no cover - no sampler available
+        ExLlamaV2Sampler = None  # type: ignore[assignment]
 
 LOG = logging.getLogger("main")
 
@@ -40,16 +48,29 @@ class SQLCoderExL2:
 
     # ---------- internals ----------
 
-    def _build_settings(self) -> ExLlamaV2Sampler.Settings:
-        s = ExLlamaV2Sampler.Settings()
-        # Sampling
-        s.temperature = float(os.getenv("GENERATION_TEMPERATURE", "0.2"))
-        s.top_p = float(os.getenv("GENERATION_TOP_P", "0.9"))
-        s.top_k = int(os.getenv("GENERATION_TOP_K", "0"))
-        # Optional stabilizers
-        s.min_p = float(os.getenv("GENERATION_MIN_P", "0.05"))
-        s.token_repetition_penalty = float(os.getenv("GENERATION_REPEAT_PENALTY", "1.08"))
-        return s
+    def _build_settings(self) -> Optional["ExLlamaV2Sampler.Settings"]:
+        if ExLlamaV2Sampler is None:
+            return None
+        try:
+            settings = ExLlamaV2Sampler.Settings()
+        except Exception:
+            return None
+
+        def _set(attr: str, env: str, default: str, cast):
+            if not hasattr(settings, attr):
+                return
+            try:
+                value = cast(os.getenv(env, default))
+            except Exception:
+                value = cast(default)
+            setattr(settings, attr, value)
+
+        _set("temperature", "GENERATION_TEMPERATURE", "0.2", float)
+        _set("top_p", "GENERATION_TOP_P", "0.9", float)
+        _set("top_k", "GENERATION_TOP_K", "0", int)
+        _set("min_p", "GENERATION_MIN_P", "0.05", float)
+        _set("token_repetition_penalty", "GENERATION_REPEAT_PENALTY", "1.08", float)
+        return settings
 
     def _truncate_prompt(self, prompt: str, max_new: int) -> str:
         """Token-level truncate so prompt + new tokens fit inside cache window."""
@@ -73,17 +94,29 @@ class SQLCoderExL2:
                 cut = min(cut, i)
         return text[:cut]
 
-    def _call_generate_simple(self, prompt: str, settings: ExLlamaV2Sampler.Settings, max_new: int) -> str:
+    def _call_generate_simple(self, prompt: str, settings: Optional["ExLlamaV2Sampler.Settings"], max_new: int) -> str:
         """
         Handle both exllamav2 signatures:
           - new: generate_simple(prompt, settings, num_tokens)
           - old: generate_simple(prompt, num_tokens)
         """
+        if settings is not None:
+            try:
+                return self._generator.generate_simple(prompt, settings, max_new)
+            except TypeError:
+                # fall back to 2-arg signature below
+                pass
+
         try:
-            return self._generator.generate_simple(prompt, settings, max_new)
-        except TypeError:
-            # Fallback for older API: (prompt, num_tokens)
             return self._generator.generate_simple(prompt, max_new)
+        except TypeError:
+            if settings is None and ExLlamaV2Sampler is not None:
+                try:
+                    fallback = ExLlamaV2Sampler.Settings()
+                    return self._generator.generate_simple(prompt, fallback, max_new)
+                except Exception:
+                    pass
+            raise
 
     # ---------- public ----------
 
