@@ -27,6 +27,37 @@ NAMESPACE = "dw::common"
 dw_bp = Blueprint("dw", __name__)
 
 
+DW_BIND_WHITELIST = {
+    "date_start",
+    "date_end",
+    "top_n",
+    "owner_name",
+    "dept",
+    "entity_no",
+    "contract_id_pattern",
+    "request_type",
+}
+
+_BIND_RE = re.compile(r":([A-Za-z_][A-Za-z0-9_]*)")
+
+
+def _binds_used_in_sql(sql: str) -> set[str]:
+    if not sql:
+        return set()
+    return set(_BIND_RE.findall(sql))
+
+
+def _validate_bind_whitelist(sql: str, whitelist: set[str]) -> tuple[bool, list[str]]:
+    used = _binds_used_in_sql(sql)
+    not_allowed = sorted(used - whitelist)
+    return (len(not_allowed) == 0, not_allowed)
+
+
+def _filter_binds_for_sql(sql: str, candidate_binds: dict) -> dict:
+    used = _binds_used_in_sql(sql)
+    return {k: v for k, v in (candidate_binds or {}).items() if k in used}
+
+
 @dw_bp.route("/model/info", methods=["GET"])
 def model_info_route():
     from core.model_loader import model_info as _model_info
@@ -157,26 +188,9 @@ def _window_requested(text: str) -> bool:
     return False
 
 
-_BIND_WHITELIST = {
-    "date_start",
-    "date_end",
-    "top_n",
-    "owner_name",
-    "dept",
-    "entity_no",
-    "contract_id_pattern",
-    "request_type",
-}
-
-
-def _find_binds(sql: str) -> set[str]:
-    return set(re.findall(r":([A-Za-z_][A-Za-z0-9_]*)", sql or ""))
-
-
 def _validate_sql(
     sql: str,
     *,
-    allow_binds: set[str],
     need_window: bool,
     date_col_hint: str | None,
 ) -> tuple[bool, str, set[str]]:
@@ -187,10 +201,7 @@ def _validate_sql(
     if not (lowered.startswith("select") or lowered.startswith("with")):
         return False, "not_select", set()
 
-    binds = _find_binds(sql)
-    bad = {b for b in binds if b not in allow_binds}
-    if bad:
-        return False, "forbidden_bind", bad
+    binds = _binds_used_in_sql(sql)
 
     has_window_binds = {"date_start", "date_end"}.issubset(binds)
     any_window_binds = bool({"date_start", "date_end"} & binds)
@@ -1096,47 +1107,26 @@ def answer():
             "I couldn't derive a clean SELECT. Could you rephrase or specify filters (stakeholders, departments, date columns)?"
         )
 
-    binds: Dict[str, Any] = {}
+    candidate_binds: Dict[str, Any] = {}
     window_label: Optional[str] = None
     date_column_used: Optional[str] = None
     win = _infer_window_from_question(question) if need_window else None
     if win:
         date_col = date_col_hint or "REQUEST_DATE"
-        wants_date_binds = ":date_start" in sql or ":date_end" in sql
         start_dt = _normalize_dt(win["start"]) if "start" in win else None
         end_dt = _normalize_dt(win["end"]) if "end" in win else None
         if start_dt and end_dt:
-            binds["date_start"] = start_dt
-            binds["date_end"] = end_dt
+            candidate_binds["date_start"] = start_dt
+            candidate_binds["date_end"] = end_dt
             window_label = win.get("label")
             date_column_used = date_col
-            if not wants_date_binds:
-                sql = (
-                    "WITH q AS (\n"
-                    f"{sql}\n"
-                    ")\n"
-                    "SELECT * FROM q\n"
-                    f"WHERE {date_col} >= :date_start AND {date_col} < :date_end"
-                )
-        else:
-            binds.pop("date_start", None)
-            binds.pop("date_end", None)
 
-    ok_sql, reason, bind_info = _validate_sql(
+    ok_sql, reason, _ = _validate_sql(
         sql,
-        allow_binds=_BIND_WHITELIST,
         need_window=need_window,
         date_col_hint=date_col_hint,
     )
     if not ok_sql:
-        if reason == "forbidden_bind":
-            bad_binds = sorted(f":{name}" for name in bind_info)
-            return _needs_clarification(
-                f"Your query used unsupported bind(s): {', '.join(bad_binds)}. "
-                f"Allowed binds: {', '.join(':'+b for b in sorted(_BIND_WHITELIST))}.",
-                sql_text=sql,
-                error="bad_binds",
-            )
         if reason == "missing_date_context":
             return _needs_clarification(
                 "This question needs a start and end date. Please provide the timeframe you have in mind.",
@@ -1155,16 +1145,37 @@ def answer():
             error=reason,
         )
 
-    expected_binds = bind_info
-    missing_binds = sorted(name for name in expected_binds if name not in binds)
-    if missing_binds:
-        return _needs_clarification(
-            f"Provide values for: {', '.join(missing_binds)} or rephrase with explicit filters.",
-            sql_text=sql,
-            error="missing_binds",
-        )
+    ok_allowed, not_allowed = _validate_bind_whitelist(sql, DW_BIND_WHITELIST)
+    if not ok_allowed:
+        _update_inquiry("needs_clarification")
+        payload = {
+            "ok": False,
+            "status": "needs_clarification",
+            "error": "binds_not_allowed",
+            "details": {"not_allowed": not_allowed},
+            "sql": sql,
+            "inquiry_id": inquiry_id,
+        }
+        return jsonify(payload), 200
 
-    exec_binds = {name: binds[name] for name in expected_binds}
+    candidate_binds = dict(candidate_binds or {})
+    runtime_binds = _filter_binds_for_sql(sql, candidate_binds)
+
+    used_binds = _binds_used_in_sql(sql)
+    missing = sorted(used_binds - set(runtime_binds.keys()))
+    if missing:
+        _update_inquiry("needs_clarification")
+        payload = {
+            "ok": False,
+            "status": "needs_clarification",
+            "error": "missing_binds",
+            "questions": [
+                "Provide values for: " + ", ".join(missing) + " or rephrase with explicit filters."
+            ],
+            "sql": sql,
+            "inquiry_id": inquiry_id,
+        }
+        return jsonify(payload), 200
 
     appended_limit = False
     if "fetch first" not in sql.lower():
@@ -1172,7 +1183,7 @@ def answer():
         appended_limit = True
 
     start_time = time.perf_counter()
-    ok, fetched_rows, meta_exec, exec_error = run_sql_oracle(oracle, sql, exec_binds)
+    ok, fetched_rows, meta_exec, exec_error = run_sql_oracle(oracle, sql, runtime_binds)
     elapsed_ms = int((time.perf_counter() - start_time) * 1000)
     if not ok:
         return _needs_clarification(
@@ -1185,7 +1196,7 @@ def answer():
     rows = fetched_rows or []
     meta_payload: Dict[str, Any] = dict(meta_exec or {})
     serialized_binds: Dict[str, Any] = {}
-    for key, value in exec_binds.items():
+    for key, value in runtime_binds.items():
         if isinstance(value, (datetime, date)):
             serialized_binds[key] = value.isoformat()
         else:
