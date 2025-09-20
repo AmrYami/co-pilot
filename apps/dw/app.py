@@ -1,49 +1,93 @@
-from flask import Blueprint, request, jsonify, current_app
-from sqlalchemy import text
-from datetime import datetime, date, timedelta
-import os, json, csv, pathlib, re
+from __future__ import annotations
+
+import csv
+import json
+import logging
+import os
+import pathlib
+import re
+from datetime import date, datetime, timedelta
 from logging.handlers import TimedRotatingFileHandler
+
+from flask import Blueprint, jsonify, current_app, request
+from sqlalchemy import text
 from core.settings import Settings
 from core.datasources import DatasourceRegistry
 from core.sql_exec import get_mem_engine
-from .llm import nl_to_sql_with_llm, _extract_sql
+from .llm import (
+    BIND_WHITELIST,
+    build_repair_prompt,
+    call_sql_model,
+    extract_sql,
+    nl_to_sql_with_llm,
+)
 from .validator import validate_sql
 
 
 dw_bp = Blueprint("dw", __name__, url_prefix="/dw")
 
+
+def _env_truthy(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"", "0", "false", "no"}
+
+
 NAMESPACE = os.environ.get("DW_NAMESPACE", "dw::common")
-DW_DEBUG = os.environ.get("DW_DEBUG", "1") == "1"
-DW_INCLUDE_DEBUG = os.environ.get("DW_INCLUDE_DEBUG", "1") == "1"
+DW_DEBUG = _env_truthy("DW_DEBUG")
+DW_INCLUDE_DEBUG = _env_truthy("DW_INCLUDE_DEBUG", default=True)
 
 
 def _settings():
     return Settings()
 
 
-def _ensure_daily_log():
-    """Attach a daily rotating file handler for DW logs."""
+def _ensure_log_dir_and_handler(app):
+    """Create logs/ and attach a daily rotating file handler once."""
 
-    log_dir = os.path.join(os.getcwd(), "logs")
-    os.makedirs(log_dir, exist_ok=True)
-    fname = os.path.join(log_dir, "dw.log")
-    if not any(isinstance(h, TimedRotatingFileHandler) for h in current_app.logger.handlers):
-        handler = TimedRotatingFileHandler(fname, when="midnight", backupCount=14, encoding="utf-8")
-        handler.setLevel(current_app.logger.level)
-        current_app.logger.addHandler(handler)
+    try:
+        log_dir = os.environ.get("DW_LOG_DIR", "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, "dw.log")
+
+        existing = [h for h in app.logger.handlers if getattr(h, "_dw_handler", False)]
+        if existing:
+            return
+
+        debug_level = logging.DEBUG if DW_DEBUG else logging.INFO
+
+        console = logging.StreamHandler()
+        console.setLevel(debug_level)
+        console.setFormatter(logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s"))
+
+        fileh = TimedRotatingFileHandler(log_path, when="midnight", backupCount=14, encoding="utf-8")
+        fileh.setLevel(debug_level)
+        fileh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s"))
+        fileh._dw_handler = True  # type: ignore[attr-defined]
+
+        app.logger.setLevel(debug_level)
+        app.logger.addHandler(console)
+        app.logger.addHandler(fileh)
+        app.logger.info("[dw] logging initialized")
+    except Exception as exc:  # pragma: no cover - defensive logging setup
+        print(f"[dw] log init failed: {exc}")
+
 
 def _log(tag, payload):
     """Structured logging helper scoped to DW blueprint."""
 
     try:
-        current_app.logger.info(f"[dw] {tag}: {payload}")
+        msg = payload if isinstance(payload, str) else json.dumps(payload, default=str)
+        current_app.logger.info(f"[dw] {tag}: {msg}")
     except Exception:
-        pass
+        current_app.logger.info(f"[dw] {tag}: {payload}")
 
 
-@dw_bp.before_app_first_request
-def _init_dw_logging():
-    _ensure_daily_log()
+@dw_bp.record_once
+def _init_dw_logging(setup_state):
+    app = setup_state.app
+    _ensure_log_dir_and_handler(app)
 
 
 def _question_has_window(q: str) -> bool:
@@ -111,7 +155,7 @@ def answer():
 
     table_name = s.get("DW_CONTRACT_TABLE", scope="namespace") or "Contract"
     default_date_col = s.get("DW_DATE_COLUMN", scope="namespace") or "REQUEST_DATE"
-    allow_binds = ["date_start","date_end","top_n","owner_name","dept","entity_no","contract_id_pattern","request_type"]
+    allow_binds = sorted(BIND_WHITELIST)
 
     # Create inquiry row (status open)
     with mem.begin() as conn:
@@ -143,21 +187,18 @@ def answer():
     v_final = v1
     used_repair = False
     if not v1["ok"]:
-        from core.model_loader import get_model
-
-        repair_prompt = (
-            "Previous SQL had validation errors:\n"
-            f"{json.dumps(v1['errors'])}\n\n"
-            "Repair the SQL. Return Oracle SQL only. Output must begin with SELECT or WITH. No prose. No comments.\n"
-            f"Question:\n{q}\n\n"
-            "Previous SQL to repair:\n"
-            f"{sql1}\n"
+        repair_prompt = build_repair_prompt(
+            q,
+            sql1,
+            v1.get("errors", []),
+            intent,
+            table=table_name,
+            default_date_col=default_date_col,
         )
         _log("sql_repair_prompt", {"prompt": repair_prompt})
-        sql_model = get_model("sql")
-        raw2 = sql_model.generate(repair_prompt, max_new_tokens=384, stop=[])
+        raw2 = call_sql_model(repair_prompt, max_new_tokens=384)
         _log("llm_raw_pass2", {"text": raw2[:1200]})
-        sql2 = _extract_sql(raw2)
+        sql2 = extract_sql(raw2)
         _log("llm_sql_pass2", {"sql": sql2})
         v2 = validate_sql(sql2, allow_binds=allow_binds)
         _log("validation_pass2", v2)
