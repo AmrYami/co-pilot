@@ -5,8 +5,7 @@ from datetime import datetime, timedelta
 
 from flask import Blueprint, current_app, jsonify, request
 from logging.handlers import TimedRotatingFileHandler
-from sqlalchemy import bindparam, text
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy import text
 
 from core.sql_exec import get_mem_engine, get_oracle_engine
 from .llm import nl_to_sql_with_llm
@@ -43,21 +42,18 @@ def _log(tag: str, payload):
 def _insert_inquiry(conn, namespace: str, question: str, auth_email: str, prefixes):
     """Insert a mem inquiry using JSONB-aware binds."""
 
-    stmt = (
-        text(
-            """
-            INSERT INTO mem_inquiries(namespace, question, auth_email, prefixes, status, created_at, updated_at)
-            VALUES (:ns, :q, :auth, :pfx, 'open', NOW(), NOW())
-            RETURNING id
-            """
-        )
-        .bindparams(bindparam("pfx", type_=JSONB))
+    stmt = text(
+        """
+        INSERT INTO mem_inquiries(namespace, question, auth_email, prefixes, status, created_at, updated_at)
+        VALUES (:ns, :q, :auth, CAST(:pfx AS jsonb), 'open', NOW(), NOW())
+        RETURNING id
+        """
     )
     params = {
         "ns": namespace,
         "q": question,
         "auth": auth_email,
-        "pfx": prefixes or [],
+        "pfx": json.dumps(prefixes or []),
     }
     return conn.execute(stmt, params).scalar_one()
 
@@ -141,19 +137,19 @@ def answer():
 
     try:
         chosen = "pass2" if debug.get("used_repair") else "pass1"
+        current_app.logger.info("[dw] chosen_sql: %s", (sql[:2000] if sql else ""))
         current_app.logger.info(
-            "[dw] final_sql_exec: %s",
+            "[dw] execution_binds: %s",
             json.dumps(
                 {
                     "chosen": chosen,
-                    "sql": sql,
                     "binds": {
                         k: (v.isoformat() if hasattr(v, "isoformat") else v)
                         for k, v in binds.items()
                     },
                 },
                 default=str,
-            )[:4000],
+            ),
         )
     except Exception:
         pass

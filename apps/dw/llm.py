@@ -67,16 +67,49 @@ def clarify_intent(question: str, ctx: dict) -> dict:
 
 # ------------- SQL Prompt -------------
 
-_ALLOWED_COLS = (
-    "CONTRACT_ID, CONTRACT_OWNER, "
-    "CONTRACT_STAKEHOLDER_1, CONTRACT_STAKEHOLDER_2, CONTRACT_STAKEHOLDER_3, CONTRACT_STAKEHOLDER_4, "
-    "CONTRACT_STAKEHOLDER_5, CONTRACT_STAKEHOLDER_6, CONTRACT_STAKEHOLDER_7, CONTRACT_STAKEHOLDER_8, "
-    "DEPARTMENT_1, DEPARTMENT_2, DEPARTMENT_3, DEPARTMENT_4, DEPARTMENT_5, DEPARTMENT_6, DEPARTMENT_7, DEPARTMENT_8, "
-    "OWNER_DEPARTMENT, CONTRACT_VALUE_NET_OF_VAT, VAT, CONTRACT_PURPOSE, CONTRACT_SUBJECT, "
-    "START_DATE, END_DATE, REQUEST_DATE, REQUEST_TYPE, CONTRACT_STATUS, ENTITY_NO, REQUESTER"
-)
+ALLOWED_COLUMNS = [
+    "CONTRACT_ID",
+    "CONTRACT_OWNER",
+    "CONTRACT_STAKEHOLDER_1",
+    "CONTRACT_STAKEHOLDER_2",
+    "CONTRACT_STAKEHOLDER_3",
+    "CONTRACT_STAKEHOLDER_4",
+    "CONTRACT_STAKEHOLDER_5",
+    "CONTRACT_STAKEHOLDER_6",
+    "CONTRACT_STAKEHOLDER_7",
+    "CONTRACT_STAKEHOLDER_8",
+    "DEPARTMENT_1",
+    "DEPARTMENT_2",
+    "DEPARTMENT_3",
+    "DEPARTMENT_4",
+    "DEPARTMENT_5",
+    "DEPARTMENT_6",
+    "DEPARTMENT_7",
+    "DEPARTMENT_8",
+    "OWNER_DEPARTMENT",
+    "CONTRACT_VALUE_NET_OF_VAT",
+    "VAT",
+    "CONTRACT_PURPOSE",
+    "CONTRACT_SUBJECT",
+    "START_DATE",
+    "END_DATE",
+    "REQUEST_DATE",
+    "REQUEST_TYPE",
+    "CONTRACT_STATUS",
+    "ENTITY_NO",
+    "REQUESTER",
+]
 
-_WHITELIST_BINDS = "contract_id_pattern, date_end, date_start, dept, entity_no, owner_name, request_type, top_n"
+ALLOWED_BINDS = [
+    "contract_id_pattern",
+    "date_end",
+    "date_start",
+    "dept",
+    "entity_no",
+    "owner_name",
+    "request_type",
+    "top_n",
+]
 
 
 def build_sql_prompt(question: str, intent: dict) -> str:
@@ -84,25 +117,27 @@ def build_sql_prompt(question: str, intent: dict) -> str:
     date_col = intent.get("date_column") or "REQUEST_DATE"
     top_n = intent.get("top_n")
 
-    head = (
-        "Return Oracle SQL only inside a fenced block:\n"
-        "```sql\n"
-        "-- SQL starts on next line\n"
+    allowed_cols = ", ".join(ALLOWED_COLUMNS)
+    allowed_binds = ", ".join(ALLOWED_BINDS)
+
+    prompt = (
+        "Return Oracle SQL only inside ```sql fenced block. No prose.\n\n"
         'Table: "Contract"\n'
-        f"Allowed columns: {_ALLOWED_COLS}\n"
-        "Oracle syntax only (NVL, TRIM, LISTAGG WITHIN GROUP, FETCH FIRST N ROWS ONLY). SELECT/CTE only.\n"
-        f"Allowed binds: {_WHITELIST_BINDS}\n"
-        "Add date filter ONLY if user asks. For windows use :date_start and :date_end.\n"
-        f"Default window column: {date_col}.\n"
-        "No prose, comments, or explanations.\n"
-        f"Question:\n{question}\n```sql\n"
+        f"Allowed columns only: {allowed_cols}\n"
+        "Use Oracle syntax: NVL, TRIM, LISTAGG WITHIN GROUP, FETCH FIRST N ROWS ONLY.\n"
+        "Use SELECT or WITH queries only.\n"
+        f"Allowed binds: {allowed_binds}\n"
+        f"Default date column: {date_col}.\n"
+        "Use :date_start and :date_end only when the question asks for a time window.\n"
     )
 
-    tail_hint = ""
+    if has_window:
+        prompt += "Add an appropriate BETWEEN filter on the requested date column.\n"
     if top_n and isinstance(top_n, int):
-        tail_hint = f"-- Prefer FETCH FIRST {top_n} ROWS ONLY if needed\n"
+        prompt += f"If a TOP clause is implied, prefer FETCH FIRST {top_n} ROWS ONLY.\n"
 
-    return head + tail_hint
+    prompt += f"\nQuestion:\n{question}\n\n```sql\n"
+    return prompt
 
 
 # ------------- SQL Extractor -------------
@@ -185,13 +220,10 @@ def nl_to_sql_with_llm(question: str, ctx: dict) -> dict:
         dbg["used_repair"] = False
         return {"sql": sql1, "intent": intent, "debug": dbg}
 
+    errors = dbg["validation1"].get("errors") if dbg.get("validation1") else ["unknown"]
     repair = (
-        "Previous SQL had validation errors: ['empty_sql']\n\n"
-        "Repair the SQL. Return Oracle SQL only inside a ```sql fenced block. No prose. No comments. "
-        'Table: "Contract".\n'
-        f"Allowed columns: {_ALLOWED_COLS}\n"
-        f"Allowed binds: {_WHITELIST_BINDS}\n"
-        "Use :date_start and :date_end only if a time window is requested.\n\n"
+        "Fix the SQL. Return only Oracle SQL in ```sql fenced block. No prose.\n\n"
+        f"Errors: {errors}\n\n"
         f"Question:\n{question}\n\n"
         "```sql\n"
     )

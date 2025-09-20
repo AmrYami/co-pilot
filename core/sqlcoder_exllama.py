@@ -9,6 +9,14 @@ from typing import Any, Dict, Iterable, Optional
 
 import torch
 
+try:  # exllamav2 >= 0.1.5
+    from exllamav2.generator.sampler import ExLlamaV2Sampler  # type: ignore
+except Exception:  # pragma: no cover - fallback for older versions
+    try:
+        from exllamav2.generator import ExLlamaV2Sampler  # type: ignore
+    except Exception:  # pragma: no cover - sampler unavailable
+        ExLlamaV2Sampler = None  # type: ignore
+
 
 logger = logging.getLogger("dw")
 
@@ -49,7 +57,7 @@ class SQLCoderExLlama:
         reserve_tokens = max(0, reserve_tokens)
 
         try:
-            ids = self._tokenizer.encode(prompt)
+            ids = self._tokenizer.encode(prompt, add_bos=True)
         except Exception:
             if len(prompt) > 8000:
                 tail = prompt[-8000:]
@@ -57,14 +65,23 @@ class SQLCoderExLlama:
                 return tail
             return prompt
 
+        if hasattr(ids, "tolist"):
+            tokens = ids.tolist()
+            if tokens and isinstance(tokens[0], list):
+                tokens = tokens[0]
+        else:
+            tokens = list(ids)
+
+        token_count = len(tokens)
+
         max_new = max(0, int(max_new_tokens or 0))
         max_input_tokens = max(1, self._cache_max_seq_len - max_new - reserve_tokens)
-        if len(ids) > max_input_tokens:
-            ids = ids[-max_input_tokens:]
-            prompt = self._tokenizer.decode(ids)
+        if token_count > max_input_tokens:
+            tokens = tokens[-max_input_tokens:]
+            prompt = self._tokenizer.decode(tokens)
             logger.debug(
                 "[dw] prompt truncated to %d tokens (max_input_tokens=%d)",
-                len(ids),
+                len(tokens),
                 max_input_tokens,
             )
         return prompt
@@ -90,11 +107,40 @@ class SQLCoderExLlama:
 
         return text[:cut]
 
-    def _call_generate_simple(self, prompt: str, max_new_tokens: int):
+    def _call_generate_simple(
+        self,
+        prompt: str,
+        max_new_tokens: int,
+        temperature: Optional[float],
+        top_p: Optional[float],
+    ):
+        settings = None
+        if ExLlamaV2Sampler is not None:
+            try:
+                settings = ExLlamaV2Sampler.Settings()
+                if temperature is not None:
+                    try:
+                        settings.temperature = float(temperature)
+                    except Exception:
+                        settings.temperature = 0.2
+                if top_p is not None:
+                    try:
+                        settings.top_p = float(top_p)
+                    except Exception:
+                        settings.top_p = 0.9
+            except Exception:  # pragma: no cover - fallback for unexpected API changes
+                settings = None
+
+        if settings is not None:
+            try:
+                return self._generator.generate_simple(prompt, settings, max_new_tokens)
+            except TypeError:
+                pass
+
         try:
-            return self._generator.generate_simple(prompt, None, max_new_tokens)
-        except TypeError:
             return self._generator.generate_simple(prompt, max_new_tokens)
+        except TypeError:
+            return self._generator.generate_simple(prompt, None, max_new_tokens)
 
     def generate(
         self,
@@ -106,22 +152,42 @@ class SQLCoderExLlama:
     ) -> str:
         """Generate text with safe defaults and robust stopping."""
 
-        del temperature, top_p  # Generation knobs are ignored if unsupported.
-
         try:
             max_new = int(os.getenv("GENERATION_MAX_NEW_TOKENS", max_new_tokens))
         except Exception:
             max_new = int(max_new_tokens or 256)
         max_new = max(1, max_new)
 
+        if temperature is None:
+            try:
+                temperature = float(os.getenv("GENERATION_TEMPERATURE", "0.2"))
+            except Exception:
+                temperature = 0.2
+        else:
+            try:
+                temperature = float(temperature)
+            except Exception:
+                temperature = 0.2
+
+        if top_p is None:
+            try:
+                top_p = float(os.getenv("GENERATION_TOP_P", "0.9"))
+            except Exception:
+                top_p = 0.9
+        else:
+            try:
+                top_p = float(top_p)
+            except Exception:
+                top_p = 0.9
+
         prompt = self._truncate_prompt(prompt, max_new)
 
         try:
-            output = self._call_generate_simple(prompt, max_new)
+            output = self._call_generate_simple(prompt, max_new, temperature, top_p)
         except AssertionError as err:
             logger.warning("[dw] exllama overflow; retrying with truncated context: %s", err)
             prompt = self._truncate_prompt(prompt, max_new)
-            output = self._call_generate_simple(prompt, min(max_new, 128))
+            output = self._call_generate_simple(prompt, min(max_new, 128), temperature, top_p)
 
         text = output if isinstance(output, str) else output[0] if isinstance(output, (list, tuple)) else str(output)
         if not isinstance(text, str):
