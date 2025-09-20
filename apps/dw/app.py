@@ -81,6 +81,12 @@ def answer():
     out = nl_to_sql_with_llm(question, llm_context)
     intent = out.get("intent") or {}
     sql = out.get("sql") or ""
+    final_pass = f"pass{out.get('pass')}" if out.get("pass") else "unknown"
+    trunc_sql = (sql[:600] + "...") if len(sql) > 600 else sql
+    current_app.logger.info(
+        "[dw] chosen_sql",
+        extra={"payload": {"pass": final_pass, "sql": trunc_sql}},
+    )
 
     if not out.get("ok") or not sql:
         _log(

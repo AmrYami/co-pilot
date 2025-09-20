@@ -8,7 +8,7 @@ import re
 from typing import Callable
 
 from core.model_loader import get_model
-from .validator import extract_sql, validate_sql
+from .validator import validate_sql
 
 DEFAULT_BINDS = [
     "date_start",
@@ -25,6 +25,16 @@ DEFAULT_BINDS = [
 # ------------- Clarifier -------------
 
 _JSON_RE = re.compile(r"<<JSON>>\s*(\{.*?\})\s*<</JSON>>", re.S)
+_FENCE_RE = re.compile(r"```sql\s*(.+?)\s*```", re.I | re.S)
+_SQL_START_RE = re.compile(r"\b(SELECT|WITH)\b.*", re.I | re.S)
+
+
+def _extract_sql(text: str) -> str:
+    match = _FENCE_RE.search(text or "")
+    if match:
+        return match.group(1).strip()
+    match = _SQL_START_RE.search(text or "")
+    return match.group(0).strip() if match else ""
 
 
 def _heuristic_intent(question: str) -> dict:
@@ -112,7 +122,7 @@ def _build_prompt_fenced(question: str, intent: dict, allow_binds) -> str:
     default_date_col = intent.get("date_column") or "REQUEST_DATE"
     has_window = bool(intent.get("has_time_window"))
     window_line = (
-        "Use :date_start and :date_end on the appropriate date column."
+        f"If a time window is requested, filter on {default_date_col} BETWEEN :date_start AND :date_end."
         if has_window
         else "Do not add any date filter."
     )
@@ -123,8 +133,10 @@ def _build_prompt_fenced(question: str, intent: dict, allow_binds) -> str:
         "Use Oracle syntax: NVL, TRIM, LISTAGG WITHIN GROUP, FETCH FIRST N ROWS ONLY.\n"
         "Use SELECT or WITH queries only.\n"
         f"Allowed binds: {', '.join(allow_binds)}\n"
-        f"Default date column: {default_date_col}.\n"
-        f"{window_line}\n\n"
+        f"Default date column for windows: {default_date_col}.\n"
+        f"{window_line}\n"
+        "When aggregating by stakeholder, UNPIVOT across CONTRACT_STAKEHOLDER_1..8 paired with DEPARTMENT_1..8 using UNION ALL.\n"
+        "Gross value = NVL(CONTRACT_VALUE_NET_OF_VAT,0) + NVL(VAT,0).\n\n"
         "Question:\n"
         f"{question}\n\n"
         "```sql\n"
@@ -136,7 +148,7 @@ def _build_prompt_plain(question: str, intent: dict, allow_binds) -> str:
     default_date_col = intent.get("date_column") or "REQUEST_DATE"
     has_window = bool(intent.get("has_time_window"))
     window_line = (
-        "When a time window is asked, use :date_start and :date_end."
+        f"If a time window is requested, filter on {default_date_col} BETWEEN :date_start AND :date_end."
         if has_window
         else "Do not add any date filter."
     )
@@ -146,8 +158,10 @@ def _build_prompt_plain(question: str, intent: dict, allow_binds) -> str:
         f"Allowed columns only: {cols}\n"
         "Oracle syntax only: NVL, TRIM, LISTAGG WITHIN GROUP, FETCH FIRST N ROWS ONLY.\n"
         f"Allowed binds: {', '.join(allow_binds)}\n"
-        f"Default date column: {default_date_col}.\n"
-        f"{window_line}\n\n"
+        f"Default date column for windows: {default_date_col}.\n"
+        f"{window_line}\n"
+        "When aggregating by stakeholder, UNPIVOT across CONTRACT_STAKEHOLDER_1..8 paired with DEPARTMENT_1..8 using UNION ALL.\n"
+        "Gross value = NVL(CONTRACT_VALUE_NET_OF_VAT,0) + NVL(VAT,0).\n\n"
         "Question:\n"
         f"{question}\n\n"
         "SQL:\n"
@@ -199,8 +213,8 @@ def nl_to_sql_with_llm(question: str, ctx: dict) -> dict:
     # --- PASS 1: fenced prompt
     prompt1 = _build_prompt_fenced(question, intent, allow_binds)
     logger("sql_prompt_pass1", {"preview": prompt1[:400]})
-    raw1 = sql_mdl.generate(prompt1, max_new_tokens=max_new_tokens, stop=["```"])
-    sql1 = extract_sql(raw1)
+    raw1 = sql_mdl.generate(prompt1, max_new_tokens=max_new_tokens)
+    sql1 = _extract_sql(raw1)
     logger(
         "llm_raw_pass1",
         {
@@ -234,8 +248,8 @@ def nl_to_sql_with_llm(question: str, ctx: dict) -> dict:
     # --- PASS 2: plain prompt
     prompt2 = _build_prompt_plain(question, intent, allow_binds)
     logger("sql_prompt_pass2", {"preview": prompt2[:400]})
-    raw2 = sql_mdl.generate(prompt2, max_new_tokens=max_new_tokens, stop=["```"])
-    sql2 = extract_sql(raw2)
+    raw2 = sql_mdl.generate(prompt2, max_new_tokens=max_new_tokens)
+    sql2 = _extract_sql(raw2)
     logger(
         "llm_raw_pass2",
         {
@@ -273,7 +287,7 @@ def nl_to_sql_with_llm(question: str, ctx: dict) -> dict:
     text3 = raw3 or ""
     if not text3.strip().lower().startswith("select"):
         text3 = "SELECT " + text3.lstrip()
-    sql3 = extract_sql(text3)
+    sql3 = _extract_sql(text3)
     logger(
         "llm_raw_pass3",
         {
