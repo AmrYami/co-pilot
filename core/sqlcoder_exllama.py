@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import time
 from typing import Any, Dict, Iterable, Optional
 
 import torch
-from exllamav2.generator import ExLlamaV2Sampler
+from exllamav2 import ExLlamaV2Sampler
+
+
+logger = logging.getLogger("dw")
 
 
 def _parse_gpu_split(env_value: str | None) -> Optional[list[float]]:
@@ -28,87 +32,56 @@ def _parse_gpu_split(env_value: str | None) -> Optional[list[float]]:
     return [n / total for n in numbers]
 
 
-class ExllamaSqlCoder:
-    def __init__(
-        self,
-        model_generator,
-        tokenizer,
-        stop_tokens: Iterable[str],
-        defaults: Dict[str, Any],
-        dynamic: bool,
-        cache,
-    ) -> None:
-        self._generator = model_generator
+class SQLCoderExLlama:
+    def __init__(self, generator, tokenizer):
+        self._generator = generator
         self._tokenizer = tokenizer
-        self._defaults = defaults
-        self._stop_tokens = [tok for tok in stop_tokens if tok]
-        self._dynamic = dynamic
-        self._cache = cache
-
-    def _truncate_to_fit(self, prompt: str, max_new: int) -> str:
-        try:
-            max_seq = getattr(self._cache, "max_seq_len", 2048)
-            ids = self._tokenizer.encode(prompt, add_bos=True)
-            if hasattr(ids, "tolist"):
-                ids = ids.tolist()
-            max_input = max_seq - max_new - 32
-            if max_input <= 0 or not isinstance(ids, (list, tuple)):
-                return prompt
-            if len(ids) <= max_input:
-                return prompt
-            keep_ids = ids[-max_input:]
-            return self._tokenizer.decode(keep_ids)
-        except Exception:
-            return prompt[-8000:]
-
-    @staticmethod
-    def _truncate_at_stop(text: str, stops: Iterable[str]) -> str:
-        if not text:
-            return ""
-        cut = len(text)
-        for token in stops or ():
-            if not token:
-                continue
-            idx = text.find(token)
-            if idx != -1 and idx < cut:
-                cut = idx
-        return text[:cut]
 
     def generate(
         self,
         prompt: str,
-        max_new_tokens: int = 192,
-        temperature: float = 0.05,
-        top_p: float = 0.9,
+        max_new_tokens: int = 256,
         stop: Optional[Iterable[str]] = None,
+        temperature: float = 0.2,
+        top_p: float = 0.9,
     ) -> str:
-        stop_list = list(self._stop_tokens)
-        if stop:
-            for token in stop:
-                if token and token not in stop_list:
-                    stop_list.append(token)
+        """Generate text with safe defaults and robust stopping."""
 
-        max_new = int(
-            max_new_tokens if max_new_tokens is not None else self._defaults.get("max_new_tokens", 192)
-        )
-        prompt = self._truncate_to_fit(prompt, max_new)
         settings = ExLlamaV2Sampler.Settings()
-        settings.temperature = float(
-            temperature if temperature is not None else self._defaults.get("temperature", 0.0)
-        )
-        settings.top_p = float(top_p if top_p is not None else self._defaults.get("top_p", 1.0))
-        settings.token_repetition_penalty = 1.05
+        settings.temperature = float(temperature) if temperature is not None else 0.2
+        settings.top_p = float(top_p) if top_p is not None else 0.9
 
-        output = self._generator.generate_simple(prompt, settings, max_new)
-        text = output[0] if isinstance(output, (list, tuple)) else output
-        if not isinstance(text, str):
-            text = str(text)
-        text = text.strip()
-        text = self._truncate_at_stop(text, stop_list)
-        return text.strip()
+        if stop:
+            try:
+                settings.stop_sequences = list(stop)
+            except Exception as exc:  # pragma: no cover - compatibility shim
+                logger.debug("[dw] exllama: stop_sequences not supported on settings (%s)", exc)
+
+        max_new = int(max_new_tokens or 256)
+        if max_new > 256:
+            max_new = 256
+
+        try:
+            output = self._generator.generate_simple(prompt, settings, max_new)
+            text = output[0] if isinstance(output, (list, tuple)) else output
+            if not isinstance(text, str):
+                text = str(text)
+            return text
+        except AssertionError as err:
+            logger.warning("[dw] exllama overflow; retrying with reduced context/new tokens: %s", err)
+            prompt_tail = prompt[-4000:]
+            try:
+                output = self._generator.generate_simple(prompt_tail, settings, 128)
+                text = output[0] if isinstance(output, (list, tuple)) else output
+                if not isinstance(text, str):
+                    text = str(text)
+                return text
+            except Exception as exc:  # pragma: no cover - secondary failure
+                logger.error("[dw] exllama second attempt failed: %s", exc, exc_info=True)
+                raise
 
 
-def load_exllama_generator(model_path: str, config: Dict[str, Any]) -> ExllamaSqlCoder:
+def load_exllama_generator(model_path: str, config: Dict[str, Any]) -> SQLCoderExLlama:
     """Load ExLlamaV2 for SQLCoder and return a lightweight generator wrapper."""
 
     from exllamav2 import ExLlamaV2, ExLlamaV2Cache, ExLlamaV2Config, ExLlamaV2Tokenizer
@@ -189,34 +162,17 @@ def load_exllama_generator(model_path: str, config: Dict[str, Any]) -> ExllamaSq
     cache = current_cache
 
     gen = None
-    gen_is_dynamic = False
     if dyn_available and not force_base:
         try:
             from exllamav2.generator.dynamic import ExLlamaV2DynamicGenerator
 
             gen = ExLlamaV2DynamicGenerator(model=model, tokenizer=tokenizer, cache=cache)
-            gen_is_dynamic = True
         except Exception:
             gen = None
-            gen_is_dynamic = False
 
     if gen is None:
         from exllamav2.generator.base import ExLlamaV2BaseGenerator
 
         gen = ExLlamaV2BaseGenerator(model=model, tokenizer=tokenizer, cache=cache)
-        gen_is_dynamic = False
 
-    defaults = {
-        "max_new_tokens": int(config.get("max_new_tokens", 256)),
-        "temperature": float(config.get("temperature", 0.2)),
-        "top_p": float(config.get("top_p", 0.9)),
-    }
-    stop_tokens = list(config.get("stop") or [])
-    return ExllamaSqlCoder(
-        gen,
-        tokenizer,
-        stop_tokens,
-        defaults,
-        gen_is_dynamic,
-        cache,
-    )
+    return SQLCoderExLlama(gen, tokenizer)
