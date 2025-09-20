@@ -1,4 +1,4 @@
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request, jsonify, current_app
 from sqlalchemy import text
 from datetime import datetime, date, timedelta
 import os, json, csv, pathlib, re
@@ -38,11 +38,14 @@ def _get_allowed_columns() -> list:
     ]
 
 
-def _log(app, tag, payload):
+def _log(tag, payload):
+    """Safe logging from inside blueprint routes."""
     try:
-        app.logger.info(f"[dw] {tag}: {json.dumps(payload, default=str)[:4000]}")
-    except Exception:
-        app.logger.info(f"[dw] {tag}: {payload}")
+        msg = f"[dw] {tag}: {json.dumps(payload, default=str)[:4000]}"
+        current_app.logger.info(msg)
+    except Exception as e:
+        # Fallback in case we're outside an application context
+        print(f"[dw] {tag}: {payload}  [log-fallback: {e}]")
 
 
 def _question_has_window(q: str) -> bool:
@@ -133,12 +136,11 @@ def answer():
             RETURNING id
         """), {"ns": NAMESPACE, "q": q, "email": auth_email, "pfx": json.dumps(prefixes)}).scalar_one()
 
-    app = dw_bp  # for logger
-    _log(app, "inquiry_start", {"id": inq_id, "q": q, "email": auth_email})
+    _log("inquiry_start", {"id": inq_id, "q": q, "email": auth_email})
 
     # ---------- Clarify (non-blocking but useful) ----------
     intent = clarify_intent(q)
-    _log(app, "clarifier_raw", intent)
+    _log("clarifier_raw", intent)
     intent_ok = bool(intent.get("ok")) and isinstance(intent.get("intent"), dict)
     has_window_by_clarifier = intent_ok and bool(intent["intent"].get("has_time_window"))
     explicit_dates = intent_ok and intent["intent"].get("explicit_dates") or None
@@ -182,11 +184,11 @@ def answer():
         suggested_date_column=suggested_date_col,
         top_n_literal=top_n_literal,
     )
-    _log(app, "sql_prompt", {"prompt": prompt})
+    _log("sql_prompt", {"prompt": prompt})
     raw1 = nl_to_sql_raw(prompt)
-    _log(app, "llm_raw_pass1", {"text": raw1})
+    _log("llm_raw_pass1", {"text": raw1})
     sql1 = extract_sql(raw1) or ""
-    _log(app, "llm_sql_pass1", {"sql": sql1})
+    _log("llm_sql_pass1", {"sql": sql1})
 
     # ---------- Validate ----------
     v1 = validate_sql(
@@ -197,7 +199,7 @@ def answer():
         question_has_window=question_has_window,
         required_date_column=(suggested_date_col or default_date_col) if question_has_window else None,
     )
-    _log(app, "validation_pass1", v1)
+    _log("validation_pass1", v1)
 
     # ---------- Repair pass if needed ----------
     sql_final = sql1
@@ -214,11 +216,11 @@ def answer():
             suggested_date_column=suggested_date_col,
             top_n_literal=top_n_literal,
         )
-        _log(app, "sql_repair_prompt", {"prompt": repair_prompt})
+        _log("sql_repair_prompt", {"prompt": repair_prompt})
         raw2 = nl_to_sql_raw(repair_prompt)
-        _log(app, "llm_raw_pass2", {"text": raw2})
+        _log("llm_raw_pass2", {"text": raw2})
         sql2 = extract_sql(raw2) or ""
-        _log(app, "llm_sql_pass2", {"sql": sql2})
+        _log("llm_sql_pass2", {"sql": sql2})
         v2 = validate_sql(
             sql2,
             allow_tables=[table_name],
@@ -227,7 +229,7 @@ def answer():
             question_has_window=question_has_window,
             required_date_column=(suggested_date_col or default_date_col) if question_has_window else None,
         )
-        _log(app, "validation_pass2", v2)
+        _log("validation_pass2", v2)
         if v2["ok"]:
             sql_final = sql2
             v_final = v2
@@ -324,7 +326,7 @@ def answer():
                 }
             return jsonify(res)
 
-    _log(app, "execution_binds", {k: str(v) for k,v in binds.items()})
+    _log("execution_binds", {k: str(v) for k,v in binds.items()})
 
     # ---------- Execute on Oracle ----------
     oracle_engine = ds_registry.engine(None)
@@ -339,10 +341,10 @@ def answer():
             rows = rs.fetchall()
     except Exception as ex:
         error = str(ex)
-        _log(app, "oracle_error", {"error": error})
+        _log("oracle_error", {"error": error})
 
     duration_ms = int((datetime.utcnow() - started).total_seconds() * 1000)
-    _log(app, "execution_result", {"rows": len(rows), "cols": headers, "ms": duration_ms})
+    _log("execution_result", {"rows": len(rows), "cols": headers, "ms": duration_ms})
 
     if error:
         with mem.begin() as conn:
@@ -360,7 +362,7 @@ def answer():
     csv_path = None
     if rows:
         csv_path = _write_csv(rows, headers)
-        _log(app, "csv_export", {"path": csv_path})
+        _log("csv_export", {"path": csv_path})
 
     # ---------- Auto-save snippet (if enabled) ----------
     autosave = bool(s.get("SNIPPETS_AUTOSAVE", scope="namespace", default=True))
@@ -384,7 +386,7 @@ def answer():
                 "tags": json.dumps(["dw","contracts","auto"]),
                 "verified": False,
             }).scalar_one()
-        _log(app, "snippet_saved", {"id": snippet_id})
+        _log("snippet_saved", {"id": snippet_id})
 
     # ---------- Mark inquiry answered ----------
     with mem.begin() as conn:

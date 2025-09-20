@@ -1,41 +1,37 @@
 import json, os, re
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional
 
 from core.model_loader import get_model
 
 STOP_TOKENS = os.environ.get("SQL_STOP", "</s>,<|im_end|").split(",")
+if "```" not in STOP_TOKENS:
+    STOP_TOKENS.append("```")
 
 CLARIFIER_JSON_MARKER_START = "<<JSON>>"
 CLARIFIER_JSON_MARKER_END = "<<END_JSON>>"
-SQL_MARKER_START = "<<SQL>>"
-SQL_MARKER_END = "<<END_SQL>>"
+
+_FENCE_RE = re.compile(r"```(?:sql)?\s*(.*?)```", re.IGNORECASE | re.DOTALL)
+_TAG_RE = re.compile(r"<SQL>(.*?)</SQL>", re.IGNORECASE | re.DOTALL)
+_HEAD_RE = re.compile(r"(?is)\b(SELECT|WITH)\b")
 
 
-def _clean(s: str) -> str:
-    return (s or "").strip()
-
-
-def _extract_fenced_sql(text: str) -> Optional[str]:
-    """Extract SQL between ```sql ... ``` or our <<SQL>> ... <<END_SQL>> markers."""
+def extract_sql_only(text: str) -> str:
     if not text:
-        return None
-    # Preferred: <<SQL>> ... <<END_SQL>>
-    m = re.search(
-        re.escape(SQL_MARKER_START) + r"(.*)" + re.escape(SQL_MARKER_END),
-        text,
-        re.S | re.I,
-    )
+        return ""
+    fences = _FENCE_RE.findall(text)
+    for chunk in reversed(fences):
+        candidate = chunk.strip()
+        if candidate:
+            return candidate
+    tags = _TAG_RE.findall(text)
+    for chunk in reversed(tags):
+        candidate = chunk.strip()
+        if candidate:
+            return candidate
+    m = _HEAD_RE.search(text)
     if m:
-        return m.group(1).strip()
-    # Fallback: triple-backtick sql
-    m = re.search(r"```(?:sql)?\s*(.*?)```", text, re.S | re.I)
-    if m:
-        return m.group(1).strip()
-    # Fallback: last SELECT/WITH block
-    m = re.search(r"((?:SELECT|WITH)\b[\s\S]+)$", text, re.I)
-    if m:
-        return m.group(1).strip()
-    return None
+        return text[m.start():].strip()
+    return ""
 
 
 def build_sql_prompt(
@@ -58,35 +54,37 @@ def build_sql_prompt(
     """
     cols = ", ".join(allowed_columns)
     binds = ", ".join(allowed_binds)
-    # We prefer literal FETCH FIRST N when top_n_literal provided to avoid driver bind issues.
-    top_hint = ""
-    if top_n_literal and top_n_literal > 0:
-        top_hint = (
-            f"\n- If a TOP clause is implied, prefer a literal `FETCH FIRST {top_n_literal} ROWS ONLY`."
-        )
-
-    date_hint = f"- Default date column: {default_date_column}."
+    date_hint = f"Default date column: {default_date_column}."
     if suggested_date_column and suggested_date_column != default_date_column:
         date_hint += f" If a window is requested, prefer {suggested_date_column}."
     needs_window = "Yes" if force_date_binds else "No"
 
-    prompt = f"""Return Oracle SQL only between {SQL_MARKER_START} and {SQL_MARKER_END}. No prose. No comments.
-Rules:
-- Table: "{table_name}"
-- Allowed columns only: {cols}
-- Use Oracle syntax: NVL(), TRIM(), UPPER(), LISTAGG(... WITHIN GROUP (...)), FETCH FIRST N ROWS ONLY.
-- Do not modify data. SELECT / CTE only.
-- Use named binds only from this whitelist when binds are needed: {binds}.{top_hint}
-- Do not add any date filter **unless** the user explicitly requests a time window (e.g., "last month", "next 30 days", "in 2024"). 
-  When a time window IS requested, use binds :date_start and :date_end with the appropriate date column.
-- {date_hint}
-- Question implies time window? {needs_window}
-
-Question:
-{question}
-
-{SQL_MARKER_START}
-"""
+    window_anchor = suggested_date_column or default_date_column
+    rules = [
+        f'Use only table "{table_name}".',
+        f"Allowed columns only: {cols}",
+        "Use Oracle syntax: NVL(), TRIM(), UPPER(), LISTAGG(... WITHIN GROUP (...)), FETCH FIRST N ROWS ONLY.",
+        "Do not modify data. SELECT / CTE only.",
+        f"Use named binds only from this whitelist when binds are needed: {binds}.",
+        "Do not add any date filter unless the user explicitly requests a time window (e.g., last month, next 30 days, in 2024).",
+        "When a time window IS requested, use binds :date_start and :date_end.",
+        f"If the user asks for a time window but does not name a date column, use {window_anchor} for the filter.",
+        f"Question implies time window? {needs_window}",
+        date_hint,
+        "Close the fenced block after the SQL with ```.",
+    ]
+    if top_n_literal and top_n_literal > 0:
+        rules.append(
+            f"If a TOP clause is implied, prefer a literal `FETCH FIRST {top_n_literal} ROWS ONLY`."
+        )
+    prompt = (
+        "Return only Oracle SQL inside a fenced block."
+        "\n```sql\n"
+        "-- your SQL here\n"
+        "```\n"
+        + "\n".join(f"- {rule}" for rule in rules)
+        + f"\n\nQuestion:\n{question}\n\nAnswer with:\n```sql\n"
+    )
     return prompt
 
 
@@ -104,27 +102,26 @@ def build_sql_repair_prompt(
 ) -> str:
     cols = ", ".join(allowed_columns)
     binds = ", ".join(allowed_binds)
-    top_hint = ""
-    if top_n_literal and top_n_literal > 0:
-        top_hint = (
-            f"\n- If a TOP clause is implied, prefer a literal `FETCH FIRST {top_n_literal} ROWS ONLY`."
-        )
 
     prompt = f"""Previous SQL had validation errors:
 {json.dumps(validation_errors)}
 
-Repair the SQL. Return Oracle SQL only between {SQL_MARKER_START} and {SQL_MARKER_END}. No prose. No comments.
+Repair the SQL. Return Oracle SQL only inside a fenced block. No prose. No comments.
 Rules:
 - Table: "{table_name}"
 - Allowed columns only: {cols}
 - Use Oracle syntax: NVL(), TRIM(), UPPER(), LISTAGG(... WITHIN GROUP (...)), FETCH FIRST N ROWS ONLY.
-- Use only whitelisted binds: {binds}.{top_hint}
+- Use only whitelisted binds: {binds}.
 - When a time window is requested, use :date_start and :date_end on the correct date column.
 - Default date column: {default_date_column}.
 """
     if suggested_date_column and suggested_date_column != default_date_column:
         prompt += (
             f"- Prefer {suggested_date_column} for the time window when explicitly requested.\n"
+        )
+    if top_n_literal and top_n_literal > 0:
+        prompt += (
+            f"- If a TOP clause is implied, prefer a literal `FETCH FIRST {top_n_literal} ROWS ONLY`.\n"
         )
 
     prompt += f"""
@@ -136,7 +133,8 @@ Previous SQL to repair:
 {prev_sql}
 ```
 
-{SQL_MARKER_START}
+Answer with:
+```sql
 """
     return prompt
 
@@ -148,7 +146,7 @@ def nl_to_sql_raw(prompt: str) -> str:
 
 
 def extract_sql(generated_text: str) -> Optional[str]:
-    sql = _extract_fenced_sql(generated_text)
+    sql = extract_sql_only(generated_text)
     if not sql:
         return None
     # Remove accidental comments that some models still insert:
@@ -210,6 +208,7 @@ __all__ = [
     "build_sql_prompt",
     "build_sql_repair_prompt",
     "nl_to_sql_raw",
+    "extract_sql_only",
     "extract_sql",
     "clarify_intent",
 ]
