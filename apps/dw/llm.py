@@ -6,35 +6,26 @@ from flask import current_app
 from core.model_loader import get_model
 from core.logging_setup import log_kv
 
-STOP_TOKENS = os.environ.get("SQL_STOP", "</s>,<|im_end|").split(",")
-if "```" not in STOP_TOKENS:
-    STOP_TOKENS.append("```")
+STOP_TOKENS = [tok for tok in os.environ.get("SQL_STOP", "</s>,<|im_end|").split(",") if tok]
+STOP_TOKENS = [tok for tok in STOP_TOKENS if "```" not in tok]
 
 CLARIFIER_JSON_MARKER_START = "<<JSON>>"
 CLARIFIER_JSON_MARKER_END = "<</JSON>>"
 
-_FENCE_RE = re.compile(r"```(?:sql)?\s*(.*?)```", re.IGNORECASE | re.DOTALL)
-_TAG_RE = re.compile(r"<SQL>(.*?)</SQL>", re.IGNORECASE | re.DOTALL)
-_HEAD_RE = re.compile(r"(?is)\b(SELECT|WITH)\b")
+_FENCE_RE = re.compile(r"```(?:sql)?\s*(.+?)\s*```", re.IGNORECASE | re.DOTALL)
+_SQL_START_RE = re.compile(r"\b(WITH\b.*|SELECT\b.*)$", re.IGNORECASE | re.DOTALL)
 
 
-def extract_sql_only(text: str) -> str:
+def _extract_sql_candidate(text: str) -> str:
     if not text:
         return ""
-    fences = _FENCE_RE.findall(text)
-    for chunk in reversed(fences):
-        candidate = chunk.strip()
-        if candidate:
-            return candidate
-    tags = _TAG_RE.findall(text)
-    for chunk in reversed(tags):
-        candidate = chunk.strip()
-        if candidate:
-            return candidate
-    m = _HEAD_RE.search(text)
-    if m:
-        return text[m.start():].strip()
-    return ""
+    fenced = _FENCE_RE.search(text)
+    if fenced:
+        return fenced.group(1).strip()
+    unfenced = _SQL_START_RE.search(text)
+    if unfenced:
+        return unfenced.group(1).strip()
+    return text.strip()
 
 
 def build_sql_prompt(
@@ -42,53 +33,73 @@ def build_sql_prompt(
     *,
     table_name: str,
     allowed_columns: List[str],
-    allowed_binds: List[str],
-    default_date_column: str,
-    force_date_binds: bool,
-    suggested_date_column: Optional[str],
+    allow_binds: List[str],
+    time_window_hint: Optional[dict],
     top_n_literal: Optional[int] = None,
 ) -> str:
-    """
-    A short deterministic prompt tailored for SQLCoder:
-    - Never allow prose in output
-    - Only allowed columns
-    - Only whitelisted binds when needed
-    - Oracle dialect hints
-    """
-    cols = ", ".join(allowed_columns)
-    binds = ", ".join(allowed_binds)
-    date_hint = f"Default date column: {default_date_column}."
-    if suggested_date_column and suggested_date_column != default_date_column:
-        date_hint += f" If a window is requested, prefer {suggested_date_column}."
-    needs_window = "Yes" if force_date_binds else "No"
+    """Construct the base SQL prompt shown to SQLCoder."""
 
-    window_anchor = suggested_date_column or default_date_column
-    rules = [
-        f'Use only table "{table_name}".',
-        f"Allowed columns only: {cols}",
-        "Use Oracle syntax: NVL(), TRIM(), UPPER(), LISTAGG(... WITHIN GROUP (...)), FETCH FIRST N ROWS ONLY.",
-        "Do not modify data. SELECT / CTE only.",
-        f"Use named binds only from this whitelist when binds are needed: {binds}.",
-        "Do not add any date filter unless the user explicitly requests a time window (e.g., last month, next 30 days, in 2024).",
-        "When a time window IS requested, use binds :date_start and :date_end.",
-        f"If the user asks for a time window but does not name a date column, use {window_anchor} for the filter.",
-        f"Question implies time window? {needs_window}",
-        date_hint,
-        "Close the fenced block after the SQL with ```.",
-    ]
-    if top_n_literal and top_n_literal > 0:
-        rules.append(
-            f"If a TOP clause is implied, prefer a literal `FETCH FIRST {top_n_literal} ROWS ONLY`."
-        )
-    prompt = (
-        "Return only Oracle SQL inside a fenced block."
-        "\n```sql\n"
-        "-- your SQL here\n"
-        "```\n"
-        + "\n".join(f"- {rule}" for rule in rules)
-        + f"\n\nQuestion:\n{question}\n\nAnswer with:\n```sql\n"
+    fewshot = (
+        "Example:\n"
+        "User: top 5 stakeholders by gross value last month\n"
+        "Assistant (SQL):\n"
+        "WITH stakeholders AS (\n"
+        "  SELECT CONTRACT_ID,\n"
+        "         NVL(CONTRACT_VALUE_NET_OF_VAT,0)+NVL(VAT,0) AS CONTRACT_VALUE_GROSS,\n"
+        "         CONTRACT_STAKEHOLDER_1 AS STAKEHOLDER,\n"
+        "         DEPARTMENT_1 AS DEPARTMENT,\n"
+        "         REQUEST_DATE AS REF_DATE\n"
+        "    FROM \"Contract\"\n"
+        "  UNION ALL SELECT CONTRACT_ID, NVL(CONTRACT_VALUE_NET_OF_VAT,0)+NVL(VAT,0), CONTRACT_STAKEHOLDER_2, DEPARTMENT_2, REQUEST_DATE FROM \"Contract\"\n"
+        "  UNION ALL SELECT CONTRACT_ID, NVL(CONTRACT_VALUE_NET_OF_VAT,0)+NVL(VAT,0), CONTRACT_STAKEHOLDER_3, DEPARTMENT_3, REQUEST_DATE FROM \"Contract\"\n"
+        "  UNION ALL SELECT CONTRACT_ID, NVL(CONTRACT_VALUE_NET_OF_VAT,0)+NVL(VAT,0), CONTRACT_STAKEHOLDER_4, DEPARTMENT_4, REQUEST_DATE FROM \"Contract\"\n"
+        "  UNION ALL SELECT CONTRACT_ID, NVL(CONTRACT_VALUE_NET_OF_VAT,0)+NVL(VAT,0), CONTRACT_STAKEHOLDER_5, DEPARTMENT_5, REQUEST_DATE FROM \"Contract\"\n"
+        "  UNION ALL SELECT CONTRACT_ID, NVL(CONTRACT_VALUE_NET_OF_VAT,0)+NVL(VAT,0), CONTRACT_STAKEHOLDER_6, DEPARTMENT_6, REQUEST_DATE FROM \"Contract\"\n"
+        "  UNION ALL SELECT CONTRACT_ID, NVL(CONTRACT_VALUE_NET_OF_VAT,0)+NVL(VAT,0), CONTRACT_STAKEHOLDER_7, DEPARTMENT_7, REQUEST_DATE FROM \"Contract\"\n"
+        "  UNION ALL SELECT CONTRACT_ID, NVL(CONTRACT_VALUE_NET_OF_VAT,0)+NVL(VAT,0), CONTRACT_STAKEHOLDER_8, DEPARTMENT_8, REQUEST_DATE FROM \"Contract\"\n"
+        ")\n"
+        "SELECT TRIM(STAKEHOLDER) AS stakeholder,\n"
+        "       SUM(CONTRACT_VALUE_GROSS) AS total_gross_value,\n"
+        "       COUNT(DISTINCT CONTRACT_ID) AS contract_count,\n"
+        "       LISTAGG(DISTINCT TRIM(DEPARTMENT), ', ') WITHIN GROUP (ORDER BY TRIM(DEPARTMENT)) AS departments\n"
+        "  FROM stakeholders\n"
+        " WHERE STAKEHOLDER IS NOT NULL AND TRIM(STAKEHOLDER) <> ''\n"
+        "   AND REF_DATE >= :date_start AND REF_DATE < :date_end\n"
+        " GROUP BY TRIM(STAKEHOLDER)\n"
+        " ORDER BY total_gross_value DESC\n"
+        " FETCH FIRST 5 ROWS ONLY\n"
     )
-    return prompt
+
+    allowed_cols = ", ".join(allowed_columns)
+    bind_list = ", ".join(allow_binds)
+    top_clause_rule = (
+        "If a TOP clause is implied (e.g., top 10), emit a literal FETCH FIRST N ROWS ONLY."
+    )
+    if top_n_literal and top_n_literal > 0:
+        top_clause_rule = (
+            f"If a TOP clause is implied, emit a literal FETCH FIRST {top_n_literal} ROWS ONLY."
+        )
+
+    instr = (
+        "Return Oracle SQL (SELECT or WITH ... SELECT) only.\n"
+        "No prose. No comments. No code fences.\n"
+        f"Use only table \"{table_name}\".\n"
+        f"Allowed columns only: {allowed_cols}\n"
+        "Use Oracle syntax: NVL(), TRIM(), UPPER(), LISTAGG(... WITHIN GROUP (...)), FETCH FIRST N ROWS ONLY.\n"
+        f"Use named binds only from this whitelist when needed: {bind_list}.\n"
+        "Do NOT add date filters unless the user explicitly asks (e.g., last month, next 30 days, in 2024).\n"
+        "When a time window IS requested and no date column is named, use REQUEST_DATE with :date_start and :date_end.\n"
+        f"{top_clause_rule}\n"
+    )
+
+    hint = ""
+    if time_window_hint and time_window_hint.get("has_time_window"):
+        hinted_col = time_window_hint.get("date_column") or "REQUEST_DATE"
+        hint = (
+            f"\nHint: apply time window on {hinted_col} using :date_start and :date_end.\n"
+        )
+
+    return f"{instr}\n{fewshot}\n\nUser:\n{question}\n\nAssistant (SQL):{hint}\n"
 
 
 def build_sql_repair_prompt(
@@ -98,47 +109,47 @@ def build_sql_repair_prompt(
     *,
     table_name: str,
     allowed_columns: List[str],
-    allowed_binds: List[str],
-    default_date_column: str,
-    suggested_date_column: Optional[str],
+    allow_binds: List[str],
+    time_window_hint: Optional[dict],
     top_n_literal: Optional[int] = None,
 ) -> str:
     cols = ", ".join(allowed_columns)
-    binds = ", ".join(allowed_binds)
+    binds = ", ".join(allow_binds)
 
-    prompt = f"""Previous SQL had validation errors:
-{json.dumps(validation_errors)}
-
-Repair the SQL. Return Oracle SQL only inside a fenced block. No prose. No comments.
-Rules:
-- Table: "{table_name}"
-- Allowed columns only: {cols}
-- Use Oracle syntax: NVL(), TRIM(), UPPER(), LISTAGG(... WITHIN GROUP (...)), FETCH FIRST N ROWS ONLY.
-- Use only whitelisted binds: {binds}.
-- When a time window is requested, use :date_start and :date_end on the correct date column.
-- Default date column: {default_date_column}.
-"""
-    if suggested_date_column and suggested_date_column != default_date_column:
-        prompt += (
-            f"- Prefer {suggested_date_column} for the time window when explicitly requested.\n"
-        )
+    top_clause_rule = (
+        "- If a TOP clause is implied (e.g., top 10), emit a literal FETCH FIRST N ROWS ONLY.\n"
+    )
     if top_n_literal and top_n_literal > 0:
-        prompt += (
-            f"- If a TOP clause is implied, prefer a literal `FETCH FIRST {top_n_literal} ROWS ONLY`.\n"
+        top_clause_rule = (
+            f"- If a TOP clause is implied, emit a literal FETCH FIRST {top_n_literal} ROWS ONLY.\n"
         )
 
-    prompt += f"""
-Question:
-{question}
+    prompt = (
+        f"Previous SQL had validation errors:\n{json.dumps(validation_errors)}\n\n"
+        "Repair the SQL. Return Oracle SQL (SELECT or WITH ... SELECT) only.\n"
+        "No prose. No comments. No code fences.\n"
+        "Rules:\n"
+        f"- Table: \"{table_name}\"\n"
+        f"- Allowed columns only: {cols}\n"
+        "- Use Oracle syntax: NVL(), TRIM(), UPPER(), LISTAGG(... WITHIN GROUP (...)), FETCH FIRST N ROWS ONLY.\n"
+        f"- Use only whitelisted binds: {binds}.\n"
+        "- Do NOT add date filters unless the user explicitly asks.\n"
+        "- When a time window IS requested and no date column is named, use REQUEST_DATE with :date_start and :date_end.\n"
+        f"{top_clause_rule}"
+    )
 
-Previous SQL to repair:
-```sql
-{prev_sql}
-```
+    if time_window_hint and time_window_hint.get("has_time_window"):
+        hinted_col = time_window_hint.get("date_column") or "REQUEST_DATE"
+        prompt += f"- Apply the requested time window on {hinted_col} using :date_start and :date_end.\n"
 
-Answer with:
-```sql
-"""
+    prompt += (
+        "\nQuestion:\n"
+        f"{question}\n\n"
+        "Previous SQL to repair:\n"
+        f"{prev_sql}\n\n"
+        "Assistant (SQL):\n"
+    )
+
     return prompt
 
 
@@ -149,7 +160,7 @@ def nl_to_sql_raw(prompt: str) -> str:
 
 
 def extract_sql(generated_text: str) -> Optional[str]:
-    sql = extract_sql_only(generated_text)
+    sql = _extract_sql_candidate(generated_text)
     if not sql:
         return None
     # Remove accidental comments that some models still insert:
@@ -260,7 +271,6 @@ __all__ = [
     "build_sql_prompt",
     "build_sql_repair_prompt",
     "nl_to_sql_raw",
-    "extract_sql_only",
     "extract_sql",
     "clarify_intent",
 ]
