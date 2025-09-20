@@ -61,6 +61,19 @@ class ExllamaSqlCoder:
         except Exception:
             return prompt[-8000:]
 
+    @staticmethod
+    def _truncate_at_stop(text: str, stops: Iterable[str]) -> str:
+        if not text:
+            return ""
+        cut = len(text)
+        for token in stops or ():
+            if not token:
+                continue
+            idx = text.find(token)
+            if idx != -1 and idx < cut:
+                cut = idx
+        return text[:cut]
+
     def generate(
         self,
         prompt: str,
@@ -86,13 +99,13 @@ class ExllamaSqlCoder:
         settings.top_p = float(top_p if top_p is not None else self._defaults.get("top_p", 1.0))
         settings.token_repetition_penalty = 1.05
 
-        self._generator.set_stop_strings(stop_list)
         output = self._generator.generate_simple(prompt, settings, max_new)
         text = output[0] if isinstance(output, (list, tuple)) else output
-        for token in stop_list:
-            if token and text.endswith(token):
-                text = text[: -len(token)]
-        return text
+        if not isinstance(text, str):
+            text = str(text)
+        text = text.strip()
+        text = self._truncate_at_stop(text, stop_list)
+        return text.strip()
 
 
 def load_exllama_generator(model_path: str, config: Dict[str, Any]) -> ExllamaSqlCoder:
