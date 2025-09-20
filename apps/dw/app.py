@@ -14,13 +14,7 @@ from sqlalchemy import text
 from core.settings import Settings
 from core.datasources import DatasourceRegistry
 from core.sql_exec import get_mem_engine
-from .llm import (
-    BIND_WHITELIST,
-    build_repair_prompt,
-    call_sql_model,
-    extract_sql,
-    nl_to_sql_with_llm,
-)
+from .llm import ALLOWED_BINDS, nl_to_sql_with_llm, repair_sql
 from .validator import validate_sql
 
 
@@ -78,10 +72,11 @@ def _log(tag, payload):
     """Structured logging helper scoped to DW blueprint."""
 
     try:
-        msg = payload if isinstance(payload, str) else json.dumps(payload, default=str)
-        current_app.logger.info(f"[dw] {tag}: {msg}")
+        current_app.logger.info(
+            f"[dw] {tag}: {json.dumps(payload, default=str)[:4000]}"
+        )
     except Exception:
-        current_app.logger.info(f"[dw] {tag}: {payload}")
+        print(f"[dw] {tag}: {payload}")
 
 
 @dw_bp.record_once
@@ -155,7 +150,7 @@ def answer():
 
     table_name = s.get("DW_CONTRACT_TABLE", scope="namespace") or "Contract"
     default_date_col = s.get("DW_DATE_COLUMN", scope="namespace") or "REQUEST_DATE"
-    allow_binds = sorted(BIND_WHITELIST)
+    bind_whitelist = set(ALLOWED_BINDS)
 
     # Create inquiry row (status open)
     with mem.begin() as conn:
@@ -173,13 +168,18 @@ def answer():
         "default_date_col": default_date_col,
     }
     llm_out = nl_to_sql_with_llm(q, llm_context)
-    intent = llm_out.get("intent") or {}
-    _log("clarifier_intent", intent)
+    intent_bundle = llm_out.get("intent") or {}
+    _log("clarifier_intent", intent_bundle)
+    prompt_text = llm_out.get("prompt") or ""
+    _log("sql_prompt", {"prompt": prompt_text[:900]})
+    raw1 = llm_out.get("raw1") or ""
+    _log("llm_raw_pass1", {"text": raw1[:900]})
     sql1 = (llm_out.get("sql1") or "").strip()
-    _log("llm_sql_pass1", {"sql": sql1})
+    _log("llm_sql_pass1", {"sql": sql1[:900]})
+    intent = intent_bundle.get("intent", {}) if isinstance(intent_bundle, dict) else {}
 
     # ---------- Validate ----------
-    v1 = validate_sql(sql1, allow_binds=allow_binds)
+    v1 = validate_sql(sql1, allow_tables=[table_name], bind_whitelist=bind_whitelist)
     _log("validation_pass1", v1)
 
     # ---------- Repair pass if needed ----------
@@ -187,23 +187,15 @@ def answer():
     v_final = v1
     used_repair = False
     if not v1["ok"]:
-        repair_prompt = build_repair_prompt(
-            q,
-            sql1,
-            v1.get("errors", []),
-            intent,
-            table=table_name,
-            default_date_col=default_date_col,
-        )
-        _log("sql_repair_prompt", {"prompt": repair_prompt})
-        raw2 = call_sql_model(repair_prompt, max_new_tokens=384)
-        _log("llm_raw_pass2", {"text": raw2[:1200]})
-        sql2 = extract_sql(raw2)
-        _log("llm_sql_pass2", {"sql": sql2})
-        v2 = validate_sql(sql2, allow_binds=allow_binds)
+        repair_out = repair_sql(sql1, prompt_text, q)
+        raw2 = repair_out.get("raw2") or ""
+        sql2 = (repair_out.get("sql2") or "").strip()
+        _log("llm_raw_pass2", {"text": raw2[:900]})
+        _log("llm_sql_pass2", {"sql": sql2[:900]})
+        v2 = validate_sql(sql2, allow_tables=[table_name], bind_whitelist=bind_whitelist)
         _log("validation_pass2", v2)
         if v2["ok"]:
-            sql_final = (sql2 or "").strip()
+            sql_final = sql2
             v_final = v2
             used_repair = True
 
@@ -223,16 +215,16 @@ def answer():
             "status": "needs_clarification",
             "inquiry_id": inq_id,
             "error": v_final["errors"][0] if v_final["errors"] else "error",
-            "sql": sql_final or llm_out.get("sql1"),
+            "sql": sql_final,
             "questions": [
                 "I couldn't derive a clean SELECT. Can you rephrase or specify filters (stakeholders, departments, date columns)?"
             ],
         }
         if include_debug:
             res["debug"] = {
-                "intent": intent,
-                "prompt": llm_out.get("prompt"),
-                "raw1": llm_out.get("raw1"),
+                "clarifier": intent_bundle,
+                "prompt": prompt_text,
+                "raw1": raw1,
                 "sql1": sql1,
                 "validation1": v1,
                 "used_repair": used_repair,
@@ -260,6 +252,12 @@ def answer():
                 candidate_window = {}
         if not candidate_window:
             candidate_window = _derive_dates_for_question(q) if wants_window else {}
+        if not candidate_window and needs_window:
+            today = date.today()
+            candidate_window = {
+                "date_start": datetime.combine(today - timedelta(days=30), datetime.min.time()),
+                "date_end": datetime.combine(today, datetime.min.time()),
+            }
         if candidate_window.get("date_start") and candidate_window.get("date_end"):
             binds["date_start"] = candidate_window["date_start"]
             binds["date_end"] = candidate_window["date_end"]
@@ -287,9 +285,9 @@ def answer():
             }
             if include_debug:
                 res["debug"] = {
-                    "intent": intent,
-                    "prompt": llm_out.get("prompt"),
-                    "raw1": llm_out.get("raw1"),
+                    "clarifier": intent_bundle,
+                    "prompt": prompt_text,
+                    "raw1": raw1,
                     "sql1": sql1,
                     "validation1": v1,
                     "used_repair": used_repair,
@@ -332,9 +330,9 @@ def answer():
         }
         if include_debug:
             res["debug"] = {
-                "intent": intent,
-                "prompt": llm_out.get("prompt"),
-                "raw1": llm_out.get("raw1"),
+                "clarifier": intent_bundle,
+                "prompt": prompt_text,
+                "raw1": raw1,
                 "sql1": sql1,
                 "validation1": v1,
                 "used_repair": used_repair,
@@ -356,7 +354,14 @@ def answer():
             rows = rs.fetchall()
     except Exception as ex:
         error = str(ex)
-        _log("oracle_error", {"error": error})
+        _log(
+            "oracle_error",
+            {
+                "error": error,
+                "sql": sql_final[:4000],
+                "binds": {k: str(v) for k, v in binds.items()},
+            },
+        )
 
     duration_ms = int((datetime.utcnow() - started).total_seconds() * 1000)
     _log("execution_result", {"rows": len(rows), "cols": headers, "ms": duration_ms})
@@ -420,6 +425,8 @@ def answer():
         "used_repair": used_repair,
         "question_has_window": question_has_window,
         "suggested_date_column": intent.get("date_column") or default_date_col,
+        "clarifier": intent_bundle,
+        "binds": {k: str(v) for k, v in binds.items()},
     }
     csv_path_str = str(csv_path) if csv_path else None
     resp = {
@@ -432,9 +439,10 @@ def answer():
     }
     if include_debug:
         resp["debug"] = {
-            "intent": intent,
-            "prompt": llm_out.get("prompt"),
-            "raw1": llm_out.get("raw1"),
+            "clarifier": intent_bundle,
+            "prompt": prompt_text,
+            "raw1": raw1,
+            "sql1": sql1,
             "validation1": v1,
             "used_repair": used_repair,
         }
