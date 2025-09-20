@@ -1,163 +1,190 @@
-import os
+import importlib
 import logging
+import os
 from typing import List, Optional
 
-from exllamav2 import ExLlamaV2, ExLlamaV2Config
-from exllamav2.tokenizer import ExLlamaV2Tokenizer
-from exllamav2.generator import ExLlamaV2Generator
+logger = logging.getLogger(__name__)
 
-try:  # pragma: no cover - depends on exllamav2 version
-    from exllamav2.generator.sampler import ExLlamaV2Sampler  # type: ignore[attr-defined]
+try:  # pragma: no cover - depends on exllamav2 install
+    from exllamav2.generator import ExLlamaV2BaseGenerator  # type: ignore[attr-defined]
 except Exception:  # pragma: no cover - fallback for older builds
+    ExLlamaV2BaseGenerator = None  # type: ignore[assignment]
+
+try:  # pragma: no cover - prefer modern sampler location
+    from exllamav2.generator import ExLlamaV2Sampler  # type: ignore[attr-defined]
+except Exception:  # pragma: no cover - fallback to legacy path or absence
     try:
-        from exllamav2.generator import ExLlamaV2Sampler  # type: ignore[attr-defined]
-    except Exception:  # pragma: no cover - no sampler available
+        from exllamav2.generator.sampler import ExLlamaV2Sampler  # type: ignore[attr-defined]
+    except Exception:  # pragma: no cover - sampler missing entirely
         ExLlamaV2Sampler = None  # type: ignore[assignment]
 
-LOG = logging.getLogger("main")
+try:  # pragma: no cover - legacy generator alias
+    from exllamav2.generator import ExLlamaV2Generator as _LegacyGenerator  # type: ignore[attr-defined]
+except Exception:  # pragma: no cover - not available on newer builds
+    _LegacyGenerator = None  # type: ignore[assignment]
 
-class SQLCoderExL2:
-    """
-    Thin, robust wrapper around ExLlamaV2 to generate SQL with safe prompt truncation
-    and consistent sampler settings across exllamav2 versions.
-    """
 
-    def __init__(self, model: ExLlamaV2, tokenizer: ExLlamaV2Tokenizer, generator: ExLlamaV2Generator):
-        self._model = model
-        self._tokenizer = tokenizer
+class ExLlamaSqlGenerator:
+    """Version-tolerant SQL generator wrapper for ExLlamaV2."""
+
+    def __init__(self, generator: "ExLlamaV2BaseGenerator") -> None:
         self._generator = generator
+        self.temperature = float(os.getenv("GENERATION_TEMPERATURE", "0.2"))
+        self.top_p = float(os.getenv("GENERATION_TOP_P", "0.9"))
+        self.max_seq_env = int(os.getenv("EXL2_CACHE_MAX_SEQ_LEN", "2048"))
+        self.reserve_env = int(os.getenv("EXL2_INPUT_RESERVE_TOKENS", "64"))
 
-        # Env knobs
-        self._max_new_default = int(os.getenv("GENERATION_MAX_NEW_TOKENS", os.getenv("LLM_MAX_NEW", "192")))
-        self._reserve_tokens = int(os.getenv("EXL2_INPUT_RESERVE_TOKENS", "64"))
+    # ------------------------ internal helpers ------------------------
 
-        # Detect cache length
-        cache_len = None
-        try:
-            cache_len = getattr(generator, "max_seq_len", None)
-            if cache_len is None and hasattr(generator, "cache"):
-                cache_len = getattr(generator.cache, "max_seq_len", None)
-        except Exception:
-            cache_len = None
-        if cache_len is None:
-            cache_len = int(os.getenv("EXL2_CACHE_MAX_SEQ_LEN", "2048"))
-        self._cache_max_len = int(cache_len)
+    def _truncate_prompt(self, prompt: str, max_new_tokens: int) -> str:
+        """Approximate prompt truncation to avoid cache overflows."""
+        max_in_tokens = max(64, self.max_seq_env - self.reserve_env - max_new_tokens)
+        max_chars = max(1024, max_in_tokens * 4)
+        if len(prompt) > max_chars:
+            return prompt[-max_chars:]
+        return prompt
 
-        if os.getenv("DW_DEBUG", "0") == "1":
-            LOG.info("[sql] exllamav2: cache_max_len=%s, reserve=%s", self._cache_max_len, self._reserve_tokens)
-
-    # ---------- internals ----------
-
-    def _build_settings(self) -> Optional["ExLlamaV2Sampler.Settings"]:
+    def _make_settings(self):
         if ExLlamaV2Sampler is None:
             return None
         try:
             settings = ExLlamaV2Sampler.Settings()
-        except Exception:
+        except Exception:  # pragma: no cover - sampler lacks Settings
             return None
-
-        def _set(attr: str, env: str, default: str, cast):
-            if not hasattr(settings, attr):
-                return
-            try:
-                value = cast(os.getenv(env, default))
-            except Exception:
-                value = cast(default)
-            setattr(settings, attr, value)
-
-        _set("temperature", "GENERATION_TEMPERATURE", "0.2", float)
-        _set("top_p", "GENERATION_TOP_P", "0.9", float)
-        _set("top_k", "GENERATION_TOP_K", "0", int)
-        _set("min_p", "GENERATION_MIN_P", "0.05", float)
-        _set("token_repetition_penalty", "GENERATION_REPEAT_PENALTY", "1.08", float)
+        if hasattr(settings, "temperature"):
+            settings.temperature = self.temperature
+        if hasattr(settings, "top_p"):
+            settings.top_p = self.top_p
         return settings
 
-    def _truncate_prompt(self, prompt: str, max_new: int) -> str:
-        """Token-level truncate so prompt + new tokens fit inside cache window."""
-        ids = self._tokenizer.encode(prompt)
-        max_input = max(8, self._cache_max_len - max_new - self._reserve_tokens)
-        if len(ids) > max_input:
-            ids = ids[-max_input:]
-            truncated = self._tokenizer.decode(ids)
-            if os.getenv("DW_DEBUG", "0") == "1":
-                LOG.info("[sql] prompt truncated: tokens=%s -> %s (max_input=%s)", len(self._tokenizer.encode(prompt)), len(ids), max_input)
-            return truncated
-        return prompt
-
-    def _manual_stop(self, text: str, stop: Optional[List[str]] = None) -> str:
-        if not stop:
+    @staticmethod
+    def _apply_stops(text: str, stops: Optional[List[str]]) -> str:
+        if not stops:
             return text
         cut = len(text)
-        for s in stop:
-            i = text.find(s)
-            if i != -1:
-                cut = min(cut, i)
+        for stop in stops:
+            if not stop:
+                continue
+            idx = text.find(stop)
+            if idx != -1:
+                cut = min(cut, idx)
         return text[:cut]
 
-    def _call_generate_simple(self, prompt: str, settings: Optional["ExLlamaV2Sampler.Settings"], max_new: int) -> str:
-        """
-        Handle both exllamav2 signatures:
-          - new: generate_simple(prompt, settings, num_tokens)
-          - old: generate_simple(prompt, num_tokens)
-        """
+    def _call_generate(self, prompt: str, settings, max_new_tokens: int) -> str:
+        # Prefer modern (prompt, settings, num_tokens) signature
         if settings is not None:
             try:
-                return self._generator.generate_simple(prompt, settings, max_new)
+                return self._generator.generate_simple(prompt, settings, max_new_tokens)
             except TypeError:
-                # fall back to 2-arg signature below
                 pass
-
+        # Try two-argument signature (prompt, num_tokens)
         try:
-            return self._generator.generate_simple(prompt, max_new)
+            return self._generator.generate_simple(prompt, max_new_tokens)
         except TypeError:
-            if settings is None and ExLlamaV2Sampler is not None:
-                try:
-                    fallback = ExLlamaV2Sampler.Settings()
-                    return self._generator.generate_simple(prompt, fallback, max_new)
-                except Exception:
-                    pass
-            raise
+            # Final fallback for legacy (prompt, None, num_tokens)
+            return self._generator.generate_simple(prompt, None, max_new_tokens)
 
-    # ---------- public ----------
+    # ----------------------------- public -----------------------------
 
-    def generate(self, prompt: str, max_new_tokens: Optional[int] = None, stop: Optional[List[str]] = None) -> str:
-        max_new = int(max_new_tokens or self._max_new_default)
-        prompt2 = self._truncate_prompt(prompt, max_new)
-        settings = self._build_settings()
+    def generate(
+        self,
+        prompt: str,
+        max_new_tokens: int = 256,
+        stop: Optional[List[str]] = None,
+    ) -> str:
+        prompt = self._truncate_prompt(prompt, max_new_tokens)
+        settings = self._make_settings()
 
         if os.getenv("DW_DEBUG", "0") == "1":
-            LOG.info("[sql] gen.begin max_new=%s prompt_len=%s", max_new, len(prompt2))
+            logger.info(
+                "[sql] exllamav2.generate start max_new=%s prompt_len=%s",
+                max_new_tokens,
+                len(prompt),
+            )
 
-        out = self._call_generate_simple(prompt2, settings, max_new)
+        out = self._call_generate(prompt, settings, max_new_tokens)
         text = out if isinstance(out, str) else str(out)
-        text = self._manual_stop(text, stop)
+        text = self._apply_stops(text, stop)
 
         if os.getenv("DW_DEBUG", "0") == "1":
-            LOG.info("[sql] gen.end out_size=%s", len(text))
+            logger.info("[sql] exllamav2.generate end out_len=%s", len(text))
 
         return text
 
 
-# -------- loader --------
+# ------------------------------- loader -------------------------------
 
-def load_exllama_generator(path: str) -> SQLCoderExL2:
-    """
-    Create model/tokenizer/generator and wrap them in SQLCoderExL2
-    """
-    LOG.info("Loading model: %s", path)
+
+def _resolve_tokenizer(cfg):
+    tok_mod = importlib.import_module("exllamav2.tokenizer")
+    candidates = [
+        "ExLlamaV2Tokenizer",
+        "ExLlamaV2TokenizerHF",
+        "Tokenizer",
+    ]
+    last_exc: Exception | None = None
+    for name in candidates:
+        tok_cls = getattr(tok_mod, name, None)
+        if tok_cls is None:
+            continue
+        try:
+            return tok_cls(cfg)
+        except Exception as exc:  # pragma: no cover - signature mismatch
+            last_exc = exc
+            continue
+    if last_exc is not None:
+        raise RuntimeError("No compatible tokenizer class available") from last_exc
+    raise RuntimeError("No tokenizer class found in exllamav2.tokenizer")
+
+
+def _build_generator(model, tokenizer, cache_len: int):
+    if ExLlamaV2BaseGenerator is not None:
+        try:
+            gen = ExLlamaV2BaseGenerator(model, tokenizer, max_seq_len=cache_len)
+        except TypeError:  # pragma: no cover - signature differences
+            gen = ExLlamaV2BaseGenerator(model, tokenizer)
+            if hasattr(gen, "set_max_seq_len"):
+                try:
+                    gen.set_max_seq_len(cache_len)
+                except Exception:
+                    pass
+            elif hasattr(gen, "max_seq_len") and not getattr(gen, "max_seq_len", None):
+                try:
+                    setattr(gen, "max_seq_len", cache_len)
+                except Exception:
+                    pass
+        return gen
+    if _LegacyGenerator is not None:
+        try:
+            return _LegacyGenerator(model, tokenizer, max_seq_len=cache_len)
+        except TypeError:  # pragma: no cover - old signature without kwarg
+            return _LegacyGenerator(model, tokenizer, cache_len)
+    raise RuntimeError("No compatible ExLlama generator class available")
+
+
+def load_exllama_generator(model_path: str) -> ExLlamaSqlGenerator:
+    """Create a base generator and wrap it in :class:`ExLlamaSqlGenerator`."""
+    logger.info("Loading ExLlamaV2 model: %s", model_path)
+
+    from exllamav2 import ExLlamaV2, ExLlamaV2Config  # type: ignore import
+
     cfg = ExLlamaV2Config()
-    cfg.model_path = path
-    # Lower VRAM / safer defaults if env suggests
-    if os.getenv("EXL2_FORCE_BASE", "0") == "1":
-        cfg.max_input_len = int(os.getenv("EXL2_CACHE_MAX_SEQ_LEN", "2048"))
+    cfg.model_path = model_path
+
+    cache_len = int(os.getenv("EXL2_CACHE_MAX_SEQ_LEN", "2048"))
+    if hasattr(cfg, "max_input_len"):
+        cfg.max_input_len = cache_len
     cfg.prepare()
 
     model = ExLlamaV2(cfg)
-    tok = ExLlamaV2Tokenizer(cfg)
+    tokenizer = _resolve_tokenizer(cfg)
+    generator = _build_generator(model, tokenizer, cache_len)
 
-    cache_len = int(os.getenv("EXL2_CACHE_MAX_SEQ_LEN", "2048"))
-    gen = ExLlamaV2Generator(model, tok, max_seq_len=cache_len)
-    gen.warmup()
+    if hasattr(generator, "warmup"):
+        try:
+            generator.warmup()
+        except Exception:  # pragma: no cover - warmup optional
+            pass
 
-    LOG.info("ExLlamaV2 ready (cache=%s)", cache_len)
-    return SQLCoderExL2(model, tok, gen)
+    logger.info("ExLlamaV2 generator ready (cache_len=%s)", cache_len)
+    return ExLlamaSqlGenerator(generator)
