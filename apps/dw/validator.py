@@ -1,36 +1,91 @@
+from __future__ import annotations
+
 import re
+from typing import Dict, Iterable, List, Optional
 
-SQL_ALLOWED_START = re.compile(r'^\s*(select|with)\b', re.IGNORECASE | re.DOTALL)
-BIND_RE = re.compile(r':([A-Za-z_][A-Za-z0-9_]*)')
-DML_DDL_RE = re.compile(r'\b(insert|update|delete|merge|create|alter|drop|truncate|grant|revoke)\b', re.IGNORECASE)
+_RE_FENCE = re.compile(r"```(?:sql)?\s*(.+?)```", re.IGNORECASE | re.DOTALL)
+_RE_START = re.compile(r"^\s*(SELECT|WITH)\b", re.IGNORECASE | re.DOTALL)
+_RE_FIRST_SELECT = re.compile(r"(SELECT|WITH)\b.*", re.IGNORECASE | re.DOTALL)
+_RE_DML = re.compile(
+    r"\b(INSERT|UPDATE|DELETE|MERGE|DROP|ALTER|TRUNCATE|CREATE|GRANT|REVOKE)\b",
+    re.IGNORECASE,
+)
+_RE_BINDS = re.compile(r":([a-zA-Z_][a-zA-Z0-9_]*)")
+
+WHITELIST_BINDS = {
+    "date_start",
+    "date_end",
+    "top_n",
+    "owner_name",
+    "dept",
+    "entity_no",
+    "contract_id_pattern",
+    "request_type",
+}
 
 
-def analyze_binds(sql: str):
-    """Return the sorted list of bind names present in the SQL string."""
+def extract_sql(text: str) -> str:
+    """Extract SQL content, preferring fenced blocks."""
 
+    if not text:
+        return ""
+    match = _RE_FENCE.search(text)
+    if match:
+        return match.group(1).strip()
+    match = _RE_FIRST_SELECT.search(text)
+    if match:
+        return match.group(0).strip()
+    return ""
+
+
+def analyze_binds(sql: str) -> List[str]:
     if not sql:
         return []
-    return sorted({m.group(1) for m in BIND_RE.finditer(sql)})
-def validate_sql(sql_text: str, allow_tables=None, bind_whitelist=None):
-    """Basic validation ensuring we only run SELECT/CTE statements and approved binds."""
+    seen: set[str] = set()
+    ordered: List[str] = []
+    for name in _RE_BINDS.findall(sql):
+        lowered = name.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        ordered.append(name)
+    return ordered
 
-    if not sql_text or not sql_text.strip():
-        return {"ok": False, "errors": ["empty_sql"], "binds": []}
 
-    cleaned = sql_text.strip()
-    errors = []
+def basic_checks(sql: str, allowed_binds: Optional[Iterable[str]] = None) -> Dict[str, object]:
+    """Basic validation ensuring SQL is a SELECT/CTE with approved binds only."""
 
-    if not SQL_ALLOWED_START.search(cleaned):
-        errors.append("not_select")
+    errs: List[str] = []
+    cleaned = (sql or "").strip()
+    if not cleaned or not _RE_START.match(cleaned):
+        errs.append("not_select")
+        return {"ok": False, "errors": errs, "binds": []}
+    if _RE_DML.search(cleaned):
+        errs.append("forbidden_dml")
+    binds = analyze_binds(cleaned)
+    whitelist = set((allowed_binds or WHITELIST_BINDS) or [])
+    illegal = [b for b in (name.lower() for name in binds) if b not in whitelist]
+    if illegal:
+        errs.append(f"illegal_binds:{','.join(illegal)}")
+    binds_lower = [name.lower() for name in binds]
+    return {"ok": len(errs) == 0, "errors": errs, "binds": binds_lower, "bind_names": binds}
 
-    if DML_DDL_RE.search(cleaned):
-        errors.append("dml_or_ddl")
 
-    used_binds = analyze_binds(cleaned)
-    if bind_whitelist is not None:
-        invalid = sorted(set(used_binds) - set(bind_whitelist))
-        if invalid:
-            errors.append(f"illegal_binds:{','.join(invalid)}")
+def validate_sql(
+    sql_text: str,
+    allow_tables: Optional[Iterable[str]] = None,
+    bind_whitelist: Optional[Iterable[str]] = None,
+) -> Dict[str, object]:
+    """Compatibility shim around :func:`basic_checks`."""
 
-    # allow_tables retained for compatibility; caller enforces via prompt constraints
-    return {"ok": len(errors) == 0, "errors": errors, "binds": used_binds}
+    _ = allow_tables  # retained for backwards compatibility
+    return basic_checks(sql_text or "", allowed_binds=bind_whitelist)
+
+
+__all__ = [
+    "WHITELIST_BINDS",
+    "extract_sql",
+    "analyze_binds",
+    "basic_checks",
+    "validate_sql",
+]

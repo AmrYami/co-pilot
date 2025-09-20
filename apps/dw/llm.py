@@ -2,220 +2,263 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any, Dict
+from datetime import date, datetime, timedelta
+from typing import Dict, Optional
+
+from flask import current_app
 
 from core.model_loader import get_model
+from .validator import basic_checks, extract_sql
 
-ALLOWED_COLUMNS = (
-    "CONTRACT_ID, CONTRACT_OWNER, "
-    "CONTRACT_STAKEHOLDER_1, CONTRACT_STAKEHOLDER_2, CONTRACT_STAKEHOLDER_3, CONTRACT_STAKEHOLDER_4, "
-    "CONTRACT_STAKEHOLDER_5, CONTRACT_STAKEHOLDER_6, CONTRACT_STAKEHOLDER_7, CONTRACT_STAKEHOLDER_8, "
-    "DEPARTMENT_1, DEPARTMENT_2, DEPARTMENT_3, DEPARTMENT_4, DEPARTMENT_5, DEPARTMENT_6, DEPARTMENT_7, DEPARTMENT_8, "
-    "OWNER_DEPARTMENT, CONTRACT_VALUE_NET_OF_VAT, VAT, CONTRACT_PURPOSE, CONTRACT_SUBJECT, "
-    "START_DATE, END_DATE, REQUEST_DATE, REQUEST_TYPE, CONTRACT_STATUS, ENTITY_NO, REQUESTER"
+_MONTH_WORDS = re.compile(r"\blast\s+month\b", re.IGNORECASE)
+_NEXT_30 = re.compile(r"\bnext\s+30\s+days\b", re.IGNORECASE)
+_IN_YEAR = re.compile(r"\bin\s+(\d{4})\b", re.IGNORECASE)
+_BETWEEN = re.compile(
+    r"\bbetween\s+(\d{4}-\d{2}-\d{2})\s+(?:and|to)\s+(\d{4}-\d{2}-\d{2})",
+    re.IGNORECASE,
 )
-
-ALLOWED_BINDS = (
-    "date_start",
-    "date_end",
-    "top_n",
-    "owner_name",
-    "dept",
-    "entity_no",
-    "contract_id_pattern",
-    "request_type",
-)
-
-_FENCE_SQL = re.compile(r"```sql\s*(.*?)```", re.IGNORECASE | re.DOTALL)
-_FENCE_ANY = re.compile(r"```+\s*(.*?)```+", re.IGNORECASE | re.DOTALL)
-_START_SQL_ANCHORED = re.compile(r"(?mis)^\s*(SELECT|WITH)\b.*")
+_LAST_DAYS = re.compile(r"\blast\s+(\d+)\s+days\b", re.IGNORECASE)
+_TOP_N = re.compile(r"\btop\s+(\d+)\b", re.IGNORECASE)
 
 
-def extract_sql(text: str) -> str:
-    """Extract the SQL portion from a model response."""
+def _fallback_intent(question: str) -> Dict[str, Optional[object]]:
+    has_window = False
+    col: Optional[str] = None
+    explicit: Optional[Dict[str, str]] = None
+    top_n: Optional[int] = None
 
-    if not text:
-        return ""
+    text = question or ""
+    if _MONTH_WORDS.search(text) or _NEXT_30.search(text) or _LAST_DAYS.search(text):
+        has_window = True
+    m_year = _IN_YEAR.search(text)
+    if m_year:
+        has_window = True
+        year = int(m_year.group(1))
+        explicit = {
+            "start": f"{year:04d}-01-01",
+            "end": f"{year + 1:04d}-01-01",
+        }
+    m_between = _BETWEEN.search(text)
+    if m_between:
+        has_window = True
+        explicit = {"start": m_between.group(1), "end": m_between.group(2)}
+    m_top = _TOP_N.search(text)
+    if m_top:
+        try:
+            top_n = int(m_top.group(1))
+        except Exception:
+            top_n = None
 
-    # 1) Prefer fenced ```sql blocks
-    match = _FENCE_SQL.search(text)
-    if match and match.group(1).strip():
-        return match.group(1).strip()
+    if re.search(r"\bEND_DATE\b", text, re.IGNORECASE):
+        col = "END_DATE"
+    elif re.search(r"\bSTART_DATE\b", text, re.IGNORECASE):
+        col = "START_DATE"
+    elif re.search(r"\bREQUEST_DATE\b", text, re.IGNORECASE):
+        col = "REQUEST_DATE"
 
-    # 2) Any fenced block when the model omits `sql`
-    match = _FENCE_ANY.search(text)
-    if match and match.group(1).strip():
-        return match.group(1).strip()
-
-    # 3) Fallback to first anchored SELECT/WITH line
-    match = _START_SQL_ANCHORED.search(text)
-    if match:
-        return match.group(0).strip()
-
-    return ""
-
-
-def clarify_intent(question: str, context: dict) -> Dict[str, Any]:
-    """Run the clarifier model and augment with heuristic defaults."""
-
-    mdl = get_model("clarifier")
-    prompt = (
-        "You are a precise NLU clarifier. Output JSON only.\n"
-        "Keys:\n"
-        "  has_time_window: boolean\n"
-        "  date_column: string|null (END_DATE|REQUEST_DATE|START_DATE)\n"
-        "  top_n: integer|null\n"
-        "  explicit_dates: object|null {start,end} (ISO dates)\n"
-        "Return JSON only between <<JSON>> and <</JSON>>.\n\n"
-        f"Question: {question}\n\n<<JSON>>\n{{}}\n<</JSON>>\n"
-    )
-    raw = mdl.generate(prompt, max_new_tokens=192)
-    raw_json = "{}"
-    if raw:
-        text = raw
-        start = text.find("<<JSON>>")
-        end = text.find("<</JSON>>")
-        if start != -1 and end != -1 and end > start:
-            raw_json = text[start + 8 : end].strip() or "{}"
-    try:
-        intent_data = json.loads(raw_json or "{}")
-    except Exception:
-        intent_data = {}
-
-    intent: Dict[str, Any] = {
-        "has_time_window": intent_data.get("has_time_window"),
-        "date_column": intent_data.get("date_column"),
-        "top_n": intent_data.get("top_n"),
-        "explicit_dates": intent_data.get("explicit_dates"),
+    return {
+        "has_time_window": has_window,
+        "date_column": col,
+        "explicit_dates": explicit,
+        "top_n": top_n,
     }
 
-    q_lower = (question or "").lower()
-    date_terms = [
-        "last month",
-        "this month",
-        "next 30 days",
-        "last 30 days",
-        "in 2024",
-        "in 2025",
-        "last quarter",
-        "last 90 days",
-    ]
-    if any(term in q_lower for term in date_terms):
-        intent.setdefault("has_time_window", True)
 
-    if intent.get("has_time_window") and not intent.get("date_column"):
-        if any(k in q_lower for k in ("end date", "end_date", "expiry", "expires")):
-            intent["date_column"] = "END_DATE"
-        elif any(k in q_lower for k in ("start date", "start_date")):
-            intent["date_column"] = "START_DATE"
-        else:
-            intent["date_column"] = "REQUEST_DATE"
+def _dates_for_last_month(today: date) -> tuple[date, date]:
+    first_this = today.replace(day=1)
+    last_month_end = first_this
+    last_month_last = last_month_end - timedelta(days=1)
+    last_month_first = last_month_last.replace(day=1)
+    return last_month_first, last_month_end
 
-    match = re.search(r"\btop\s+(\d+)\b", q_lower)
-    if match and not intent.get("top_n"):
+
+def clarify_intent(question: str, context: dict) -> Dict[str, object]:
+    mdl = get_model("clarifier")
+    raw = ""
+    data: Dict[str, object] = {}
+    if mdl is not None:
+        prompt = (
+            "You are a precise NLU clarifier. Output JSON only.\n"
+            "Keys:\n"
+            "  has_time_window: boolean\n"
+            "  date_column: string|null (END_DATE|REQUEST_DATE|START_DATE)\n"
+            "  top_n: integer|null\n"
+            "  explicit_dates: object|null {start,end} (ISO dates)\n"
+            "Return JSON only between <<JSON>> and <</JSON>>.\n\n"
+            f"Question: {question}\n\n<<JSON>>\n{{}}\n<</JSON>>\n"
+        )
         try:
-            intent["top_n"] = int(match.group(1))
+            raw = mdl.generate(prompt, max_new_tokens=192)
         except Exception:
-            pass
+            raw = ""
+        payload = "{}"
+        if raw:
+            start = raw.find("<<JSON>>")
+            end = raw.find("<</JSON>>")
+            if start != -1 and end != -1 and end > start:
+                payload = raw[start + 8 : end].strip() or "{}"
+        try:
+            parsed = json.loads(payload)
+        except Exception:
+            parsed = {}
+        if isinstance(parsed, dict):
+            data = {
+                "has_time_window": parsed.get("has_time_window"),
+                "date_column": parsed.get("date_column"),
+                "top_n": parsed.get("top_n"),
+                "explicit_dates": parsed.get("explicit_dates"),
+            }
 
-    return {"ok": True, "used": True, "intent": intent, "raw": raw}
+    fb = _fallback_intent(question)
+    if not isinstance(data, dict):
+        data = {}
+    data.setdefault("has_time_window", fb["has_time_window"])
+    data.setdefault("date_column", fb["date_column"])
+    data.setdefault("top_n", fb["top_n"])
+    data.setdefault("explicit_dates", fb["explicit_dates"])
+    return {"intent": data, "raw": raw}
 
 
-def build_sql_prompt(question: str, intent_bundle: Dict[str, Any], context: dict) -> str:
-    """Construct the SQL generation prompt with guidance and example."""
+def _build_prompt(question: str, ctx: dict, intent: Dict[str, object]) -> str:
+    allowed_cols = ctx.get("allowed_columns", [])
+    allowed_binds = ctx.get("allowed_binds", [])
+    table = ctx.get("table") or ctx.get("contract_table") or "Contract"
+    default_date_col = intent.get("date_column") or ctx.get("default_date_col", "REQUEST_DATE")
 
-    intent = intent_bundle.get("intent", {}) if intent_bundle else {}
-    allowed_cols = ALLOWED_COLUMNS
     lines = [
-        "Return Oracle SQL only in a fenced block:",
+        "Return Oracle SQL only inside ```sql fenced block.",
+        f'Table: "{table}"',
+        f"Allowed columns: {', '.join(allowed_cols)}",
+        "Oracle syntax only (NVL, TRIM, LISTAGG WITHIN GROUP, FETCH FIRST N ROWS ONLY). SELECT/CTE only.",
+        f"Allowed binds: {', '.join(allowed_binds)}",
+        "Add date filter ONLY if user asks. For windows use :date_start and :date_end.",
+        f"Default window column: {default_date_col}.",
+        "No prose, comments, or explanations.",
+        "",
+        f"Question:\n{question}\n",
         "```sql",
-        "-- Table: \"Contract\"",
-        f"-- Allowed columns: {allowed_cols}",
-        "-- Oracle only: NVL, LISTAGG ... WITHIN GROUP, TRIM, UPPER, FETCH FIRST N ROWS ONLY",
-        "-- Never write DML/DDL",
-        "-- Use only these named binds when needed: :date_start, :date_end, :top_n, :owner_name, :dept, :entity_no, :contract_id_pattern, :request_type",
     ]
-
-    if intent.get("has_time_window"):
-        column = intent.get("date_column") or "REQUEST_DATE"
-        lines.append(f"-- Use :date_start and :date_end on {column} for the requested window")
-    else:
-        lines.append("-- Do not add a date filter unless explicitly requested")
-
-    example = (
-        "/* Example: top 3 stakeholders by gross value in a window */\n"
-        "WITH stk AS (\n"
-        "  SELECT CONTRACT_ID,\n"
-        "         NVL(CONTRACT_VALUE_NET_OF_VAT,0)+NVL(VAT,0) AS CONTRACT_VALUE_GROSS,\n"
-        "         CONTRACT_STAKEHOLDER_1 AS STAKEHOLDER,\n"
-        "         REQUEST_DATE AS REF_DATE\n"
-        "  FROM \"Contract\"\n"
-        "  UNION ALL SELECT CONTRACT_ID, NVL(CONTRACT_VALUE_NET_OF_VAT,0)+NVL(VAT,0), CONTRACT_STAKEHOLDER_2, REQUEST_DATE FROM \"Contract\"\n"
-        "  UNION ALL SELECT CONTRACT_ID, NVL(CONTRACT_VALUE_NET_OF_VAT,0)+NVL(VAT,0), CONTRACT_STAKEHOLDER_3, REQUEST_DATE FROM \"Contract\"\n"
-        "  UNION ALL SELECT CONTRACT_ID, NVL(CONTRACT_VALUE_NET_OF_VAT,0)+NVL(VAT,0), CONTRACT_STAKEHOLDER_4, REQUEST_DATE FROM \"Contract\"\n"
-        "  UNION ALL SELECT CONTRACT_ID, NVL(CONTRACT_VALUE_NET_OF_VAT,0)+NVL(VAT,0), CONTRACT_STAKEHOLDER_5, REQUEST_DATE FROM \"Contract\"\n"
-        "  UNION ALL SELECT CONTRACT_ID, NVL(CONTRACT_VALUE_NET_OF_VAT,0)+NVL(VAT,0), CONTRACT_STAKEHOLDER_6, REQUEST_DATE FROM \"Contract\"\n"
-        "  UNION ALL SELECT CONTRACT_ID, NVL(CONTRACT_VALUE_NET_OF_VAT,0)+NVL(VAT,0), CONTRACT_STAKEHOLDER_7, REQUEST_DATE FROM \"Contract\"\n"
-        "  UNION ALL SELECT CONTRACT_ID, NVL(CONTRACT_VALUE_NET_OF_VAT,0)+NVL(VAT,0), CONTRACT_STAKEHOLDER_8, REQUEST_DATE FROM \"Contract\"\n"
-        ")\n"
-        "SELECT TRIM(STAKEHOLDER) AS STAKEHOLDER,\n"
-        "       SUM(CONTRACT_VALUE_GROSS) AS TOTAL_GROSS_VALUE\n"
-        "FROM stk\n"
-        "WHERE STAKEHOLDER IS NOT NULL AND TRIM(STAKEHOLDER) <> ''\n"
-        "  AND REF_DATE >= :date_start AND REF_DATE < :date_end\n"
-        "GROUP BY TRIM(STAKEHOLDER)\n"
-        "ORDER BY TOTAL_GROSS_VALUE DESC\n"
-        "FETCH FIRST 3 ROWS ONLY"
-    )
-    lines.append(example)
-    lines.append("")
-    lines.append("-- Question:")
-    lines.append(question)
-    lines.append("")
-    lines.append("-- Answer below:")
-    lines.append("```sql")
-
     return "\n".join(lines)
 
 
-def nl_to_sql_with_llm(question: str, context: dict) -> Dict[str, Any]:
-    """Clarify, prompt, generate, and extract SQL."""
-
-    intent = clarify_intent(question, context)
-    prompt = build_sql_prompt(question, intent, context)
+def nl_to_sql_with_llm(
+    question: str,
+    ctx: dict,
+    *,
+    intent: Optional[Dict[str, object]] = None,
+) -> Dict[str, object]:
     mdl = get_model("sql")
-    raw1 = mdl.generate(prompt, max_new_tokens=512, stop=["```"])
-    sql1 = extract_sql(raw1 or "")
-    return {
-        "intent": intent,
+    if mdl is None:
+        return {"sql": "", "validation": {"ok": False, "errors": ["model_unavailable"], "binds": []}}
+
+    clarifier_raw = None
+    if intent is None:
+        clarifier = clarify_intent(question, ctx)
+        intent = clarifier.get("intent", {})
+        clarifier_raw = clarifier.get("raw")
+
+    intent = intent or {}
+    prompt = _build_prompt(question, ctx, intent)
+    try:
+        current_app.logger.info("[dw] sql_prompt_compact")
+    except Exception:
+        pass
+
+    raw1 = mdl.generate(prompt, max_new_tokens=192, stop=["```"])
+    sql1 = extract_sql(raw1)
+    val1 = basic_checks(sql1, allowed_binds=ctx.get("allowed_binds"))
+
+    result: Dict[str, object] = {
         "prompt": prompt,
         "raw1": raw1,
-        "sql1": sql1,
+        "clarifier_raw": clarifier_raw,
+        "intent": intent,
     }
 
+    if not val1["ok"]:
+        repair_prompt = (
+            f"Errors: {json.dumps(val1['errors'])}\n"
+            "Fix and return only Oracle SQL in ```sql block.\n"
+            f'Table: "{ctx.get("table") or ctx.get("contract_table") or "Contract"}". '
+            f"Allowed columns: {', '.join(ctx.get('allowed_columns', []))}. "
+            f"Allowed binds: {', '.join(ctx.get('allowed_binds', []))}.\n"
+            f"Default window column: {intent.get('date_column') or ctx.get('default_date_col', 'REQUEST_DATE')}.\n"
+            f"Question:\n{question}\n\nPrevious SQL:\n```sql\n{sql1}\n```\n```sql\n"
+        )
+        raw2 = mdl.generate(repair_prompt, max_new_tokens=160, stop=["```"])
+        sql2 = extract_sql(raw2)
+        val2 = basic_checks(sql2, allowed_binds=ctx.get("allowed_binds"))
+        result.update(
+            {
+                "sql": sql2,
+                "validation": val2,
+                "used_repair": True,
+                "raw2": raw2,
+            }
+        )
+    else:
+        result.update(
+            {
+                "sql": sql1,
+                "validation": val1,
+                "used_repair": False,
+            }
+        )
 
-def repair_sql(bad_sql: str, prompt_rules: str, question: str) -> Dict[str, Any]:
-    """Run a repair pass using only the failing SQL."""
+    return result
 
-    mdl = get_model("sql")
-    repair_prompt = (
-        "Previous SQL had validation errors.\n"
-        "Return Oracle SQL only inside a fenced block. No prose. No comments.\n"
-        f"Question:\n{question}\n\n"
-        f"Bad SQL:\n```sql\n{bad_sql or ''}\n```\n\n"
-        "Fixed SQL:\n```sql\n"
-    )
-    raw2 = mdl.generate(repair_prompt, max_new_tokens=512, stop=["```"])
-    sql2 = extract_sql(raw2 or "")
-    return {"raw2": raw2, "sql2": sql2}
+
+def derive_bind_values(question: str, used_binds: list[str], intent: Dict[str, object]) -> Dict[str, object]:
+    binds: Dict[str, object] = {}
+    used = {b.lower() for b in used_binds}
+    today = date.today()
+
+    if {"date_start", "date_end"} & used:
+        explicit = intent.get("explicit_dates") if isinstance(intent, dict) else None
+        if isinstance(explicit, dict) and explicit.get("start") and explicit.get("end"):
+            try:
+                binds["date_start"] = datetime.fromisoformat(str(explicit["start"]))
+                binds["date_end"] = datetime.fromisoformat(str(explicit["end"]))
+            except Exception:
+                binds.pop("date_start", None)
+                binds.pop("date_end", None)
+        if "date_start" not in binds or "date_end" not in binds:
+            if _MONTH_WORDS.search(question or ""):
+                ds, de = _dates_for_last_month(today)
+                binds["date_start"] = datetime.combine(ds, datetime.min.time())
+                binds["date_end"] = datetime.combine(de, datetime.min.time())
+            elif _NEXT_30.search(question or ""):
+                binds["date_start"] = datetime.combine(today, datetime.min.time())
+                binds["date_end"] = datetime.combine(today + timedelta(days=30), datetime.min.time())
+            else:
+                m = _LAST_DAYS.search(question or "")
+                if m:
+                    try:
+                        days = int(m.group(1))
+                    except Exception:
+                        days = 30
+                    binds["date_start"] = datetime.combine(today - timedelta(days=days), datetime.min.time())
+                    binds["date_end"] = datetime.combine(today, datetime.min.time())
+                else:
+                    binds["date_end"] = datetime.combine(today, datetime.min.time())
+                    binds["date_start"] = datetime.combine(today - timedelta(days=30), datetime.min.time())
+
+    if "top_n" in used:
+        top_n_val = intent.get("top_n") if isinstance(intent, dict) else None
+        if not isinstance(top_n_val, int):
+            m = _TOP_N.search(question or "")
+            if m:
+                try:
+                    top_n_val = int(m.group(1))
+                except Exception:
+                    top_n_val = None
+        binds["top_n"] = top_n_val or 10
+
+    return binds
 
 
 __all__ = [
-    "ALLOWED_COLUMNS",
-    "ALLOWED_BINDS",
-    "build_sql_prompt",
     "clarify_intent",
-    "extract_sql",
+    "derive_bind_values",
     "nl_to_sql_with_llm",
-    "repair_sql",
 ]
