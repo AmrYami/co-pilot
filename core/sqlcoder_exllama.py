@@ -107,36 +107,7 @@ class SQLCoderExLlama:
 
         return text[:cut]
 
-    def _call_generate_simple(
-        self,
-        prompt: str,
-        max_new_tokens: int,
-        temperature: Optional[float],
-        top_p: Optional[float],
-    ):
-        settings = None
-        if ExLlamaV2Sampler is not None:
-            try:
-                settings = ExLlamaV2Sampler.Settings()
-                if temperature is not None:
-                    try:
-                        settings.temperature = float(temperature)
-                    except Exception:
-                        settings.temperature = 0.2
-                if top_p is not None:
-                    try:
-                        settings.top_p = float(top_p)
-                    except Exception:
-                        settings.top_p = 0.9
-            except Exception:  # pragma: no cover - fallback for unexpected API changes
-                settings = None
-
-        if settings is not None:
-            try:
-                return self._generator.generate_simple(prompt, settings, max_new_tokens)
-            except TypeError:
-                pass
-
+    def _call_generate_simple(self, prompt: str, max_new_tokens: int):
         try:
             return self._generator.generate_simple(prompt, max_new_tokens)
         except TypeError:
@@ -158,36 +129,14 @@ class SQLCoderExLlama:
             max_new = int(max_new_tokens or 256)
         max_new = max(1, max_new)
 
-        if temperature is None:
-            try:
-                temperature = float(os.getenv("GENERATION_TEMPERATURE", "0.2"))
-            except Exception:
-                temperature = 0.2
-        else:
-            try:
-                temperature = float(temperature)
-            except Exception:
-                temperature = 0.2
-
-        if top_p is None:
-            try:
-                top_p = float(os.getenv("GENERATION_TOP_P", "0.9"))
-            except Exception:
-                top_p = 0.9
-        else:
-            try:
-                top_p = float(top_p)
-            except Exception:
-                top_p = 0.9
-
         prompt = self._truncate_prompt(prompt, max_new)
 
         try:
-            output = self._call_generate_simple(prompt, max_new, temperature, top_p)
+            output = self._call_generate_simple(prompt, max_new)
         except AssertionError as err:
             logger.warning("[dw] exllama overflow; retrying with truncated context: %s", err)
             prompt = self._truncate_prompt(prompt, max_new)
-            output = self._call_generate_simple(prompt, min(max_new, 128), temperature, top_p)
+            output = self._call_generate_simple(prompt, min(max_new, 128))
 
         text = output if isinstance(output, str) else output[0] if isinstance(output, (list, tuple)) else str(output)
         if not isinstance(text, str):
