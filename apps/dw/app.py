@@ -5,7 +5,8 @@ import json
 import logging
 import os
 import pathlib
-from datetime import datetime
+from datetime import date, datetime, timedelta
+from typing import Any, Dict, Optional
 
 from flask import Blueprint, current_app, jsonify, request
 from sqlalchemy import text
@@ -13,8 +14,8 @@ from sqlalchemy import text
 from core.datasources import DatasourceRegistry
 from core.settings import Settings
 from core.sql_exec import get_mem_engine
-from .llm import clarify_intent, derive_bind_values, nl_to_sql_with_llm
-from .validator import WHITELIST_BINDS, basic_checks
+from .llm import nl_to_sql_with_llm
+from .validator import validate_sql
 
 
 ALLOWED_COLUMNS = [
@@ -50,7 +51,16 @@ ALLOWED_COLUMNS = [
     "REQUESTER",
 ]
 
-ALLOWED_BINDS = sorted(WHITELIST_BINDS)
+ALLOWED_BINDS = [
+    "contract_id_pattern",
+    "date_end",
+    "date_start",
+    "dept",
+    "entity_no",
+    "owner_name",
+    "request_type",
+    "top_n",
+]
 
 dw_bp = Blueprint("dw", __name__, url_prefix="/dw")
 
@@ -107,6 +117,44 @@ def _log(tag, payload):
         print(f"[dw] {tag}: {payload}")
 
 
+def _parse_iso_datetime(value) -> Optional[datetime]:
+    if value is None:
+        return None
+    try:
+        if isinstance(value, datetime):
+            return value
+        if isinstance(value, date):
+            return datetime.combine(value, datetime.min.time())
+        parsed = datetime.fromisoformat(str(value))
+        return parsed
+    except Exception:
+        return None
+
+
+def _derive_dates_from_intent(intent: Dict[str, Any]) -> tuple[datetime, datetime]:
+    now = datetime.utcnow()
+    default_end = now
+    default_start = now - timedelta(days=30)
+
+    if not isinstance(intent, dict):
+        return default_start, default_end
+
+    explicit = intent.get("explicit_dates")
+    if isinstance(explicit, dict):
+        start_val = _parse_iso_datetime(explicit.get("start"))
+        end_val = _parse_iso_datetime(explicit.get("end"))
+        start = start_val or default_start
+        end = end_val or default_end
+        if start > end:
+            start, end = end, start
+        return start, end
+
+    if intent.get("has_time_window"):
+        return default_start, default_end
+
+    return default_start, default_end
+
+
 @dw_bp.record_once
 def _init_dw_logging(setup_state):
     _ensure_file_logger(setup_state.app)
@@ -142,7 +190,7 @@ def answer():
     table_name = settings.get("DW_CONTRACT_TABLE", scope="namespace") or "Contract"
     default_date_col = settings.get("DW_DATE_COLUMN", scope="namespace") or "REQUEST_DATE"
 
-    ctx = {
+    llm_context = {
         "table": table_name,
         "allowed_columns": ALLOWED_COLUMNS,
         "allowed_binds": ALLOWED_BINDS,
@@ -163,30 +211,67 @@ def answer():
 
     _log("inquiry_start", {"id": inq_id, "q": q, "email": auth_email})
 
-    clarifier = clarify_intent(q, ctx)
-    intent = clarifier.get("intent", {}) if isinstance(clarifier, dict) else {}
-    _log("clarifier_intent", intent)
-    if clarifier.get("raw"):
-        payload = {"size": len(clarifier["raw"])}
+    llm_out = nl_to_sql_with_llm(q, llm_context)
+    debug_blob = llm_out.get("debug", {}) if isinstance(llm_out, dict) else {}
+    clarifier_dbg = debug_blob.get("clarifier") or {}
+    intent = clarifier_dbg.get("intent") or {}
+    if intent:
+        _log("clarifier_intent", intent)
+    clar_raw = clarifier_dbg.get("raw")
+    if clar_raw:
+        payload = {"size": len(clar_raw)}
         if include_debug:
-            payload["text"] = clarifier["raw"][:900]
+            payload["text"] = clar_raw[:900]
         _log("clarifier_raw", payload)
 
-    llm_out = nl_to_sql_with_llm(q, ctx, intent=intent)
-    prompt_text = llm_out.get("prompt") or ""
-    _log("sql_prompt", {"prompt": prompt_text if include_debug else "<hidden>"})
-    raw1 = llm_out.get("raw1") or ""
+    prompt_label = debug_blob.get("prompt", "")
+    _log("sql_prompt", {"prompt": prompt_label if include_debug else "<hidden>"})
+    raw1 = debug_blob.get("raw1", "") or ""
     _log("llm_raw_pass1", {"size": len(raw1)})
-    if llm_out.get("used_repair"):
-        raw2 = llm_out.get("raw2") or ""
+    raw2 = debug_blob.get("raw2")
+    if raw2:
         _log("llm_raw_pass2", {"size": len(raw2)})
 
     sql_final = (llm_out.get("sql") or "").strip()
     sql_payload = {"size": len(sql_final)}
     sql_payload["sql"] = sql_final[:900] if include_debug else "<hidden>"
     _log("final_sql", sql_payload)
-    validation = llm_out.get("validation") or basic_checks(sql_final, allowed_binds=ALLOWED_BINDS)
+
+    validation = validate_sql(sql_final)
     _log("validation", validation)
+
+    if not llm_out.get("ok"):
+        with mem.begin() as conn:
+            conn.execute(
+                text(
+                    """
+                UPDATE mem_inquiries
+                   SET status = 'needs_clarification',
+                       last_sql = :sql,
+                       last_error = :err,
+                       updated_at = NOW()
+                 WHERE id = :id
+            """
+                ),
+                {
+                    "sql": sql_final,
+                    "err": llm_out.get("error") or "validation_failed",
+                    "id": inq_id,
+                },
+            )
+        response = {
+            "ok": False,
+            "status": "needs_clarification",
+            "inquiry_id": inq_id,
+            "error": llm_out.get("error") or "validation_failed",
+            "sql": sql_final,
+            "questions": [
+                "I couldn’t derive a clean SELECT. Can you rephrase or specify filters (stakeholders, departments, date columns)?",
+            ],
+        }
+        if include_debug:
+            response["debug"] = debug_blob
+        return jsonify(response)
 
     if not validation.get("ok"):
         with mem.begin() as conn:
@@ -211,28 +296,32 @@ def answer():
             "ok": False,
             "status": "needs_clarification",
             "inquiry_id": inq_id,
-            "error": (validation.get("errors") or ["error"])[0],
+            "error": (validation.get("errors") or ["invalid_sql"])[0],
             "sql": sql_final,
             "questions": [
-                "I couldn't derive a clean SELECT. Can you rephrase or specify filters (stakeholders, departments, date columns)?"
+                "I couldn’t derive a clean SELECT. Can you rephrase or specify filters (stakeholders, departments, date columns)?",
             ],
         }
         if include_debug:
-            res["debug"] = {
-                "intent": intent,
-                "prompt": prompt_text,
-                "raw1": raw1,
-                "validation": validation,
-            }
+            res["debug"] = debug_blob
         return jsonify(res)
 
-    used_binds = validation.get("binds") or []
-    actual_bind_names = validation.get("bind_names") or []
-    bind_name_map = {canon: actual for canon, actual in zip(used_binds, actual_bind_names)}
+    bind_names = validation.get("bind_names") or []
+    exec_binds: Dict[str, Any] = {}
+    if "date_start" in bind_names or "date_end" in bind_names:
+        start_dt, end_dt = _derive_dates_from_intent(intent)
+        if "date_start" in bind_names:
+            exec_binds["date_start"] = start_dt
+        if "date_end" in bind_names:
+            exec_binds["date_end"] = end_dt
+    if "top_n" in bind_names and intent.get("top_n") is not None:
+        try:
+            exec_binds["top_n"] = int(intent["top_n"])
+        except Exception:
+            exec_binds["top_n"] = intent["top_n"]
 
-    bind_values = derive_bind_values(q, used_binds, intent)
-    missing = [b for b in used_binds if b not in bind_values]
-    if missing:
+    missing_binds = [name for name in bind_names if name not in exec_binds]
+    if missing_binds:
         with mem.begin() as conn:
             conn.execute(
                 text(
@@ -251,19 +340,12 @@ def answer():
             "error": "missing_bind_values",
             "sql": sql_final,
             "questions": [
-                f"Provide values for: {', '.join(sorted(missing))} or rephrase with explicit filters."
+                f"Provide values for: {', '.join(sorted(missing_binds))} or rephrase with explicit filters."
             ],
         }
         if include_debug:
-            resp["debug"] = {
-                "intent": intent,
-                "prompt": prompt_text,
-                "raw1": raw1,
-                "validation": validation,
-            }
+            resp["debug"] = debug_blob
         return jsonify(resp)
-
-    exec_binds = {bind_name_map.get(k, k): v for k, v in bind_values.items()}
     _log("execution_binds", {k: str(v) for k, v in exec_binds.items()})
 
     oracle_engine = ds_registry.engine(None)
@@ -348,16 +430,15 @@ def answer():
         )
 
     binds_public = {
-        bind_name_map.get(k, k): (
-            v.isoformat() if hasattr(v, "isoformat") else v
-        )
-        for k, v in bind_values.items()
+        name: (value.isoformat() if hasattr(value, "isoformat") else value)
+        for name, value in exec_binds.items()
     }
+    used_repair = bool(debug_blob.get("sql2"))
     meta = {
         "rowcount": len(rows),
         "columns": headers,
         "duration_ms": duration_ms,
-        "used_repair": bool(llm_out.get("used_repair")),
+        "used_repair": used_repair,
         "suggested_date_column": intent.get("date_column") or default_date_col,
         "clarifier_intent": intent,
         "binds": binds_public,
@@ -372,17 +453,10 @@ def answer():
         "meta": meta,
     }
     if include_debug:
-        debug_payload = {
-            "intent": intent,
-            "prompt": prompt_text,
-            "raw1": raw1,
-            "validation": validation,
-            "clarifier_raw": clarifier.get("raw"),
-        }
-        if llm_out.get("used_repair"):
-            debug_payload["raw2"] = llm_out.get("raw2")
-        resp["debug"] = debug_payload
+        resp["debug"] = debug_blob
     return jsonify(resp)
+
+
 
 
 def create_dw_blueprint(*args, **kwargs):
