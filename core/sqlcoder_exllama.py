@@ -28,11 +28,43 @@ def _parse_gpu_split(env_value: str | None) -> Optional[list[float]]:
 
 
 class ExLlamaGenerator:
-    def __init__(self, generator, stop_tokens: Iterable[str], defaults: Dict[str, Any], dynamic: bool) -> None:
+    def __init__(
+        self,
+        generator,
+        tokenizer,
+        stop_tokens: Iterable[str],
+        defaults: Dict[str, Any],
+        dynamic: bool,
+        cache_max_seq_len: Optional[int] = None,
+    ) -> None:
         self._generator = generator
+        self._tokenizer = tokenizer
         self._stop_tokens = [tok for tok in stop_tokens if tok]
         self._defaults = defaults
         self._dynamic = dynamic
+        self._cache_max_seq_len = cache_max_seq_len or int(
+            os.getenv("EXL2_CACHE_MAX_SEQ_LEN", "2048")
+        )
+        self._input_reserve = int(os.getenv("EXL2_INPUT_RESERVE_TOKENS", "64"))
+
+    def _truncate_tokens_left(self, text: str, keep_tokens: int) -> str:
+        if keep_tokens <= 0 or not text:
+            return text
+        try:
+            ids = self._tokenizer.encode(text)
+        except Exception:
+            return text
+        if hasattr(ids, "tolist"):
+            ids = ids.tolist()
+        if not isinstance(ids, (list, tuple)):
+            return text
+        if len(ids) <= keep_tokens:
+            return text
+        trimmed = ids[-keep_tokens:]
+        try:
+            return self._tokenizer.decode(trimmed)
+        except Exception:
+            return text
 
     def generate(
         self,
@@ -53,14 +85,20 @@ class ExLlamaGenerator:
             args["top_p"] = float(top_p)
 
         stop_tokens = list(stop or self._stop_tokens)
+        for token in ("```", "</s>"):
+            if token and token not in stop_tokens:
+                stop_tokens.append(token)
         max_new = int(args["max_new_tokens"])
         temp = float(args["temperature"])
         nucleus = float(args["top_p"])
 
+        allow_in = max(self._cache_max_seq_len - max_new - self._input_reserve, 256)
+        prompt_text = self._truncate_tokens_left(prompt, allow_in)
+
         if self._dynamic:
             try:
                 text = self._generator.generate_simple(
-                    prompt,
+                    prompt_text,
                     max_new_tokens=max_new,
                     temperature=temp,
                     top_p=nucleus,
@@ -80,13 +118,13 @@ class ExLlamaGenerator:
         settings.temperature = temp
         settings.top_p = nucleus
         try:
-            output = self._generator.generate_simple(prompt, settings, max_new)
+            output = self._generator.generate_simple(prompt_text, settings, max_new)
         except TypeError:
             try:
-                output = self._generator.generate_simple(prompt, max_new, settings)
+                output = self._generator.generate_simple(prompt_text, max_new, settings)
             except TypeError:
                 output = self._generator.generate_simple(
-                    prompt,
+                    prompt_text,
                     settings=settings,
                     max_new_tokens=max_new,
                 )
@@ -201,4 +239,12 @@ def load_exllama_generator(model_path: str, config: Dict[str, Any]) -> ExLlamaGe
         "top_p": float(config.get("top_p", 0.9)),
     }
     stop_tokens = config.get("stop") or []
-    return ExLlamaGenerator(gen, stop_tokens, defaults, gen_is_dynamic)
+    cache_max_seq_len = getattr(cache, "max_seq_len", None)
+    return ExLlamaGenerator(
+        gen,
+        tokenizer,
+        stop_tokens,
+        defaults,
+        gen_is_dynamic,
+        cache_max_seq_len=cache_max_seq_len,
+    )
