@@ -126,17 +126,14 @@ def answer():
         binds["date_start"] = datetime.combine(date_start, datetime.min.time())
         binds["date_end"] = datetime.combine(date_end, datetime.min.time())
 
-    _log("final_sql", {"size": len(sql), "sql": sql[:1200]})
-    _log(
-        "execution_binds",
-        {k: (v.isoformat() if hasattr(v, "isoformat") else v) for k, v in binds.items()},
-    )
-
     engine = get_oracle_engine()
     rows: list[list[object]] = []
     cols: list[str] = []
     started = datetime.utcnow()
     try:
+        bind_params_log = {k: (v.isoformat() if hasattr(v, "isoformat") else v) for k, v in binds.items()}
+        _log("execution_sql", {"sql": sql[:1800]})
+        _log("execution_binds", bind_params_log)
         with engine.begin() as conn:
             result = conn.exec_driver_sql(sql, binds)
             cols = list(result.keys())

@@ -8,7 +8,6 @@ import time
 from typing import Any, Dict, Iterable, Optional
 
 import torch
-from exllamav2 import ExLlamaV2Sampler
 
 
 logger = logging.getLogger("dw")
@@ -33,89 +32,102 @@ def _parse_gpu_split(env_value: str | None) -> Optional[list[float]]:
 
 
 class SQLCoderExLlama:
-    def __init__(self, generator, tokenizer):
+    def __init__(self, generator, tokenizer, cache_max_seq_len: int, input_reserve_tokens: int = 64):
         self._generator = generator
         self._tokenizer = tokenizer
-        self._settings = ExLlamaV2Sampler.Settings()
+        self._cache_max_seq_len = cache_max_seq_len
+        self._input_reserve_tokens = input_reserve_tokens
 
-    def _trim_prompt(self, prompt: str, reserve_tokens: int = 256) -> str:
-        """Left-truncate prompt to avoid cache overflow."""
+    def _truncate_prompt(self, prompt: str, max_new_tokens: int) -> str:
+        """Ensure the prompt fits within the KV cache budget."""
 
+        reserve_env = os.getenv("EXL2_INPUT_RESERVE_TOKENS")
         try:
-            max_len = int(os.getenv("EXL2_CACHE_MAX_SEQ_LEN", "2048"))
+            reserve_tokens = int(reserve_env) if reserve_env is not None else self._input_reserve_tokens
         except Exception:
-            max_len = 2048
+            reserve_tokens = self._input_reserve_tokens
+        reserve_tokens = max(0, reserve_tokens)
 
         try:
-            ids = self._tokenizer.encode(prompt, add_bos=True)
-            if len(ids) + reserve_tokens > max_len:
-                keep = max(max_len - reserve_tokens, 128)
-                ids = ids[-keep:]
-                prompt = self._tokenizer.decode(ids)
+            ids = self._tokenizer.encode(prompt)
         except Exception:
             if len(prompt) > 8000:
-                prompt = prompt[-8000:]
+                tail = prompt[-8000:]
+                logger.debug("[dw] prompt truncated to last 8000 characters (encode fallback)")
+                return tail
+            return prompt
+
+        max_new = max(0, int(max_new_tokens or 0))
+        max_input_tokens = max(1, self._cache_max_seq_len - max_new - reserve_tokens)
+        if len(ids) > max_input_tokens:
+            ids = ids[-max_input_tokens:]
+            prompt = self._tokenizer.decode(ids)
+            logger.debug(
+                "[dw] prompt truncated to %d tokens (max_input_tokens=%d)",
+                len(ids),
+                max_input_tokens,
+            )
         return prompt
 
     @staticmethod
-    def _truncate_on_stop(text: str, stops: Optional[Iterable[str]]) -> str:
-        if not stops:
+    def _apply_stops(text: str, stops: Optional[Iterable[str]]) -> str:
+        if not text:
             return text
+
         cut = len(text)
-        for s in stops:
-            if not s:
-                continue
-            idx = text.find(s)
-            if idx != -1 and idx < cut:
-                cut = idx
+        for fence in ("```sql", "```"):
+            idx = text.find(fence)
+            if idx != -1:
+                cut = min(cut, idx)
+
+        if stops:
+            for stop in stops:
+                if not stop:
+                    continue
+                idx = text.find(stop)
+                if idx != -1:
+                    cut = min(cut, idx)
+
         return text[:cut]
+
+    def _call_generate_simple(self, prompt: str, max_new_tokens: int):
+        try:
+            return self._generator.generate_simple(prompt, None, max_new_tokens)
+        except TypeError:
+            return self._generator.generate_simple(prompt, max_new_tokens)
 
     def generate(
         self,
         prompt: str,
         max_new_tokens: int = 256,
         stop: Optional[Iterable[str]] = None,
-        temperature: float = 0.2,
-        top_p: float = 0.9,
+        temperature: float | None = None,
+        top_p: float | None = None,
     ) -> str:
         """Generate text with safe defaults and robust stopping."""
 
-        settings = self._settings.clone() if hasattr(self._settings, "clone") else ExLlamaV2Sampler.Settings()
-        settings.temperature = float(temperature) if temperature is not None else 0.2
-        settings.top_p = float(top_p) if top_p is not None else 0.9
-
-        max_new = int(max_new_tokens or 256)
-        if max_new < 1:
-            max_new = 1
-        if max_new > 512:
-            max_new = 512
+        del temperature, top_p  # Generation knobs are ignored if unsupported.
 
         try:
-            reserve = int(os.getenv("EXL2_INPUT_RESERVE_TOKENS", "64") or 64)
+            max_new = int(os.getenv("GENERATION_MAX_NEW_TOKENS", max_new_tokens))
         except Exception:
-            reserve = 64
-        prompt = self._trim_prompt(prompt, reserve_tokens=reserve)
+            max_new = int(max_new_tokens or 256)
+        max_new = max(1, max_new)
+
+        prompt = self._truncate_prompt(prompt, max_new)
 
         try:
-            output = self._generator.generate_simple(prompt, settings, max_new)
+            output = self._call_generate_simple(prompt, max_new)
         except AssertionError as err:
-            logger.warning("[dw] exllama overflow; retrying with reduced context/new tokens: %s", err)
-            prompt_tail = self._trim_prompt(prompt, reserve_tokens=reserve + 128)
-            output = self._generator.generate_simple(prompt_tail, settings, min(128, max_new))
+            logger.warning("[dw] exllama overflow; retrying with truncated context: %s", err)
+            prompt = self._truncate_prompt(prompt, max_new)
+            output = self._call_generate_simple(prompt, min(max_new, 128))
+
         text = output if isinstance(output, str) else output[0] if isinstance(output, (list, tuple)) else str(output)
         if not isinstance(text, str):
             text = str(text)
 
-        if stop:
-            cut = len(text)
-            for s in stop:
-                if not s:
-                    continue
-                idx = text.find(s)
-                if idx != -1:
-                    cut = min(cut, idx)
-            text = text[:cut]
-
+        text = self._apply_stops(text, stop)
         return text.strip()
 
 
@@ -199,6 +211,11 @@ def load_exllama_generator(model_path: str, config: Dict[str, Any]) -> SQLCoderE
 
     cache = current_cache
 
+    try:
+        reserve_tokens = int(os.getenv("EXL2_INPUT_RESERVE_TOKENS", "64") or 64)
+    except Exception:
+        reserve_tokens = 64
+
     gen = None
     if dyn_available and not force_base:
         try:
@@ -213,4 +230,4 @@ def load_exllama_generator(model_path: str, config: Dict[str, Any]) -> SQLCoderE
 
         gen = ExLlamaV2BaseGenerator(model=model, tokenizer=tokenizer, cache=cache)
 
-    return SQLCoderExLlama(gen, tokenizer)
+    return SQLCoderExLlama(gen, tokenizer, cache.max_seq_len, reserve_tokens)
