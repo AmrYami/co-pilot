@@ -230,7 +230,6 @@ def nl_to_sql_with_llm(question: str, ctx: dict) -> dict:
     raw1 = sql_mdl.generate(
         prompt1,
         max_new_tokens=max_new_tokens,
-        stop=["```"],
     )
     sql1 = _extract_sql(raw1)
     logger(
@@ -269,7 +268,6 @@ def nl_to_sql_with_llm(question: str, ctx: dict) -> dict:
     raw2 = sql_mdl.generate(
         prompt2,
         max_new_tokens=max_new_tokens,
-        stop=["```"],
     )
     sql2 = _extract_sql(raw2)
     logger(
