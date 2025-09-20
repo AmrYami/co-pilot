@@ -52,13 +52,17 @@ def _load_sql_model() -> Optional[Dict[str, Any]]:
         "stop": stop_tokens,
     }
 
-    handle = load_exllama_generator(path)
+    bundle = load_exllama_generator(path)
+    handle = bundle.get("generator") if isinstance(bundle, dict) else bundle
+    if handle is None:
+        raise RuntimeError("ExLlamaV2 loader did not return a generator")
     _log("SQL model (SQLCoder/ExLlamaV2) ready")
     return {
         "role": "sql",
         "backend": backend,
         "path": path,
         "handle": handle,
+        "bundle": bundle,
         "gen_cfg": cfg,
     }
 
