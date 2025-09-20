@@ -1,5 +1,5 @@
 import re
-from typing import Dict, List
+from typing import Dict, List, Sequence
 
 _DML_RE = re.compile(r"\b(INSERT|UPDATE|DELETE|MERGE|TRUNCATE|ALTER|CREATE|DROP)\b", re.I)
 _SELECT_RE = re.compile(r"^\s*(SELECT|WITH)\b", re.I)
@@ -68,28 +68,30 @@ def validate_sql(
             # Heuristic: don't scream on obvious aliases; we only guard binds strictly.
             pass
 
-    # Bind whitelist
-    # cleaned should already contain only extracted SQL to avoid binds from guardrail text.
     binds = _BIND_RE.findall(cleaned)
-    bad_binds = [b for b in binds if b not in allow_binds]
-    if bad_binds:
-        errs.append(f"illegal_bind:{','.join(bad_binds)}")
 
     # Window logic
     if question_has_window:
-        # require :date_start and :date_end
-        need = {"date_start","date_end"}
-        have = set(binds)
-        missing = list(need - have)
-        if missing:
-            errs.append("missing_binds")
-        # ensure correct date column is in WHERE / filters
         if required_date_column and not _mentions_column(cleaned, required_date_column):
-            # allow if some date column is used, but prefer required
             errs.append(f"date_column_mismatch:{required_date_column}")
     else:
-        # reject unexpected date binds unless the SQL has a *very* clear literal date filter that user asked for (we assume not)
         if "date_start" in binds or "date_end" in binds:
             errs.append("unexpected_date_filter")
 
     return {"ok": len(errs) == 0, "errors": errs, "binds": binds}
+
+
+def analyze_binds(sql: str, allow: Sequence[str], provided: Dict[str, object] | None = None) -> Dict:
+    """Inspect bind usage ensuring only allowed binds appear and required values exist."""
+
+    provided = provided or {}
+    found = set(_BIND_RE.findall(sql or ""))
+    allowed = set(allow)
+    unknown = sorted(b for b in found if b not in allowed)
+    missing = sorted(b for b in found if b not in provided)
+    return {
+        "found": sorted(found),
+        "unknown": unknown,
+        "missing": missing,
+        "ok": not unknown and not missing,
+    }
