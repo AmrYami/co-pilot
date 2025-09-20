@@ -1,50 +1,43 @@
 import re
 
-_SQL_FENCE_RE = re.compile(r"```sql\s*(.*?)\s*```", re.IGNORECASE | re.DOTALL)
-_BIND_RE = re.compile(r":([A-Za-z_][A-Za-z0-9_]*)")
+_WHITELIST_BINDS = {
+    "date_start",
+    "date_end",
+    "top_n",
+    "owner_name",
+    "dept",
+    "entity_no",
+    "contract_id_pattern",
+    "request_type",
+}
 
-_ILLEGAL_START = re.compile(r"^\s*(UPDATE|DELETE|INSERT|MERGE|CREATE|ALTER|DROP|TRUNCATE)\b", re.IGNORECASE)
 
-def extract_sql_from_fenced(text: str) -> str:
-    """
-    Accept only fenced SQL blocks. If none, return empty to force repair/clarification.
-    """
-    if not text:
-        return ""
-    m = _SQL_FENCE_RE.search(text)
-    if not m:
-        return ""
-    sql = m.group(1).strip()
-    return sql
+def analyze_sql(sql: str) -> dict:
+    errors: list[str] = []
+    binds: list[str] = []
 
-def find_named_binds(sql: str) -> list[str]:
-    return sorted(set(_BIND_RE.findall(sql))) if sql else []
-
-def validate_sql(sql: str, allow_binds: set[str] | None = None) -> dict:
-    """
-    Very lightweight safety gate:
-      - Must start with SELECT or WITH
-      - Must not start with DML/DDL
-      - If binds are present, all must be in allow list (when provided)
-    """
-    if not sql:
+    if not sql or not sql.strip():
         return {"ok": False, "errors": ["empty_sql"], "binds": []}
 
-    head = sql.strip()[:6].upper()
-    if head not in ("SELECT", "WITH"):
-        return {"ok": False, "errors": ["not_select"], "binds": []}
+    trimmed = sql.strip()
+    if not re.match(r"^(SELECT|WITH)\b", trimmed, re.IGNORECASE):
+        errors.append("must_start_select_or_with")
 
-    if _ILLEGAL_START.match(sql or ""):
-        return {"ok": False, "errors": ["illegal_command"], "binds": []}
+    lowered = trimmed.lower()
+    if "```" in trimmed or "allowed columns" in lowered or "question:" in lowered:
+        errors.append("instruction_leak")
 
-    binds = find_named_binds(sql)
-    errors = []
-    if allow_binds is not None:
-        illegal = [b for b in binds if b not in allow_binds]
-        if illegal:
-            errors.append(f"illegal_binds:{','.join(illegal)}")
+    for match in re.finditer(r":([A-Za-z_][A-Za-z0-9_]*)", trimmed):
+        name = match.group(1)
+        binds.append(name)
+        if name not in _WHITELIST_BINDS:
+            errors.append(f"illegal_bind:{name}")
 
-    return {"ok": len(errors) == 0, "errors": errors, "binds": binds}
+    if re.search(r"\b(INSERT|UPDATE|DELETE|MERGE|CREATE|DROP|ALTER)\b", trimmed, re.IGNORECASE):
+        errors.append("no_dml_ddl")
+
+    return {"ok": not errors, "errors": errors, "binds": binds}
 
 
-__all__ = ["extract_sql_from_fenced", "find_named_binds", "validate_sql"]
+__all__ = ["analyze_sql"]
+

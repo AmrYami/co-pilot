@@ -160,3 +160,16 @@ def as_csv(result: Dict[str, Any]) -> bytes:
     for r in rows:
         w.writerow([r.get(c) for c in cols])
     return sio.getvalue().encode("utf-8")
+
+
+def get_oracle_engine() -> Engine:
+    """Return the Oracle engine used by the DW app via environment configuration."""
+
+    url = (
+        os.getenv("APP_DB_URL")
+        or os.getenv("DW_APP_DB_URL")
+        or os.getenv("DOCUWARE_DB_URL")
+    )
+    if not url:
+        raise RuntimeError("APP_DB_URL (Oracle) not set in environment.")
+    return get_engine_for_url(url)
