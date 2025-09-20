@@ -16,8 +16,9 @@ from core.datasources import DatasourceRegistry
 from core.settings import Settings
 from core.sql_exec import get_mem_engine
 
-from apps.dw.clarifier import propose_clarifying_questions
+from apps.dw.clarifier import analyze_question_intent, propose_clarifying_questions
 from apps.dw.llm import nl_to_sql_with_llm
+from apps.dw.sql_validate import analyze_binds, build_runtime_binds
 
 if TYPE_CHECKING:  # pragma: no cover
     from core.pipeline import Pipeline
@@ -37,25 +38,6 @@ DW_BIND_WHITELIST = {
     "contract_id_pattern",
     "request_type",
 }
-
-_BIND_RE = re.compile(r":([A-Za-z_][A-Za-z0-9_]*)")
-
-
-def _binds_used_in_sql(sql: str) -> set[str]:
-    if not sql:
-        return set()
-    return set(_BIND_RE.findall(sql))
-
-
-def _validate_bind_whitelist(sql: str, whitelist: set[str]) -> tuple[bool, list[str]]:
-    used = _binds_used_in_sql(sql)
-    not_allowed = sorted(used - whitelist)
-    return (len(not_allowed) == 0, not_allowed)
-
-
-def _filter_binds_for_sql(sql: str, candidate_binds: dict) -> dict:
-    used = _binds_used_in_sql(sql)
-    return {k: v for k, v in (candidate_binds or {}).items() if k in used}
 
 
 @dw_bp.route("/model/info", methods=["GET"])
@@ -1098,70 +1080,74 @@ def answer():
             return value
         return value
 
-    date_col_hint = _choose_date_column(question)
-    need_window = _window_requested(question)
+    def _intent_bind_context(intent_data: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        context: Dict[str, Any] = {}
+        if not intent_data:
+            return context
+        window = intent_data.get("date_window") or {}
+        start = window.get("start")
+        if start is not None:
+            context["date_start"] = _normalize_dt(start)
+        end = window.get("end")
+        if end is not None:
+            context["date_end"] = _normalize_dt(end)
+        top_n_value = intent_data.get("top_n")
+        if top_n_value is not None:
+            context["top_n"] = top_n_value
+        filters = intent_data.get("filters") or {}
+        for key in ("owner_name", "dept", "entity_no", "contract_id_pattern", "request_type"):
+            value = filters.get(key)
+            if value is not None and value != "":
+                context[key] = value
+        return context
 
-    sql = nl_to_sql_with_llm(question, context={})
+    def _serialize_intent(intent_data: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if not intent_data:
+            return None
+        serialized: Dict[str, Any] = {}
+        for key, value in intent_data.items():
+            if key == "date_window" and isinstance(value, dict):
+                window_payload: Dict[str, Any] = {}
+                for bind_key, bind_value in value.items():
+                    if isinstance(bind_value, (datetime, date)):
+                        window_payload[bind_key] = _normalize_dt(bind_value).isoformat()
+                    else:
+                        window_payload[bind_key] = bind_value
+                serialized[key] = window_payload
+            elif isinstance(value, (datetime, date)):
+                serialized[key] = _normalize_dt(value).isoformat()
+            else:
+                serialized[key] = value
+        return serialized
+
+    default_date_column = settings.get_string("DW_DEFAULT_DATE_COLUMN", default="REQUEST_DATE") or "REQUEST_DATE"
+    intent = analyze_question_intent(question, default_date_column=default_date_column)
+
+    sql = nl_to_sql_with_llm(question, context=intent)
     if not sql:
         return _needs_clarification(
             "I couldn't derive a clean SELECT. Could you rephrase or specify filters (stakeholders, departments, date columns)?"
         )
 
-    candidate_binds: Dict[str, Any] = {}
-    window_label: Optional[str] = None
-    date_column_used: Optional[str] = None
-    win = _infer_window_from_question(question) if need_window else None
-    if win:
-        date_col = date_col_hint or "REQUEST_DATE"
-        start_dt = _normalize_dt(win["start"]) if "start" in win else None
-        end_dt = _normalize_dt(win["end"]) if "end" in win else None
-        if start_dt and end_dt:
-            candidate_binds["date_start"] = start_dt
-            candidate_binds["date_end"] = end_dt
-            window_label = win.get("label")
-            date_column_used = date_col
+    window_label: Optional[str] = intent.get("window_label")
+    date_column_used: Optional[str] = intent.get("date_column") if intent.get("date_window") else None
 
-    ok_sql, reason, _ = _validate_sql(
-        sql,
-        need_window=need_window,
-        date_col_hint=date_col_hint,
-    )
-    if not ok_sql:
-        if reason == "missing_date_context":
-            return _needs_clarification(
-                "This question needs a start and end date. Please provide the timeframe you have in mind.",
-                sql_text=sql,
-                error=reason,
-            )
-        if reason == "unexpected_date_filter":
-            return _needs_clarification(
-                "No timeframe was requested, but the SQL added date filters. Please clarify the desired dates or rephrase without them.",
-                sql_text=sql,
-                error=reason,
-            )
-        return _needs_clarification(
-            "I couldn't derive a clean SELECT. Could you rephrase or specify filters?",
-            sql_text=sql,
-            error=reason,
-        )
-
-    ok_allowed, not_allowed = _validate_bind_whitelist(sql, DW_BIND_WHITELIST)
-    if not ok_allowed:
+    used_binds, illegal_binds = analyze_binds(sql, DW_BIND_WHITELIST)
+    if illegal_binds:
         _update_inquiry("needs_clarification")
         payload = {
             "ok": False,
             "status": "needs_clarification",
             "error": "binds_not_allowed",
-            "details": {"not_allowed": not_allowed},
+            "details": {"not_allowed": sorted(illegal_binds)},
             "sql": sql,
             "inquiry_id": inquiry_id,
         }
         return jsonify(payload), 200
 
-    candidate_binds = dict(candidate_binds or {})
-    runtime_binds = _filter_binds_for_sql(sql, candidate_binds)
+    bind_context = _intent_bind_context(intent)
+    runtime_binds = build_runtime_binds(used_binds, bind_context)
 
-    used_binds = _binds_used_in_sql(sql)
     missing = sorted(used_binds - set(runtime_binds.keys()))
     if missing:
         _update_inquiry("needs_clarification")
@@ -1193,6 +1179,8 @@ def answer():
             status="failed",
         )
 
+    intent_payload = _serialize_intent(intent)
+
     rows = fetched_rows or []
     meta_payload: Dict[str, Any] = dict(meta_exec or {})
     serialized_binds: Dict[str, Any] = {}
@@ -1202,7 +1190,8 @@ def answer():
         else:
             serialized_binds[key] = value
     meta_payload["binds"] = serialized_binds
-    meta_payload["clarifier_used"] = False
+    meta_payload["clarifier_used"] = True
+    meta_payload["clarifier_intent"] = intent_payload
     meta_payload["limit_applied"] = appended_limit
     meta_payload["elapsed_ms"] = elapsed_ms
     meta_payload["rewritten_question"] = question
@@ -1218,7 +1207,6 @@ def answer():
         meta_payload["columns"] = list(rows[0].keys())
 
     tags = ["dw", "contracts", "llm"]
-    intent_payload = None
     run_id = save_learning_artifacts(
         NAMESPACE,
         question,
