@@ -1,4 +1,3 @@
-import inspect
 import logging
 import os
 from typing import List, Optional
@@ -20,33 +19,7 @@ try:
 except Exception:  # pragma: no cover - fallback for alternate layout
     from exllamav2.generator import ExLlamaV2BaseGenerator  # type: ignore[attr-defined]
 
-
-def _make_sampler_settings(temperature: float, top_p: float):
-    """Return a sampler/settings object compatible with installed exllamav2."""
-
-    settings = None
-    try:  # pragma: no cover - new sampler location
-        from exllamav2.generator.sampler import SamplerSettings
-
-        settings = SamplerSettings()
-    except Exception:
-        try:  # pragma: no cover - legacy sampler location
-            from exllamav2.generator.settings import (  # type: ignore[attr-defined]
-                ExLlamaV2SamplerSettings as SamplerSettings,
-            )
-
-            settings = SamplerSettings()
-        except Exception:
-            settings = None
-    if settings is not None:
-        try:
-            if hasattr(settings, "temperature"):
-                settings.temperature = float(temperature)
-            if hasattr(settings, "top_p"):
-                settings.top_p = float(top_p)
-        except Exception:  # pragma: no cover - tolerate exotic sampler APIs
-            pass
-    return settings
+from exllamav2.generator.sampler import ExLlamaV2Sampler
 
 
 class SQLCoderExLlama:
@@ -58,6 +31,48 @@ class SQLCoderExLlama:
         self._generator = generator
         self._cache = cache
         self._cfg = cfg
+        self._log = logging.getLogger("core.sqlcoder_exllama")
+
+    def _build_settings(
+        self,
+        temperature: Optional[float],
+        top_p: Optional[float],
+    ) -> ExLlamaV2Sampler.Settings:
+        settings = ExLlamaV2Sampler.Settings()
+        settings.temperature = float(
+            temperature if temperature is not None else os.getenv("GENERATION_TEMPERATURE", "0.2")
+        )
+        settings.top_p = float(top_p if top_p is not None else os.getenv("GENERATION_TOP_P", "0.9"))
+        try:
+            settings.token_repetition_penalty_max = float(os.getenv("GENERATION_REP_PENALTY", "1.08"))
+            settings.token_repetition_penalty_sustain = 256
+            settings.token_repetition_penalty_decay = 128
+        except Exception:  # pragma: no cover - tolerate sampler variants lacking these attrs
+            pass
+        return settings
+
+    def _truncate_to_ctx(self, text: str, max_new_tokens: int) -> str:
+        try:
+            max_ctx = int(os.getenv("EXL2_CACHE_MAX_SEQ_LEN", "2048"))
+            reserve = int(os.getenv("EXL2_INPUT_RESERVE_TOKENS", "64"))
+            limit = max(32, max_ctx - reserve - int(max_new_tokens))
+            tokenizer = getattr(self._generator, "tokenizer", None) or self._tokenizer
+            if tokenizer is None:
+                return text
+            token_ids = tokenizer.encode(text, add_bos=True)
+            length = token_ids.shape[-1] if hasattr(token_ids, "shape") else len(token_ids)
+            if length > limit:
+                if hasattr(token_ids, "shape"):
+                    token_ids = token_ids[:, -limit:]
+                    text = tokenizer.decode(token_ids[0])
+                else:
+                    token_ids = token_ids[-limit:]
+                    text = tokenizer.decode(token_ids)
+                self._log.info("[exl2] truncated prompt tokens: %s -> %s", length, limit)
+            return text
+        except Exception as exc:  # pragma: no cover - trimming best-effort only
+            self._log.warning("[exl2] prompt trim skipped: %s", exc)
+            return text
 
     def generate(
         self,
@@ -68,52 +83,21 @@ class SQLCoderExLlama:
         top_p: Optional[float] = None,
         **_ignored,
     ) -> str:
-        # Build sampler/settings (if supported by installed version)
-        temp_val = float(temperature) if temperature is not None else float(os.getenv("GENERATION_TEMPERATURE", "0.2"))
-        top_p_val = float(top_p) if top_p is not None else float(os.getenv("GENERATION_TOP_P", "0.9"))
-        settings = _make_sampler_settings(temp_val, top_p_val)
+        prompt = self._truncate_to_ctx(prompt, int(max_new_tokens))
+        settings = self._build_settings(temperature, top_p)
 
-        # Respect cache length and keep an input reserve
-        reserve = int(os.getenv("EXL2_INPUT_RESERVE_TOKENS", "64"))
-        try:
-            max_seq = getattr(self._cache, "max_seq_len", int(os.getenv("EXL2_CACHE_MAX_SEQ_LEN", "2048")))
-        except Exception:
-            max_seq = int(os.getenv("EXL2_CACHE_MAX_SEQ_LEN", "2048"))
-        try:
-            token_ids = self._tokenizer.encode(prompt)
-            prompt_tokens = len(token_ids)
-        except Exception:
-            prompt_tokens = max(1, len(prompt) // 4)
-        budget = max_seq - prompt_tokens - reserve
-        if budget < 1:
-            safe_new = 1
-        else:
-            safe_new = max(1, min(int(max_new_tokens), budget))
-
-        # Call generate_simple with signature detection
-        gen_simple = getattr(self._generator, "generate_simple")
-        sig = inspect.signature(gen_simple)
-        try:
-            if len(sig.parameters) == 2:
-                text = gen_simple(prompt, safe_new)
-            else:
-                if settings is None:
-                    settings = _make_sampler_settings(temp_val, top_p_val)
-                text = gen_simple(prompt, settings, safe_new)
-        except TypeError:
-            text = gen_simple(prompt, settings or None, safe_new)
-
+        text = self._generator.generate_simple(prompt, settings, int(max_new_tokens))
         text = text or ""
 
-        # Local stop-string enforcement independent of generator implementation
-        stop_list = list(stop or [])
-        stop_list.extend(["```", "</s>"])
-        cut = len(text)
-        for marker in stop_list:
-            idx = text.find(marker)
-            if idx != -1:
-                cut = min(cut, idx)
-        return text[:cut].strip()
+        if stop:
+            cut = len(text)
+            for marker in stop:
+                idx = text.find(marker)
+                if idx != -1:
+                    cut = min(cut, idx)
+            text = text[:cut]
+
+        return text.strip()
 
 
 def load_exllama_generator(model_path: str) -> SQLCoderExLlama:

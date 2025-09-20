@@ -137,6 +137,17 @@ def answer():
     _log("sql_binds", exec_binds)
     _log("choose_sql", {"pass": out.get("pass"), "preview": (sql or "")[:240], "binds": exec_binds})
 
+    try:
+        preview_sql = sql[:600] + (" ..." if len(sql) > 600 else "")
+        current_app.logger.info("[dw] exec_sql_preview: %s", preview_sql)
+        safe_binds = {
+            key: (value if isinstance(value, (str, int, float)) else str(value))
+            for key, value in (binds or {}).items()
+        }
+        current_app.logger.info("[dw] exec_binds: %s", json.dumps(safe_binds, default=str))
+    except Exception:
+        pass
+
     engine = get_oracle_engine()
     rows: list[list[object]] = []
     cols: list[str] = []

@@ -26,15 +26,29 @@ DEFAULT_BINDS = [
 
 _JSON_RE = re.compile(r"<<JSON>>\s*(\{.*?\})\s*<</JSON>>", re.S)
 _FENCE_RE = re.compile(r"```sql\s*(.+?)\s*```", re.I | re.S)
+_GENERIC_FENCE_RE = re.compile(r"```\s*(.+?)\s*```", re.S)
 _SQL_START_RE = re.compile(r"\b(SELECT|WITH)\b.*", re.I | re.S)
 
 
 def _extract_sql(text: str) -> str:
-    match = _FENCE_RE.search(text or "")
+    text = text or ""
+    match = _FENCE_RE.search(text)
     if match:
         return match.group(1).strip()
-    match = _SQL_START_RE.search(text or "")
-    return match.group(0).strip() if match else ""
+
+    match = _GENERIC_FENCE_RE.search(text)
+    if match:
+        body = match.group(1).strip()
+        start = _SQL_START_RE.search(body)
+        if start:
+            return body[start.start():].strip()
+
+    start = _SQL_START_RE.search(text)
+    if start:
+        candidate = text[start.start():].strip()
+        candidate = re.split(r"\n`{3,}|\n--\s*END\b", candidate, 1)[0].strip()
+        return candidate
+    return ""
 
 
 def _heuristic_intent(question: str) -> dict:
