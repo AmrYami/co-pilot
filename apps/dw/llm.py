@@ -1,7 +1,8 @@
 import json
 import os
 import re
-from datetime import datetime, timedelta
+
+from flask import current_app
 
 from core.model_loader import get_model
 
@@ -125,7 +126,15 @@ def extract_sql_fenced(text: str) -> str:
 # ------------- NL → SQL (two-pass with repair) -------------
 
 def nl_to_sql_with_llm(question: str, ctx: dict) -> dict:
-    dbg = {"prompt": None, "raw1": None, "sql1": None, "validation1": None, "raw2": None, "sql2": None}
+    dbg = {
+        "prompt": None,
+        "raw1": None,
+        "sql1": None,
+        "validation1": None,
+        "raw2": None,
+        "sql2": None,
+        "used_repair": False,
+    }
     sql_mdl = get_model("sql")
     if not sql_mdl:
         raise RuntimeError("SQL model not available")
@@ -138,14 +147,42 @@ def nl_to_sql_with_llm(question: str, ctx: dict) -> dict:
     dbg["prompt"] = prompt[:1000]
 
     raw1 = sql_mdl.generate(prompt, max_new_tokens=int(os.getenv("SQL_MAX_NEW_TOKENS", "384")), stop=["```"])
+    try:
+        current_app.logger.info(
+            "[dw] llm_raw_pass1: %s",
+            json.dumps(
+                {
+                    "size": len(raw1 or ""),
+                    "head": (raw1 or "")[:240],
+                    "tail": (raw1 or "")[-240:],
+                },
+                default=str,
+            ),
+        )
+    except Exception:
+        pass
     dbg["raw1"] = raw1[:1000] if raw1 else ""
     sql1 = extract_sql_fenced(raw1)
+    try:
+        current_app.logger.info(
+            "[dw] llm_sql_pass1: %s",
+            json.dumps(
+                {
+                    "size": len(sql1 or ""),
+                    "preview": (sql1 or "")[:400],
+                },
+                default=str,
+            ),
+        )
+    except Exception:
+        pass
     dbg["sql1"] = sql1
 
     ok1 = bool(sql1) and re.match(r"^\s*(SELECT|WITH)\b", sql1, re.I)
     dbg["validation1"] = {"ok": bool(ok1), "errors": [] if ok1 else ["empty_sql"], "binds": []}
 
     if ok1:
+        dbg["used_repair"] = False
         return {"sql": sql1, "intent": intent, "debug": dbg}
 
     repair = (
@@ -159,11 +196,40 @@ def nl_to_sql_with_llm(question: str, ctx: dict) -> dict:
         "```sql\n"
     )
     raw2 = sql_mdl.generate(repair, max_new_tokens=int(os.getenv("SQL_MAX_NEW_TOKENS", "256")), stop=["```"])
+    try:
+        current_app.logger.info(
+            "[dw] llm_raw_pass2: %s",
+            json.dumps(
+                {
+                    "size": len(raw2 or ""),
+                    "head": (raw2 or "")[:240],
+                    "tail": (raw2 or "")[-240:],
+                },
+                default=str,
+            ),
+        )
+    except Exception:
+        pass
     dbg["raw2"] = raw2[:1000] if raw2 else ""
     sql2 = extract_sql_fenced(raw2)
+    try:
+        current_app.logger.info(
+            "[dw] llm_sql_pass2: %s",
+            json.dumps(
+                {
+                    "size": len(sql2 or ""),
+                    "preview": (sql2 or "")[:400],
+                },
+                default=str,
+            ),
+        )
+    except Exception:
+        pass
     dbg["sql2"] = sql2
 
     if sql2 and re.match(r"^\s*(SELECT|WITH)\b", sql2, re.I):
+        dbg["used_repair"] = True
         return {"sql": sql2, "intent": intent, "debug": dbg}
 
+    dbg["used_repair"] = True
     return {"sql": "", "intent": intent, "debug": dbg}

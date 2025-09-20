@@ -5,7 +5,8 @@ from datetime import datetime, timedelta
 
 from flask import Blueprint, current_app, jsonify, request
 from logging.handlers import TimedRotatingFileHandler
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
+from sqlalchemy.dialects.postgresql import JSONB
 
 from core.sql_exec import get_mem_engine, get_oracle_engine
 from .llm import nl_to_sql_with_llm
@@ -39,6 +40,28 @@ def _log(tag: str, payload):
         current_app.logger.info(f"[dw] {tag}: {payload}")
 
 
+def _insert_inquiry(conn, namespace: str, question: str, auth_email: str, prefixes):
+    """Insert a mem inquiry using JSONB-aware binds."""
+
+    stmt = (
+        text(
+            """
+            INSERT INTO mem_inquiries(namespace, question, auth_email, prefixes, status, created_at, updated_at)
+            VALUES (:ns, :q, :auth, :pfx, 'open', NOW(), NOW())
+            RETURNING id
+            """
+        )
+        .bindparams(bindparam("pfx", type_=JSONB))
+    )
+    params = {
+        "ns": namespace,
+        "q": question,
+        "auth": auth_email,
+        "pfx": prefixes or [],
+    }
+    return conn.execute(stmt, params).scalar_one()
+
+
 @dw_bp.route("/answer", methods=["POST"])
 def answer():
     body = request.get_json(force=True, silent=True) or {}
@@ -53,17 +76,7 @@ def answer():
 
     mem = get_mem_engine(settings)
     with mem.begin() as conn:
-        stmt = text(
-            """
-            INSERT INTO mem_inquiries(namespace, question, auth_email, prefixes, status, created_at, updated_at)
-            VALUES (:ns, :q, :auth, :pfx::jsonb, 'open', NOW(), NOW())
-            RETURNING id
-            """
-        )
-        inq_id = conn.execute(
-            stmt,
-            {"ns": namespace, "q": question, "auth": auth_email, "pfx": json.dumps(prefixes)},
-        ).scalar_one()
+        inq_id = _insert_inquiry(conn, namespace, question, auth_email, prefixes)
 
     _log("inquiry_start", {"id": inq_id, "q": question, "email": auth_email})
 
@@ -125,6 +138,25 @@ def answer():
             date_start = now - timedelta(days=30)
         binds["date_start"] = datetime.combine(date_start, datetime.min.time())
         binds["date_end"] = datetime.combine(date_end, datetime.min.time())
+
+    try:
+        chosen = "pass2" if debug.get("used_repair") else "pass1"
+        current_app.logger.info(
+            "[dw] final_sql_exec: %s",
+            json.dumps(
+                {
+                    "chosen": chosen,
+                    "sql": sql,
+                    "binds": {
+                        k: (v.isoformat() if hasattr(v, "isoformat") else v)
+                        for k, v in binds.items()
+                    },
+                },
+                default=str,
+            )[:4000],
+        )
+    except Exception:
+        pass
 
     engine = get_oracle_engine()
     rows: list[list[object]] = []
