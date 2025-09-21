@@ -34,7 +34,7 @@ def _log(msg: str) -> None:
 # ---------------------------
 
 def _load_sql_model() -> Optional[Dict[str, Any]]:
-    backend = os.getenv("MODEL_BACKEND", "exllama")
+    backend = os.getenv("MODEL_BACKEND", "exllama").lower()
     path = os.getenv("MODEL_PATH")
     if not path:
         raise RuntimeError("MODEL_PATH not set for SQL model")
@@ -43,28 +43,16 @@ def _load_sql_model() -> Optional[Dict[str, Any]]:
 
     from core.sqlcoder_exllama import load_exllama_generator
 
-    stop_tokens = [tok for tok in os.getenv("STOP", "</s>,<|im_end|>").split(",") if tok]
-    stop_tokens = [tok for tok in stop_tokens if "```" not in tok]
-
-    cfg = {
-        "max_seq_len": _env_int("MODEL_MAX_SEQ_LEN", 4096),
-        "max_new_tokens": _env_int("GENERATION_MAX_NEW_TOKENS", 256),
-        "stop": stop_tokens,
-    }
-
     bundle = load_exllama_generator(path)
-    handle = bundle.get("generator") if isinstance(bundle, dict) else bundle
-    if handle is None:
-        raise RuntimeError("ExLlamaV2 loader did not return a generator")
+    if not isinstance(bundle, dict) or bundle.get("handle") is None:
+        raise RuntimeError("ExLlamaV2 loader did not return a valid bundle")
+
+    bundle.setdefault("role", "sql")
+    bundle.setdefault("backend", backend)
+    bundle.setdefault("path", path)
+
     _log("SQL model (SQLCoder/ExLlamaV2) ready")
-    return {
-        "role": "sql",
-        "backend": backend,
-        "path": path,
-        "handle": handle,
-        "bundle": bundle,
-        "gen_cfg": cfg,
-    }
+    return bundle
 
 
 # --------------------------------------
