@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import logging
 from typing import Any, Dict, List, Optional, Sequence
 
 from sqlalchemy import text
@@ -20,6 +19,7 @@ from core.settings import Settings
 from core.snippets import autosave_snippet
 from core.sql_exec import SQLExecutionResult, get_mem_engine, run_sql
 from core.sql_utils import extract_sql, extract_sql_one_stmt
+from core.logging_utils import get_logger
 
 try:  # pragma: no cover - optional hints module
     from apps.dw.hints import (
@@ -53,7 +53,7 @@ except Exception:  # pragma: no cover - fallback when templates unavailable
     StakeholderAnswerer = None  # type: ignore[assignment]
 
 
-log = logging.getLogger(__name__)
+log = get_logger(__name__)
 
 
 class Pipeline:
