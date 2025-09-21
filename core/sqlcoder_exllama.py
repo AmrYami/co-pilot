@@ -1,202 +1,206 @@
+# core/sqlcoder_exllama.py
+# Adapter for SQLCoder (EXL2 4-bit) on ExLlamaV2 – API-compatible with recent exllamav2
+
+from __future__ import annotations
 import os
 import logging
-from typing import Dict, Any, List
+from typing import List, Optional
+
 import torch
 
-# ExLlamaV2 imports – keep them broad to tolerate minor version changes
-from exllamav2 import ExLlamaV2Config, ExLlamaV2, ExLlamaV2Cache, ExLlamaV2Tokenizer
-try:
-    from exllamav2.generator import ExLlamaV2BaseGenerator, ExLlamaV2Sampler
-    _HAS_SAMPLER = True
-except Exception:
-    # Some older wheels expose sampler under a different path or not at all
-    from exllamav2.generator.base import ExLlamaV2BaseGenerator  # type: ignore
-    ExLlamaV2Sampler = None  # type: ignore
-    _HAS_SAMPLER = False
-
-# Loader API moved around across versions; try a couple of options
-_LOADER_CLS = None
-for cand in (
-    "exllamav2.loader.ModelLoader",
-    "exllamav2.loader.LazyModelLoader",
-    "exllamav2.loader.SelectiveGPUModelLoader"
-):
-    try:
-        mod_name, cls_name = cand.rsplit(".", 1)
-        mod = __import__(mod_name, fromlist=[cls_name])
-        _LOADER_CLS = getattr(mod, cls_name)
-        break
-    except Exception:
-        continue
+from exllamav2 import (
+    ExLlamaV2,
+    ExLlamaV2Cache,
+    ExLlamaV2Config,
+    ExLlamaV2Tokenizer,
+)
+from exllamav2.generator import (
+    ExLlamaV2BaseGenerator,
+    ExLlamaV2SamplingSettings,
+)
 
 log = logging.getLogger("core.sqlcoder_exllama")
 
 
-def _parse_gpu_split() -> List[float]:
-    """Parse EXL2_GPU_SPLIT_GB=29,2 -> [29.0, 2.0]"""
-    env = os.getenv("EXL2_GPU_SPLIT_GB", "").strip()
-    if not env:
-        return []
-    parts = []
-    for p in env.split(","):
-        p = p.strip()
-        if not p:
-            continue
-        try:
-            parts.append(float(p))
-        except Exception:
-            pass
-    return parts
+# ---------- Utilities ----------
 
-
-def _autosplit(model: ExLlamaV2, model_dir: str, gpu_split: List[float]) -> None:
+def _parse_gpu_split(env_val: Optional[str]) -> Optional[List[float]]:
     """
-    Load weights and set device map. Tries the loader class if available,
-    otherwise falls back to model-level helpers.
+    Parse EXL2_GPU_SPLIT_GB like "29,2" into [29.0, 2.0].
+    Return None if empty/unset.
     """
-    if _LOADER_CLS is not None:
-        try:
-            loader = _LOADER_CLS(model, model_dir=model_dir)
-        except TypeError:
-            # Some versions expect (model,) only and take model_dir from config
-            loader = _LOADER_CLS(model)
-        # Not all loaders expose the same method names; try autosplit first
-        for meth in ("load_autosplit", "load_multi_gpu_autosplit", "load"):
-            if hasattr(loader, meth):
-                fn = getattr(loader, meth)
-                try:
-                    if meth == "load_autosplit":
-                        fn(gpu_split if gpu_split else None)
-                    else:
-                        # Best-effort: call without split if the signature is unknown
-                        fn()
-                    log.info("[exllama] weights loaded via %s", meth)
-                    return
-                except Exception as e:
-                    log.warning("[exllama] %s failed: %s", meth, e)
-                    continue
-    # Fallback: single device best effort
-    dev = 0
+    if not env_val:
+        return None
+    parts = [p.strip() for p in env_val.split(",") if p.strip()]
+    if not parts:
+        return None
     try:
-        if torch.cuda.is_available():
-            dev = 0
-        model.to( torch.device(f"cuda:{dev}") if torch.cuda.is_available() else torch.device("cpu") )
-        log.info("[exllama] weights loaded to single device %s", f"cuda:{dev}" if torch.cuda.is_available() else "cpu")
-    except Exception as e:
-        log.error("[exllama] fallback to single-device failed: %s", e)
-        raise
+        return [float(p) for p in parts]
+    except Exception:
+        log.warning("[exl2] Could not parse EXL2_GPU_SPLIT_GB=%r; ignoring.", env_val)
+        return None
 
 
-class SQLCoderExLlama:
+def _cut_at_first(text: str, stops: List[str]) -> str:
+    if not text:
+        return text
+    first = len(text)
+    for s in stops:
+        i = text.find(s)
+        if i != -1 and i < first:
+            first = i
+    return text[:first]
+
+
+def _extract_sql_fenced(text: str) -> str:
     """
-    Thin wrapper around ExLlamaV2BaseGenerator to normalize generate() across
-    minor API differences and provide simple stop-string truncation.
+    Try to extract the first ```sql ... ``` or ``` ... ``` block.
+    If none, return raw text (caller may decide it’s invalid).
+    """
+    if not text:
+        return ""
+
+    # Prefer ```sql fenced block
+    start = text.find("```sql")
+    fence_len = 6
+    if start == -1:
+        # fallback: any ```
+        start = text.find("```")
+        fence_len = 3
+
+    if start == -1:
+        return text.strip()
+
+    start += fence_len
+    end = text.find("```", start)
+    if end == -1:
+        return text[start:].strip()
+    return text[start:end].strip()
+
+
+# ---------- Main loader & wrapper ----------
+
+class SQLCoderExL2:
+    """
+    Thin wrapper exposing .generate(prompt, max_new_tokens=..., stop=...), as expected by model_loader.get_model("sql").
     """
 
-    def __init__(self, generator: Any, tokenizer: Any):
+    def __init__(
+        self,
+        generator: ExLlamaV2BaseGenerator,
+        tokenizer: ExLlamaV2Tokenizer,
+        cache: ExLlamaV2Cache,
+        input_reserve_tokens: int = 64,
+        model_name: str = "sqlcoder-exl2",
+    ):
         self._generator = generator
         self._tokenizer = tokenizer
-        # Default sampler settings if available
-        if _HAS_SAMPLER:
-            self._settings = ExLlamaV2Sampler.Settings()
-            try:
-                # Stable defaults; can be overridden in generate()
-                self._settings.temperature = float(os.getenv("GENERATION_TEMPERATURE", "0.2"))
-                self._settings.top_p = float(os.getenv("GENERATION_TOP_P", "0.9"))
-                # make sure CFG unset unless explicitly provided
-                self._settings.cfg_scale = None
-            except Exception:
-                pass
-        else:
-            self._settings = None
+        self._cache = cache
+        self._input_reserve = max(0, int(input_reserve_tokens))
+        self.name = f"{model_name} (exllama)"
 
-    def generate(self, prompt: str, max_new_tokens: int = 256, stop: List[str] | None = None,
-                 temperature: float | None = None, top_p: float | None = None) -> str:
-        # Update settings if we have a sampler
-        settings = self._settings
-        if settings is not None:
-            if temperature is not None:
-                settings.temperature = float(temperature)
-            if top_p is not None:
-                settings.top_p = float(top_p)
+        # Default sampling settings – deterministic but not pathological
+        self._temperature = float(os.getenv("GENERATION_TEMPERATURE", "0.2"))
+        self._top_p = float(os.getenv("GENERATION_TOP_P", "0.9"))
 
-        # ExLlamaV2BaseGenerator.generate_simple signature differs across versions.
-        # Try (prompt, settings, num_tokens) first, then (prompt, num_tokens).
-        text = None
+    # --- internal helpers ---
+
+    def _truncate_prompt_to_fit(self, prompt: str, max_new: int) -> str:
+        """
+        Ensure total tokens <= cache.max_seq_len - small_safety.
+        We keep the last part of the prompt if it is too long (most important instructions are usually near the end).
+        """
         try:
-            text = self._generator.generate_simple(prompt, settings, int(max_new_tokens))  # type: ignore[arg-type]
-        except TypeError:
-            # Older/newer signature without settings
-            text = self._generator.generate_simple(prompt, int(max_new_tokens))  # type: ignore[call-arg]
+            # encode returns a tensor of token ids
+            ids = self._tokenizer.encode(prompt)
+            max_allowed = max(16, self._cache.max_seq_len - max_new - self._input_reserve)
+            if ids.numel() > max_allowed:
+                ids = ids[-max_allowed:]
+                # decode back to text
+                prompt = self._tokenizer.decode(ids)
+        except Exception as e:
+            # If anything goes wrong, don't kill the run – just return original text.
+            log.warning("[exl2] prompt truncation skipped: %s", e)
+        return prompt
 
-        # Manual stop-string truncation (don’t rely on set_stop_strings API)
-        if text and stop:
-            cut = len(text)
-            for s in stop:
-                i = text.find(s)
-                if i != -1:
-                    cut = min(cut, i)
-            text = text[:cut]
-        return text or ""
+    # --- public API expected by the rest of the app ---
+
+    def generate(
+        self,
+        prompt: str,
+        max_new_tokens: int = 256,
+        stop: Optional[List[str]] = None,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+    ) -> str:
+        """
+        Generate raw model text. We *do not* call removed/unstable generator APIs like set_stop_strings.
+        We post-trim in Python using `stop` markers (e.g., "```").
+        """
+        max_new = int(max_new_tokens)
+        prompt = self._truncate_prompt_to_fit(prompt, max_new)
+
+        # Build sampling settings every call (cheap & side-effect free)
+        s = ExLlamaV2SamplingSettings()
+        s.temperature = float(temperature if temperature is not None else self._temperature)
+        s.top_p = float(top_p if top_p is not None else self._top_p)
+        # A couple of sensible defaults for SQL
+        s.token_repetition_penalty = 1.05
+        s.disallow_tokens = None  # keep simple
+
+        # exllamav2 >= 0.2 expects (text, settings, num_tokens)
+        text = self._generator.generate_simple(prompt, s, max_new)
+
+        # Apply simple stop trimming client-side
+        if stop:
+            text = _cut_at_first(text, stop)
+
+        return text
 
 
-def load_exllama_generator(model_dir: str) -> Dict[str, Any]:
+def load_exllama_generator(model_dir: str) -> SQLCoderExL2:
     """
-    Build ExLlamaV2 model/tokenizer/generator with a safe autosplit and cache.
-    Returns a dictionary the model_loader expects.
+    Create and return a SQLCoderExL2 (generator+tokenizer+cache bundle).
+    Environment knobs:
+      - EXL2_GPU_SPLIT_GB="29,2"     # optional autosplit across GPUs
+      - EXL2_CACHE_MAX_SEQ_LEN=2048  # cache length
+      - EXL2_INPUT_RESERVE_TOKENS=64 # budget for system suffixes/stops
     """
     log.info("Loading ExLlamaV2 model: %s", model_dir)
 
+    # 1) Config
     cfg = ExLlamaV2Config()
-    # Newer versions expect model_dir on the config object
     cfg.model_dir = model_dir
-    # Max seq len & cache len from env
-    cfg.max_seq_len = int(os.getenv("MODEL_MAX_SEQ_LEN", "4096"))
-    try:
-        # Keep some headroom for long prompts
-        input_reserve = int(os.getenv("EXL2_INPUT_RESERVE_TOKENS", "64"))
-        cfg.max_input_len = max(256, min(cfg.max_seq_len - 128, cfg.max_seq_len - input_reserve))
-    except Exception:
-        pass
-
-    # Enforce base if requested (helps compat)
-    try:
-        if os.getenv("EXL2_FORCE_BASE", "0") in ("1", "true", "True"):
-            cfg.no_flash_attn = True
-    except Exception:
-        pass
-
     cfg.prepare()
 
+    # 2) Model
     model = ExLlamaV2(cfg)
+
+    split = _parse_gpu_split(os.getenv("EXL2_GPU_SPLIT_GB", "").strip())
+    if split:
+        model.load_autosplit(split)
+        log.info("ExLlamaV2 weights loaded (autosplit): %s", split)
+    else:
+        model.load()
+        log.info("ExLlamaV2 weights loaded (single device)")
+
+    # 3) Tokenizer
     tokenizer = ExLlamaV2Tokenizer(cfg)
 
-    # Load weights + device map
-    gpu_split = _parse_gpu_split()
-    _autosplit(model, model_dir, gpu_split)
-
-    # Build cache and generator
+    # 4) Cache + Generator
     cache_len = int(os.getenv("EXL2_CACHE_MAX_SEQ_LEN", "2048"))
-    cache = ExLlamaV2Cache(model, batch_size=1, max_seq_len=cache_len)
-    generator = ExLlamaV2BaseGenerator(model, tokenizer, cache)
+    cache = ExLlamaV2Cache(model, cache_len)
 
-    # Always decode to string using the model’s tokenizer
-    wrapper = SQLCoderExLlama(generator, tokenizer)
+    generator = ExLlamaV2BaseGenerator(model, cache, tokenizer)
 
-    log.info("ExLlamaV2 ready (seq_len=%s, cache_len=%s, gpus=%s, split=%s)",
-             cfg.max_seq_len, cache_len,
-             torch.cuda.device_count() if torch.cuda.is_available() else 0,
-             gpu_split if gpu_split else "auto/single")
-
-    return {
-        "model": model,
-        "tokenizer": tokenizer,
-        "generator": wrapper,   # expose wrapper with .generate()
-        "cache": cache,
-        "meta": {
-            "backend": "exllama",
-            "path": model_dir,
-            "max_seq_len": cfg.max_seq_len,
-            "cache_len": cache_len
-        }
-    }
+    # 5) Wrap
+    reserve = int(os.getenv("EXL2_INPUT_RESERVE_TOKENS", "64"))
+    wrapper = SQLCoderExL2(
+        generator=generator,
+        tokenizer=tokenizer,
+        cache=cache,
+        input_reserve_tokens=reserve,
+        model_name=os.path.basename(model_dir.rstrip("/")),
+    )
+    log.info("ExLlamaV2 model ready (cache_len=%d, reserve=%d)", cache_len, reserve)
+    return wrapper
