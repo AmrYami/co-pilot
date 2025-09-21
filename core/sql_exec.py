@@ -11,6 +11,8 @@ from typing import Any, Dict, List, Optional, Tuple
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
+from core.sql_utils import extract_sql_one_stmt
+
 SAFE_SQL_RE = re.compile(r"(?is)^\s*(with|select)\b")
 
 _ENGINES: Dict[str, Engine] = {}
@@ -105,8 +107,12 @@ def validate_select(sql: str) -> Tuple[bool, str]:
     return True, ""
 
 def explain(engine: Engine, sql: str) -> None:
+    dialect = getattr(getattr(engine, "dialect", None), "name", "generic")
+    cleaned = extract_sql_one_stmt(sql, dialect=dialect)
+    if not cleaned:
+        raise ValueError("No valid SQL to explain after sanitization.")
     with engine.connect() as c:
-        c.execute(text(f"EXPLAIN {sql}"))
+        c.execute(text(f"EXPLAIN {cleaned}"))
 
 def run_select(engine: Engine, sql: str, limit: Optional[int] = None) -> Dict[str, Any]:
     s = sql.strip().rstrip(";")
@@ -122,7 +128,18 @@ def run_select(engine: Engine, sql: str, limit: Optional[int] = None) -> Dict[st
 def run_sql(engine: Engine, sql: str, limit: Optional[int] = None) -> SQLExecutionResult:
     """Execute a read-only SQL statement and normalise the response."""
 
-    valid, message = validate_select(sql)
+    dialect = getattr(getattr(engine, "dialect", None), "name", "generic")
+    cleaned = extract_sql_one_stmt(sql, dialect=dialect)
+    if not cleaned:
+        return SQLExecutionResult(
+            ok=False,
+            columns=[],
+            rows=[],
+            rowcount=0,
+            error="empty_or_invalid_sql_after_sanitize",
+        )
+
+    valid, message = validate_select(cleaned)
     if not valid:
         return SQLExecutionResult(
             ok=False,
@@ -133,7 +150,7 @@ def run_sql(engine: Engine, sql: str, limit: Optional[int] = None) -> SQLExecuti
         )
 
     try:
-        result = run_select(engine, sql, limit)
+        result = run_select(engine, cleaned, limit)
     except Exception as exc:  # pragma: no cover - passthrough to caller
         return SQLExecutionResult(
             ok=False,

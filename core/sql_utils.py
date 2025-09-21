@@ -5,12 +5,73 @@ Keep generic; FA specifics stay in apps/fa.
 from __future__ import annotations
 import re
 
+_CODE_FENCE = re.compile(r"```(?:sql)?\s*(.*?)```", re.S | re.I)
+_SQL_START_STRICT = re.compile(r"(?is)\b(with|select)\b")
+_NONSQL_LINES = re.compile(r"(?:^|\n)\s*(?:Fix and return only.*|Return only .* SQL.*)$", re.I | re.M)
+
 _WHERE_RE = re.compile(r"(?is)\bwhere\b")
 
 # Fenced code block: ```sql ... ```
-_SQL_FENCE = re.compile(r"```(?:sql)?\s*(.*?)```", re.I | re.S)
-# First SQL-ish token
-_SQL_START = re.compile(r"(?is)\b(SELECT|WITH|EXPLAIN|SHOW)\b")
+_SQL_FENCE = _CODE_FENCE
+# First SQL-ish token (legacy helper keeps broader match)
+_SQL_START_LOOSE = re.compile(r"(?is)\b(SELECT|WITH|EXPLAIN|SHOW)\b")
+
+
+def extract_sql_one_stmt(text: str, dialect: str = "generic") -> str:
+    """
+    Extract exactly one SQL statement suitable for execution.
+    - Prefer first fenced ```sql``` block if present.
+    - Strip instructional lines / non-SQL chatter.
+    - Keep only the first statement; drop anything after the first ; (outside quotes).
+    - Enforce read-only: must start with SELECT or WITH.
+    - For Oracle/SQLAlchemy: strip trailing semicolon.
+    """
+    if not text:
+        return ""
+
+    # Prefer fenced code
+    m = _CODE_FENCE.search(text)
+    if m:
+        text = m.group(1)
+
+    # Remove obvious non-SQL instruction lines
+    text = _NONSQL_LINES.sub("", text).strip()
+
+    # If the SQL starts later in the string, trim leading chatter
+    m = _SQL_START_STRICT.search(text)
+    if m:
+        text = text[m.start():]
+
+    # Keep only first statement; respect quoted strings
+    out: list[str] = []
+    in_s = False
+    in_d = False
+    for ch in text:
+        if ch == "'" and not in_d:
+            in_s = not in_s
+        elif ch == '"' and not in_s:
+            in_d = not in_d
+        out.append(ch)
+        if ch == ';' and not in_s and not in_d:
+            break
+    sql = "".join(out).strip()
+
+    # Enforce read-only
+    if not _SQL_START_STRICT.match(sql or ""):
+        return ""
+
+    # Oracle through SQLAlchemy: avoid trailing semicolon
+    if dialect.lower().startswith("oracle"):
+        if sql.endswith(";"):
+            sql = sql[:-1].rstrip()
+
+    # Kill accidental stray bracket lines, markdown, etc.
+    sql = sql.replace("\r", "").strip()
+    # Guard against leftover instructional keywords
+    if "Fix and return only" in sql or "ONLY SQL" in sql:
+        return ""
+
+    return sql
 
 
 def extract_sql(text: str) -> str | None:
@@ -23,7 +84,7 @@ def extract_sql(text: str) -> str | None:
         body = m.group(1).strip()
     # drop leading 'sql:' labels etc.
     body = re.sub(r"^\s*sql\s*:\s*", "", body, flags=re.I).strip()
-    m2 = _SQL_START.search(body)
+    m2 = _SQL_START_LOOSE.search(body)
     if not m2:
         return None
     sql = body[m2.start():]
@@ -38,7 +99,7 @@ def extract_sql(text: str) -> str | None:
 
 
 def looks_like_sql(text: str) -> bool:
-    return bool(_SQL_START.search((text or "").strip()))
+    return bool(_SQL_START_LOOSE.search((text or "").strip()))
 
 def _strip_semicolon(sql: str) -> str:
     return sql.rstrip().rstrip(";").rstrip()
@@ -68,8 +129,12 @@ def explain_sql(engine, sql: str):
     """Run EXPLAIN on the given SQL and return the plan rows."""
     from sqlalchemy import text as _text
 
+    dialect = str(getattr(getattr(engine, "dialect", None), "name", "generic"))
+    cleaned = extract_sql_one_stmt(sql, dialect=dialect)
+    if not cleaned:
+        raise ValueError("empty_or_invalid_sql_after_sanitize")
     with engine.connect() as c:
-        rs = c.execute(_text(f"EXPLAIN {sql}"))
+        rs = c.execute(_text(f"EXPLAIN {cleaned}"))
         return [tuple(r) for r in rs.fetchall()]
 
 
@@ -77,7 +142,11 @@ def execute_sql(engine, sql: str):
     """Execute the SQL and return a list of rows (dicts)."""
     from sqlalchemy import text as _text
 
+    dialect = str(getattr(getattr(engine, "dialect", None), "name", "generic"))
+    cleaned = extract_sql_one_stmt(sql, dialect=dialect)
+    if not cleaned:
+        raise ValueError("empty_or_invalid_sql_after_sanitize")
     with engine.connect() as c:
-        rs = c.execute(_text(sql))
+        rs = c.execute(_text(cleaned))
         cols = list(rs.keys())
         return [dict(zip(cols, r)) for r in rs.fetchall()]
