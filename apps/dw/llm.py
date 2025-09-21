@@ -5,9 +5,8 @@ import re
 from datetime import date, datetime, timedelta
 from typing import Dict, Optional
 
-from flask import current_app
-
 from core.model_loader import get_model
+from core.logging_utils import get_logger
 from .validator import basic_checks, extract_sql
 
 _MONTH_WORDS = re.compile(r"\blast\s+month\b", re.IGNORECASE)
@@ -70,6 +69,9 @@ def _dates_for_last_month(today: date) -> tuple[date, date]:
     last_month_last = last_month_end - timedelta(days=1)
     last_month_first = last_month_last.replace(day=1)
     return last_month_first, last_month_end
+
+
+log = get_logger("dw")
 
 
 def clarify_intent(question: str, context: dict) -> Dict[str, object]:
@@ -159,10 +161,7 @@ def nl_to_sql_with_llm(
 
     intent = intent or {}
     prompt = _build_prompt(question, ctx, intent)
-    try:
-        current_app.logger.info("[dw] sql_prompt_compact")
-    except Exception:
-        pass
+    log.info("[dw] sql_prompt_compact")
 
     raw1 = mdl.generate(prompt, max_new_tokens=192, stop=["```"])
     sql1 = extract_sql(raw1)

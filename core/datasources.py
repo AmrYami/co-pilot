@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-import logging
 from typing import Dict, Optional
 
 from sqlalchemy import create_engine
 
 from core.settings import Settings
+from core.logging_utils import get_logger
 
-log = logging.getLogger(__name__)
+log = get_logger(__name__)
 
 
 class DatasourceRegistry:

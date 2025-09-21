@@ -2,12 +2,11 @@ from __future__ import annotations
 
 import csv
 import json
-import logging
 import os
 import pathlib
 from datetime import date, datetime, timedelta
 
-from flask import Blueprint, current_app, jsonify, request
+from flask import Blueprint, jsonify, request
 from sqlalchemy import text
 
 from core.datasources import DatasourceRegistry
@@ -20,6 +19,7 @@ from core.sql_utils import (
     sanitize_oracle_sql,
     validate_oracle_sql,
 )
+from core.logging_utils import get_logger
 from .llm import clarify_intent, derive_bind_values, nl_to_sql_with_llm
 from .validator import WHITELIST_BINDS, basic_checks
 
@@ -60,6 +60,7 @@ ALLOWED_COLUMNS = [
 ALLOWED_BINDS = sorted(WHITELIST_BINDS)
 
 dw_bp = Blueprint("dw", __name__, url_prefix="/dw")
+log = get_logger("dw")
 
 
 def _env_truthy(name: str, default: bool = False) -> bool:
@@ -70,7 +71,6 @@ def _env_truthy(name: str, default: bool = False) -> bool:
 
 
 NAMESPACE = os.environ.get("DW_NAMESPACE", "dw::common")
-DW_DEBUG = _env_truthy("DW_DEBUG")
 DW_INCLUDE_DEBUG = _env_truthy("DW_INCLUDE_DEBUG", default=True)
 
 
@@ -78,45 +78,13 @@ def _settings():
     return Settings()
 
 
-def _ensure_file_logger(app):
-    """Attach a daily log file handler writing to logs/dw-YYYYMMDD.log."""
-
-    try:
-        log_dir = os.environ.get("DW_LOG_DIR", "logs")
-        os.makedirs(log_dir, exist_ok=True)
-        today = datetime.now().strftime("%Y%m%d")
-        log_path = os.path.join(log_dir, f"dw-{today}.log")
-
-        for handler in app.logger.handlers:
-            if isinstance(handler, logging.FileHandler) and getattr(handler, "_dw_path", "") == log_path:
-                return
-
-        fileh = logging.FileHandler(log_path, encoding="utf-8")
-        fileh.setLevel(logging.DEBUG if DW_DEBUG else logging.INFO)
-        fileh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s"))
-        fileh._dw_path = log_path  # type: ignore[attr-defined]
-
-        app.logger.addHandler(fileh)
-        app.logger.setLevel(logging.DEBUG if DW_DEBUG else logging.INFO)
-        app.logger.info("[dw] logging initialized")
-    except Exception as exc:  # pragma: no cover
-        print(f"Failed to init dw logger: {exc}")
-
-
 def _log(tag, payload):
     """Structured logging helper scoped to DW blueprint."""
 
     try:
-        current_app.logger.info(
-            f"[dw] {tag}: {json.dumps(payload, default=str)[:4000]}"
-        )
+        log.info("[dw] %s: %s", tag, json.dumps(payload, default=str)[:4000])
     except Exception:
-        print(f"[dw] {tag}: {payload}")
-
-
-@dw_bp.record_once
-def _init_dw_logging(setup_state):
-    _ensure_file_logger(setup_state.app)
+        log.info("[dw] %s: %r", tag, payload)
 
 
 def _write_csv(rows, headers) -> str:
