@@ -9,18 +9,20 @@ import re
 from typing import Optional
 
 import sqlglot
+from sqlglot import exp
 
-_CODE_FENCE = re.compile(r"```(?:sql)?\s*(.*?)```", re.S | re.I)
-_SQL_START_STRICT = re.compile(r"(?is)\b(with|select)\b")
+_FENCE = re.compile(r"```(?:sql)?\s*(.*?)```", re.S | re.I)
+_CODE_FENCE = _FENCE
+_SQL_START = re.compile(r"(?is)\b(select|with)\b")
+_SQL_START_STRICT = _SQL_START
 _NONSQL_LINES = re.compile(r"(?:^|\n)\s*(?:Fix and return only.*|Return only .* SQL.*)$", re.I | re.M)
-
-_FENCE_RE = re.compile(r"```(?:sql)?\s*(.*?)```", re.S | re.I)
 
 _CUT_AFTER = (
     "Fix and return only",
     "Return Oracle SQL",
     "<<JSON>>",
     "</JSON>",
+    "<</JSON>>",
     "No prose",
     "Explanation:",
 )
@@ -118,13 +120,15 @@ def extract_sql_block(text: str) -> str:
     """Return SQL extracted from fenced block or first SELECT/WITH chunk."""
     if not text:
         return ""
-    match = _FENCE_RE.search(text)
+
+    match = _FENCE.search(text)
     if match:
         return match.group(1).strip()
 
-    match2 = re.search(r"(?is)\b(select|with)\b", text or "")
+    match2 = _SQL_START.search(text or "")
     if not match2:
         return ""
+
     tail = text[match2.start() :]
     out: list[str] = []
     for line in tail.splitlines():
@@ -132,24 +136,23 @@ def extract_sql_block(text: str) -> str:
             break
         out.append(line)
     sql = "\n".join(out).strip()
-    sql = sql.strip().lstrip('`"\'').rstrip('`"\'[]')
-    return sql.strip()
+    sql = sql.lstrip('`"\'').rstrip('`"\'[]').strip()
+    return sql
 
 
 def sanitize_oracle_sql(*candidates: str) -> str:
-    """Normalize raw LLM generations down to a single Oracle SELECT/CTE statement."""
+    """Return first plausible Oracle SELECT/WITH statement, stripped of fences/instructions."""
 
-    for candidate in candidates:
-        sql = extract_sql_block(candidate or "")
+    for raw in candidates:
+        sql = extract_sql_block(raw or "")
         if not sql:
             continue
-        if not re.search(r"(?is)^\s*(select|with)\b", sql):
-            continue
-        sql = re.sub(r"`{3,}\s*$", "", sql).strip()
         sql = re.sub(r"(?im)^\s*```.*$", "", sql).strip()
         for marker in _CUT_AFTER:
             sql = re.sub(rf"(?is){re.escape(marker)}.*$", "", sql).strip()
-        if sql:
+        if sql.endswith(";"):
+            sql = sql[:-1].rstrip()
+        if _SQL_START.match(sql):
             return sql
     return ""
 
@@ -161,14 +164,21 @@ def looks_like_instruction(text: str) -> bool:
 
 
 def validate_oracle_sql(sql: str) -> None:
-    """Raise ValueError when sqlglot cannot parse the SQL as Oracle dialect."""
+    """Raise ValueError if SQL isn’t valid Oracle SELECT/WITH with a FROM-clause."""
 
-    if not sql or not re.search(r"(?is)^\s*(select|with)\b", sql):
+    if not sql or not _SQL_START.match(sql):
         raise ValueError("No SELECT/WITH detected")
+
     try:
-        sqlglot.parse_one(sql, read="oracle")
+        tree = sqlglot.parse_one(sql, read="oracle")
     except Exception as exc:  # pragma: no cover - sqlglot raises many subclasses
         raise ValueError(f"SQL parse failed (oracle): {exc}") from exc
+
+    sel = tree.find(exp.Select)
+    if not sel:
+        raise ValueError("No SELECT found in statement")
+    if not sel.args.get("from"):
+        raise ValueError("SELECT has no FROM clause")
 
 
 JSON_BOUNDS = re.compile(r"<<JSON>>\s*(\{.*?\})\s*<</JSON>>", re.S)
@@ -233,9 +243,16 @@ def execute_sql(engine, sql: str):
     from sqlalchemy import text as _text
 
     dialect = str(getattr(getattr(engine, "dialect", None), "name", "generic"))
-    cleaned = extract_sql_one_stmt(sql, dialect=dialect)
-    if not cleaned:
-        raise ValueError("empty_or_invalid_sql_after_sanitize")
+    base = extract_sql_one_stmt(sql, dialect=dialect)
+    if dialect.lower().startswith("oracle"):
+        cleaned = sanitize_oracle_sql(sql, base)
+        if not cleaned:
+            raise ValueError("empty_or_invalid_sql_after_sanitize")
+        validate_oracle_sql(cleaned)
+    else:
+        cleaned = base
+        if not cleaned:
+            raise ValueError("empty_or_invalid_sql_after_sanitize")
     with engine.connect() as c:
         rs = c.execute(_text(cleaned))
         cols = list(rs.keys())

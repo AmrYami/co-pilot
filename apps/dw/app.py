@@ -245,7 +245,7 @@ def answer():
     if parse_error:
         strict_raw = _strict_retry()
         if strict_raw:
-            sql_final = sanitize_oracle_sql(strict_raw, *sql_candidates)
+            sql_final = sanitize_oracle_sql(strict_raw)
             parse_error = _oracle_parse_error(sql_final)
 
     sql_payload = {"size": len(sql_final)}
