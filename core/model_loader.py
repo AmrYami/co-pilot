@@ -275,7 +275,10 @@ def get_model(role: str) -> Optional[Any]:
     payload = ensure_model(role)
     if not payload:
         return None
-    return payload["model"]
+    handle = payload.get("handle")
+    if handle is not None:
+        return handle
+    return payload.get("model")
 
 
 def llm_complete(
