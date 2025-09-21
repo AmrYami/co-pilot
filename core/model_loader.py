@@ -4,6 +4,8 @@ from typing import Any, Dict, Iterable, Optional
 
 import torch
 
+from core.settings import Settings
+
 _MODELS: Dict[str, Optional[Dict[str, Any]]] = {}
 _LOCK = threading.Lock()
 
@@ -34,25 +36,27 @@ def _log(msg: str) -> None:
 # ---------------------------
 
 def _load_sql_model() -> Optional[Dict[str, Any]]:
-    backend = os.getenv("MODEL_BACKEND", "exllama").lower()
-    path = os.getenv("MODEL_PATH")
+    backend = os.getenv("MODEL_BACKEND", "exllama").strip().lower()
+    settings = Settings()
+    path = os.getenv("MODEL_PATH") or settings.get("MODEL_PATH", scope="global")
     if not path:
         raise RuntimeError("MODEL_PATH not set for SQL model")
     if backend != "exllama":
         raise RuntimeError(f"Unsupported MODEL_BACKEND={backend} for SQL model")
 
-    from core.sqlcoder_exllama import load_exllama_generator
+    from core.sqlcoder_exllama import build_sql_model
 
-    bundle = load_exllama_generator(path)
-    if not isinstance(bundle, dict) or bundle.get("handle") is None:
-        raise RuntimeError("ExLlamaV2 loader did not return a valid bundle")
+    handle = build_sql_model(path)
 
-    bundle.setdefault("role", "sql")
-    bundle.setdefault("backend", backend)
-    bundle.setdefault("path", path)
+    payload: Dict[str, Any] = {
+        "role": "sql",
+        "backend": backend,
+        "path": path,
+        "handle": handle,
+    }
 
     _log("SQL model (SQLCoder/ExLlamaV2) ready")
-    return bundle
+    return payload
 
 
 # --------------------------------------
