@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
-from core.sql_utils import extract_sql_one_stmt
+from core.sql_utils import extract_sql_one_stmt, sanitize_oracle_sql, validate_oracle_sql
 
 SAFE_SQL_RE = re.compile(r"(?is)^\s*(with|select)\b")
 
@@ -111,6 +111,12 @@ def explain(engine: Engine, sql: str) -> None:
     cleaned = extract_sql_one_stmt(sql, dialect=dialect)
     if not cleaned:
         raise ValueError("No valid SQL to explain after sanitization.")
+    if dialect.lower().startswith("oracle"):
+        sanitized = sanitize_oracle_sql(cleaned, sql)
+        if not sanitized:
+            raise ValueError("No valid SQL to explain after sanitization.")
+        validate_oracle_sql(sanitized)
+        cleaned = sanitized
     with engine.connect() as c:
         c.execute(text(f"EXPLAIN {cleaned}"))
 
@@ -138,6 +144,28 @@ def run_sql(engine: Engine, sql: str, limit: Optional[int] = None) -> SQLExecuti
             rowcount=0,
             error="empty_or_invalid_sql_after_sanitize",
         )
+
+    if dialect.lower().startswith("oracle"):
+        sanitized = sanitize_oracle_sql(cleaned, sql)
+        if not sanitized:
+            return SQLExecutionResult(
+                ok=False,
+                columns=[],
+                rows=[],
+                rowcount=0,
+                error="empty_or_invalid_sql_after_sanitize",
+            )
+        try:
+            validate_oracle_sql(sanitized)
+        except ValueError as exc:
+            return SQLExecutionResult(
+                ok=False,
+                columns=[],
+                rows=[],
+                rowcount=0,
+                error=str(exc),
+            )
+        cleaned = sanitized
 
     valid, message = validate_select(cleaned)
     if not valid:
@@ -177,3 +205,38 @@ def as_csv(result: Dict[str, Any]) -> bytes:
     for r in rows:
         w.writerow([r.get(c) for c in cols])
     return sio.getvalue().encode("utf-8")
+
+
+def execute_sql(
+    engine: Engine,
+    sql: str,
+    *,
+    read_only: bool = True,
+    dialect: Optional[str] = None,
+) -> Tuple[List[str], List[Any], str]:
+    """Final defensive execution helper used by DW and other callers."""
+    from sqlalchemy import text as sa_text
+
+    if dialect is None:
+        dialect = getattr(getattr(engine, "dialect", None), "name", "generic") or "generic"
+
+    base = extract_sql_one_stmt(sql, dialect=dialect)
+    if dialect.lower().startswith("oracle"):
+        cleaned = sanitize_oracle_sql(sql, base)
+        if not cleaned:
+            raise ValueError("empty_or_invalid_sql_after_sanitize")
+        validate_oracle_sql(cleaned)
+    else:
+        cleaned = base
+        if not cleaned:
+            raise ValueError("empty_or_invalid_sql_after_sanitize")
+
+    if read_only and not SAFE_SQL_RE.match(cleaned):
+        raise PermissionError("Only read-only SELECT/WITH queries are permitted.")
+
+    stmt = sa_text(cleaned)
+    with engine.connect() as conn:
+        result = conn.execution_options(stream_results=True).execute(stmt)
+        columns = list(result.keys())
+        rows = result.fetchmany(1000)
+    return columns, rows, cleaned
