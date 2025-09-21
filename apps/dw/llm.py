@@ -138,12 +138,12 @@ def _build_prompt_fenced(question: str, intent: dict, allow_binds) -> str:
     date_col = intent.get("date_column") or "REQUEST_DATE"
     binds = ", ".join(allow_binds)
     return (
-        "Return Oracle SQL only inside ```sql fenced block. No prose.\n"
-        'Table: "Contract"\n'
-        f"Allowed columns: {cols}\n"
-        "Use Oracle syntax: NVL, TRIM, LISTAGG WITHIN GROUP, FETCH FIRST N ROWS ONLY. SELECT/CTE only.\n"
-        f"Allowed binds: {binds}\n"
-        f"Default date column: {date_col}.\n"
+        "Return Oracle SQL only inside a fenced code block.\n"
+        f"-- Table: \"Contract\"\n"
+        f"-- Allowed columns: {cols}\n"
+        "-- Oracle syntax only; SELECT/CTE only; no prose, no comments.\n"
+        f"-- Allowed binds: {binds}\n"
+        f"-- If a time window is requested, filter on {date_col} using :date_start and :date_end binds.\n\n"
         "Question:\n"
         f"{question}\n\n"
         "```sql\n"
