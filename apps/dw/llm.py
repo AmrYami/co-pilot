@@ -163,9 +163,6 @@ def nl_to_sql_with_llm(
     intent: Optional[Dict[str, object]] = None,
 ) -> Dict[str, object]:
     mdl = get_model("sql")
-    if mdl is None:
-        return {"sql": "", "validation": {"ok": False, "errors": ["model_unavailable"], "binds": []}}
-
     clarifier_raw = None
     if intent is None:
         clarifier = clarify_intent(question, ctx)
@@ -176,52 +173,76 @@ def nl_to_sql_with_llm(
     prompt = _build_prompt(question, ctx, intent)
     log_event(log, "dw", "sql_prompt_compact", {"size": len(prompt)})
     log_event(log, "dw", "sql_prompt", {"prompt": prompt[:1600]})
-
-    raw1 = mdl.generate(prompt, max_new_tokens=192, stop=["```"])
-    log_event(log, "dw", "llm_raw_pass1", {"size": len(raw1)})
-    sql1 = extract_sql(raw1)
-    val1 = basic_checks(sql1, allowed_binds=ctx.get("allowed_binds"))
-
     result: Dict[str, object] = {
         "prompt": prompt,
-        "raw1": raw1,
-        "clarifier_raw": clarifier_raw,
+        "raw1": "",
+        "raw2": "",
+        "raw_strict": "",
+        "clarifier_raw": clarifier_raw or "",
         "intent": intent,
+        "sql": "",
+        "validation": {"ok": False, "errors": [], "binds": [], "bind_names": []},
+        "used_repair": False,
+        "errors": [],
     }
 
-    if not val1["ok"]:
-        repair_prompt = (
-            f"Errors: {json.dumps(val1['errors'])}\n"
-            "Fix and return only Oracle SQL in ```sql block.\n"
-            f'Table: "{ctx.get("table") or ctx.get("contract_table") or "Contract"}". '
-            f"Allowed columns: {', '.join(ctx.get('allowed_columns', []))}. "
-            f"Allowed binds: {', '.join(ctx.get('allowed_binds', []))}.\n"
-            f"Default window column: {intent.get('date_column') or ctx.get('default_date_col', 'REQUEST_DATE')}.\n"
-            f"Question:\n{question}\n\nPrevious SQL:\n```sql\n{sql1}\n```\n```sql\n"
-        )
-        raw2 = mdl.generate(repair_prompt, max_new_tokens=160, stop=["```"])
-        log_event(log, "dw", "sql_prompt_repair", {"size": len(repair_prompt)})
-        log_event(log, "dw", "llm_raw_pass2", {"size": len(raw2)})
-        sql2 = extract_sql(raw2)
-        val2 = basic_checks(sql2, allowed_binds=ctx.get("allowed_binds"))
-        result.update(
-            {
-                "sql": sql2,
-                "validation": val2,
-                "used_repair": True,
-                "raw2": raw2,
-            }
-        )
-    else:
-        result.update(
-            {
-                "sql": sql1,
-                "validation": val1,
-                "used_repair": False,
-            }
-        )
-
+    if mdl is None:
+        result["errors"].append("model_unavailable")
+        result["validation"] = {"ok": False, "errors": ["model_unavailable"], "binds": [], "bind_names": []}
         return result
+
+    try:
+        raw1 = mdl.generate(prompt, max_new_tokens=192, stop=["```"])
+    except Exception as exc:  # pragma: no cover - propagate diagnostics upstream
+        log_event(
+            log,
+            "dw",
+            "llm_pass1_error",
+            {"error": str(exc), "type": type(exc).__name__},
+        )
+        result["errors"].append(f"pass1_generate:{type(exc).__name__}:{exc}")
+        result["validation"] = {"ok": False, "errors": ["pass1_generate"], "binds": [], "bind_names": []}
+        return result
+
+    raw1 = raw1 or ""
+    result["raw1"] = raw1
+    log_event(log, "dw", "llm_raw_pass1", {"size": len(raw1)})
+    sql1 = extract_sql(raw1) or ""
+    val1 = basic_checks(sql1, allowed_binds=ctx.get("allowed_binds"))
+    result.update({"sql": sql1, "validation": val1, "used_repair": False})
+
+    if val1.get("ok"):
+        return result
+
+    repair_prompt = (
+        f"Errors: {json.dumps(val1['errors'])}\n"
+        "Fix and return only Oracle SQL in ```sql block.\n"
+        f'Table: "{ctx.get("table") or ctx.get("contract_table") or "Contract"}". '
+        f"Allowed columns: {', '.join(ctx.get('allowed_columns', []))}. "
+        f"Allowed binds: {', '.join(ctx.get('allowed_binds', []))}.\n"
+        f"Default window column: {intent.get('date_column') or ctx.get('default_date_col', 'REQUEST_DATE')}.\n"
+        f"Question:\n{question}\n\nPrevious SQL:\n```sql\n{sql1}\n```\n```sql\n"
+    )
+    log_event(log, "dw", "sql_prompt_repair", {"size": len(repair_prompt)})
+    try:
+        raw2 = mdl.generate(repair_prompt, max_new_tokens=160, stop=["```"])
+    except Exception as exc:  # pragma: no cover - propagate diagnostics upstream
+        log_event(
+            log,
+            "dw",
+            "llm_pass2_error",
+            {"error": str(exc), "type": type(exc).__name__},
+        )
+        result["errors"].append(f"pass2_generate:{type(exc).__name__}:{exc}")
+        return result
+
+    raw2 = raw2 or ""
+    result["raw2"] = raw2
+    log_event(log, "dw", "llm_raw_pass2", {"size": len(raw2)})
+    sql2 = extract_sql(raw2) or ""
+    val2 = basic_checks(sql2, allowed_binds=ctx.get("allowed_binds"))
+    result.update({"sql": sql2, "validation": val2, "used_repair": True})
+    return result
 
 
 def derive_bind_values(question: str, used_binds: list[str], intent: Dict[str, object]) -> Dict[str, object]:

@@ -35,7 +35,19 @@ _SQL_FENCE = _CODE_FENCE
 _SQL_START_LOOSE = re.compile(r"(?is)\b(SELECT|WITH|EXPLAIN|SHOW)\b")
 
 _RE_FENCE = re.compile(r"```(?:sql)?\s*(?P<body>.*?)```", re.I | re.S)
-_RE_HEAD = re.compile(r"(?mi)^\s*(?:WITH\b|SELECT\b(?!\s*\())")
+_RE_HEAD = re.compile(r"(?mi)^\s*(?:WITH\b|SELECT\b)")
+
+_BAD_PREFIXES = (
+    "Return Oracle SQL only inside",
+    "Return only one Oracle SELECT",
+    "Write only Oracle SQL",
+    "No code fences",
+    "No comments",
+    "No explanations",
+    "Statement:",
+    "Fix and return only Oracle SQL",
+    "SELECT (or CTE)",
+)
 
 
 def extract_sql_one_stmt(text: str, dialect: str = "generic") -> str:
@@ -154,34 +166,16 @@ def _first_sql_statement(text: str) -> str:
         head = _RE_HEAD.search(text)
         if not head:
             return ""
-        candidate = text[head.start() :].strip()
+        candidate = text[head.start():].strip()
 
     candidate = candidate.split("```", 1)[0]
     candidate = re.split(r"\n\s*(?:Explanation:|Errors?:)", candidate, maxsplit=1)[0].strip()
-
-    bad_prefixes = (
-        "Return Oracle SQL only inside",
-        "Return only one Oracle SELECT",
-        "Write only Oracle SQL",
-        "No code fences",
-        "No comments",
-        "No explanations",
-        "Statement:",
-        "Fix and return only Oracle SQL",
-        "SELECT (or CTE)",
-    )
-    lowered = candidate.lower()
-    for prefix in bad_prefixes:
-        if lowered.startswith(prefix.lower()):
+    upper_candidate = candidate.upper()
+    for prefix in _BAD_PREFIXES:
+        if upper_candidate.startswith(prefix.upper()):
             return ""
-
     if ";" in candidate:
-        before, _ = candidate.split(";", 1)
-        candidate = (before + ";").strip()
-
-    if candidate.endswith(";"):
-        candidate = candidate[:-1].rstrip()
-
+        candidate = (candidate.split(";", 1)[0] + ";").strip()
     return candidate
 
 
@@ -189,10 +183,10 @@ def looks_like_oracle_sql(text: str) -> bool:
     return bool(re.match(r"(?is)^\s*(WITH|SELECT)\b(?!\s*\()", text or ""))
 
 
-def sanitize_oracle_sql(*candidates: str) -> str:
+def sanitize_oracle_sql(primary: str, fallback: Optional[str] = None) -> str:
     """Return the first plausible Oracle SELECT/WITH statement from the candidates."""
 
-    for raw in candidates:
+    for raw in (primary or "", fallback or ""):
         if not raw:
             continue
         sql = _first_sql_statement(raw)
