@@ -29,6 +29,8 @@ _FENCE_RE = re.compile(r"```sql\s*(.+?)\s*```", re.I | re.S)
 _GENERIC_FENCE_RE = re.compile(r"```\s*(.+?)\s*```", re.S)
 _SQL_START_RE = re.compile(r"\b(SELECT|WITH)\b.*", re.I | re.S)
 
+_SQL_STOP = ["```"]
+
 
 def _extract_sql(text: str) -> str:
     text = text or ""
@@ -218,7 +220,7 @@ def nl_to_sql_with_llm(question: str, ctx: dict) -> dict:
     # --- PASS 1: fenced prompt
     prompt1 = _build_prompt_fenced(question, intent, allow_binds)
     logger("sql_prompt_pass1", {"preview": prompt1[:400]})
-    raw1 = sql_mdl.generate(prompt1, max_new_tokens=max_new_tokens)
+    raw1 = sql_mdl.generate(prompt1, max_new_tokens=max_new_tokens, stop=_SQL_STOP)
     sql1 = _extract_sql(raw1)
     logger(
         "llm_raw_pass1",
@@ -253,7 +255,7 @@ def nl_to_sql_with_llm(question: str, ctx: dict) -> dict:
     # --- PASS 2: plain prompt
     prompt2 = _build_prompt_plain(question, intent, allow_binds)
     logger("sql_prompt_pass2", {"preview": prompt2[:400]})
-    raw2 = sql_mdl.generate(prompt2, max_new_tokens=max_new_tokens)
+    raw2 = sql_mdl.generate(prompt2, max_new_tokens=max_new_tokens, stop=_SQL_STOP)
     sql2 = _extract_sql(raw2)
     logger(
         "llm_raw_pass2",
@@ -288,7 +290,7 @@ def nl_to_sql_with_llm(question: str, ctx: dict) -> dict:
     # --- PASS 3: prefix-primed SELECT
     prompt3 = _build_prompt_prefix_select(question, intent, allow_binds)
     logger("sql_prompt_pass3", {"preview": prompt3[:400]})
-    raw3 = sql_mdl.generate(prompt3, max_new_tokens=max_new_tokens)
+    raw3 = sql_mdl.generate(prompt3, max_new_tokens=max_new_tokens, stop=_SQL_STOP)
     text3 = raw3 or ""
     if not text3.strip().lower().startswith("select"):
         text3 = "SELECT " + text3.lstrip()
