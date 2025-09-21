@@ -223,13 +223,23 @@ def nl_to_sql_with_llm(question: str, ctx: dict) -> dict:
     logger("clarifier_intent", intent)
 
     max_new_tokens = int(os.getenv("SQL_MAX_NEW_TOKENS", "384"))
+    generation_temperature = float(os.getenv("GENERATION_TEMPERATURE", "0.2"))
+    generation_top_p = float(os.getenv("GENERATION_TOP_P", "0.9"))
+    fenced_stop = "```"
+
+    common_kwargs = {
+        "max_new_tokens": max_new_tokens,
+        "temperature": generation_temperature,
+        "top_p": generation_top_p,
+    }
 
     # --- PASS 1: fenced prompt
     prompt1 = _build_prompt_fenced(question, intent, allow_binds)
     logger("sql_prompt_pass1", {"preview": prompt1[:400]})
     raw1 = sql_mdl.generate(
         prompt1,
-        max_new_tokens=max_new_tokens,
+        stop=fenced_stop,
+        **common_kwargs,
     )
     sql1 = _extract_sql(raw1)
     logger(
@@ -267,7 +277,8 @@ def nl_to_sql_with_llm(question: str, ctx: dict) -> dict:
     logger("sql_prompt_pass2", {"preview": prompt2[:400]})
     raw2 = sql_mdl.generate(
         prompt2,
-        max_new_tokens=max_new_tokens,
+        stop=fenced_stop,
+        **common_kwargs,
     )
     sql2 = _extract_sql(raw2)
     logger(
@@ -303,7 +314,7 @@ def nl_to_sql_with_llm(question: str, ctx: dict) -> dict:
     # --- PASS 3: prefix-primed SELECT
     prompt3 = _build_prompt_prefix_select(question, intent, allow_binds)
     logger("sql_prompt_pass3", {"preview": prompt3[:400]})
-    raw3 = sql_mdl.generate(prompt3, max_new_tokens=max_new_tokens, stop=stop_list)
+    raw3 = sql_mdl.generate(prompt3, **common_kwargs)
     text3 = raw3 or ""
     if not text3.strip().lower().startswith("select"):
         text3 = "SELECT " + text3.lstrip()
