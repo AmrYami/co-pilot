@@ -19,7 +19,7 @@ from core.research import load_researcher
 from core.settings import Settings
 from core.snippets import autosave_snippet
 from core.sql_exec import SQLExecutionResult, get_mem_engine, run_sql
-from core.sql_utils import extract_sql
+from core.sql_utils import extract_sql, extract_sql_one_stmt
 
 try:  # pragma: no cover - optional hints module
     from apps.dw.hints import (
@@ -253,9 +253,11 @@ class Pipeline:
                 "questions": plan.get("questions"),
                 "context": {"namespace": namespace, "prefixes": prefixes},
                 "rationale": plan.get("rationale"),
+                "error": plan.get("error"),
             }
 
         sql_text = plan["sql"]
+        raw_sql_initial = plan.get("raw_sql") or sql_text
         rationale = plan.get("rationale")
 
         if self.validator and getattr(self.validator, "fa", None):
@@ -270,9 +272,15 @@ class Pipeline:
 
         exec_result = self._execute_sql(ds_engine, sql_text)
         final_sql = sql_text
+        final_raw_sql = raw_sql_initial
         final_result = exec_result
         attempts = [
-            {"sql": sql_text, "rowcount": exec_result.rowcount, "type": "initial"}
+            {
+                "sql": sql_text,
+                "rowcount": exec_result.rowcount,
+                "type": "initial",
+                "raw_sql": raw_sql_initial,
+            }
         ]
 
         if exec_result.rowcount == 0:
@@ -284,6 +292,7 @@ class Pipeline:
             )
             if retry is not None:
                 final_sql = retry["sql"]
+                final_raw_sql = retry.get("raw_sql") or final_sql
                 final_result = retry["result"]
                 rationale = retry.get("rationale") or rationale
                 attempts.append(
@@ -291,6 +300,7 @@ class Pipeline:
                         "sql": retry["sql"],
                         "rowcount": retry["result"].rowcount,
                         "type": "auto_retry",
+                        "raw_sql": retry.get("raw_sql") or retry["sql"],
                     }
                 )
 
@@ -305,6 +315,8 @@ class Pipeline:
             "rationale": rationale,
             "attempts": attempts,
             "prefixes": prefixes,
+            "raw_sql_initial": raw_sql_initial,
+            "raw_sql_final": final_raw_sql,
         }
 
         response: Dict[str, Any] = {
@@ -596,20 +608,33 @@ class Pipeline:
 
         planner = PlannerAgent(self.llm)
         sql_text, rationale = planner.plan(question, context, hints)
-        sql_candidate = extract_sql(sql_text) or sql_text.strip()
+        raw_candidate = extract_sql(sql_text) or sql_text.strip()
+        dialect = str(context.get("dialect") or "generic")
+        sql_candidate = extract_sql_one_stmt(sql_text, dialect=dialect)
 
-        if not sql_candidate or not sql_candidate.lower().startswith(("select", "with")):
+        if not sql_candidate:
             return {
                 "status": "needs_clarification",
                 "questions": planner.fallback_clarifying_question(question, context, hints),
                 "rationale": rationale,
+                "raw_sql": raw_candidate,
+                "error": "empty_or_invalid_sql_after_sanitize",
             }
 
-        return {"status": "ok", "sql": sql_candidate, "rationale": rationale}
+        return {
+            "status": "ok",
+            "sql": sql_candidate,
+            "rationale": rationale,
+            "raw_sql": raw_candidate,
+        }
 
     # ------------------------------------------------------------------
     def _execute_sql(self, engine, sql_text: str) -> SQLExecutionResult:
-        result = run_sql(engine, sql_text)
+        dialect = str(getattr(getattr(engine, "dialect", None), "name", "generic"))
+        cleaned = extract_sql_one_stmt(sql_text, dialect=dialect)
+        if not cleaned:
+            raise RuntimeError("empty_or_invalid_sql_after_sanitize")
+        result = run_sql(engine, cleaned)
         if not result.ok:
             raise RuntimeError(result.error or "SQL execution failed")
         return result
@@ -649,6 +674,7 @@ class Pipeline:
             "sql": retry_plan["sql"],
             "result": retry_result,
             "rationale": retry_plan.get("rationale"),
+            "raw_sql": retry_plan.get("raw_sql"),
         }
 
     # ------------------------------------------------------------------
