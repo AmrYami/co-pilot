@@ -3,11 +3,27 @@ Small helpers for safe-ish SQL text tweaks without a full parser.
 Keep generic; FA specifics stay in apps/fa.
 """
 from __future__ import annotations
+
+import json
 import re
+from typing import Optional
+
+import sqlglot
 
 _CODE_FENCE = re.compile(r"```(?:sql)?\s*(.*?)```", re.S | re.I)
 _SQL_START_STRICT = re.compile(r"(?is)\b(with|select)\b")
 _NONSQL_LINES = re.compile(r"(?:^|\n)\s*(?:Fix and return only.*|Return only .* SQL.*)$", re.I | re.M)
+
+_FENCE_RE = re.compile(r"```(?:sql)?\s*(.*?)```", re.S | re.I)
+
+_CUT_AFTER = (
+    "Fix and return only",
+    "Return Oracle SQL",
+    "<<JSON>>",
+    "</JSON>",
+    "No prose",
+    "Explanation:",
+)
 
 _WHERE_RE = re.compile(r"(?is)\bwhere\b")
 
@@ -96,6 +112,80 @@ def extract_sql(text: str) -> str | None:
     # strip stray backticks
     sql = sql.replace("`", "").strip()
     return sql or None
+
+
+def extract_sql_block(text: str) -> str:
+    """Return SQL extracted from fenced block or first SELECT/WITH chunk."""
+    if not text:
+        return ""
+    match = _FENCE_RE.search(text)
+    if match:
+        return match.group(1).strip()
+
+    match2 = re.search(r"(?is)\b(select|with)\b", text or "")
+    if not match2:
+        return ""
+    tail = text[match2.start() :]
+    out: list[str] = []
+    for line in tail.splitlines():
+        if any(marker.lower() in line.lower() for marker in _CUT_AFTER):
+            break
+        out.append(line)
+    sql = "\n".join(out).strip()
+    sql = sql.strip().lstrip('`"\'').rstrip('`"\'[]')
+    return sql.strip()
+
+
+def sanitize_oracle_sql(*candidates: str) -> str:
+    """Normalize raw LLM generations down to a single Oracle SELECT/CTE statement."""
+
+    for candidate in candidates:
+        sql = extract_sql_block(candidate or "")
+        if not sql:
+            continue
+        if not re.search(r"(?is)^\s*(select|with)\b", sql):
+            continue
+        sql = re.sub(r"`{3,}\s*$", "", sql).strip()
+        sql = re.sub(r"(?im)^\s*```.*$", "", sql).strip()
+        for marker in _CUT_AFTER:
+            sql = re.sub(rf"(?is){re.escape(marker)}.*$", "", sql).strip()
+        if sql:
+            return sql
+    return ""
+
+
+def looks_like_instruction(text: str) -> bool:
+    if not text:
+        return False
+    return bool(re.search(r"(?i)\b(return only|fix and return|no prose|no explanation)\b", text))
+
+
+def validate_oracle_sql(sql: str) -> None:
+    """Raise ValueError when sqlglot cannot parse the SQL as Oracle dialect."""
+
+    if not sql or not re.search(r"(?is)^\s*(select|with)\b", sql):
+        raise ValueError("No SELECT/WITH detected")
+    try:
+        sqlglot.parse_one(sql, read="oracle")
+    except Exception as exc:  # pragma: no cover - sqlglot raises many subclasses
+        raise ValueError(f"SQL parse failed (oracle): {exc}") from exc
+
+
+JSON_BOUNDS = re.compile(r"<<JSON>>\s*(\{.*?\})\s*<</JSON>>", re.S)
+
+
+def extract_json_bracket(raw: str) -> Optional[dict]:
+    """Extract JSON payload enclosed in <<JSON>> ... <</JSON>> markers."""
+
+    if not raw:
+        return None
+    match = JSON_BOUNDS.search(raw)
+    if not match:
+        return None
+    try:
+        return json.loads(match.group(1))
+    except Exception:
+        return None
 
 
 def looks_like_sql(text: str) -> bool:
