@@ -19,7 +19,7 @@ from core.settings import Settings
 from core.snippets import autosave_snippet
 from core.sql_exec import SQLExecutionResult, get_mem_engine, run_sql
 from core.sql_utils import extract_sql, extract_sql_one_stmt
-from core.logging_utils import get_logger
+from core.logging_utils import get_logger, log_event
 
 try:  # pragma: no cover - optional hints module
     from apps.dw.hints import (
@@ -123,10 +123,18 @@ class Pipeline:
     ) -> Dict[str, Any]:
         prefixes_list = list(prefixes or [])
         question_text = (question or "").strip()
+        channel = "dw.pipeline"
         if not question_text:
+            log_event(log, channel, "status", {"status": "error", "reason": "question_empty"})
             return {"ok": False, "status": "error", "error": "question_empty"}
 
         datasource_name = datasource or self._default_datasource() or "docuware"
+        log_event(
+            log,
+            channel,
+            "pipeline_start",
+            {"question": question_text, "datasource": datasource_name, "auth_email": auth_email},
+        )
         inquiry_id = self._record_inquiry(question_text, prefixes_list, auth_email, datasource_name)
 
         try:
@@ -141,15 +149,18 @@ class Pipeline:
             )
         except Exception as exc:
             log.exception("DocuWare pipeline error: %s", exc)
+            log_event(log, channel, "pipeline_exception", {"error": str(exc)})
             fallback = self._deterministic_fallback(question_text)
             if fallback:
                 self._mark_inquiry_answered(inquiry_id, fallback.get("run_id"), "dw_template")
                 meta = fallback.setdefault("meta", {})
                 meta.setdefault("fallback_reason", "pipeline_exception")
                 fallback["inquiry_id"] = inquiry_id
+                log_event(log, channel, "status", {"status": "fallback", "reason": "pipeline_exception"})
                 return fallback
 
             self._mark_inquiry_needs_clarification(inquiry_id, question_text, status="failed")
+            log_event(log, channel, "status", {"status": "failed", "reason": str(exc)})
             return {
                 "ok": False,
                 "status": "error",
@@ -171,7 +182,9 @@ class Pipeline:
                     meta = fallback.setdefault("meta", {})
                     meta.setdefault("fallback_reason", "llm_zero_rows")
                     fallback["inquiry_id"] = inquiry_id
+                    log_event(log, channel, "status", {"status": "fallback", "reason": "llm_zero_rows"})
                     return fallback
+            log_event(log, channel, "status", {"status": "ok", "rowcount": result.get("rowcount")})
             return result
 
         fallback = self._deterministic_fallback(question_text)
@@ -180,6 +193,7 @@ class Pipeline:
             meta = fallback.setdefault("meta", {})
             meta.setdefault("fallback_reason", "llm_plan_failed")
             fallback["inquiry_id"] = inquiry_id
+            log_event(log, channel, "status", {"status": "fallback", "reason": "llm_plan_failed"})
             return fallback
 
         status = result.get("status") or "needs_clarification"
@@ -189,6 +203,7 @@ class Pipeline:
             ]
         self._mark_inquiry_needs_clarification(inquiry_id, question_text, status=status)
         result["status"] = status
+        log_event(log, channel, "status", {"status": status, "inquiry_id": inquiry_id})
         return result
 
     # ------------------------------------------------------------------
@@ -208,18 +223,37 @@ class Pipeline:
         prefixes = list(prefixes or [])
         namespace = namespace or self.namespace
         question_text = (question or "").strip()
+        base_channel = (app_tag or "pipeline") or "pipeline"
+        channel = f"{base_channel}.pipeline" if app_tag else "pipeline"
+
+        log_event(
+            log,
+            channel,
+            "inquiry_start",
+            {
+                "question": question_text,
+                "namespace": namespace,
+                "prefixes": prefixes,
+                "auth_email": auth_email,
+                "datasource": datasource,
+            },
+        )
 
         if not question_text:
+            log_event(log, channel, "status", {"status": "error", "reason": "question_empty"})
             return {"ok": False, "status": "error", "error": "question_empty"}
 
         intent = self.intent_router.classify(question_text)
+        log_event(log, channel, "intent_detected", {"kind": intent.kind})
         if intent.kind == "smalltalk":
+            log_event(log, channel, "status", {"status": "smalltalk"})
             return {
                 "ok": False,
                 "status": "smalltalk",
                 "message": "Please ask a DocuWare data question.",
             }
         if intent.kind == "help":
+            log_event(log, channel, "status", {"status": "help"})
             return {
                 "ok": False,
                 "status": "help",
@@ -229,6 +263,7 @@ class Pipeline:
         ds_engine = self._resolve_engine(datasource)
 
         if intent.kind == "raw_sql":
+            log_event(log, channel, "mode", {"mode": "raw_sql"})
             return self._run_raw_sql(
                 question_text,
                 engine=ds_engine,
@@ -245,8 +280,33 @@ class Pipeline:
         base_context["prefixes"] = prefixes
         base_context["dialect"] = dialect
 
+        log_event(
+            log,
+            channel,
+            "plan_request",
+            {"has_context": bool(context), "has_hints": bool(hints)},
+        )
         plan = self._plan_sql(question_text, base_context, hints or {})
+        log_event(
+            log,
+            channel,
+            "plan_result",
+            {
+                "status": plan.get("status"),
+                "has_sql": bool(plan.get("sql")),
+                "rationale": (plan.get("rationale") or "")[:200],
+            },
+        )
         if plan.get("status") != "ok" or not plan.get("sql"):
+            log_event(
+                log,
+                channel,
+                "status",
+                {
+                    "status": plan.get("status", "needs_clarification"),
+                    "reason": plan.get("error"),
+                },
+            )
             return {
                 "ok": False,
                 "status": plan.get("status", "needs_clarification"),
@@ -261,8 +321,16 @@ class Pipeline:
         rationale = plan.get("rationale")
 
         if self.validator and getattr(self.validator, "fa", None):
+            log_event(log, channel, "validation_quick", {"enabled": True})
             valid, info = self.validator.quick_validate(sql_text)
+            log_event(
+                log,
+                channel,
+                "validation_quick_result",
+                {"ok": bool(valid), "error": info.get("error")},
+            )
             if not valid:
+                log_event(log, channel, "status", {"status": "validation_failed"})
                 return {
                     "ok": False,
                     "status": "validation_failed",
@@ -270,7 +338,26 @@ class Pipeline:
                     "details": info,
                 }
 
-        exec_result = self._execute_sql(ds_engine, sql_text)
+        log_event(
+            log,
+            channel,
+            "execution_start",
+            {"sql_size": len(sql_text)},
+        )
+        try:
+            exec_result = self._execute_sql(ds_engine, sql_text)
+        except Exception as exc:
+            log_event(log, channel, "execution_error", {"error": str(exc)})
+            raise
+        log_event(
+            log,
+            channel,
+            "execution_result",
+            {
+                "rows": exec_result.rowcount,
+                "columns": list(exec_result.columns),
+            },
+        )
         final_sql = sql_text
         final_raw_sql = raw_sql_initial
         final_result = exec_result
@@ -284,6 +371,7 @@ class Pipeline:
         ]
 
         if exec_result.rowcount == 0:
+            log_event(log, channel, "auto_retry_check", {"rowcount": exec_result.rowcount})
             retry = self._maybe_autoretry(
                 question_text,
                 base_context,
@@ -302,6 +390,12 @@ class Pipeline:
                         "type": "auto_retry",
                         "raw_sql": retry.get("raw_sql") or retry["sql"],
                     }
+                )
+                log_event(
+                    log,
+                    channel,
+                    "auto_retry",
+                    {"rowcount": retry["result"].rowcount},
                 )
 
         rows = list(final_result.rows)
@@ -349,6 +443,12 @@ class Pipeline:
         except Exception as exc:  # pragma: no cover - best effort
             log.debug("autosave snippet failed: %s", exc)
 
+        log_event(
+            log,
+            channel,
+            "status",
+            {"status": response.get("status"), "rowcount": rowcount},
+        )
         return response
 
     # ------------------------------------------------------------------

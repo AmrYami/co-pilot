@@ -19,7 +19,7 @@ from core.sql_utils import (
     sanitize_oracle_sql,
     validate_oracle_sql,
 )
-from core.logging_utils import get_logger
+from core.logging_utils import get_logger, log_event
 from .llm import clarify_intent, derive_bind_values, nl_to_sql_with_llm
 from .validator import WHITELIST_BINDS, basic_checks
 
@@ -60,7 +60,7 @@ ALLOWED_COLUMNS = [
 ALLOWED_BINDS = sorted(WHITELIST_BINDS)
 
 dw_bp = Blueprint("dw", __name__, url_prefix="/dw")
-log = get_logger("dw")
+log = get_logger("main")
 
 
 def _env_truthy(name: str, default: bool = False) -> bool:
@@ -76,15 +76,6 @@ DW_INCLUDE_DEBUG = _env_truthy("DW_INCLUDE_DEBUG", default=True)
 
 def _settings():
     return Settings()
-
-
-def _log(tag, payload):
-    """Structured logging helper scoped to DW blueprint."""
-
-    try:
-        log.info("[dw] %s: %s", tag, json.dumps(payload, default=str)[:4000])
-    except Exception:
-        log.info("[dw] %s: %r", tag, payload)
 
 
 def _write_csv(rows, headers) -> str:
@@ -136,7 +127,18 @@ def answer():
             {"ns": NAMESPACE, "q": q, "email": auth_email, "pfx": json.dumps(prefixes)},
         ).scalar_one()
 
-    _log("inquiry_start", {"id": inq_id, "q": q, "email": auth_email})
+    log_event(
+        log,
+        "dw",
+        "inquiry_start",
+        {
+            "id": inq_id,
+            "q": q,
+            "email": auth_email,
+            "ns": NAMESPACE,
+            "prefixes": prefixes,
+        },
+    )
 
     clarifier = clarify_intent(q, ctx)
     clarifier_raw = ""
@@ -165,22 +167,21 @@ def answer():
         }
         intent.setdefault("date_column", default_date_col)
 
-    _log("clarifier_intent", intent)
-    if clarifier_raw:
-        payload = {"size": len(clarifier_raw)}
-        if include_debug:
-            payload["text"] = clarifier_raw[:900]
-        _log("clarifier_raw", payload)
+    log_event(log, "dw", "clarifier_intent_adjusted", json.loads(json.dumps(intent, default=str)))
+    if clarifier_raw and include_debug:
+        log_event(
+            log,
+            "dw",
+            "clarifier_raw_debug",
+            {"size": len(clarifier_raw), "text": clarifier_raw[:900]},
+        )
 
     llm_out = nl_to_sql_with_llm(q, ctx, intent=intent)
     prompt_text = llm_out.get("prompt") or ""
-    _log("sql_prompt", {"prompt": prompt_text if include_debug else "<hidden>"})
     raw1 = llm_out.get("raw1") or ""
-    _log("llm_raw_pass1", {"size": len(raw1)})
     raw2 = ""
     if llm_out.get("used_repair"):
         raw2 = llm_out.get("raw2") or ""
-        _log("llm_raw_pass2", {"size": len(raw2)})
 
     strict_attempted = False
     strict_raw = ""
@@ -193,7 +194,7 @@ def answer():
         mdl = get_model("sql")
         if mdl is None:
             strict_raw = ""
-            _log("llm_raw_strict", {"size": 0, "skipped": True})
+            log_event(log, "dw", "llm_raw_strict", {"size": 0, "skipped": True})
             return strict_raw
         strict_prompt = (
             "Return only one Oracle SELECT (or CTE) statement.\n"
@@ -215,8 +216,8 @@ def answer():
             )
         except Exception as exc:  # pragma: no cover - logging only
             strict_raw = ""
-            _log("strict_retry_error", {"error": str(exc)})
-        _log("llm_raw_strict", {"size": len(strict_raw)})
+            log_event(log, "dw", "strict_retry_error", {"error": str(exc)})
+        log_event(log, "dw", "llm_raw_strict", {"size": len(strict_raw)})
         return strict_raw
 
     sql_candidates: list[str] = []
@@ -250,7 +251,7 @@ def answer():
 
     sql_payload = {"size": len(sql_final)}
     sql_payload["sql"] = sql_final[:900] if include_debug else "<hidden>"
-    _log("final_sql", sql_payload)
+    log_event(log, "dw", "final_sql", sql_payload)
     validation = llm_out.get("validation") or basic_checks(sql_final, allowed_binds=ALLOWED_BINDS)
     if validation is None or not isinstance(validation, dict):
         validation = basic_checks(sql_final, allowed_binds=ALLOWED_BINDS)
@@ -259,7 +260,13 @@ def answer():
         validation.setdefault("errors", [])
         validation["errors"].append(f"oracle_parse:{parse_error}")
         validation["ok"] = False
-    _log("validation", validation)
+    validation_payload = {
+        "ok": bool(validation.get("ok")),
+        "errors": validation.get("errors"),
+        "binds": validation.get("binds"),
+        "bind_names": validation.get("bind_names"),
+    }
+    log_event(log, "dw", "validation", json.loads(json.dumps(validation_payload, default=str)))
 
     if not validation.get("ok"):
         with mem.begin() as conn:
@@ -280,6 +287,12 @@ def answer():
                     "id": inq_id,
                 },
             )
+        log_event(
+            log,
+            "dw",
+            "inquiry_status",
+            {"id": inq_id, "from": "open", "to": "needs_clarification", "reason": "validation_failed"},
+        )
         res = {
             "ok": False,
             "status": "needs_clarification",
@@ -323,6 +336,12 @@ def answer():
                 ),
                 {"sql": sql_final, "id": inq_id},
             )
+        log_event(
+            log,
+            "dw",
+            "inquiry_status",
+            {"id": inq_id, "from": "open", "to": "needs_clarification", "reason": "missing_bind_values"},
+        )
         resp = {
             "ok": False,
             "status": "needs_clarification",
@@ -343,7 +362,12 @@ def answer():
         return jsonify(resp)
 
     exec_binds = {bind_name_map.get(k, k): v for k, v in bind_values.items()}
-    _log("execution_binds", {k: str(v) for k, v in exec_binds.items()})
+    log_event(
+        log,
+        "dw",
+        "execution_binds",
+        {"bind_names": sorted(exec_binds.keys())},
+    )
 
     oracle_engine = ds_registry.engine(None)
     rows = []
@@ -357,10 +381,15 @@ def answer():
             rows = rs.fetchall()
     except Exception as exc:
         error = str(exc)
-        _log("oracle_error", {"error": error})
+        log_event(log, "dw", "oracle_error", {"error": error})
 
     duration_ms = int((datetime.utcnow() - started).total_seconds() * 1000)
-    _log("execution_result", {"rows": len(rows), "cols": headers, "ms": duration_ms})
+    log_event(
+        log,
+        "dw",
+        "execution_result",
+        {"rows": len(rows), "cols": headers, "ms": duration_ms},
+    )
 
     if error:
         with mem.begin() as conn:
@@ -377,13 +406,19 @@ def answer():
                 ),
                 {"sql": sql_final, "err": error, "id": inq_id},
             )
+        log_event(
+            log,
+            "dw",
+            "inquiry_status",
+            {"id": inq_id, "from": "open", "to": "failed", "reason": "oracle_error"},
+        )
         return jsonify({"ok": False, "error": error, "inquiry_id": inq_id, "status": "failed"})
 
     csv_path = None
     if rows:
         csv_path = _write_csv(rows, headers)
         if csv_path:
-            _log("csv_export", {"path": str(csv_path)})
+            log_event(log, "dw", "csv_export", {"path": str(csv_path)})
 
     autosave = bool(settings.get("SNIPPETS_AUTOSAVE", scope="namespace", default=True))
     snippet_id = None
@@ -411,7 +446,7 @@ def answer():
                     "verified": False,
                 },
             ).scalar_one()
-        _log("snippet_saved", {"id": snippet_id})
+        log_event(log, "dw", "snippet_saved", {"id": snippet_id})
 
     with mem.begin() as conn:
         conn.execute(
@@ -425,6 +460,12 @@ def answer():
             ),
             {"by": auth_email, "sql": sql_final, "id": inq_id},
         )
+    log_event(
+        log,
+        "dw",
+        "inquiry_status",
+        {"id": inq_id, "from": "open", "to": "answered", "rows": len(rows)},
+    )
 
     binds_public = {
         bind_name_map.get(k, k): (
