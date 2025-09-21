@@ -133,24 +133,15 @@ def _columns_whitelist() -> str:
 
 def _build_prompt_fenced(question: str, intent: dict, allow_binds) -> str:
     cols = _columns_whitelist()
-    default_date_col = intent.get("date_column") or "REQUEST_DATE"
-    has_window = bool(intent.get("has_time_window"))
-    window_line = (
-        f"If a time window is requested, filter on {default_date_col} BETWEEN :date_start AND :date_end."
-        if has_window
-        else "Do not add any date filter."
-    )
+    date_col = intent.get("date_column") or "REQUEST_DATE"
+    binds = ", ".join(allow_binds)
     return (
-        "Return Oracle SQL only inside ```sql fenced block. No prose.\n\n"
+        "Return Oracle SQL only inside ```sql fenced block. No prose.\n"
         'Table: "Contract"\n'
-        f"Allowed columns only: {cols}\n"
-        "Use Oracle syntax: NVL, TRIM, LISTAGG WITHIN GROUP, FETCH FIRST N ROWS ONLY.\n"
-        "Use SELECT or WITH queries only.\n"
-        f"Allowed binds: {', '.join(allow_binds)}\n"
-        f"Default date column for windows: {default_date_col}.\n"
-        f"{window_line}\n"
-        "When aggregating by stakeholder, UNPIVOT across CONTRACT_STAKEHOLDER_1..8 paired with DEPARTMENT_1..8 using UNION ALL.\n"
-        "Gross value = NVL(CONTRACT_VALUE_NET_OF_VAT,0) + NVL(VAT,0).\n\n"
+        f"Allowed columns: {cols}\n"
+        "Use Oracle syntax: NVL, TRIM, LISTAGG WITHIN GROUP, FETCH FIRST N ROWS ONLY. SELECT/CTE only.\n"
+        f"Allowed binds: {binds}\n"
+        f"Default date column: {date_col}.\n"
         "Question:\n"
         f"{question}\n\n"
         "```sql\n"
@@ -223,24 +214,11 @@ def nl_to_sql_with_llm(question: str, ctx: dict) -> dict:
     logger("clarifier_intent", intent)
 
     max_new_tokens = int(os.getenv("SQL_MAX_NEW_TOKENS", "384"))
-    generation_temperature = float(os.getenv("GENERATION_TEMPERATURE", "0.2"))
-    generation_top_p = float(os.getenv("GENERATION_TOP_P", "0.9"))
-    fenced_stop = "```"
-
-    common_kwargs = {
-        "max_new_tokens": max_new_tokens,
-        "temperature": generation_temperature,
-        "top_p": generation_top_p,
-    }
 
     # --- PASS 1: fenced prompt
     prompt1 = _build_prompt_fenced(question, intent, allow_binds)
     logger("sql_prompt_pass1", {"preview": prompt1[:400]})
-    raw1 = sql_mdl.generate(
-        prompt1,
-        stop=fenced_stop,
-        **common_kwargs,
-    )
+    raw1 = sql_mdl.generate(prompt1, max_new_tokens=max_new_tokens)
     sql1 = _extract_sql(raw1)
     logger(
         "llm_raw_pass1",
@@ -275,11 +253,7 @@ def nl_to_sql_with_llm(question: str, ctx: dict) -> dict:
     # --- PASS 2: plain prompt
     prompt2 = _build_prompt_plain(question, intent, allow_binds)
     logger("sql_prompt_pass2", {"preview": prompt2[:400]})
-    raw2 = sql_mdl.generate(
-        prompt2,
-        stop=fenced_stop,
-        **common_kwargs,
-    )
+    raw2 = sql_mdl.generate(prompt2, max_new_tokens=max_new_tokens)
     sql2 = _extract_sql(raw2)
     logger(
         "llm_raw_pass2",
@@ -314,7 +288,7 @@ def nl_to_sql_with_llm(question: str, ctx: dict) -> dict:
     # --- PASS 3: prefix-primed SELECT
     prompt3 = _build_prompt_prefix_select(question, intent, allow_binds)
     logger("sql_prompt_pass3", {"preview": prompt3[:400]})
-    raw3 = sql_mdl.generate(prompt3, **common_kwargs)
+    raw3 = sql_mdl.generate(prompt3, max_new_tokens=max_new_tokens)
     text3 = raw3 or ""
     if not text3.strip().lower().startswith("select"):
         text3 = "SELECT " + text3.lstrip()

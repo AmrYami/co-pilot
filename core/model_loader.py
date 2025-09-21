@@ -4,6 +4,7 @@ from typing import Any, Dict, Iterable, Optional
 
 import torch
 
+from core.sqlcoder_exllama import build_sql_model
 from core.settings import Settings
 
 _MODELS: Dict[str, Optional[Dict[str, Any]]] = {}
@@ -36,23 +37,25 @@ def _log(msg: str) -> None:
 # ---------------------------
 
 def _load_sql_model() -> Optional[Dict[str, Any]]:
-    backend = os.getenv("MODEL_BACKEND", "exllama").strip().lower()
     settings = Settings()
     path = os.getenv("MODEL_PATH") or settings.get("MODEL_PATH", scope="global")
     if not path:
         raise RuntimeError("MODEL_PATH not set for SQL model")
-    if backend != "exllama":
+
+    backend = os.getenv("MODEL_BACKEND", "exllama").strip().lower()
+    if backend not in {"exllama", "exllamav2"}:
         raise RuntimeError(f"Unsupported MODEL_BACKEND={backend} for SQL model")
 
-    from core.sqlcoder_exllama import build_sql_model
-
-    handle = build_sql_model(path)
+    model = build_sql_model(path)
+    name = os.path.basename(path.rstrip("/")) or path
 
     payload: Dict[str, Any] = {
         "role": "sql",
         "backend": backend,
         "path": path,
-        "handle": handle,
+        "name": name,
+        "model": model,
+        "handle": model,
     }
 
     _log("SQL model (SQLCoder/ExLlamaV2) ready")
@@ -232,9 +235,10 @@ def _load_clarifier_model() -> Optional[Dict[str, Any]]:
         "backend": backend,
         "path": path,
         "name": os.path.basename(path.rstrip("/")) or path,
+        "model": handle,
         "handle": handle,
         "tokenizer": tokenizer,
-        "model": model,
+        "hf_model": model,
         "device_map": device_map,
     }
 
@@ -262,19 +266,16 @@ def ensure_model(role: str) -> Optional[Any]:
     payload = load_llm(role)
     if not payload:
         return None
-    return payload.get("handle")
+    return payload
 
 
 def get_model(role: str) -> Optional[Any]:
-    """Return the cached model handle for the given role if available."""
+    """Return the cached model for the given role if available."""
 
-    with _LOCK:
-        payload = _MODELS.get(role)
-    if payload is None:
-        return ensure_model(role)
-    if isinstance(payload, dict):
-        return payload.get("handle")
-    return None
+    payload = ensure_model(role)
+    if not payload:
+        return None
+    return payload["model"]
 
 
 def llm_complete(
@@ -292,7 +293,7 @@ def llm_complete(
     if not payload:
         return ""
 
-    handle = payload.get("handle")
+    handle = payload.get("handle") or payload.get("model")
     if handle is None:
         return ""
 
@@ -375,12 +376,12 @@ def model_info() -> Dict[str, Any]:
 
 def load_model(settings: Any | None = None) -> Optional[Any]:
     payload = load_llm("sql")
-    return payload.get("handle") if payload else None
+    return payload.get("model") if payload else None
 
 
 def load_clarifier(settings: Any | None = None) -> Optional[Any]:
     payload = load_llm("clarifier")
-    return payload.get("handle") if payload else None
+    return payload.get("model") if payload else None
 
 
 def load_llm_from_settings(settings: Any | None = None):
@@ -392,4 +393,4 @@ def load_llm_from_settings(settings: Any | None = None):
         "path": payload.get("path"),
         "name": os.getenv("MODEL_NAME") or os.path.basename(payload.get("path", "")) or "sqlcoder",
     }
-    return payload.get("handle"), info
+    return payload.get("model"), info

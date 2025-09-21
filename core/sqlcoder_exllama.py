@@ -1,263 +1,165 @@
 import os
-import logging
-from dataclasses import dataclass
+import inspect
 from types import SimpleNamespace
 
-# ---- ExLlamaV2 imports (version-agnostic) -----------------------------------
-from exllamav2.config import ExLlamaV2Config
-from exllamav2.model import ExLlamaV2
-from exllamav2.cache import ExLlamaV2Cache
-from exllamav2.generator.base import ExLlamaV2BaseGenerator
+# Hard requirement: PyTorch must be importable before exllamav2 loads
+import torch
 
-# Tokenizer class name/location changed across versions
+# --- ExLlamaV2 core imports (stable) ---
+from exllamav2 import ExLlamaV2, ExLlamaV2Config, ExLlamaV2Cache
+
+# --- Tokenizer import is version-dependent; try the common paths ---
 try:
-    from exllamav2.tokenizer import ExLlamaV2Tokenizer as Tokenizer
+    from exllamav2.tokenizer import Tokenizer  # many 0.2.x builds
 except Exception:
-    from exllamav2.tokenizer import Tokenizer
+    try:
+        from exllamav2.tokenizer.tokenizer import Tokenizer  # some builds
+    except Exception:
+        try:
+            from exllamav2 import Tokenizer  # fallback if re-exported
+        except Exception as e:
+            raise ImportError(
+                "Could not import ExLlamaV2 Tokenizer from any known path"
+            ) from e
 
-# Sampler settings moved into generator.sampler
+# --- Generator imports (stable base generator across 0.2.x/0.3.x) ---
+from exllamav2.generator import ExLlamaV2BaseGenerator
+
+# --- Sampling settings: name & location changed across versions ---
 try:
-    from exllamav2.generator.sampler import ExLlamaV2Sampler
+    # many 0.2.x builds
+    from exllamav2.generator import ExLlamaV2SamplingSettings as _SamplerSettings
 except Exception:
-    # Some very old builds put it in a different place
     try:
-        from exllamav2.generator import ExLlamaV2Sampler  # type: ignore
+        # some builds moved settings to sampler module
+        from exllamav2.generator.sampler import SamplingSettings as _SamplerSettings
     except Exception:
-        ExLlamaV2Sampler = None  # type: ignore
-
-log = logging.getLogger("core.sqlcoder_exllama")
-
-# -----------------------------------------------------------------------------
-# Bundle returned from loader
-# -----------------------------------------------------------------------------
-@dataclass
-class ExllamaBundle:
-    model: ExLlamaV2
-    tokenizer: Tokenizer
-    cache: ExLlamaV2Cache
-    generator: ExLlamaV2BaseGenerator
-    config: ExLlamaV2Config
+        _SamplerSettings = None  # will use a duck-typed fallback
 
 
-def _env_float(key: str, default: float) -> float:
+def _make_settings():
+    """Return a sampling settings object acceptable by this exllamav2 build."""
+    t = float(os.getenv("GENERATION_TEMPERATURE", "0.2"))
+    tp = float(os.getenv("GENERATION_TOP_P", "0.9"))
+
+    if _SamplerSettings is not None:
+        s = _SamplerSettings()
+        # The attribute names differ slightly across builds; set the common ones.
+        for name in ("temperature", "top_p"):
+            if hasattr(s, name):
+                setattr(s, name, t if name == "temperature" else tp)
+        # These are safe defaults; present in many builds (ignored if absent)
+        for name, val in (
+            ("token_repetition_penalty", 1.05),
+            ("min_p", 0.0),
+            ("top_k", 0),
+            ("mirostat_tau", 0.0),
+            ("mirostat_lr", 0.0),
+            ("cfg_scale", None),
+            ("seed", -1),
+        ):
+            if hasattr(s, name):
+                setattr(s, name, val)
+        return s
+
+    # Duck-typed fallback: the sampler only accesses attributes it needs.
+    return SimpleNamespace(
+        temperature=t,
+        top_p=tp,
+        token_repetition_penalty=1.05,
+        min_p=0.0,
+        top_k=0,
+        mirostat_tau=0.0,
+        mirostat_lr=0.0,
+        cfg_scale=None,
+        seed=-1,
+    )
+
+
+def _parse_gpu_split(var: str):
+    if not var:
+        return None
     try:
-        return float(os.getenv(key, str(default)))
+        return [float(x.strip()) for x in var.split(",") if x.strip()]
     except Exception:
-        return default
+        return None
 
 
-def _env_int(key: str, default: int) -> int:
-    try:
-        return int(os.getenv(key, str(default)))
-    except Exception:
-        return default
+class SQLCoderExLlama:
+    def __init__(self, generator: ExLlamaV2BaseGenerator, tokenizer: Tokenizer, max_seq_len: int):
+        self.generator = generator
+        self.tokenizer = tokenizer
+        self.max_seq_len = max_seq_len
 
-
-
-
-def _build_sampler_settings(temp: float, top_p: float):
-    try:
-        settings_cls = getattr(ExLlamaV2Sampler, 'Settings')
-    except Exception:
-        settings_cls = None
-
-    settings = None
-    if settings_cls is not None:
+        # detect signature: (prompt, settings, num_tokens) vs (prompt, num_tokens)
         try:
-            settings = settings_cls()
+            sig = inspect.signature(self.generator.generate_simple)
+            self._gen_has_settings = (len(sig.parameters) == 3)
         except Exception:
-            settings = None
+            # most 0.2.x builds have 3 args
+            self._gen_has_settings = True
 
-    if settings is None:
-        settings = SimpleNamespace()
-
-    defaults = {
-        'temperature': float(temp),
-        'top_p': float(top_p),
-        'top_k': 0,
-        'min_p': 0.0,
-        'typical': None,
-        'tfs': None,
-        'repetition_penalty': 1.0,
-        'penalty_range': 64,
-        'presence_penalty': 0.0,
-        'frequency_penalty': 0.0,
-        'mirostat': None,
-        'cfg_scale': 1.0,
-    }
-    for key, value in defaults.items():
-        if not hasattr(settings, key):
-            setattr(settings, key, value)
-        elif key in {'temperature', 'top_p'}:
-            setattr(settings, key, value)
-    return settings
-
-def load_exllama_generator(model_dir: str) -> ExllamaBundle:
-    """
-    Create an ExLlamaV2 stack (config, model, tokenizer, cache, generator).
-    Robust to minor API differences across exllamav2 versions.
-    """
-    log.info(f"[exl2] Loading ExLlamaV2 model from: {model_dir}")
-
-    # Config
-    try:
-        cfg = ExLlamaV2Config(model_dir)
-    except TypeError:
-        # older form may require set attribute / prepare call
-        cfg = ExLlamaV2Config()
-        cfg.model_dir = model_dir
-    try:
-        cfg.prepare()
-    except Exception:
-        # Not all versions require/allow prepare()
-        pass
-
-    # Model
-    model = ExLlamaV2(cfg)
-
-    # Tokenizer
-    try:
-        tokenizer = Tokenizer(cfg)
-    except Exception:
-        # Fallback if constructor expects dir
-        tokenizer = Tokenizer(model_dir)
-
-    # Cache
-    max_seq_len = _env_int("EXL2_CACHE_MAX_SEQ_LEN", 2048)
-    try:
-        cache = ExLlamaV2Cache(model, max_seq_len, lazy=True)
-    except TypeError:
-        # older signature
-        cache = ExLlamaV2Cache(model, max_seq_len)
-
-    # Generator **MUST** be constructed (model, cache, tokenizer)
-    generator = ExLlamaV2BaseGenerator(model, cache, tokenizer)
-
-    log.info(f"[exl2] Ready: cache.max_seq_len={getattr(cache, 'max_seq_len', 'n/a')}")
-    return ExllamaBundle(model=model, tokenizer=tokenizer, cache=cache, generator=generator, config=cfg)
-
-
-class SQLCoderExllama:
-    """
-    Thin wrapper around ExLlamaV2BaseGenerator exposing a stable .generate()
-    suitable for the DW pipeline.
-    """
-
-    def __init__(self, bundle: ExllamaBundle):
-        self.generator = bundle.generator
-        self.tokenizer = bundle.tokenizer
-        self.cache = bundle.cache
-
-        # Build sampler settings once
-        temp = _env_float("GENERATION_TEMPERATURE", 0.2)
-        nucleus = _env_float("GENERATION_TOP_P", 0.9)
-        self.settings = _build_sampler_settings(temp, nucleus)
-
-        # You can add more knobs here if needed:
-        # self.settings.repetition_penalty = _env_float("GENERATION_REP_PENALTY", 1.0)
-
-    def _encode_tokens(self, text: str, *, add_bos: bool = True):
+    def _safe_num_new(self, prompt_text: str, requested_new: int) -> int:
+        # Estimate tokens conservatively; most tokenizers return len(list[int])
         try:
-            return self.tokenizer.encode(text, add_bos=add_bos, encode_special_tokens=False)
-        except TypeError:
-            tokens = self.tokenizer.encode(text)
-            if not add_bos:
-                bos_id = getattr(self.tokenizer, 'bos_token_id', None)
-                if bos_id is not None:
-                    if hasattr(tokens, 'shape') and tokens.shape[-1] > 0:
-                        if tokens.ndim == 2 and tokens.shape[0] > 0 and tokens[0, 0].item() == bos_id:
-                            tokens = tokens[:, 1:]
-                        elif tokens.ndim == 1 and tokens[0].item() == bos_id:
-                            tokens = tokens[1:]
-                    elif isinstance(tokens, (list, tuple)) and tokens and tokens[0] == bos_id:
-                        tokens = tokens[1:]
-            return tokens
-
-    def _token_length(self, tokens) -> int:
-        if hasattr(tokens, 'shape'):
-            return int(tokens.shape[-1])
-        return len(tokens)
-
-    def _decode_tokens(self, tokens):
-        try:
-            return self.tokenizer.decode(tokens)
-        except TypeError:
-            return self.tokenizer.decode(tokens)
-
-    def _tail_tokens(self, tokens, limit: int):
-        if limit <= 0:
-            return tokens
-        if hasattr(tokens, 'shape'):
-            return tokens[:, -limit:]
-        return tokens[-limit:]
-
-    def _apply_stops(self, text: str, stop):
-        if not stop:
-            return text
-        best = len(text)
-        for s in stop:
-            idx = text.find(s)
-            if idx != -1 and idx < best:
-                best = idx
-        return text[:best]
-
-    def generate(self, prompt: str, max_new_tokens: int = 256, stop=None) -> str:
-        """
-        Generate text with ExLlamaV2, respecting cache limits and handling
-        differences in generate_simple signature across versions.
-        """
-        # Compute safe new tokens given cache size and prompt length
-        reserve = _env_int("EXL2_INPUT_RESERVE_TOKENS", 64)
-        max_ctx = getattr(self.cache, "max_seq_len", 2048)
-        max_prompt_tokens = max(1, max_ctx - reserve)
-
-        tokens = self._encode_tokens(prompt)
-        in_tokens = self._token_length(tokens)
-        if in_tokens > max_prompt_tokens:
-            tokens = self._tail_tokens(tokens, max_prompt_tokens)
-            prompt = self._decode_tokens(tokens)
-            in_tokens = self._token_length(tokens)
-            log.warning(
-                "[exl2.gen] prompt trimmed to last %s tokens to respect cache",
-                in_tokens,
-            )
-
-        available = max_ctx - in_tokens - reserve
-        target_new = max_new_tokens if max_new_tokens is not None else 256
-        allow = max(0, min(int(target_new), max(0, available)))
-
-        log.info(
-            "[exl2.gen] tokens_in=%s allow_new=%s max_req=%s max_ctx=%s reserve=%s",
-            in_tokens, allow, int(target_new), max_ctx, reserve
-        )
-
-        if allow == 0:
-            log.warning("[exl2.gen] no room for new tokens; returning empty string")
-            return ""
-
-        # Try 3-arg signature (prompt, settings, num_tokens) first
-        try:
-            text = self.generator.generate_simple(prompt, self.settings, allow)
-        except TypeError:
-            # Fall back to 2-arg (prompt, num_tokens)
-            text = self.generator.generate_simple(prompt, allow)
-
-        # Post-process string stops (ExLlamaV2 base does not universally accept stop strings)
-        text = self._apply_stops(text, stop)
-
-        try:
-            out_tokens = self._token_length(self._encode_tokens(text, add_bos=False))
+            n_in = len(self.tokenizer.encode(prompt_text, add_bos=False, add_eos=False))
         except Exception:
-            out_tokens = None
-        log.info(
-            "[exl2.gen] output_chars=%s output_tokens=%s",
-            len(text),
-            out_tokens,
-        )
+            # crude heuristic if encode(...) signature differs
+            n_in = max(1, len(prompt_text) // 4)
+
+        # keep a small reserve to prevent cache overflow
+        reserve = int(os.getenv("EXL2_INPUT_RESERVE_TOKENS", "64"))
+        budget = max(32, self.max_seq_len - n_in - reserve)
+        return max(32, min(requested_new, budget))
+
+    def generate(self, prompt: str, max_new_tokens: int = 256, stop=None):
+        settings = _make_settings()
+        n_new = self._safe_num_new(prompt, int(max_new_tokens))
+
+        # Do not call removed APIs like set_stop_strings; we’ll trim in downstream.
+        if self._gen_has_settings:
+            text = self.generator.generate_simple(prompt, settings, n_new)
+        else:
+            # some newer builds accept only (prompt, num_tokens)
+            try:
+                text = self.generator.generate_simple(prompt, n_new)
+            except TypeError:
+                # fallback to 3-arg if our guess was wrong
+                text = self.generator.generate_simple(prompt, settings, n_new)
+
         return text
 
 
-# Convenience loader used by core/model_loader.py
-def build_sql_model(model_dir: str) -> SQLCoderExllama:
-    bundle = load_exllama_generator(model_dir)
-    return SQLCoderExllama(bundle)
+def build_sql_model(model_dir: str):
+    """
+    Build and return a light wrapper exposing .generate(prompt, max_new_tokens, stop).
+    Respects:
+      - EXL2_CACHE_MAX_SEQ_LEN
+      - EXL2_GPU_SPLIT_GB (comma-separated, e.g. "29,2")
+      - RESERVE_VRAM_GB
+    """
+    if not os.path.isdir(model_dir):
+        raise RuntimeError(f"MODEL_PATH does not exist: {model_dir}")
+
+    max_seq = int(os.getenv("EXL2_CACHE_MAX_SEQ_LEN", "2048"))
+    gpu_split = _parse_gpu_split(os.getenv("EXL2_GPU_SPLIT_GB", ""))
+    reserve_gb = float(os.getenv("RESERVE_VRAM_GB", "0") or 0)
+
+    cfg = ExLlamaV2Config(model_dir)
+    cfg.prepare()  # builds internal index
+
+    model = ExLlamaV2(cfg)
+    tokenizer = Tokenizer(cfg)
+
+    # Lazy cache helps large prompts; keep it small but safe
+    cache = ExLlamaV2Cache(model, max_seq_len=max_seq, lazy=True)
+
+    # Multi-GPU autosplit; avoid model.to(...)
+    try:
+        model.load_autosplit(cache, gpu_split=gpu_split, reserve_vram=reserve_gb)
+    except TypeError:
+        # some builds use different arg name(s)
+        model.load_autosplit(cache, gpu_split)
+
+    generator = ExLlamaV2BaseGenerator(model, tokenizer, cache)
+    return SQLCoderExLlama(generator, tokenizer, max_seq_len=max_seq)

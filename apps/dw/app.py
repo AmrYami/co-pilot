@@ -45,7 +45,7 @@ def _insert_inquiry(conn, namespace: str, question: str, auth_email: str, prefix
     stmt = text(
         """
         INSERT INTO mem_inquiries(namespace, question, auth_email, prefixes, status, created_at, updated_at)
-        VALUES (:ns, :q, :auth, CAST(:pfx AS JSONB), 'open', NOW(), NOW())
+        VALUES (:ns, :q, :auth, CAST(:pfx AS jsonb), 'open', NOW(), NOW())
         RETURNING id
         """
     )
@@ -145,6 +145,8 @@ def answer():
             for key, value in (binds or {}).items()
         }
         current_app.logger.info("[dw] exec_binds: %s", json.dumps(safe_binds, default=str))
+        current_app.logger.info("[dw] final_sql: %s", sql)
+        current_app.logger.info("[dw] execution_binds: %s", safe_binds)
     except Exception:
         pass
 
