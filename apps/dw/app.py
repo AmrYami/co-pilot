@@ -80,42 +80,23 @@ def answer():
 
     out = nl_to_sql_with_llm(question, llm_context)
     intent = out.get("intent") or {}
-    sql = out.get("sql") or ""
+    final_sql = out.get("final_sql") or ""
     final_pass = f"pass{out.get('pass')}" if out.get("pass") else "unknown"
-    trunc_sql = (sql[:600] + "...") if len(sql) > 600 else sql
+    trunc_sql = (final_sql[:600] + "...") if len(final_sql) > 600 else final_sql
     current_app.logger.info(
         "[dw] chosen_sql",
         extra={"payload": {"pass": final_pass, "sql": trunc_sql}},
     )
 
-    if not out.get("ok") or not sql:
+    if os.getenv("DW_DEBUG", "0") == "1":
         _log(
-            "validation",
-            {"ok": False, "errors": out.get("errors") or ["empty_sql"], "binds": out.get("binds") or []},
-        )
-        return (
-            jsonify(
-                {
-                    "ok": False,
-                    "status": "needs_clarification",
-                    "questions": [
-                        "I couldn't derive a clean SELECT. Can you rephrase or specify filters (stakeholders, departments, date columns)?"
-                    ],
-                    "error": ",".join(out.get("errors") or ["empty_sql"]),
-                    "debug": {
-                        "llm": {
-                            "pass": out.get("pass"),
-                            "ok": out.get("ok"),
-                            "errors": out.get("errors"),
-                            "binds": out.get("binds"),
-                            "prompt_size": len(out.get("prompt") or ""),
-                            "raw_size": len(out.get("raw") or ""),
-                        },
-                        "clarifier": out.get("clarifier"),
-                    },
-                }
-            ),
-            200,
+            "llm_pass_debug",
+            {
+                "raw1": (out.get("raw1") or "")[:240],
+                "sql1": (out.get("sql1") or "")[:240],
+                "raw2": (out.get("raw2") or "")[:240],
+                "sql2": (out.get("sql2") or "")[:240],
+            },
         )
 
     binds: dict[str, object] = {}
@@ -133,19 +114,41 @@ def answer():
         binds["date_end"] = datetime.combine(date_end, datetime.min.time())
 
     exec_binds = {k: (v.isoformat() if hasattr(v, "isoformat") else v) for k, v in binds.items()}
-    _log("sql_final", {"sql": sql})
+    _log("sql_final", {"sql": final_sql})
     _log("sql_binds", exec_binds)
-    _log("choose_sql", {"pass": out.get("pass"), "preview": (sql or "")[:240], "binds": exec_binds})
+    _log("choose_sql", {"pass": out.get("pass"), "preview": (final_sql or "")[:240], "binds": exec_binds})
+
+    if os.getenv("DW_INCLUDE_DEBUG", "0") == "1":
+        current_app.logger.info("[dw] will_execute: sql_preview=%s", (final_sql[:300] if final_sql else None))
+        current_app.logger.info("[dw] will_execute: binds=%s", binds)
+
+    if not final_sql or not final_sql.strip().lower().startswith(("select", "with")):
+        llm_debug = {
+            "pass": out.get("pass"),
+            "ok": out.get("ok"),
+            "errors": out.get("errors"),
+            "sql1": out.get("sql1"),
+            "sql2": out.get("sql2"),
+            "raw1": out.get("raw1"),
+            "raw2": out.get("raw2"),
+        }
+        return jsonify({
+            "ok": False,
+            "status": "needs_clarification",
+            "error": "empty_sql",
+            "questions": ["I couldn't derive a clean SELECT. Can you rephrase or specify filters (stakeholders, departments, date columns)?"],
+            "debug": {"llm": llm_debug, "clarifier": out.get("clarifier")},
+        })
 
     try:
-        preview_sql = sql[:600] + (" ..." if len(sql) > 600 else "")
+        preview_sql = final_sql[:600] + (" ..." if len(final_sql) > 600 else "")
         current_app.logger.info("[dw] exec_sql_preview: %s", preview_sql)
         safe_binds = {
             key: (value if isinstance(value, (str, int, float)) else str(value))
             for key, value in (binds or {}).items()
         }
         current_app.logger.info("[dw] exec_binds: %s", json.dumps(safe_binds, default=str))
-        current_app.logger.info("[dw] final_sql: %s", sql)
+        current_app.logger.info("[dw] final_sql: %s", final_sql)
         current_app.logger.info("[dw] execution_binds: %s", safe_binds)
     except Exception:
         pass
@@ -155,39 +158,33 @@ def answer():
     cols: list[str] = []
     started = datetime.utcnow()
     try:
-        _log("execution_sql", {"sql": sql[:1800]})
+        _log("execution_sql", {"sql": final_sql[:1800]})
         _log("execution_binds", exec_binds)
         with engine.begin() as conn:
-            result = conn.exec_driver_sql(sql, binds)
+            result = conn.exec_driver_sql(final_sql, binds)
             cols = list(result.keys())
             rows = [list(row) for row in result.fetchall()]
         elapsed_ms = int((datetime.utcnow() - started).total_seconds() * 1000)
         _log("execution_result", {"rows": len(rows), "cols": cols, "ms": elapsed_ms})
     except Exception as exc:  # pragma: no cover - surface database errors
         _log("oracle_error", {"error": str(exc)})
-        return (
-            jsonify(
-                {
-                    "ok": False,
-                    "status": "failed",
-                    "error": str(exc),
-                    "sql": sql,
-                    "binds": binds,
-                    "debug": {
-                        "llm": {
-                            "pass": out.get("pass"),
-                            "ok": out.get("ok"),
-                            "errors": out.get("errors"),
-                            "binds": out.get("binds"),
-                            "prompt_size": len(out.get("prompt") or ""),
-                            "raw_size": len(out.get("raw") or ""),
-                        },
-                        "clarifier": out.get("clarifier"),
-                    },
-                }
-            ),
-            200,
-        )
+        llm_debug = {
+            "pass": out.get("pass"),
+            "ok": out.get("ok"),
+            "errors": out.get("errors"),
+            "sql1": out.get("sql1"),
+            "sql2": out.get("sql2"),
+            "raw1": out.get("raw1"),
+            "raw2": out.get("raw2"),
+        }
+        return (jsonify({
+            "ok": False,
+            "status": "failed",
+            "error": str(exc),
+            "sql": final_sql,
+            "binds": binds,
+            "debug": {"llm": llm_debug, "clarifier": out.get("clarifier")},
+        }), 200)
 
     return (
         jsonify(
@@ -195,7 +192,7 @@ def answer():
                 "ok": True,
                 "rows": rows,
                 "columns": cols,
-                "sql": sql,
+                "sql": final_sql,
                 "binds": {k: (v.isoformat() if hasattr(v, "isoformat") else v) for k, v in binds.items()},
                 "intent": intent,
                 "debug": {
@@ -203,9 +200,10 @@ def answer():
                         "pass": out.get("pass"),
                         "ok": out.get("ok"),
                         "errors": out.get("errors"),
-                        "binds": out.get("binds"),
-                        "prompt_size": len(out.get("prompt") or ""),
-                        "raw_size": len(out.get("raw") or ""),
+                        "sql1": out.get("sql1"),
+                        "sql2": out.get("sql2"),
+                        "raw1": out.get("raw1"),
+                        "raw2": out.get("raw2"),
                     },
                     "clarifier": out.get("clarifier"),
                 },
