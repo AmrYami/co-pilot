@@ -5,14 +5,21 @@ import json
 import logging
 import os
 import pathlib
-from datetime import datetime
+from datetime import date, datetime, timedelta
 
 from flask import Blueprint, current_app, jsonify, request
 from sqlalchemy import text
 
 from core.datasources import DatasourceRegistry
 from core.settings import Settings
+from core.model_loader import get_model
 from core.sql_exec import get_mem_engine
+from core.sql_utils import (
+    extract_json_bracket,
+    looks_like_instruction,
+    sanitize_oracle_sql,
+    validate_oracle_sql,
+)
 from .llm import clarify_intent, derive_bind_values, nl_to_sql_with_llm
 from .validator import WHITELIST_BINDS, basic_checks
 
@@ -164,12 +171,37 @@ def answer():
     _log("inquiry_start", {"id": inq_id, "q": q, "email": auth_email})
 
     clarifier = clarify_intent(q, ctx)
+    clarifier_raw = ""
     intent = clarifier.get("intent", {}) if isinstance(clarifier, dict) else {}
+    if not isinstance(intent, dict):
+        intent = {}
+    if isinstance(clarifier, dict):
+        clarifier_raw = clarifier.get("raw") or ""
+
+    bracket_payload = extract_json_bracket(clarifier_raw) or {}
+    for key in ("has_time_window", "date_column", "top_n", "explicit_dates"):
+        value = bracket_payload.get(key)
+        if value is not None:
+            intent[key] = value
+
+    lowered_question = (q or "").lower()
+    if "last month" in lowered_question:
+        today = date.today()
+        first_this_month = today.replace(day=1)
+        last_month_end = first_this_month - timedelta(days=1)
+        last_month_start = last_month_end.replace(day=1)
+        intent["has_time_window"] = True
+        intent["explicit_dates"] = {
+            "start": last_month_start.isoformat(),
+            "end": last_month_end.isoformat(),
+        }
+        intent.setdefault("date_column", default_date_col)
+
     _log("clarifier_intent", intent)
-    if clarifier.get("raw"):
-        payload = {"size": len(clarifier["raw"])}
+    if clarifier_raw:
+        payload = {"size": len(clarifier_raw)}
         if include_debug:
-            payload["text"] = clarifier["raw"][:900]
+            payload["text"] = clarifier_raw[:900]
         _log("clarifier_raw", payload)
 
     llm_out = nl_to_sql_with_llm(q, ctx, intent=intent)
@@ -177,15 +209,88 @@ def answer():
     _log("sql_prompt", {"prompt": prompt_text if include_debug else "<hidden>"})
     raw1 = llm_out.get("raw1") or ""
     _log("llm_raw_pass1", {"size": len(raw1)})
+    raw2 = ""
     if llm_out.get("used_repair"):
         raw2 = llm_out.get("raw2") or ""
         _log("llm_raw_pass2", {"size": len(raw2)})
 
-    sql_final = (llm_out.get("sql") or "").strip()
+    strict_attempted = False
+    strict_raw = ""
+
+    def _strict_retry() -> str:
+        nonlocal strict_attempted, strict_raw
+        if strict_attempted:
+            return strict_raw
+        strict_attempted = True
+        mdl = get_model("sql")
+        if mdl is None:
+            strict_raw = ""
+            _log("llm_raw_strict", {"size": 0, "skipped": True})
+            return strict_raw
+        strict_prompt = (
+            "Return only one Oracle SELECT (or CTE) statement.\n"
+            "No code fences. No comments. No explanations. No extra text.\n"
+            f'Table: "{table_name}". Allowed columns: {", ".join(ALLOWED_COLUMNS)}.\n'
+            f"Allowed binds: {', '.join(ALLOWED_BINDS)}.\n"
+            f"Use Oracle syntax. Use {intent.get('date_column') or default_date_col} for default window.\n"
+            "Question:\n"
+            f"{q}\n"
+            "Statement:\n"
+        )
+        try:
+            strict_raw = mdl.generate(
+                strict_prompt,
+                max_new_tokens=200,
+                temperature=0.0,
+                top_p=0.95,
+                stop=["```", "<<JSON>>"],
+            )
+        except Exception as exc:  # pragma: no cover - logging only
+            strict_raw = ""
+            _log("strict_retry_error", {"error": str(exc)})
+        _log("llm_raw_strict", {"size": len(strict_raw)})
+        return strict_raw
+
+    sql_candidates: list[str] = []
+    if raw2:
+        sql_candidates.append(raw2)
+    if raw1:
+        sql_candidates.append(raw1)
+    sql_from_llm = llm_out.get("sql") or ""
+    if sql_from_llm:
+        sql_candidates.append(sql_from_llm)
+
+    sql_final = sanitize_oracle_sql(*sql_candidates)
+
+    def _oracle_parse_error(sql_text: str) -> str | None:
+        if not sql_text:
+            return "empty_sql_after_sanitize"
+        if looks_like_instruction(sql_text):
+            return "instruction_echo"
+        try:
+            validate_oracle_sql(sql_text)
+        except ValueError as exc:
+            return str(exc)
+        return None
+
+    parse_error = _oracle_parse_error(sql_final)
+    if parse_error:
+        strict_raw = _strict_retry()
+        if strict_raw:
+            sql_final = sanitize_oracle_sql(strict_raw, *sql_candidates)
+            parse_error = _oracle_parse_error(sql_final)
+
     sql_payload = {"size": len(sql_final)}
     sql_payload["sql"] = sql_final[:900] if include_debug else "<hidden>"
     _log("final_sql", sql_payload)
     validation = llm_out.get("validation") or basic_checks(sql_final, allowed_binds=ALLOWED_BINDS)
+    if validation is None or not isinstance(validation, dict):
+        validation = basic_checks(sql_final, allowed_binds=ALLOWED_BINDS)
+    if parse_error:
+        validation = dict(validation)
+        validation.setdefault("errors", [])
+        validation["errors"].append(f"oracle_parse:{parse_error}")
+        validation["ok"] = False
     _log("validation", validation)
 
     if not validation.get("ok"):
@@ -218,12 +323,18 @@ def answer():
             ],
         }
         if include_debug:
-            res["debug"] = {
+            debug_payload = {
                 "intent": intent,
                 "prompt": prompt_text,
                 "raw1": raw1,
                 "validation": validation,
+                "clarifier_raw": clarifier_raw,
             }
+            if raw2:
+                debug_payload["raw2"] = raw2
+            if strict_attempted:
+                debug_payload["raw_strict"] = strict_raw
+            res["debug"] = debug_payload
         return jsonify(res)
 
     used_binds = validation.get("binds") or []
@@ -358,6 +469,7 @@ def answer():
         "columns": headers,
         "duration_ms": duration_ms,
         "used_repair": bool(llm_out.get("used_repair")),
+        "used_strict_retry": strict_attempted and bool(strict_raw),
         "suggested_date_column": intent.get("date_column") or default_date_col,
         "clarifier_intent": intent,
         "binds": binds_public,
@@ -377,10 +489,12 @@ def answer():
             "prompt": prompt_text,
             "raw1": raw1,
             "validation": validation,
-            "clarifier_raw": clarifier.get("raw"),
+            "clarifier_raw": clarifier_raw,
         }
         if llm_out.get("used_repair"):
             debug_payload["raw2"] = llm_out.get("raw2")
+        if strict_attempted:
+            debug_payload["raw_strict"] = strict_raw
         resp["debug"] = debug_payload
     return jsonify(resp)
 
