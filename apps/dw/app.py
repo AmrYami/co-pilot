@@ -4,6 +4,7 @@ import csv
 import json
 import os
 import pathlib
+from collections.abc import Mapping
 from datetime import date, datetime, timedelta
 from typing import Optional
 
@@ -84,6 +85,14 @@ def _env_truthy(name: str, default: bool = False) -> bool:
 
 NAMESPACE = os.environ.get("DW_NAMESPACE", "dw::common")
 DW_INCLUDE_DEBUG = _env_truthy("DW_INCLUDE_DEBUG", default=True)
+
+
+def _as_dict(value) -> dict:
+    return value if isinstance(value, Mapping) else {}
+
+
+def _llm_out_default() -> dict:
+    return {"prompt": "", "raw1": "", "raw2": "", "raw_strict": "", "errors": []}
 
 
 def _settings():
@@ -260,12 +269,17 @@ def answer():
             {"size": len(clarifier_raw), "text": clarifier_raw[:900]},
         )
 
-    llm_out = nl_to_sql_with_llm(q, ctx, intent=intent)
-    prompt_text = llm_out.get("prompt") or ""
-    raw1 = llm_out.get("raw1") or ""
-    raw2 = ""
-    if llm_out.get("used_repair"):
-        raw2 = llm_out.get("raw2") or ""
+    try:
+        llm_out = nl_to_sql_with_llm(q, ctx, intent=intent)
+    except Exception as exc:  # pragma: no cover - defensive guard
+        log.exception("dw nl_to_sql_with_llm failed")
+        llm_out = {"errors": [f"llm_generate:{type(exc).__name__}:{exc}"]}
+
+    d = _as_dict(llm_out) or _llm_out_default()
+    prompt_text = d.get("prompt", "") or ""
+    raw1 = d.get("raw1", "") or ""
+    raw2 = d.get("raw2", "") or ""
+    raw_strict_hint = d.get("raw_strict", "") or ""
 
     strict_attempted = False
     strict_raw = ""
@@ -341,20 +355,25 @@ def answer():
             )
         return synth_sql
 
-    sql_candidates: list[str] = []
-    if raw1:
-        sql_candidates.append(raw1)
-    sql_from_llm = llm_out.get("sql") or ""
-    if sql_from_llm:
-        sql_candidates.append(sql_from_llm)
-    if raw2:
-        sql_candidates.append(raw2)
-
-    sql_final = sanitize_oracle_sql(*sql_candidates)
+    sql_from_llm = d.get("sql") or ""
+    sql_final = ""
+    candidates = [
+        (raw_strict_hint, raw1 or raw2 or sql_from_llm),
+        (raw1, raw2 or sql_from_llm),
+        (raw2, raw1 or sql_from_llm),
+        (sql_from_llm, raw1 or raw2),
+    ]
+    for primary, fallback in candidates:
+        if not primary and not fallback:
+            continue
+        sql_final = sanitize_oracle_sql(primary, fallback)
+        if sql_final:
+            break
     if not sql_final:
         strict_raw = _strict_retry()
         if strict_raw:
-            sql_final = sanitize_oracle_sql(strict_raw, *sql_candidates)
+            raw_strict_hint = strict_raw
+            sql_final = sanitize_oracle_sql(strict_raw, raw1 or raw2 or sql_from_llm)
     if not sql_final:
         sql_final = _maybe_synthesize("empty_sanitize")
     if not sql_final:
@@ -400,8 +419,12 @@ def answer():
             }
             if raw2:
                 debug_payload["raw2"] = raw2
-            if strict_attempted:
-                debug_payload["raw_strict"] = strict_raw
+            strict_debug = strict_raw if strict_attempted else raw_strict_hint
+            if strict_debug:
+                debug_payload["raw_strict"] = strict_debug
+            errors = d.get("errors") or []
+            if errors:
+                debug_payload["errors"] = errors
             res["debug"] = debug_payload
         return jsonify(res)
 
@@ -420,7 +443,8 @@ def answer():
     if parse_error:
         strict_raw = _strict_retry()
         if strict_raw:
-            alt_sql = sanitize_oracle_sql(strict_raw, *sql_candidates)
+            raw_strict_hint = strict_raw
+            alt_sql = sanitize_oracle_sql(strict_raw, raw1 or raw2 or sql_from_llm)
             if alt_sql:
                 sql_final = alt_sql
                 parse_error = _oracle_parse_error(sql_final)
@@ -433,7 +457,7 @@ def answer():
     sql_payload = {"size": len(sql_final)}
     sql_payload["sql"] = sql_final[:900] if include_debug else "<hidden>"
     log_event(log, "dw", "final_sql", sql_payload)
-    validation = llm_out.get("validation") or basic_checks(sql_final, allowed_binds=ALLOWED_BINDS)
+    validation = d.get("validation") or basic_checks(sql_final, allowed_binds=ALLOWED_BINDS)
     if validation is None or not isinstance(validation, dict):
         validation = basic_checks(sql_final, allowed_binds=ALLOWED_BINDS)
     if parse_error:
@@ -494,8 +518,12 @@ def answer():
             }
             if raw2:
                 debug_payload["raw2"] = raw2
-            if strict_attempted:
-                debug_payload["raw_strict"] = strict_raw
+            strict_debug = strict_raw if strict_attempted else raw_strict_hint
+            if strict_debug:
+                debug_payload["raw_strict"] = strict_debug
+            errors = d.get("errors") or []
+            if errors:
+                debug_payload["errors"] = errors
             res["debug"] = debug_payload
         return jsonify(res)
 
@@ -658,7 +686,7 @@ def answer():
         "rowcount": len(rows),
         "columns": headers,
         "duration_ms": duration_ms,
-        "used_repair": bool(llm_out.get("used_repair")),
+        "used_repair": bool(d.get("used_repair")),
         "used_strict_retry": strict_attempted and bool(strict_raw),
         "suggested_date_column": intent.get("date_column") or default_date_col,
         "clarifier_intent": intent,
@@ -681,10 +709,14 @@ def answer():
             "validation": validation,
             "clarifier_raw": clarifier_raw,
         }
-        if llm_out.get("used_repair"):
-            debug_payload["raw2"] = llm_out.get("raw2")
-        if strict_attempted:
-            debug_payload["raw_strict"] = strict_raw
+        if d.get("used_repair"):
+            debug_payload["raw2"] = d.get("raw2")
+        strict_debug = strict_raw if strict_attempted else raw_strict_hint
+        if strict_debug:
+            debug_payload["raw_strict"] = strict_debug
+        errors = d.get("errors") or []
+        if errors:
+            debug_payload["errors"] = errors
         resp["debug"] = debug_payload
     return jsonify(resp)
 
