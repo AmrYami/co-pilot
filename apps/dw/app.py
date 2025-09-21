@@ -5,6 +5,7 @@ import json
 import os
 import pathlib
 from datetime import date, datetime, timedelta
+from typing import Optional
 
 from flask import Blueprint, jsonify, request
 from sqlalchemy import text
@@ -63,6 +64,17 @@ dw_bp = Blueprint("dw", __name__, url_prefix="/dw")
 log = get_logger("main")
 
 
+SQL_ONLY_STRICT_TEMPLATE = """Write only an Oracle query. Start with SELECT or WITH.
+No code fences. No comments. No explanations. No extra text.
+Table: "{table}"
+Allowed columns: {allowed_columns}
+Allowed binds: {allowed_binds}
+Use Oracle syntax. For a time window, filter with :date_start and :date_end on {date_column}.
+Question:
+{question}
+"""
+
+
 def _env_truthy(name: str, default: bool = False) -> bool:
     value = os.environ.get(name)
     if value is None:
@@ -76,6 +88,71 @@ DW_INCLUDE_DEBUG = _env_truthy("DW_INCLUDE_DEBUG", default=True)
 
 def _settings():
     return Settings()
+
+
+def _heuristic_fill(question: str, intent: dict, default_date_col: str) -> dict:
+    if not isinstance(intent, dict):
+        return {}
+
+    lowered = (question or "").lower()
+    upper = (question or "").upper()
+
+    if intent.get("has_time_window") is None:
+        if "next 30 day" in lowered or "next thirty day" in lowered:
+            intent["has_time_window"] = True
+
+    if intent.get("date_column") is None:
+        if "END_DATE" in upper:
+            intent["date_column"] = "END_DATE"
+        elif "START_DATE" in upper:
+            intent["date_column"] = "START_DATE"
+        elif "REQUEST_DATE" in upper:
+            intent["date_column"] = "REQUEST_DATE"
+        elif intent.get("has_time_window"):
+            intent["date_column"] = default_date_col
+
+    if intent.get("explicit_dates") is None:
+        if "next 30 day" in lowered or "next thirty day" in lowered:
+            today = date.today()
+            intent["explicit_dates"] = {
+                "start": today.isoformat(),
+                "end": (today + timedelta(days=30)).isoformat(),
+            }
+
+    if intent.get("explicit_dates") and intent.get("has_time_window") is None:
+        intent["has_time_window"] = True
+
+    if intent.get("has_time_window") and intent.get("date_column") is None:
+        intent["date_column"] = default_date_col
+
+    return intent
+
+
+def _synthesize_window_query(table: str, date_col: str, top_n: Optional[int] = None) -> str:
+    table_literal = table.strip() or "Contract"
+    if not table_literal.startswith('"') or not table_literal.endswith('"'):
+        table_literal = f'"{table_literal.strip("\"")}"'
+
+    base = f"""
+SELECT
+  CONTRACT_ID,
+  CONTRACT_OWNER,
+  {date_col} AS WINDOW_DATE,
+  CONTRACT_VALUE_NET_OF_VAT
+FROM {table_literal}
+WHERE {date_col} BETWEEN :date_start AND :date_end
+ORDER BY {date_col} ASC
+""".strip()
+
+    if top_n is not None:
+        try:
+            top_val = int(top_n)
+        except Exception:
+            top_val = None
+        if top_val and top_val > 0:
+            base = f"{base}\nFETCH FIRST {top_val} ROWS ONLY"
+
+    return base
 
 
 def _write_csv(rows, headers) -> str:
@@ -154,6 +231,8 @@ def answer():
         if value is not None:
             intent[key] = value
 
+    intent = _heuristic_fill(q, intent, default_date_col)
+
     lowered_question = (q or "").lower()
     if "last month" in lowered_question:
         today = date.today()
@@ -166,6 +245,11 @@ def answer():
             "end": last_month_end.isoformat(),
         }
         intent.setdefault("date_column", default_date_col)
+
+    if intent.get("explicit_dates") and intent.get("has_time_window") is None:
+        intent["has_time_window"] = True
+    if intent.get("has_time_window") and intent.get("date_column") is None:
+        intent["date_column"] = default_date_col
 
     log_event(log, "dw", "clarifier_intent_adjusted", json.loads(json.dumps(intent, default=str)))
     if clarifier_raw and include_debug:
@@ -196,15 +280,12 @@ def answer():
             strict_raw = ""
             log_event(log, "dw", "llm_raw_strict", {"size": 0, "skipped": True})
             return strict_raw
-        strict_prompt = (
-            "Return only one Oracle SELECT (or CTE) statement.\n"
-            "No code fences. No comments. No explanations. No extra text.\n"
-            f'Table: "{table_name}". Allowed columns: {", ".join(ALLOWED_COLUMNS)}.\n'
-            f"Allowed binds: {', '.join(ALLOWED_BINDS)}.\n"
-            f"Use Oracle syntax. Use {intent.get('date_column') or default_date_col} for default window.\n"
-            "Question:\n"
-            f"{q}\n"
-            "Statement:\n"
+        strict_prompt = SQL_ONLY_STRICT_TEMPLATE.format(
+            table=table_name,
+            allowed_columns=", ".join(ALLOWED_COLUMNS),
+            allowed_binds=", ".join(ALLOWED_BINDS),
+            date_column=intent.get("date_column") or default_date_col,
+            question=q,
         )
         try:
             strict_raw = mdl.generate(
@@ -220,16 +301,109 @@ def answer():
         log_event(log, "dw", "llm_raw_strict", {"size": len(strict_raw)})
         return strict_raw
 
+    def _maybe_synthesize(reason: str) -> str:
+        explicit = intent.get("explicit_dates") if isinstance(intent.get("explicit_dates"), dict) else None
+        if not explicit:
+            return ""
+        start = explicit.get("start")
+        end = explicit.get("end")
+        if not (start and end):
+            return ""
+        date_col_for_window = intent.get("date_column") or default_date_col
+        if not date_col_for_window:
+            return ""
+        if date_col_for_window not in ALLOWED_COLUMNS:
+            return ""
+        table_clean = table_name.strip().strip('"')
+        if table_clean.lower() != "contract":
+            return ""
+        top_n_val = intent.get("top_n")
+        top_n_num: Optional[int] = None
+        if top_n_val is not None:
+            try:
+                top_n_num = int(top_n_val)
+            except Exception:
+                top_n_num = None
+        synth_sql = _synthesize_window_query(table_name, date_col_for_window, top_n_num)
+        if synth_sql:
+            log_event(
+                log,
+                "dw",
+                "synthetic_sql_fallback",
+                {
+                    "reason": reason,
+                    "table": table_name,
+                    "date_column": date_col_for_window,
+                    "start": start,
+                    "end": end,
+                    "top_n": top_n_num,
+                },
+            )
+        return synth_sql
+
     sql_candidates: list[str] = []
-    if raw2:
-        sql_candidates.append(raw2)
     if raw1:
         sql_candidates.append(raw1)
     sql_from_llm = llm_out.get("sql") or ""
     if sql_from_llm:
         sql_candidates.append(sql_from_llm)
+    if raw2:
+        sql_candidates.append(raw2)
 
     sql_final = sanitize_oracle_sql(*sql_candidates)
+    if not sql_final:
+        strict_raw = _strict_retry()
+        if strict_raw:
+            sql_final = sanitize_oracle_sql(strict_raw, *sql_candidates)
+    if not sql_final:
+        sql_final = _maybe_synthesize("empty_sanitize")
+    if not sql_final:
+        sql_payload = {"size": 0}
+        sql_payload["sql"] = "" if include_debug else "<hidden>"
+        log_event(log, "dw", "final_sql", sql_payload)
+        with mem.begin() as conn:
+            conn.execute(
+                text(
+                    """
+                UPDATE mem_inquiries
+                   SET status = 'needs_clarification',
+                       last_sql = :sql,
+                       last_error = 'no_sql_extracted',
+                       updated_at = NOW()
+                 WHERE id = :id
+            """
+                ),
+                {"sql": "", "id": inq_id},
+            )
+        log_event(
+            log,
+            "dw",
+            "inquiry_status",
+            {"id": inq_id, "from": "open", "to": "needs_clarification", "reason": "no_sql_extracted"},
+        )
+        res = {
+            "ok": False,
+            "status": "needs_clarification",
+            "inquiry_id": inq_id,
+            "error": "no_sql_extracted",
+            "sql": "",
+            "questions": [
+                "I couldn't extract a SELECT statement. Can you restate the request with the date column and time window?",
+            ],
+        }
+        if include_debug:
+            debug_payload = {
+                "intent": intent,
+                "prompt": prompt_text,
+                "raw1": raw1,
+                "clarifier_raw": clarifier_raw,
+            }
+            if raw2:
+                debug_payload["raw2"] = raw2
+            if strict_attempted:
+                debug_payload["raw_strict"] = strict_raw
+            res["debug"] = debug_payload
+        return jsonify(res)
 
     def _oracle_parse_error(sql_text: str) -> str | None:
         if not sql_text:
@@ -246,7 +420,14 @@ def answer():
     if parse_error:
         strict_raw = _strict_retry()
         if strict_raw:
-            sql_final = sanitize_oracle_sql(strict_raw)
+            alt_sql = sanitize_oracle_sql(strict_raw, *sql_candidates)
+            if alt_sql:
+                sql_final = alt_sql
+                parse_error = _oracle_parse_error(sql_final)
+    if parse_error:
+        synthesized = _maybe_synthesize("parse_error")
+        if synthesized:
+            sql_final = synthesized
             parse_error = _oracle_parse_error(sql_final)
 
     sql_payload = {"size": len(sql_final)}

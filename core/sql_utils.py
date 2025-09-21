@@ -34,6 +34,9 @@ _SQL_FENCE = _CODE_FENCE
 # First SQL-ish token (legacy helper keeps broader match)
 _SQL_START_LOOSE = re.compile(r"(?is)\b(SELECT|WITH|EXPLAIN|SHOW)\b")
 
+_RE_FENCE = re.compile(r"```(?:sql)?\s*(?P<body>.*?)```", re.I | re.S)
+_RE_HEAD = re.compile(r"(?mi)^\s*(?:WITH\b|SELECT\b(?!\s*\())")
+
 
 def extract_sql_one_stmt(text: str, dialect: str = "generic") -> str:
     """
@@ -140,20 +143,63 @@ def extract_sql_block(text: str) -> str:
     return sql
 
 
+def _first_sql_statement(text: str) -> str:
+    if not text:
+        return ""
+
+    match = _RE_FENCE.search(text)
+    if match:
+        candidate = match.group("body").strip()
+    else:
+        head = _RE_HEAD.search(text)
+        if not head:
+            return ""
+        candidate = text[head.start() :].strip()
+
+    candidate = candidate.split("```", 1)[0]
+    candidate = re.split(r"\n\s*(?:Explanation:|Errors?:)", candidate, maxsplit=1)[0].strip()
+
+    bad_prefixes = (
+        "Return Oracle SQL only inside",
+        "Return only one Oracle SELECT",
+        "Write only Oracle SQL",
+        "No code fences",
+        "No comments",
+        "No explanations",
+        "Statement:",
+        "Fix and return only Oracle SQL",
+        "SELECT (or CTE)",
+    )
+    lowered = candidate.lower()
+    for prefix in bad_prefixes:
+        if lowered.startswith(prefix.lower()):
+            return ""
+
+    if ";" in candidate:
+        before, _ = candidate.split(";", 1)
+        candidate = (before + ";").strip()
+
+    if candidate.endswith(";"):
+        candidate = candidate[:-1].rstrip()
+
+    return candidate
+
+
+def looks_like_oracle_sql(text: str) -> bool:
+    return bool(re.match(r"(?is)^\s*(WITH|SELECT)\b(?!\s*\()", text or ""))
+
+
 def sanitize_oracle_sql(*candidates: str) -> str:
-    """Return first plausible Oracle SELECT/WITH statement, stripped of fences/instructions."""
+    """Return the first plausible Oracle SELECT/WITH statement from the candidates."""
 
     for raw in candidates:
-        sql = extract_sql_block(raw or "")
+        if not raw:
+            continue
+        sql = _first_sql_statement(raw)
         if not sql:
             continue
-        sql = re.sub(r"(?im)^\s*```.*$", "", sql).strip()
-        for marker in _CUT_AFTER:
-            sql = re.sub(rf"(?is){re.escape(marker)}.*$", "", sql).strip()
-        if sql.endswith(";"):
-            sql = sql[:-1].rstrip()
-        if _SQL_START.match(sql):
-            return sql
+        if looks_like_oracle_sql(sql):
+            return sql.strip()
     return ""
 
 
