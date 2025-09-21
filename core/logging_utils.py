@@ -1,63 +1,106 @@
 from __future__ import annotations
 
 import logging
+import logging.handlers
 import os
 import sys
 from datetime import datetime
-
-_FMT = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
-
-
-def _env_truthy(value: str | None, *, default: bool = False) -> bool:
-    if value is None:
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
+from typing import Any, Dict, Optional
 
 
-def _resolve_level() -> int:
-    level_name = os.getenv("LOG_LEVEL")
-    if level_name:
-        return getattr(logging, level_name.upper(), logging.INFO)
-    debug_env = os.getenv("COPILOT_DEBUG")
-    return logging.DEBUG if _env_truthy(debug_env) else logging.INFO
+def _log_dir(settings: Optional[Any]) -> str:
+    """Resolve the directory used for log files."""
+
+    try:
+        value = (settings.get("LOG_DIR") if settings else None) or os.getenv("LOG_DIR")
+    except Exception:
+        value = os.getenv("LOG_DIR")
+    return value or "logs"
 
 
-def setup_root_logging() -> None:
-    """Configure the root logger once, guarding against duplicate handlers."""
+def _log_level(settings: Optional[Any]) -> str:
+    """Resolve the logging level from settings or environment."""
 
-    level = _resolve_level()
+    try:
+        value = (settings.get("LOG_LEVEL") if settings else None) or os.getenv("LOG_LEVEL")
+    except Exception:
+        value = os.getenv("LOG_LEVEL")
+    return (value or "INFO").upper()
+
+
+def _make_formatter() -> logging.Formatter:
+    fmt = "%(asctime)s %(levelname)s [%(name)s]%(channel_tag)s %(message)s"
+
+    class _Formatter(logging.Formatter):
+        def format(self, record: logging.LogRecord) -> str:  # pragma: no cover - exercised indirectly
+            channel = getattr(record, "channel", "")
+            record.channel_tag = f" [{channel}]" if channel else ""
+            return super().format(record)
+
+    return _Formatter(fmt)
+
+
+def setup_logging(settings: Optional[Any] = None) -> None:
+    """Configure the root logger with stdout and a date-stamped file once."""
+
     root = logging.getLogger()
-
-    if root.handlers:
-        root.setLevel(level)
+    if getattr(root, "_configured", False):
         return
 
-    stream_handler = logging.StreamHandler(sys.stdout)
-    stream_handler.setLevel(level)
-    stream_handler.setFormatter(logging.Formatter(_FMT))
-    root.addHandler(stream_handler)
+    level_name = _log_level(settings)
+    level = getattr(logging, level_name, logging.INFO)
+    log_dir = _log_dir(settings)
+    os.makedirs(log_dir, exist_ok=True)
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    file_path = os.path.join(log_dir, f"log-{date_str}.log")
 
-    log_dir = os.getenv("COPILOT_LOG_DIR")
-    if log_dir:
-        os.makedirs(log_dir, exist_ok=True)
-        log_path = os.path.join(
-            log_dir, f"log-{datetime.now().strftime('%Y-%m-%d')}.log"
-        )
-        file_handler = logging.FileHandler(log_path, encoding="utf-8")
-        file_handler.setLevel(level)
-        file_handler.setFormatter(logging.Formatter(_FMT))
-        root.addHandler(file_handler)
+    for handler in list(root.handlers):
+        root.removeHandler(handler)
 
     root.setLevel(level)
 
+    console = logging.StreamHandler(sys.stdout)
+    console.setLevel(level)
+    console.setFormatter(_make_formatter())
+    root.addHandler(console)
+
+    file_handler = logging.FileHandler(file_path, encoding="utf-8")
+    file_handler.setLevel(level)
+    file_handler.setFormatter(_make_formatter())
+    root.addHandler(file_handler)
+
+    root._configured = True  # type: ignore[attr-defined]
+
 
 def get_logger(name: str) -> logging.Logger:
-    """Return a child logger that relies on the root handler."""
+    """Return a child logger that uses the configured root handlers."""
 
-    setup_root_logging()
+    setup_logging()
     logger = logging.getLogger(name)
     logger.propagate = True
-    if logger.handlers:
-        for handler in list(logger.handlers):
-            logger.removeHandler(handler)
+    for handler in list(logger.handlers):
+        logger.removeHandler(handler)
     return logger
+
+
+def log_event(
+    logger: logging.Logger,
+    channel: str,
+    event: str,
+    payload: Dict[str, Any] | None = None,
+    *,
+    level: int = logging.INFO,
+) -> None:
+    """Log a structured event with a consistent JSON payload."""
+
+    import json
+
+    data = payload or {}
+    try:
+        message = f"{event}: {json.dumps(data, ensure_ascii=False, default=str)}"
+    except Exception:
+        message = f"{event}: {data!r}"
+    logger.log(level, message, extra={"channel": channel})
+
+
+__all__ = ["setup_logging", "get_logger", "log_event"]

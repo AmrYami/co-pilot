@@ -5,8 +5,8 @@ import re
 from datetime import date, datetime, timedelta
 from typing import Dict, Optional
 
+from core.logging_utils import get_logger, log_event
 from core.model_loader import get_model
-from core.logging_utils import get_logger
 from .validator import basic_checks, extract_sql
 
 _MONTH_WORDS = re.compile(r"\blast\s+month\b", re.IGNORECASE)
@@ -71,7 +71,7 @@ def _dates_for_last_month(today: date) -> tuple[date, date]:
     return last_month_first, last_month_end
 
 
-log = get_logger("dw")
+log = get_logger("main")
 
 
 def clarify_intent(question: str, context: dict) -> Dict[str, object]:
@@ -89,12 +89,19 @@ def clarify_intent(question: str, context: dict) -> Dict[str, object]:
             "Return JSON only between <<JSON>> and <</JSON>>.\n\n"
             f"Question: {question}\n\n<<JSON>>\n{{}}\n<</JSON>>\n"
         )
+        log_event(log, "dw", "clarifier_prompt", {"size": len(prompt)})
         try:
             raw = mdl.generate(prompt, max_new_tokens=192)
         except Exception:
             raw = ""
         payload = "{}"
         if raw:
+            log_event(
+                log,
+                "dw",
+                "clarifier_raw",
+                {"size": len(raw), "text": raw[:1200]},
+            )
             start = raw.find("<<JSON>>")
             end = raw.find("<</JSON>>")
             if start != -1 and end != -1 and end > start:
@@ -118,6 +125,12 @@ def clarify_intent(question: str, context: dict) -> Dict[str, object]:
     data.setdefault("date_column", fb["date_column"])
     data.setdefault("top_n", fb["top_n"])
     data.setdefault("explicit_dates", fb["explicit_dates"])
+    log_event(
+        log,
+        "dw",
+        "clarifier_intent",
+        json.loads(json.dumps({"intent": data}, default=str)),
+    )
     return {"intent": data, "raw": raw}
 
 
@@ -161,9 +174,11 @@ def nl_to_sql_with_llm(
 
     intent = intent or {}
     prompt = _build_prompt(question, ctx, intent)
-    log.info("[dw] sql_prompt_compact")
+    log_event(log, "dw", "sql_prompt_compact", {"size": len(prompt)})
+    log_event(log, "dw", "sql_prompt", {"prompt": prompt[:1600]})
 
     raw1 = mdl.generate(prompt, max_new_tokens=192, stop=["```"])
+    log_event(log, "dw", "llm_raw_pass1", {"size": len(raw1)})
     sql1 = extract_sql(raw1)
     val1 = basic_checks(sql1, allowed_binds=ctx.get("allowed_binds"))
 
@@ -185,6 +200,8 @@ def nl_to_sql_with_llm(
             f"Question:\n{question}\n\nPrevious SQL:\n```sql\n{sql1}\n```\n```sql\n"
         )
         raw2 = mdl.generate(repair_prompt, max_new_tokens=160, stop=["```"])
+        log_event(log, "dw", "sql_prompt_repair", {"size": len(repair_prompt)})
+        log_event(log, "dw", "llm_raw_pass2", {"size": len(raw2)})
         sql2 = extract_sql(raw2)
         val2 = basic_checks(sql2, allowed_binds=ctx.get("allowed_binds"))
         result.update(
@@ -204,7 +221,7 @@ def nl_to_sql_with_llm(
             }
         )
 
-    return result
+        return result
 
 
 def derive_bind_values(question: str, used_binds: list[str], intent: Dict[str, object]) -> Dict[str, object]:

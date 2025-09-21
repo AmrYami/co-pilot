@@ -3,21 +3,25 @@ from flask import Flask, jsonify
 from apps.common.admin import admin_bp as admin_common_bp
 from apps.dw.app import create_dw_blueprint
 from core.admin_api import admin_bp as core_admin_bp
-from core.logging_setup import init_logging
-from core.logging_utils import get_logger, setup_root_logging
+from core.logging_utils import get_logger, log_event, setup_logging
 from core.model_loader import ensure_model, model_info
 from core.pipeline import Pipeline
 from core.settings import Settings
 
 
 def create_app():
-    setup_root_logging()
-
-    app = Flask(__name__)
-    init_logging(app)
+    settings = Settings()
+    setup_logging(settings)
     log = get_logger("main")
 
-    log.info("app_init: registering blueprints")
+    app = Flask(__name__)
+    try:
+        app.logger.handlers.clear()
+        app.logger.propagate = True
+    except Exception:  # pragma: no cover - defensive
+        pass
+
+    log_event(log, "boot", "app_boot", {"message": "registering blueprints"})
 
     # Warm up SQL model (already works)
     ensure_model(role="sql")
@@ -29,11 +33,12 @@ def create_app():
     except Exception as e:  # pragma: no cover - best effort log
         log.warning("[clarifier] load failed: %s", e)
 
-    settings = Settings()
     pipeline = Pipeline(settings=settings, namespace="dw::common")
 
     app.config["SETTINGS"] = settings
-    app.config["pipeline"] = pipeline
+    app.config["PIPELINE"] = pipeline
+    app.config["MEM_ENGINE"] = pipeline.mem_engine
+    app.config["pipeline"] = pipeline  # backwards compatibility
 
     dw_bp = create_dw_blueprint(settings=settings, pipeline=pipeline)
 
