@@ -7,60 +7,39 @@ from typing import Dict, Optional
 
 from core.logging_utils import get_logger, log_event
 from core.model_loader import get_model
+from core.nlu.clarify import infer_intent
+from core.nlu.types import NLIntent, TimeWindow
 from .validator import basic_checks, extract_sql
 
 _MONTH_WORDS = re.compile(r"\blast\s+month\b", re.IGNORECASE)
 _NEXT_30 = re.compile(r"\bnext\s+30\s+days\b", re.IGNORECASE)
-_IN_YEAR = re.compile(r"\bin\s+(\d{4})\b", re.IGNORECASE)
-_BETWEEN = re.compile(
-    r"\bbetween\s+(\d{4}-\d{2}-\d{2})\s+(?:and|to)\s+(\d{4}-\d{2}-\d{2})",
-    re.IGNORECASE,
-)
 _LAST_DAYS = re.compile(r"\blast\s+(\d+)\s+days\b", re.IGNORECASE)
-_TOP_N = re.compile(r"\btop\s+(\d+)\b", re.IGNORECASE)
 
 
-def _fallback_intent(question: str) -> Dict[str, Optional[object]]:
-    has_window = False
-    col: Optional[str] = None
-    explicit: Optional[Dict[str, str]] = None
-    top_n: Optional[int] = None
+def _intent_payload(intent: NLIntent, default_col: str) -> Dict[str, object]:
+    payload: Dict[str, object] = {}
 
-    text = question or ""
-    if _MONTH_WORDS.search(text) or _NEXT_30.search(text) or _LAST_DAYS.search(text):
-        has_window = True
-    m_year = _IN_YEAR.search(text)
-    if m_year:
-        has_window = True
-        year = int(m_year.group(1))
-        explicit = {
-            "start": f"{year:04d}-01-01",
-            "end": f"{year + 1:04d}-01-01",
-        }
-    m_between = _BETWEEN.search(text)
-    if m_between:
-        has_window = True
-        explicit = {"start": m_between.group(1), "end": m_between.group(2)}
-    m_top = _TOP_N.search(text)
-    if m_top:
-        try:
-            top_n = int(m_top.group(1))
-        except Exception:
-            top_n = None
+    payload["top_n"] = intent.top_n
+    payload["group_by"] = intent.group_by
+    payload["agg"] = intent.agg
+    payload["sort_by"] = intent.sort_by
+    payload["sort_desc"] = intent.sort_desc
+    payload["wants_all_columns"] = intent.wants_all_columns
 
-    if re.search(r"\bEND_DATE\b", text, re.IGNORECASE):
-        col = "END_DATE"
-    elif re.search(r"\bSTART_DATE\b", text, re.IGNORECASE):
-        col = "START_DATE"
-    elif re.search(r"\bREQUEST_DATE\b", text, re.IGNORECASE):
-        col = "REQUEST_DATE"
+    tw: Optional[TimeWindow] = intent.time_window
+    if tw and tw.start and tw.end:
+        payload["explicit_dates"] = {"start": tw.start, "end": tw.end}
+        payload["has_time_window"] = (
+            True if intent.has_time_window is None else intent.has_time_window
+        )
+        payload["date_column"] = (tw.column or default_col).upper()
+    else:
+        payload["explicit_dates"] = None
+        payload["has_time_window"] = intent.has_time_window
+        column = (tw.column if tw else None) or default_col
+        payload["date_column"] = column.upper() if isinstance(column, str) else column
 
-    return {
-        "has_time_window": has_window,
-        "date_column": col,
-        "explicit_dates": explicit,
-        "top_n": top_n,
-    }
+    return payload
 
 
 def _dates_for_last_month(today: date) -> tuple[date, date]:
@@ -75,19 +54,57 @@ log = get_logger("main")
 
 
 def clarify_intent(question: str, context: dict) -> Dict[str, object]:
-    mdl = get_model("clarifier")
+    default_col = context.get("default_date_col", "REQUEST_DATE")
+    settings = context.get("settings")
+    all_columns_default = context.get("all_columns_default", True)
+
+    base_intent = infer_intent(
+        question,
+        default_date_col=default_col,
+        all_columns_default=all_columns_default,
+    )
+    data = _intent_payload(base_intent, default_col)
+
+    upper = (question or "").upper()
+    if "END_DATE" in upper:
+        data["date_column"] = "END_DATE"
+    elif "START_DATE" in upper:
+        data["date_column"] = "START_DATE"
+    elif "REQUEST_DATE" in upper:
+        data["date_column"] = "REQUEST_DATE"
+
+    if data.get("explicit_dates") and data.get("has_time_window") is None:
+        data["has_time_window"] = True
+
+    clarifier_enabled = False
+    if settings and hasattr(settings, "get_bool"):
+        try:
+            clarifier_enabled = bool(settings.get_bool("CLARIFIER_ENABLED", False))
+        except Exception:
+            clarifier_enabled = False
+
     raw = ""
-    data: Dict[str, object] = {}
-    if mdl is not None:
+    mdl = None
+    if clarifier_enabled:
+        mdl = get_model("clarifier")
+
+    needs_window = not bool(data.get("has_time_window"))
+    if needs_window and mdl is not None:
+        skeleton = {
+            "has_time_window": data.get("has_time_window"),
+            "date_column": data.get("date_column"),
+            "top_n": data.get("top_n"),
+            "explicit_dates": data.get("explicit_dates"),
+        }
         prompt = (
             "You are a precise NLU clarifier. Output JSON only.\n"
-            "Keys:\n"
+            "Update only the NULL values in the JSON skeleton. Keys:\n"
             "  has_time_window: boolean\n"
             "  date_column: string|null (END_DATE|REQUEST_DATE|START_DATE)\n"
             "  top_n: integer|null\n"
             "  explicit_dates: object|null {start,end} (ISO dates)\n"
             "Return JSON only between <<JSON>> and <</JSON>>.\n\n"
-            f"Question: {question}\n\n<<JSON>>\n{{}}\n<</JSON>>\n"
+            f"Question: {question}\n\n<<JSON>>\n{json.dumps(skeleton)}\n<</JSON>>\n"
         )
         log_event(log, "dw", "clarifier_prompt", {"size": len(prompt)})
         try:
@@ -111,20 +128,31 @@ def clarify_intent(question: str, context: dict) -> Dict[str, object]:
         except Exception:
             parsed = {}
         if isinstance(parsed, dict):
-            data = {
-                "has_time_window": parsed.get("has_time_window"),
-                "date_column": parsed.get("date_column"),
-                "top_n": parsed.get("top_n"),
-                "explicit_dates": parsed.get("explicit_dates"),
-            }
+            has_window_val = parsed.get("has_time_window")
+            if data.get("has_time_window") in {None, False} and isinstance(has_window_val, bool):
+                data["has_time_window"] = has_window_val
+            date_col_val = parsed.get("date_column")
+            if data.get("date_column") in {None, ""} and isinstance(date_col_val, str):
+                data["date_column"] = date_col_val.upper()
+            top_n_val = parsed.get("top_n")
+            if data.get("top_n") is None and isinstance(top_n_val, int):
+                data["top_n"] = top_n_val
+            explicit_val = parsed.get("explicit_dates")
+            if (
+                not data.get("explicit_dates")
+                and isinstance(explicit_val, dict)
+                and explicit_val.get("start")
+                and explicit_val.get("end")
+            ):
+                data["explicit_dates"] = {
+                    "start": explicit_val.get("start"),
+                    "end": explicit_val.get("end"),
+                }
+                data.setdefault("has_time_window", True)
 
-    fb = _fallback_intent(question)
-    if not isinstance(data, dict):
-        data = {}
-    data.setdefault("has_time_window", fb["has_time_window"])
-    data.setdefault("date_column", fb["date_column"])
-    data.setdefault("top_n", fb["top_n"])
-    data.setdefault("explicit_dates", fb["explicit_dates"])
+    if data.get("explicit_dates") and data.get("has_time_window") is None:
+        data["has_time_window"] = True
+
     log_event(
         log,
         "dw",

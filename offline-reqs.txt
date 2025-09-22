@@ -57,6 +57,8 @@ sympy==1.14.0
 tqdm==4.67.1
 packaging==24.2
 python-dateutil==2.9.0.post0
+dateparser==1.2.0
+word2number==1.1
 six==1.17.0
 tenacity==9.1.2
 typing_extensions==4.14.1

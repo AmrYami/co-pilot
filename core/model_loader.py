@@ -1,10 +1,11 @@
 import os
 import threading
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
 
-_MODELS: Dict[str, Optional[Dict[str, Any]]] = {}
+_MODEL_CACHE: Dict[Tuple[str, str, str], Optional[Dict[str, Any]]] = {}
+_ROLE_TO_KEY: Dict[str, Tuple[str, str, str]] = {}
 _LOCK = threading.Lock()
 
 
@@ -29,13 +30,27 @@ def _log(msg: str) -> None:
     print(msg, flush=True)
 
 
+def _resolve_role_config(role: str) -> tuple[str, Optional[str]]:
+    if role == "sql":
+        backend = os.getenv("MODEL_BACKEND", "exllama")
+        path = os.getenv("MODEL_PATH")
+        return backend or "exllama", path
+    if role == "clarifier":
+        backend = os.getenv("CLARIFIER_MODEL_BACKEND")
+        if backend is None:
+            backend = os.getenv("CLARIFIER_BACKEND")
+        path = os.getenv("CLARIFIER_MODEL_PATH")
+        return backend or "off", path
+    raise ValueError(f"Unknown model role: {role}")
+
+
 # ---------------------------
 # SQLCoder (ExLlamaV2) loader
 # ---------------------------
 
-def _load_sql_model() -> Optional[Dict[str, Any]]:
-    backend = os.getenv("MODEL_BACKEND", "exllama")
-    path = os.getenv("MODEL_PATH")
+def _load_sql_model(backend: str, path: Optional[str]) -> Optional[Dict[str, Any]]:
+    backend = (backend or "exllama").lower()
+    path = path or os.getenv("MODEL_PATH")
     if not path:
         raise RuntimeError("MODEL_PATH not set for SQL model")
     if backend != "exllama":
@@ -87,13 +102,12 @@ def _resolve_device_for_inputs(model: Any, device_map: str | None) -> Any:
         return None
 
 
-def _load_clarifier_model() -> Optional[Dict[str, Any]]:
-    backend = os.getenv("CLARIFIER_MODEL_BACKEND", "off").lower()
+def _load_clarifier_model(backend: str, path: Optional[str]) -> Optional[Dict[str, Any]]:
+    backend = (backend or "off").lower()
     if backend in {"off", "none", "disabled"}:
         _log("[clarifier] disabled by config")
         return None
 
-    path = os.getenv("CLARIFIER_MODEL_PATH")
     if not path:
         raise RuntimeError("CLARIFIER_MODEL_PATH not set")
 
@@ -248,18 +262,29 @@ def _load_clarifier_model() -> Optional[Dict[str, Any]]:
 def load_llm(role: str) -> Optional[Dict[str, Any]]:
     """Load a model for the given role ("sql" or "clarifier")."""
 
-    with _LOCK:
-        if role in _MODELS and _MODELS[role] is not None:
-            _log(f"Reusing cached model for role={role}")
-            return _MODELS[role]
+    backend_raw, path = _resolve_role_config(role)
+    backend_key = (backend_raw or "").lower()
+    cache_key = (role, backend_key, path or "")
 
-        if role == "sql":
-            _MODELS[role] = _load_sql_model()
-        elif role == "clarifier":
-            _MODELS[role] = _load_clarifier_model()
-        else:
-            raise ValueError(f"Unknown model role: {role}")
-        return _MODELS[role]
+    with _LOCK:
+        if cache_key in _MODEL_CACHE:
+            payload = _MODEL_CACHE[cache_key]
+            if payload is not None:
+                _log(f"Reusing cached model for role={role}")
+            _ROLE_TO_KEY[role] = cache_key
+            return payload
+
+    if role == "sql":
+        payload = _load_sql_model(backend_key, path)
+    elif role == "clarifier":
+        payload = _load_clarifier_model(backend_key, path)
+    else:
+        raise ValueError(f"Unknown model role: {role}")
+
+    with _LOCK:
+        _MODEL_CACHE[cache_key] = payload
+        _ROLE_TO_KEY[role] = cache_key
+    return payload
 
 
 def ensure_model(role: str) -> Optional[Any]:
@@ -275,7 +300,8 @@ def get_model(role: str) -> Optional[Any]:
     """Return the cached model handle for the given role if available."""
 
     with _LOCK:
-        payload = _MODELS.get(role)
+        key = _ROLE_TO_KEY.get(role)
+        payload = _MODEL_CACHE.get(key) if key else None
     if payload is None:
         return ensure_model(role)
     if isinstance(payload, dict):
@@ -335,7 +361,9 @@ def llm_complete(
 
 def model_info() -> Dict[str, Any]:
     def _ensure_payload(role: str) -> Optional[Dict[str, Any]]:
-        payload = _MODELS.get(role)
+        with _LOCK:
+            key = _ROLE_TO_KEY.get(role)
+            payload = _MODEL_CACHE.get(key) if key else None
         if payload is None:
             try:
                 payload = load_llm(role)
@@ -379,8 +407,11 @@ def model_info() -> Dict[str, Any]:
 # Backwards-compatible helpers
 # ------------------------------------------------------------------
 
-def load_model(settings: Any | None = None) -> Optional[Any]:
-    payload = load_llm("sql")
+def load_model(settings: Any | None = None, role: str = "primary") -> Optional[Any]:
+    requested_role = role or "primary"
+    if requested_role == "primary":
+        requested_role = "sql"
+    payload = load_llm(requested_role)
     return payload.get("handle") if payload else None
 
 
