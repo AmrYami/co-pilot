@@ -4,6 +4,8 @@ import csv
 import json
 import os
 import pathlib
+import re
+from calendar import monthrange
 from collections.abc import Mapping
 from datetime import date, datetime, timedelta
 from typing import Optional
@@ -16,6 +18,7 @@ from core.settings import Settings
 from core.model_loader import get_model
 from core.sql_exec import get_mem_engine
 from core.sql_utils import (
+    extract_bind_names,
     extract_json_bracket,
     looks_like_instruction,
     sanitize_oracle_sql,
@@ -65,6 +68,92 @@ dw_bp = Blueprint("dw", __name__, url_prefix="/dw")
 log = get_logger("main")
 
 
+# --- Helpers to compute date ranges ---------------------------------------------------------
+def _month_bounds(offset: int = 0, today: date | None = None) -> tuple[date, date]:
+    """Return first/last day for month `today` + offset (offset=-1 -> last month)."""
+
+    today = today or date.today()
+    year, month = today.year, today.month + offset
+    while month <= 0:
+        month += 12
+        year -= 1
+    while month > 12:
+        month -= 12
+        year += 1
+    start = date(year, month, 1)
+    end = date(year, month, monthrange(year, month)[1])
+    return start, end
+
+
+def _quarter_bounds(offset: int = 0, today: date | None = None) -> tuple[date, date]:
+    """Quarter bounds for quarter containing today + offset quarters."""
+
+    today = today or date.today()
+    quarter = (today.month - 1) // 3 + 1
+    quarter += offset
+    year = today.year + (quarter - 1) // 4
+    quarter = ((quarter - 1) % 4) + 1
+    month_start = 3 * (quarter - 1) + 1
+    start = date(year, month_start, 1)
+    end_month = month_start + 2
+    end = date(year, end_month, monthrange(year, end_month)[1])
+    return start, end
+
+
+def derive_window_from_text(q: str) -> dict:
+    """Best-effort parser for common date windows from free-form text."""
+
+    lowered = (q or "").lower().strip()
+    if not lowered:
+        return {}
+
+    today = date.today()
+
+    match = re.search(r"\bnext\s+(\d{1,3})\s+days?\b", lowered)
+    if match:
+        days = int(match.group(1))
+        return {
+            "start": today.isoformat(),
+            "end": (today + timedelta(days=days)).isoformat(),
+        }
+
+    match = re.search(r"\blast\s+(\d{1,3})\s+days?\b", lowered)
+    if match:
+        days = int(match.group(1))
+        return {
+            "start": (today - timedelta(days=days)).isoformat(),
+            "end": today.isoformat(),
+        }
+
+    if "last month" in lowered:
+        start, end = _month_bounds(-1, today)
+        return {"start": start.isoformat(), "end": end.isoformat()}
+    if "this month" in lowered or "current month" in lowered:
+        start, end = _month_bounds(0, today)
+        return {"start": start.isoformat(), "end": end.isoformat()}
+    if "next month" in lowered:
+        start, end = _month_bounds(+1, today)
+        return {"start": start.isoformat(), "end": end.isoformat()}
+
+    if "last quarter" in lowered:
+        start, end = _quarter_bounds(-1, today)
+        return {"start": start.isoformat(), "end": end.isoformat()}
+    if "this quarter" in lowered or "current quarter" in lowered:
+        start, end = _quarter_bounds(0, today)
+        return {"start": start.isoformat(), "end": end.isoformat()}
+    if "next quarter" in lowered:
+        start, end = _quarter_bounds(+1, today)
+        return {"start": start.isoformat(), "end": end.isoformat()}
+
+    if "next 30 days" in lowered:
+        return {
+            "start": today.isoformat(),
+            "end": (today + timedelta(days=30)).isoformat(),
+        }
+
+    return {}
+
+
 SQL_ONLY_STRICT_TEMPLATE = """Write only an Oracle query. Start with SELECT or WITH.
 No code fences. No comments. No explanations. No extra text.
 Table: "{table}"
@@ -103,12 +192,14 @@ def _heuristic_fill(question: str, intent: dict, default_date_col: str) -> dict:
     if not isinstance(intent, dict):
         return {}
 
-    lowered = (question or "").lower()
     upper = (question or "").upper()
 
-    if intent.get("has_time_window") is None:
-        if "next 30 day" in lowered or "next thirty day" in lowered:
-            intent["has_time_window"] = True
+    derived_window = derive_window_from_text(question or "")
+    if derived_window and not intent.get("explicit_dates"):
+        intent["explicit_dates"] = derived_window
+
+    if intent.get("has_time_window") is None and derived_window:
+        intent["has_time_window"] = True
 
     if intent.get("date_column") is None:
         if "END_DATE" in upper:
@@ -119,14 +210,6 @@ def _heuristic_fill(question: str, intent: dict, default_date_col: str) -> dict:
             intent["date_column"] = "REQUEST_DATE"
         elif intent.get("has_time_window"):
             intent["date_column"] = default_date_col
-
-    if intent.get("explicit_dates") is None:
-        if "next 30 day" in lowered or "next thirty day" in lowered:
-            today = date.today()
-            intent["explicit_dates"] = {
-                "start": today.isoformat(),
-                "end": (today + timedelta(days=30)).isoformat(),
-            }
 
     if intent.get("explicit_dates") and intent.get("has_time_window") is None:
         intent["has_time_window"] = True
@@ -241,19 +324,6 @@ def answer():
             intent[key] = value
 
     intent = _heuristic_fill(q, intent, default_date_col)
-
-    lowered_question = (q or "").lower()
-    if "last month" in lowered_question:
-        today = date.today()
-        first_this_month = today.replace(day=1)
-        last_month_end = first_this_month - timedelta(days=1)
-        last_month_start = last_month_end.replace(day=1)
-        intent["has_time_window"] = True
-        intent["explicit_dates"] = {
-            "start": last_month_start.isoformat(),
-            "end": last_month_end.isoformat(),
-        }
-        intent.setdefault("date_column", default_date_col)
 
     if intent.get("explicit_dates") and intent.get("has_time_window") is None:
         intent["has_time_window"] = True
@@ -457,6 +527,10 @@ def answer():
     sql_payload = {"size": len(sql_final)}
     sql_payload["sql"] = sql_final[:900] if include_debug else "<hidden>"
     log_event(log, "dw", "final_sql", sql_payload)
+
+    bind_names_in_sql = extract_bind_names(sql_final)
+    bind_name_map = {name.lower(): name for name in bind_names_in_sql}
+
     validation = d.get("validation") or basic_checks(sql_final, allowed_binds=ALLOWED_BINDS)
     if validation is None or not isinstance(validation, dict):
         validation = basic_checks(sql_final, allowed_binds=ALLOWED_BINDS)
@@ -469,7 +543,7 @@ def answer():
         "ok": bool(validation.get("ok")),
         "errors": validation.get("errors"),
         "binds": validation.get("binds"),
-        "bind_names": validation.get("bind_names"),
+        "bind_names": sorted(bind_names_in_sql),
     }
     log_event(log, "dw", "validation", json.loads(json.dumps(validation_payload, default=str)))
 
@@ -527,13 +601,54 @@ def answer():
             res["debug"] = debug_payload
         return jsonify(res)
 
-    used_binds = validation.get("binds") or []
-    actual_bind_names = validation.get("bind_names") or []
-    bind_name_map = {canon: actual for canon, actual in zip(used_binds, actual_bind_names)}
+    needed_canonical = sorted(bind_name_map.keys())
 
-    bind_values = derive_bind_values(q, used_binds, intent)
-    missing = [b for b in used_binds if b not in bind_values]
+    raw_bind_values = derive_bind_values(q, needed_canonical, intent) or {}
+    bind_values: dict[str, object] = dict(raw_bind_values)
+
+    needs_dates = {"date_start", "date_end"} & set(needed_canonical)
+    if needs_dates:
+        window = {}
+        if isinstance(intent, dict):
+            maybe_window = intent.get("explicit_dates")
+            if isinstance(maybe_window, dict):
+                window = maybe_window
+        if (
+            (not window or not window.get("start") or not window.get("end"))
+            and not (bind_values.get("date_start") and bind_values.get("date_end"))
+        ):
+            window = derive_window_from_text(q)
+
+        if isinstance(window, dict) and window.get("start") and window.get("end"):
+            def _coerce_date(value):
+                if isinstance(value, datetime):
+                    return value.date()
+                if isinstance(value, date):
+                    return value
+                if isinstance(value, str):
+                    try:
+                        return date.fromisoformat(value)
+                    except Exception:
+                        return value
+                return value
+
+            bind_values["date_start"] = _coerce_date(window.get("start"))
+            bind_values["date_end"] = _coerce_date(window.get("end"))
+
+    if "top_n" in bind_name_map:
+        top_n_val = None
+        if isinstance(intent, dict):
+            top_n_val = intent.get("top_n")
+        if isinstance(top_n_val, int) and top_n_val > 0:
+            bind_values["top_n"] = top_n_val
+
+    missing = [
+        name
+        for name in needed_canonical
+        if name not in bind_values or bind_values[name] is None
+    ]
     if missing:
+        missing_pretty = [bind_name_map.get(name, name) for name in missing]
         with mem.begin() as conn:
             conn.execute(
                 text(
@@ -558,7 +673,7 @@ def answer():
             "error": "missing_bind_values",
             "sql": sql_final,
             "questions": [
-                f"Provide values for: {', '.join(sorted(missing))} or rephrase with explicit filters."
+                f"Provide values for: {', '.join(sorted(missing_pretty))} or rephrase with explicit filters."
             ],
         }
         if include_debug:
@@ -570,13 +685,12 @@ def answer():
             }
         return jsonify(resp)
 
-    exec_binds = {bind_name_map.get(k, k): v for k, v in bind_values.items()}
-    log_event(
-        log,
-        "dw",
-        "execution_binds",
-        {"bind_names": sorted(exec_binds.keys())},
-    )
+    exec_binds = {
+        bind_name_map.get(key, key): value
+        for key, value in bind_values.items()
+        if key in bind_name_map
+    }
+    log_event(log, "dw", "execution_binds", {k: str(v) for k, v in exec_binds.items()})
 
     oracle_engine = ds_registry.engine(None)
     rows = []

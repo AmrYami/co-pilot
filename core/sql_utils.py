@@ -49,6 +49,16 @@ _BAD_PREFIXES = (
     "SELECT (or CTE)",
 )
 
+_BIND_RE = re.compile(r":([A-Za-z_][A-Za-z0-9_]*)")
+
+
+def extract_bind_names(sql: str) -> list[str]:
+    """Return a sorted list of distinct bind names (Oracle style :name)."""
+
+    if not sql:
+        return []
+    return sorted(set(_BIND_RE.findall(sql)))
+
 
 def extract_sql_one_stmt(text: str, dialect: str = "generic") -> str:
     """
