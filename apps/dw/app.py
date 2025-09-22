@@ -21,10 +21,8 @@ from core.sql_utils import (
     extract_bind_names,
     extract_json_bracket,
     looks_like_instruction,
-    rewrite_projection_to_star,
     sanitize_oracle_sql,
     validate_oracle_sql,
-    wants_all_columns_from_question,
 )
 from core.logging_utils import get_logger, log_event
 
@@ -143,15 +141,90 @@ dw_bp = Blueprint("dw", __name__, url_prefix="/dw")
 log = get_logger("main")
 
 
-# --- Helpers for UX rules --------------------------------------------------
+_STAR_SAFE_TABLE = r'"?Contract"?'
+_DATE_COLS = {"end_date", "start_date", "request_date"}
+_PROJECTION_COLS = {
+    "contract_id",
+    "contract_owner",
+    "contract_stakeholder_1",
+    "contract_stakeholder_2",
+    "contract_stakeholder_3",
+    "contract_stakeholder_4",
+    "contract_stakeholder_5",
+    "contract_stakeholder_6",
+    "contract_stakeholder_7",
+    "contract_stakeholder_8",
+    "department_1",
+    "department_2",
+    "department_3",
+    "department_4",
+    "department_5",
+    "department_6",
+    "department_7",
+    "department_8",
+    "owner_department",
+    "contract_value_net_of_vat",
+    "vat",
+    "contract_purpose",
+    "contract_subject",
+    "request_type",
+    "contract_status",
+    "entity_no",
+    "requester",
+}
 
-_RE_FETCH_FIRST = re.compile(r"(?is)\s*FETCH\s+FIRST\s+(?:\d+|:\w+)\s+ROWS\s+ONLY\s*")
+
+def _mentions_specific_projection(question: str) -> bool:
+    """Return True when the question asks for specific non-date columns."""
+
+    q = (question or "").lower()
+    if re.search(r"\b(all columns|everything|full details|show all|display all)\b", q):
+        return False
+
+    sanitized = q
+    for date_col in _DATE_COLS:
+        date_pattern = date_col.replace("_", r"[_\s]+")
+        sanitized = re.sub(rf"\b{date_pattern}\b", " ", sanitized)
+
+    for token in _PROJECTION_COLS:
+        pattern = token.replace("_", r"[_\s]+")
+        if re.search(rf"\b{pattern}\b", sanitized):
+            return True
+    return False
 
 
-def _remove_row_limit(sql: str) -> str:
-    """Strip trailing FETCH FIRST ... ROWS ONLY clauses."""
+def _strip_code_fences(sql: str) -> str:
+    if not sql:
+        return sql
+    sql = re.sub(r"(?is)^\s*```sql\s*", "", sql)
+    sql = re.sub(r"(?is)\s*```\s*$", "", sql)
+    return sql.strip()
 
-    return _RE_FETCH_FIRST.sub(" ", sql or "")
+
+def _is_simple_contract_select(sql: str) -> bool:
+    if re.search(r"(?is)\bwith\b", sql):
+        return False
+    if re.search(r"(?is)\bjoin\b", sql):
+        return False
+    return bool(re.search(rf"(?is)^\s*select\b.+\bfrom\s+{_STAR_SAFE_TABLE}\b", sql))
+
+
+def _rewrite_projection_to_star(sql: str) -> str:
+    return re.sub(
+        rf"(?is)^\s*select\s+(.+?)\s+(from\s+{_STAR_SAFE_TABLE}\b)",
+        r"SELECT * \2",
+        sql,
+        count=1,
+    )
+
+
+def _strip_limits(sql: str) -> str:
+    if not sql:
+        return sql
+    sql = re.sub(r"(?is)\s+fetch\s+(first|next)\s+(?::\w+|\d+)\s+rows\s+only", "", sql)
+    sql = re.sub(r"(?is)\s+offset\s+\d+\s+rows", "", sql)
+    sql = re.sub(r"(?is)\s+limit\s+(?::\w+|\d+)\b", "", sql)
+    return sql.strip()
 
 
 # --- Helpers to compute date ranges ---------------------------------------------------------
@@ -437,18 +510,8 @@ def answer():
 
     intent = _heuristic_fill(q, intent, default_date_col)
 
-    wants_all_columns = wants_all_columns_from_question(q, ALLOWED_COLUMNS)
-    used_projection_rewrite = False
-
-    def _enforce_star(sql_text: str) -> str:
-        nonlocal used_projection_rewrite
-        if not wants_all_columns or not sql_text:
-            return sql_text
-        rewritten = rewrite_projection_to_star(sql_text, table_name)
-        if rewritten and rewritten != sql_text:
-            used_projection_rewrite = True
-            return rewritten
-        return sql_text
+    explicit_projection = _mentions_specific_projection(q)
+    wants_all_columns = not explicit_projection
 
     if intent.get("explicit_dates") and intent.get("has_time_window") is None:
         intent["has_time_window"] = True
@@ -630,7 +693,8 @@ def answer():
             res["debug"] = debug_payload
         return jsonify(res)
 
-    top_n_raw = intent.get("top_n") if isinstance(intent, dict) else None
+    requested_top_n = intent.get("top_n") if isinstance(intent, dict) else None
+    top_n_raw = requested_top_n
     if isinstance(top_n_raw, str):
         try:
             top_n_raw = int(top_n_raw)
@@ -642,9 +706,36 @@ def answer():
     if top_n_int is not None:
         intent["top_n"] = top_n_int
 
-    sql_final = _enforce_star(sql_final)
-    if top_n_int is None:
-        sql_final = _remove_row_limit(sql_final)
+    def _has_top_n_request(value: Any) -> bool:
+        if value is None:
+            return False
+        if isinstance(value, str):
+            return bool(value.strip())
+        if isinstance(value, (int, float)):
+            return value > 0
+        return True
+
+    user_requested_top_n = _has_top_n_request(requested_top_n)
+
+    projection_rewrite_applied = False
+    limit_strip_applied = False
+
+    def _apply_projection_and_limits(sql_text: str) -> str:
+        nonlocal projection_rewrite_applied, limit_strip_applied
+        sql_clean = _strip_code_fences(sql_text)
+        if wants_all_columns and _is_simple_contract_select(sql_clean):
+            rewritten = _rewrite_projection_to_star(sql_clean)
+            if rewritten != sql_clean:
+                projection_rewrite_applied = True
+                sql_clean = rewritten
+        if not user_requested_top_n:
+            stripped = _strip_limits(sql_clean)
+            if stripped != sql_clean:
+                limit_strip_applied = True
+                sql_clean = stripped
+        return sql_clean
+
+    sql_final = _apply_projection_and_limits(sql_final)
 
     def _oracle_parse_error(sql_text: str) -> str | None:
         if not sql_text:
@@ -665,13 +756,13 @@ def answer():
             alt_sql = sanitize_oracle_sql(strict_raw, raw1 or raw2 or sql_from_llm)
             if alt_sql:
                 sql_final = alt_sql
-                sql_final = _enforce_star(sql_final)
+                sql_final = _apply_projection_and_limits(sql_final)
                 parse_error = _oracle_parse_error(sql_final)
     if parse_error:
         synthesized = _maybe_synthesize("parse_error")
         if synthesized:
             sql_final = synthesized
-            sql_final = _enforce_star(sql_final)
+            sql_final = _apply_projection_and_limits(sql_final)
             parse_error = _oracle_parse_error(sql_final)
 
     sql_payload = {"size": len(sql_final)}
@@ -1035,7 +1126,8 @@ def answer():
         "clarifier_intent": intent,
         "binds": binds_public,
         "wants_all_columns": wants_all_columns,
-        "used_projection_rewrite": used_projection_rewrite,
+        "used_projection_rewrite": projection_rewrite_applied,
+        "used_limit_strip": limit_strip_applied,
     }
     if widen_meta:
         meta["autowiden"] = widen_meta
@@ -1091,6 +1183,9 @@ def answer():
         errors = d.get("errors") or []
         if errors:
             debug_payload["errors"] = errors
+        debug_payload["projection_rewrite_applied"] = projection_rewrite_applied
+        debug_payload["limit_strip_applied"] = limit_strip_applied
+        debug_payload["wants_all_columns"] = wants_all_columns
         resp["debug"] = debug_payload
     return jsonify(resp)
 
