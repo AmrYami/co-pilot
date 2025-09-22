@@ -274,6 +274,22 @@ def answer():
     prefixes = body.get("prefixes") or []
     include_debug = DW_INCLUDE_DEBUG or (request.args.get("debug") == "true")
 
+    try:
+        window_days = int(body.get("window_days") or 0)
+    except (TypeError, ValueError):
+        window_days = 0
+    date_column_override = (body.get("date_column") or "").upper().strip()
+    override_explicit_dates = None
+    override_date_column = None
+    if window_days > 0:
+        override_start = date.today()
+        override_end = override_start + timedelta(days=window_days)
+        override_explicit_dates = {
+            "start": override_start.isoformat(),
+            "end": override_end.isoformat(),
+        }
+        override_date_column = date_column_override or "END_DATE"
+
     table_name = settings.get("DW_CONTRACT_TABLE", scope="namespace") or "Contract"
     default_date_col = settings.get("DW_DATE_COLUMN", scope="namespace") or "REQUEST_DATE"
 
@@ -322,6 +338,14 @@ def answer():
         value = bracket_payload.get(key)
         if value is not None:
             intent[key] = value
+
+    if override_explicit_dates:
+        intent["explicit_dates"] = override_explicit_dates
+        intent["has_time_window"] = True
+        if override_date_column:
+            intent["date_column"] = override_date_column
+    elif date_column_override:
+        intent["date_column"] = date_column_override
 
     intent = _heuristic_fill(q, intent, default_date_col)
 
@@ -790,6 +814,8 @@ def answer():
         {"id": inq_id, "from": "open", "to": "answered", "rows": len(rows)},
     )
 
+    rowcount = len(rows)
+
     binds_public = {
         bind_name_map.get(k, k): (
             v.isoformat() if hasattr(v, "isoformat") else v
@@ -797,7 +823,7 @@ def answer():
         for k, v in bind_values.items()
     }
     meta = {
-        "rowcount": len(rows),
+        "rowcount": rowcount,
         "columns": headers,
         "duration_ms": duration_ms,
         "used_repair": bool(d.get("used_repair")),
@@ -815,6 +841,30 @@ def answer():
         "csv_path": str(csv_path) if csv_path else None,
         "meta": meta,
     }
+    if rowcount == 0:
+        base_date_column = (intent.get("date_column") or "END_DATE").upper()
+        suggestions = [
+            {
+                "action": "retry",
+                "label": "Try next 60 days",
+                "params": {"window_days": 60, "date_column": base_date_column},
+            },
+            {
+                "action": "retry",
+                "label": "Try next 90 days",
+                "params": {"window_days": 90, "date_column": base_date_column},
+            },
+        ]
+        if (intent.get("date_column") or "").upper() != "REQUEST_DATE":
+            suggestions.append(
+                {
+                    "action": "retry",
+                    "label": "Use REQUEST_DATE next 30 days",
+                    "params": {"window_days": 30, "date_column": "REQUEST_DATE"},
+                }
+            )
+        resp["note"] = "No contracts found in the selected window."
+        resp["suggestions"] = suggestions
     if include_debug:
         debug_payload = {
             "intent": intent,
