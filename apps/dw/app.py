@@ -19,7 +19,6 @@ from core.model_loader import get_model
 from core.sql_exec import get_mem_engine
 from core.sql_utils import (
     extract_bind_names,
-    extract_json_bracket,
     looks_like_instruction,
     sanitize_oracle_sql,
     validate_oracle_sql,
@@ -31,18 +30,142 @@ import sqlglot
 parse_one = getattr(sqlglot, "parse_one", lambda sql, read=None: None)
 exp = getattr(sqlglot, "expressions", None) or getattr(sqlglot, "exp", None)
 
-TOPN_RE = re.compile(r"\btop\s+(\d+)\b", re.I)
-VALUE_RE = re.compile(r"\b(contract\s*value|value|amount|net)\b", re.I)
+JSON_BLOCK_RE = re.compile(r"<<JSON>>\s*(\{.*?\})\s*<</JSON>>", re.S | re.I)
+TOP_N_RE = re.compile(r"\btop\s+(\d{1,4})\b", re.I)
+NEXT_DAYS_RE = re.compile(r"\b(next|within|in)\s+(\d{1,4})\s+days?\b", re.I)
+LAST_MONTH_RE = re.compile(r"\blast\s+month\b", re.I)
+COUNT_RE = re.compile(r"\b(count|how many|عدد)\b", re.I)
+VALUE_RE = re.compile(r"\b(value|net\s*of\s*vat|amount|القيمة)\b", re.I)
+
+
+def _find_json_objects(text: str) -> list[str]:
+    """Return every balanced {...} substring in order."""
+
+    objs: list[str] = []
+    stack: list[str] = []
+    start = -1
+    for idx, ch in enumerate(text or ""):
+        if ch == "{":
+            if not stack:
+                start = idx
+            stack.append("{")
+        elif ch == "}":
+            if stack:
+                stack.pop()
+                if not stack and start >= 0:
+                    objs.append((text or "")[start : idx + 1])
+                    start = -1
+    return objs
+
+
+def _parse_clarifier_output(raw: str) -> dict:
+    """Robustly parse clarifier JSON even if the model ignored the tags."""
+
+    if not raw:
+        return {}
+
+    match = JSON_BLOCK_RE.search(raw)
+    if match:
+        try:
+            obj = json.loads(match.group(1))
+            if obj:
+                return obj
+        except Exception:
+            pass
+
+    for candidate in reversed(_find_json_objects(raw)):
+        try:
+            data = json.loads(candidate)
+            if isinstance(data, dict) and data:
+                return data
+        except Exception:
+            continue
+    return {}
 
 
 def _parse_top_n(text: str) -> int | None:
-    match = TOPN_RE.search(text or "")
+    match = TOP_N_RE.search(text or "")
     if not match:
         return None
     try:
         return int(match.group(1))
     except Exception:
         return None
+
+
+def _month_bounds_for_last_month(today: date) -> tuple[date, date]:
+    first_this = today.replace(day=1)
+    last_month_last_day = first_this - timedelta(days=1)
+    last_month_first_day = last_month_last_day.replace(day=1)
+    return last_month_first_day, last_month_last_day
+
+
+def _iso(d: date) -> str:
+    return d.isoformat()
+
+
+def _normalize_intent(question: str, parsed: dict) -> dict:
+    text = (question or "").strip()
+    intent = {
+        "has_time_window": parsed.get("has_time_window"),
+        "date_column": parsed.get("date_column"),
+        "explicit_dates": parsed.get("explicit_dates"),
+        "top_n": parsed.get("top_n"),
+        "agg": None,
+        "wants_all_columns": True,
+        "sort_by": None,
+        "sort_desc": False,
+    }
+
+    if COUNT_RE.search(text):
+        intent["agg"] = "count"
+        intent["wants_all_columns"] = False
+
+    if intent.get("top_n") is None:
+        match = TOP_N_RE.search(text)
+        if match:
+            try:
+                intent["top_n"] = int(match.group(1))
+            except Exception:
+                pass
+    if intent.get("top_n"):
+        if VALUE_RE.search(text):
+            intent["sort_by"] = "CONTRACT_VALUE_NET_OF_VAT"
+            intent["sort_desc"] = True
+        intent["wants_all_columns"] = True
+
+    today = date.today()
+
+    if not intent.get("explicit_dates"):
+        match = NEXT_DAYS_RE.search(text)
+        if match:
+            try:
+                n_days = int(match.group(2))
+                start = today
+                end = today + timedelta(days=n_days)
+                intent["explicit_dates"] = {"start": _iso(start), "end": _iso(end)}
+                intent["has_time_window"] = True
+            except Exception:
+                pass
+
+    if not intent.get("explicit_dates") and LAST_MONTH_RE.search(text):
+        start, end = _month_bounds_for_last_month(today)
+        intent["explicit_dates"] = {"start": _iso(start), "end": _iso(end)}
+        intent["has_time_window"] = True
+
+    if not intent.get("date_column"):
+        lowered = text.lower()
+        if "end_date" in lowered or "expir" in lowered:
+            intent["date_column"] = "END_DATE"
+        elif "start_date" in lowered:
+            intent["date_column"] = "START_DATE"
+        else:
+            intent["date_column"] = "REQUEST_DATE"
+
+    if intent.get("date_column"):
+        intent["date_column"] = str(intent["date_column"]).upper()
+
+    return intent
 
 
 def _parse_date_yyyy_mm_dd(s: str) -> datetime:
@@ -245,47 +368,109 @@ def _strip_limits(sql: str) -> str:
     return sql.strip()
 
 
-def enforce_topn_sort(sql: str, intent: dict, question: str) -> tuple[str, bool]:
-    """Ensure top-N queries sort by contract value and apply FETCH FIRST :top_n."""
+def _build_oracle_prompt(
+    question: str,
+    intent: dict,
+    *,
+    table: str,
+    allowed_columns: list[str],
+    allowed_binds: list[str],
+) -> str:
+    allowed_cols = ", ".join(allowed_columns)
+    lines = [
+        "Return Oracle SQL only inside ```sql fenced block.",
+        f'Table: "{table}"',
+        f"Allowed columns: {allowed_cols}",
+        "Oracle syntax only (NVL, TRIM, LISTAGG WITHIN GROUP, FETCH FIRST N ROWS ONLY). SELECT/CTE only.",
+        f"Allowed binds: {', '.join(allowed_binds)}",
+    ]
 
-    top_n = intent.get("top_n") if isinstance(intent, dict) else None
-    if not top_n:
-        return sql, False
-
-    if not VALUE_RE.search(question or ""):
-        return sql, False
-
-    metric_col = "CONTRACT_VALUE_NET_OF_VAT"
-
-    try:
-        tree = parse_one(sql, read="oracle")
-        if not tree:
-            raise ValueError("sqlglot returned None")
-
-        order_expr = exp.Order(
-            expressions=[exp.Ordered(this=exp.to_identifier(metric_col), desc=True)]
-        )
-        tree.set("order", order_expr)
-
-        if not tree.args.get("limit"):
-            tree.set("limit", exp.Fetch(this=exp.Parameter(this="top_n")))
-
-        return tree.sql(dialect="oracle"), True
-
-    except Exception:
-        out = sql or ""
-        if re.search(r"\border\s+by\b", out, re.I):
-            out = re.sub(
-                r"order\s+by\s+.*?$",
-                f"ORDER BY {metric_col} DESC",
-                out,
-                flags=re.I | re.S,
-            )
+    if intent.get("agg") == "count":
+        lines.append("Return a single COUNT query: SELECT COUNT(*) AS CNT ...")
+        lines.append("Do not select other columns.")
+    else:
+        if intent.get("wants_all_columns", True):
+            lines.append("If the question does not specify which columns to show, SELECT ALL columns (use SELECT *).")
         else:
-            out = out.rstrip() + f"\nORDER BY {metric_col} DESC"
-        if not re.search(r"fetch\s+first\s+.*rows\s+only", out, re.I) and ":top_n" not in out:
-            out = out.rstrip() + "\nFETCH FIRST :top_n ROWS ONLY"
-        return out, True
+            lines.append("If unsure, default to SELECT *.")
+        lines.append("Only add a row limit (FETCH FIRST :top_n ROWS ONLY) if the user explicitly asks for Top N.")
+
+    default_col = intent.get("date_column") or "REQUEST_DATE"
+    lines.append("Add date filter ONLY if user asks. For windows use :date_start and :date_end.")
+    lines.append(f"Default window column: {default_col}.")
+    lines.append("No prose, comments, or explanations.\n")
+    lines.append("Question:")
+    lines.append(question.strip())
+    lines.append("\n```sql")
+    return "\n".join(lines)
+
+
+def _build_oracle_prompt_strict(
+    question: str,
+    intent: dict,
+    *,
+    table: str,
+    allowed_columns: list[str],
+    allowed_binds: list[str],
+) -> str:
+    allowed_cols = ", ".join(allowed_columns)
+    parts = [
+        "Write only an Oracle query. Start with SELECT or WITH.",
+        "No code fences. No comments. No explanations. No extra text.",
+        f'Table: "{table}"',
+        f"Allowed columns: {allowed_cols}",
+        f"Allowed binds: {', '.join(allowed_binds)}.",
+    ]
+    if intent.get("agg") == "count":
+        parts.append("Return exactly: SELECT COUNT(*) AS CNT ... with the filters applied. No other columns.")
+    else:
+        if intent.get("wants_all_columns", True):
+            parts.append("If the question does not specify which columns to show, SELECT *.")
+        parts.append("Only add row limit (FETCH FIRST :top_n ROWS ONLY) when Top N is asked explicitly.")
+    default_col = intent.get("date_column") or "REQUEST_DATE"
+    parts.append(f"Use :date_start and :date_end on {default_col} when a time window is implied.")
+    parts.append("Question:")
+    parts.append(question.strip())
+    parts.append("Statement:")
+    return "\n".join(parts)
+
+
+def _maybe_rewrite_sql_for_intent(sql: str, intent: dict) -> tuple[str, dict, dict]:
+    sql_text = (sql or "").strip()
+    meta = {
+        "used_projection_rewrite": False,
+        "used_limit_inject": False,
+        "used_order_inject": False,
+    }
+
+    lowered = sql_text.lower()
+
+    if intent.get("agg") == "count" and "count(" not in lowered:
+        match = re.match(r"(?is)\s*select\s+.+?\s+from\s+", sql_text)
+        if match:
+            sql_text = re.sub(
+                r"(?is)\A\s*select\s+.+?\s+from\s+",
+                "SELECT COUNT(*) AS CNT FROM ",
+                sql_text,
+                count=1,
+            )
+            meta["used_projection_rewrite"] = True
+        else:
+            sql_text = f"SELECT COUNT(*) AS CNT FROM ({sql_text}) q"
+            meta["used_projection_rewrite"] = True
+        lowered = sql_text.lower()
+
+    if intent.get("sort_by") and "order by" not in lowered:
+        direction = " DESC" if intent.get("sort_desc") else ""
+        sql_text = sql_text.rstrip() + f"\nORDER BY {intent['sort_by']}{direction}"
+        meta["used_order_inject"] = True
+        lowered = sql_text.lower()
+
+    if intent.get("top_n") and "fetch first" not in lowered:
+        sql_text = sql_text.rstrip() + "\nFETCH FIRST :top_n ROWS ONLY"
+        meta["used_limit_inject"] = True
+
+    return sql_text, meta, {}
 
 
 # --- Helpers to compute date ranges ---------------------------------------------------------
@@ -372,19 +557,6 @@ def derive_window_from_text(q: str) -> dict:
         }
 
     return {}
-
-
-SQL_ONLY_STRICT_TEMPLATE = """Write only an Oracle query. Start with SELECT or WITH.
-No code fences. No comments. No explanations. No extra text.
-Table: "{table}"
-{allowed_columns_line}
-Allowed binds: {allowed_binds}
-{projection_hint}
-Only add a row limit (FETCH FIRST :top_n ROWS ONLY) if the user explicitly asks for top N.
-Use Oracle syntax. For a time window, filter with :date_start and :date_end on {date_column}.
-Question:
-{question}
-"""
 
 
 def _env_truthy(name: str, default: bool = False) -> bool:
@@ -516,11 +688,21 @@ def answer():
     table_name = settings.get("DW_CONTRACT_TABLE", scope="namespace") or "Contract"
     default_date_col = settings.get("DW_DATE_COLUMN", scope="namespace") or "REQUEST_DATE"
 
+    def _prompt_builder(question_text: str, _ctx: dict, intent_data: dict | None) -> str:
+        return _build_oracle_prompt(
+            question_text,
+            intent_data or {},
+            table=table_name,
+            allowed_columns=ALLOWED_COLUMNS,
+            allowed_binds=ALLOWED_BINDS,
+        )
+
     ctx = {
         "table": table_name,
         "allowed_columns": ALLOWED_COLUMNS,
         "allowed_binds": ALLOWED_BINDS,
         "default_date_col": default_date_col,
+        "prompt_builder": _prompt_builder,
     }
 
     with mem.begin() as conn:
@@ -550,17 +732,18 @@ def answer():
 
     clarifier = clarify_intent(q, ctx)
     clarifier_raw = ""
-    intent = clarifier.get("intent", {}) if isinstance(clarifier, dict) else {}
-    if not isinstance(intent, dict):
-        intent = {}
+    parsed_from_clarifier: dict = {}
     if isinstance(clarifier, dict):
         clarifier_raw = clarifier.get("raw") or ""
+        maybe_intent = clarifier.get("intent")
+        if isinstance(maybe_intent, dict):
+            parsed_from_clarifier = maybe_intent
 
-    bracket_payload = extract_json_bracket(clarifier_raw) or {}
-    for key in ("has_time_window", "date_column", "top_n", "explicit_dates"):
-        value = bracket_payload.get(key)
-        if value is not None:
-            intent[key] = value
+    parsed = _parse_clarifier_output(clarifier_raw) or {}
+    if not parsed and parsed_from_clarifier:
+        parsed = parsed_from_clarifier
+
+    intent = _normalize_intent(q, parsed)
 
     if override_explicit_dates:
         intent["explicit_dates"] = override_explicit_dates
@@ -576,9 +759,13 @@ def answer():
         intent["top_n"] = top_n_from_text
 
     explicit_projection = _mentions_specific_projection(q)
-    wants_all_columns = not explicit_projection
-    if intent.get("top_n"):
-        wants_all_columns = False
+    if explicit_projection:
+        intent["wants_all_columns"] = False
+
+    if intent.get("agg") == "count":
+        intent["wants_all_columns"] = False
+
+    wants_all_columns = bool(intent.get("wants_all_columns", True))
 
     if intent.get("explicit_dates") and intent.get("has_time_window") is None:
         intent["has_time_window"] = True
@@ -619,19 +806,12 @@ def answer():
             strict_raw = ""
             log_event(log, "dw", "llm_raw_strict", {"size": 0, "skipped": True})
             return strict_raw
-        allowed_columns_line = ""
-        if not wants_all_columns:
-            allowed_columns_line = f"Allowed columns: {', '.join(ALLOWED_COLUMNS)}"
-        projection_hint = (
-            "If the question does not specify which columns to show, SELECT ALL columns (use SELECT *)."
-        )
-        strict_prompt = SQL_ONLY_STRICT_TEMPLATE.format(
+        strict_prompt = _build_oracle_prompt_strict(
+            q,
+            intent,
             table=table_name,
-            allowed_columns_line=allowed_columns_line,
-            allowed_binds=", ".join(ALLOWED_BINDS),
-            projection_hint=projection_hint,
-            date_column=intent.get("date_column") or default_date_col,
-            question=q,
+            allowed_columns=ALLOWED_COLUMNS,
+            allowed_binds=ALLOWED_BINDS,
         )
         try:
             strict_raw = mdl.generate(
@@ -786,7 +966,11 @@ def answer():
 
     projection_rewrite_applied = False
     limit_strip_applied = False
-    used_topn_enforce = False
+    intent_rewrite_meta = {
+        "used_projection_rewrite": False,
+        "used_limit_inject": False,
+        "used_order_inject": False,
+    }
 
     def _apply_projection_and_limits(sql_text: str) -> str:
         nonlocal projection_rewrite_applied, limit_strip_applied
@@ -803,7 +987,16 @@ def answer():
                 sql_clean = stripped
         return sql_clean
 
+    def _apply_intent_rewrite(sql_text: str) -> str:
+        nonlocal intent_rewrite_meta
+        rewritten, meta, _ = _maybe_rewrite_sql_for_intent(sql_text, intent)
+        for key, value in meta.items():
+            if value:
+                intent_rewrite_meta[key] = True
+        return rewritten
+
     sql_final = _apply_projection_and_limits(sql_final)
+    sql_final = _apply_intent_rewrite(sql_final)
 
     def _oracle_parse_error(sql_text: str) -> str | None:
         if not sql_text:
@@ -825,19 +1018,15 @@ def answer():
             if alt_sql:
                 sql_final = alt_sql
                 sql_final = _apply_projection_and_limits(sql_final)
+                sql_final = _apply_intent_rewrite(sql_final)
                 parse_error = _oracle_parse_error(sql_final)
     if parse_error:
         synthesized = _maybe_synthesize("parse_error")
         if synthesized:
             sql_final = synthesized
             sql_final = _apply_projection_and_limits(sql_final)
+            sql_final = _apply_intent_rewrite(sql_final)
             parse_error = _oracle_parse_error(sql_final)
-
-    enforced_sql, enforced = enforce_topn_sort(sql_final, intent, q)
-    if enforced:
-        sql_final = enforced_sql
-        used_topn_enforce = True
-        parse_error = _oracle_parse_error(sql_final)
 
     sql_payload = {"size": len(sql_final)}
     sql_payload["sql"] = sql_final[:900] if include_debug else "<hidden>"
@@ -1202,7 +1391,9 @@ def answer():
         "wants_all_columns": wants_all_columns,
         "used_projection_rewrite": projection_rewrite_applied,
         "used_limit_strip": limit_strip_applied,
-        "used_topn_enforce": used_topn_enforce,
+        "intent_projection_rewrite": intent_rewrite_meta["used_projection_rewrite"],
+        "intent_limit_inject": intent_rewrite_meta["used_limit_inject"],
+        "intent_order_inject": intent_rewrite_meta["used_order_inject"],
         "top_n_from_text": top_n_from_text,
     }
     if widen_meta:
@@ -1262,7 +1453,9 @@ def answer():
         debug_payload["projection_rewrite_applied"] = projection_rewrite_applied
         debug_payload["limit_strip_applied"] = limit_strip_applied
         debug_payload["wants_all_columns"] = wants_all_columns
-        debug_payload["used_topn_enforce"] = used_topn_enforce
+        debug_payload["intent_projection_rewrite"] = intent_rewrite_meta["used_projection_rewrite"]
+        debug_payload["intent_limit_inject"] = intent_rewrite_meta["used_limit_inject"]
+        debug_payload["intent_order_inject"] = intent_rewrite_meta["used_order_inject"]
         resp["debug"] = debug_payload
     return jsonify(resp)
 
