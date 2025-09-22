@@ -24,9 +24,13 @@ Important columns (only these matter for now):
 Derived:
 - CONTRACT_VALUE_GROSS = NVL(CONTRACT_VALUE_NET_OF_VAT,0) + NVL(VAT,0)
 
+Date column guidance:
+- Unless the user explicitly specifies a different date column (e.g. END_DATE, START_DATE), default to REQUEST_DATE for time windows.
+- For day-based windows, use half-open comparisons like END_DATE >= :date_start AND END_DATE < :date_end + 1. Avoid wrapping date columns in functions unless absolutely necessary.
+
 Date windows (don’t use sysdate literals directly in SQL; caller binds :date_start, :date_end):
-- last month: [:date_start, :date_end) == previous calendar month
-- last 90 days: [:date_start, :date_end) rolling
+- last month: [:date_start, :date_end + 1) == previous calendar month
+- last 90 days: [:date_start, :date_end + 1) rolling
 - next 30 days: (today, today+30]
 
 General rules:
@@ -86,7 +90,7 @@ FROM stakeholders
 WHERE STAKEHOLDER IS NOT NULL
   AND TRIM(STAKEHOLDER) <> ''
   AND REF_DATE >= :date_start
-  AND REF_DATE <  :date_end
+  AND REF_DATE <  :date_end + 1
 GROUP BY TRIM(STAKEHOLDER)
 ORDER BY total_gross_value DESC
 FETCH FIRST :top_n ROWS ONLY"""
@@ -102,7 +106,7 @@ FETCH FIRST :top_n ROWS ONLY"""
   NVL(CONTRACT_VALUE_NET_OF_VAT,0) + NVL(VAT,0) AS CONTRACT_VALUE_GROSS
 FROM "Contract"
 WHERE END_DATE >= :date_start
-  AND END_DATE <  :date_end
+  AND END_DATE <  :date_end + 1
 ORDER BY END_DATE ASC"""
     ),
     (
@@ -113,7 +117,7 @@ ORDER BY END_DATE ASC"""
   COUNT(*) AS contract_count
 FROM "Contract"
 WHERE REQUEST_DATE >= :date_start
-  AND REQUEST_DATE <  :date_end
+  AND REQUEST_DATE <  :date_end + 1
 GROUP BY TRIM(OWNER_DEPARTMENT)
 ORDER BY total_gross_value DESC"""
     ),
