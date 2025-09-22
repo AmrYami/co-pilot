@@ -89,7 +89,8 @@ def _extract_topn(q: str) -> Optional[int]:
 def _metric_expr(measure: str) -> Tuple[str, str]:
     if measure == "gross":
         return (
-            "NVL(CONTRACT_VALUE_NET_OF_VAT,0) + NVL(VAT,0)",
+            "NVL(CONTRACT_VALUE_NET_OF_VAT,0) + CASE WHEN NVL(VAT,0) BETWEEN 0 AND 1 "
+            "THEN NVL(CONTRACT_VALUE_NET_OF_VAT,0) * NVL(VAT,0) ELSE NVL(VAT,0) END",
             "TOTAL_GROSS_VALUE",
         )
     return ("NVL(CONTRACT_VALUE_NET_OF_VAT,0)", "TOTAL_CONTRACT_VALUE")
@@ -134,13 +135,16 @@ def _build_agg_sql(
 ) -> str:
     expr, alias = _metric_expr(measure)
     table_literal = f'"{table}"' if not table.startswith('"') else table
+    group_expr = group_col
+    if group_col.upper() == "OWNER_DEPARTMENT":
+        group_expr = "NVL(OWNER_DEPARTMENT, '(Unknown)')"
     lines = [
         "SELECT",
-        f"  {group_col} AS GROUP_KEY,",
+        f"  {group_expr} AS GROUP_KEY,",
         f"  SUM({expr}) AS {alias}",
         f"FROM {table_literal}",
         f"WHERE {date_col} BETWEEN :date_start AND :date_end",
-        f"GROUP BY {group_col}",
+        f"GROUP BY {group_expr}",
         f"ORDER BY {alias} DESC",
     ]
     if topn:
@@ -166,7 +170,10 @@ _DIMENSION_MAP = {
 }
 
 _VALUE_COL_NET = "NVL(CONTRACT_VALUE_NET_OF_VAT, 0)"  # "contract value" / "net value"
-_VALUE_COL_GROSS = "NVL(CONTRACT_VALUE_NET_OF_VAT, 0) + NVL(VAT, 0)"  # "gross value"
+_VALUE_COL_GROSS = (
+    "NVL(CONTRACT_VALUE_NET_OF_VAT, 0) + CASE WHEN NVL(VAT, 0) BETWEEN 0 AND 1 "
+    "THEN NVL(CONTRACT_VALUE_NET_OF_VAT, 0) * NVL(VAT, 0) ELSE NVL(VAT, 0) END"
+)
 
 _TOP_RE = re.compile(r"\btop\s+(\d+)\b", re.I)
 _LAST_N_MONTHS = re.compile(r"\blast\s+(\d+)\s+month", re.I)
@@ -309,18 +316,27 @@ def _fallback_dw_sql(
     binds: Dict[str, Any] = {}
     where_parts: List[str] = []
 
+    normalized_date_col = (date_col or "REQUEST_DATE").strip().upper()
+    if normalized_date_col not in {"REQUEST_DATE", "END_DATE", "START_DATE"}:
+        normalized_date_col = "REQUEST_DATE"
+
     table_literal = table_name.strip()
     if not table_literal.startswith('"'):
         table_literal = f'"{table_literal.strip("\"")}"'
 
     if start_iso and end_iso:
-        where_parts.append(f"{date_col} BETWEEN :date_start AND :date_end")
+        where_parts.append(f"{normalized_date_col} BETWEEN :date_start AND :date_end")
         binds["date_start"] = start_iso
         binds["date_end"] = end_iso
 
     where_clause = f"\nWHERE {' AND '.join(where_parts)}" if where_parts else ""
 
     value_expr = _VALUE_COL_GROSS if _mentions_gross(question) else _VALUE_COL_NET
+
+    top_n_is_explicit = False
+    if isinstance(top_n, int) and top_n > 0 and re.search(r"\btop\b", question or "", re.I):
+        top_n_is_explicit = True
+        binds["top_n"] = int(top_n)
 
     if wants_count or group_dim:
         if wants_count and not group_dim:
@@ -329,25 +345,27 @@ FROM {table_literal}{where_clause}"""
             return sql, binds
 
         dimension = group_dim or ""
-        agg_alias = "TOTAL_VALUE"
-        sql = f"""SELECT
-  {dimension} AS DIMENSION,
-  SUM({value_expr}) AS {agg_alias}
-FROM {table_literal}{where_clause}
-GROUP BY {dimension}
-ORDER BY {agg_alias} DESC"""
-        if top_n and top_n > 0:
+        if dimension.upper() == "OWNER_DEPARTMENT":
+            dimension = "NVL(OWNER_DEPARTMENT, '(Unknown)')"
+        agg_alias = "TOTAL_GROSS_VALUE" if _mentions_gross(question) else "TOTAL_CONTRACT_VALUE"
+        sql = (
+            "SELECT\n"
+            f"  {dimension} AS DIMENSION,\n"
+            f"  SUM({value_expr}) AS {agg_alias}\n"
+            f"FROM {table_literal}{where_clause}\n"
+            f"GROUP BY {dimension}\n"
+            f"ORDER BY {agg_alias} DESC"
+        )
+        if top_n_is_explicit:
             sql += "\nFETCH FIRST :top_n ROWS ONLY"
-            binds["top_n"] = int(top_n)
         return sql, binds
 
     sql = f"""SELECT *
 FROM {table_literal}{where_clause}"""
-    if top_n and top_n > 0:
+    if top_n_is_explicit:
         sql += "\nFETCH FIRST :top_n ROWS ONLY"
-        binds["top_n"] = int(top_n)
     if start_iso and end_iso:
-        sql += f"\nORDER BY {date_col} ASC"
+        sql += f"\nORDER BY {normalized_date_col} ASC"
     return sql, binds
 
 
@@ -429,6 +447,9 @@ def _normalize_intent(question: str, parsed: dict) -> dict:
         "sort_by": None,
         "sort_desc": False,
     }
+
+    question_has_top = bool(TOP_N_RE.search(text))
+    intent["user_requested_top_n"] = question_has_top
 
     if COUNT_RE.search(text):
         intent["agg"] = "count"
@@ -716,7 +737,7 @@ def _build_oracle_prompt(
             "- \"entity\" -> ENTITY_NO",
             "- \"owner\" -> CONTRACT_OWNER",
             "- \"stakeholder\" -> CONTRACT_STAKEHOLDER_1",
-            "If the question mentions \"gross value\", define GROSS_VALUE := NVL(CONTRACT_VALUE_NET_OF_VAT,0) + NVL(VAT,0) and use SUM(GROSS_VALUE).",
+            "If the question mentions \"gross value\", define GROSS_VALUE := NVL(CONTRACT_VALUE_NET_OF_VAT,0) + CASE WHEN NVL(VAT,0) BETWEEN 0 AND 1 THEN NVL(CONTRACT_VALUE_NET_OF_VAT,0) * NVL(VAT,0) ELSE NVL(VAT,0) END and use SUM(GROSS_VALUE).",
             "If it mentions \"net value\" or just \"contract value\", use SUM(NVL(CONTRACT_VALUE_NET_OF_VAT,0)).",
             "If the question asks for count (contains the word 'count' or '(count)'), return COUNT(*) (and include the dimension in SELECT if grouped).",
             "Only add a row limit (FETCH FIRST :top_n ROWS ONLY) if the user explicitly asks for Top N.",
@@ -763,7 +784,7 @@ def _build_oracle_prompt_strict(
             "- \"entity\" -> ENTITY_NO",
             "- \"owner\" -> CONTRACT_OWNER",
             "- \"stakeholder\" -> CONTRACT_STAKEHOLDER_1",
-            "If the question mentions \"gross value\", define GROSS_VALUE := NVL(CONTRACT_VALUE_NET_OF_VAT,0) + NVL(VAT,0) and use SUM(GROSS_VALUE).",
+            "If the question mentions \"gross value\", define GROSS_VALUE := NVL(CONTRACT_VALUE_NET_OF_VAT,0) + CASE WHEN NVL(VAT,0) BETWEEN 0 AND 1 THEN NVL(CONTRACT_VALUE_NET_OF_VAT,0) * NVL(VAT,0) ELSE NVL(VAT,0) END and use SUM(GROSS_VALUE).",
             "If it mentions \"net value\" or just \"contract value\", use SUM(NVL(CONTRACT_VALUE_NET_OF_VAT,0)).",
             "If the question asks for count (contains the word 'count' or '(count)'), return COUNT(*) (and include the dimension in SELECT if grouped).",
             "Only add row limit (FETCH FIRST :top_n ROWS ONLY) when Top N is asked explicitly.",
@@ -786,6 +807,11 @@ def _maybe_rewrite_sql_for_intent(sql: str, intent: dict) -> tuple[str, dict, di
     }
 
     lowered = sql_text.lower()
+    top_n_value = None
+    user_requested_limit = False
+    if isinstance(intent, dict):
+        top_n_value = intent.get("top_n")
+        user_requested_limit = bool(intent.get("user_requested_top_n"))
 
     if intent.get("agg") == "count" and "count(" not in lowered:
         match = re.match(r"(?is)\s*select\s+.+?\s+from\s+", sql_text)
@@ -808,7 +834,7 @@ def _maybe_rewrite_sql_for_intent(sql: str, intent: dict) -> tuple[str, dict, di
         meta["used_order_inject"] = True
         lowered = sql_text.lower()
 
-    if intent.get("top_n") and "fetch first" not in lowered:
+    if user_requested_limit and top_n_value and "fetch first" not in lowered:
         sql_text = sql_text.rstrip() + "\nFETCH FIRST :top_n ROWS ONLY"
         meta["used_limit_inject"] = True
 
@@ -1105,6 +1131,7 @@ def answer():
 
     group_col = _extract_group_by(q)
     topn_req = _extract_topn(q)
+    question_requested_topn = bool(top_n_from_text or topn_req)
 
     if intent.get("top_n") is not None:
         try:
@@ -1119,6 +1146,9 @@ def answer():
         intent["top_n"] = topn_req
     elif topn_req is not None:
         intent["top_n"] = topn_req
+
+    if question_requested_topn:
+        intent["user_requested_top_n"] = True
 
     if isinstance(topn_req, int) and topn_req <= 0:
         topn_req = None
@@ -1135,7 +1165,7 @@ def answer():
     fallback_bind_values: dict[str, Any] = {}
     if date_start and date_end and (measure == "count" or group_col):
         fallback_bind_values = {"date_start": date_start, "date_end": date_end}
-        if topn_req:
+        if question_requested_topn and topn_req:
             fallback_bind_values["top_n"] = topn_req
         table_literal = table_name.strip()
         if measure == "count":
@@ -1145,7 +1175,7 @@ def answer():
                 start=date_start,
                 end=date_end,
                 group_col=group_col,
-                topn=topn_req,
+                topn=topn_req if question_requested_topn else None,
             )
         elif group_col:
             fallback_sql = _build_agg_sql(
@@ -1155,7 +1185,7 @@ def answer():
                 end=date_end,
                 group_col=group_col,
                 measure=measure,
-                topn=topn_req,
+                topn=topn_req if question_requested_topn else None,
             )
 
     explicit_projection = _mentions_specific_projection(q)
@@ -1447,16 +1477,7 @@ def answer():
     if top_n_int is not None:
         intent["top_n"] = top_n_int
 
-    def _has_top_n_request(value: Any) -> bool:
-        if value is None:
-            return False
-        if isinstance(value, str):
-            return bool(value.strip())
-        if isinstance(value, (int, float)):
-            return value > 0
-        return True
-
-    user_requested_top_n = _has_top_n_request(requested_top_n)
+    user_requested_top_n = bool(intent.get("user_requested_top_n")) if isinstance(intent, dict) else False
 
     projection_rewrite_applied = False
     limit_strip_applied = False
