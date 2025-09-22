@@ -1,0 +1,17 @@
+# Minimal, robust checks for DW
+cases:
+  - id: end_next_30_days
+    question: "Contracts with END_DATE in the next 30 days."
+    must_contain:
+      - 'FROM "Contract"'
+      - 'END_DATE BETWEEN :date_start AND :date_end'
+    compile_oracle: true
+    allow_zero_rows: true
+
+  - id: end_after_today_top20
+    question: "Next 20 contracts by END_DATE from today"
+    must_contain:
+      - 'FROM "Contract"'
+      - 'ORDER BY END_DATE'
+    compile_oracle: true
+    expect_min_rows: 1

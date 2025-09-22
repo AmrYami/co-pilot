@@ -8,7 +8,7 @@ import re
 from calendar import monthrange
 from collections.abc import Mapping
 from datetime import date, datetime, timedelta
-from typing import Optional
+from typing import Any, Dict, Optional, Tuple
 
 from flask import Blueprint, jsonify, request
 from sqlalchemy import text
@@ -25,6 +25,78 @@ from core.sql_utils import (
     validate_oracle_sql,
 )
 from core.logging_utils import get_logger, log_event
+
+
+def _parse_date_yyyy_mm_dd(s: str) -> datetime:
+    return datetime.strptime(s, "%Y-%m-%d")
+
+
+def _fmt_date_yyyy_mm_dd(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%d")
+
+
+def _maybe_autowiden_and_rerun(
+    sql_text: str,
+    binds: Dict[str, Any],
+    rows: list[tuple],
+    intent: Dict[str, Any],
+    settings,
+    exec_fn,
+) -> Tuple[list[tuple], Dict[str, Any], Optional[dict]]:
+    """Retry the DW query with a wider window if appropriate."""
+
+    try:
+        enabled = bool(settings.get("DW_AUTOWIDEN_ENABLED", True))
+        if not enabled:
+            return rows, binds, None
+
+        if not intent or not intent.get("has_time_window"):
+            return rows, binds, None
+        if "date_start" not in binds or "date_end" not in binds:
+            return rows, binds, None
+        if rows and len(rows) > 0:
+            return rows, binds, None
+
+        threshold_days = int(settings.get("DW_AUTOWIDEN_THRESHOLD_DAYS", 45) or 45)
+        widen_to_days = int(settings.get("DW_AUTOWIDEN_TO_DAYS", 90) or 90)
+
+        ds = binds["date_start"]
+        de = binds["date_end"]
+        if not isinstance(ds, str) or not isinstance(de, str):
+            return rows, binds, None
+
+        d0 = _parse_date_yyyy_mm_dd(ds)
+        d1 = _parse_date_yyyy_mm_dd(de)
+        window_days = (d1 - d0).days
+
+        if window_days > threshold_days:
+            return rows, binds, None
+
+        today = datetime.utcnow().date()
+        new_start = today
+        new_end = today + timedelta(days=widen_to_days)
+
+        new_binds = dict(binds)
+        new_binds["date_start"] = _fmt_date_yyyy_mm_dd(new_start)
+        new_binds["date_end"] = _fmt_date_yyyy_mm_dd(new_end)
+
+        rows2, cols2 = exec_fn(sql_text, new_binds)
+
+        meta = {
+            "autowiden_applied": True,
+            "autowiden_from_days": window_days,
+            "autowiden_to_days": widen_to_days,
+            "rows_after_autowiden": len(rows2),
+            "new_binds": {
+                "date_start": new_binds["date_start"],
+                "date_end": new_binds["date_end"],
+            },
+            "columns": [c.lower() for c in cols2],
+        }
+        return rows2, new_binds, meta
+
+    except Exception:
+        return rows, binds, None
 from .llm import clarify_intent, derive_bind_values, nl_to_sql_with_llm
 from .validator import WHITELIST_BINDS, basic_checks
 
@@ -714,18 +786,70 @@ def answer():
         for key, value in bind_values.items()
         if key in bind_name_map
     }
-    log_event(log, "dw", "execution_binds", {k: str(v) for k, v in exec_binds.items()})
+    ds_bind = bind_name_map.get("date_start")
+    de_bind = bind_name_map.get("date_end")
+
+    def _as_loggable(value):
+        return value.isoformat() if hasattr(value, "isoformat") else value
+
+    def _describe_window(bind_dict: Dict[str, Any]) -> tuple[Optional[str], Optional[int]]:
+        if not ds_bind or not de_bind:
+            return None, None
+        start_val = bind_dict.get(ds_bind)
+        end_val = bind_dict.get(de_bind)
+        if not (isinstance(start_val, str) and isinstance(end_val, str)):
+            return None, None
+        try:
+            start_dt = _parse_date_yyyy_mm_dd(start_val).date()
+            end_dt = _parse_date_yyyy_mm_dd(end_val).date()
+        except Exception:
+            return None, None
+        window_days = (end_dt - start_dt).days
+        if window_days <= 0:
+            return None, window_days
+        today_date = datetime.utcnow().date()
+        description = f"{window_days}-day window"
+        if start_dt == today_date:
+            description = f"next {window_days} days"
+        elif end_dt == today_date:
+            description = f"last {window_days} days"
+        return description, window_days
+
+    log_event(
+        log,
+        "dw",
+        "execution_binds",
+        {
+            "date_start": _as_loggable(exec_binds.get(ds_bind) if ds_bind else None),
+            "date_end": _as_loggable(exec_binds.get(de_bind) if de_bind else None),
+            "other": sorted(
+                [
+                    key
+                    for key in exec_binds.keys()
+                    if key not in {ds_bind, de_bind}
+                ]
+            ),
+        },
+    )
+
+    orig_exec_binds = dict(exec_binds)
+    initial_window_desc, _ = _describe_window(orig_exec_binds)
 
     oracle_engine = ds_registry.engine(None)
-    rows = []
-    headers = []
+
+    def _oracle_exec(sql_text: str, bind_params: Dict[str, Any]) -> tuple[list[Any], list[str]]:
+        with oracle_engine.begin() as oc:
+            rs_local = oc.execute(text(sql_text), bind_params)
+            cols_local = list(rs_local.keys())
+            rows_local = rs_local.fetchall()
+        return rows_local, cols_local
+
+    rows: list[Any] = []
+    headers: list[str] = []
     error = None
     started = datetime.utcnow()
     try:
-        with oracle_engine.begin() as oc:
-            rs = oc.execute(text(sql_final), exec_binds)
-            headers = list(rs.keys())
-            rows = rs.fetchall()
+        rows, headers = _oracle_exec(sql_final, exec_binds)
     except Exception as exc:
         error = str(exc)
         log_event(log, "dw", "oracle_error", {"error": error})
@@ -737,6 +861,31 @@ def answer():
         "execution_result",
         {"rows": len(rows), "cols": headers, "ms": duration_ms},
     )
+
+    initial_rowcount = len(rows)
+    widen_meta = None
+    if not error:
+        exec_state: Dict[str, Any] = {"headers": headers}
+
+        def _exec_for_widen(sql_text: str, bind_params: Dict[str, Any]):
+            widened_rows, widened_cols = _oracle_exec(sql_text, bind_params)
+            exec_state["headers"] = widened_cols
+            return widened_rows, widened_cols
+
+        rows, exec_binds, widen_meta = _maybe_autowiden_and_rerun(
+            sql_final,
+            exec_binds,
+            rows,
+            intent,
+            settings,
+            exec_fn=_exec_for_widen,
+        )
+        headers = exec_state["headers"]
+        if widen_meta:
+            log_event(log, "dw", "autowiden", widen_meta)
+            for canonical, actual in bind_name_map.items():
+                if actual in exec_binds:
+                    bind_values[canonical] = exec_binds[actual]
 
     if error:
         with mem.begin() as conn:
@@ -824,7 +973,7 @@ def answer():
     }
     meta = {
         "rowcount": rowcount,
-        "columns": headers,
+        "columns": [c.lower() for c in headers] if headers else [],
         "duration_ms": duration_ms,
         "used_repair": bool(d.get("used_repair")),
         "used_strict_retry": strict_attempted and bool(strict_raw),
@@ -832,6 +981,8 @@ def answer():
         "clarifier_intent": intent,
         "binds": binds_public,
     }
+    if widen_meta:
+        meta["autowiden"] = widen_meta
 
     resp = {
         "ok": True,
@@ -841,29 +992,32 @@ def answer():
         "csv_path": str(csv_path) if csv_path else None,
         "meta": meta,
     }
+
+    message: Optional[str] = None
+    suggestions: list[str] = []
     if rowcount == 0:
-        base_date_column = (intent.get("date_column") or "END_DATE").upper()
-        suggestions = [
-            {
-                "action": "retry",
-                "label": "Try next 60 days",
-                "params": {"window_days": 60, "date_column": base_date_column},
-            },
-            {
-                "action": "retry",
-                "label": "Try next 90 days",
-                "params": {"window_days": 90, "date_column": base_date_column},
-            },
-        ]
-        if (intent.get("date_column") or "").upper() != "REQUEST_DATE":
-            suggestions.append(
-                {
-                    "action": "retry",
-                    "label": "Use REQUEST_DATE next 30 days",
-                    "params": {"window_days": 30, "date_column": "REQUEST_DATE"},
-                }
-            )
-        resp["note"] = "No contracts found in the selected window."
+        message = "No contracts matched that window."
+        if widen_meta:
+            message += f" I widened to {widen_meta['autowiden_to_days']} days and still found 0."
+            suggestions = [
+                "Try a longer window (e.g., next 180 days)",
+                "Filter by OWNER_DEPARTMENT or REQUEST_TYPE",
+            ]
+        else:
+            suggestions = [
+                "Try a longer window (e.g., next 90 days)",
+                "Try ‘contracts ending after today’",
+            ]
+    elif widen_meta and initial_rowcount == 0 and rowcount > 0:
+        window_desc = initial_window_desc or f"{widen_meta['autowiden_from_days']}-day window"
+        message = (
+            f"No contracts found in the {window_desc}. "
+            f"I widened to {widen_meta['autowiden_to_days']} days and found {rowcount} rows."
+        )
+
+    if message:
+        resp["message"] = message
+    if suggestions:
         resp["suggestions"] = suggestions
     if include_debug:
         debug_payload = {
