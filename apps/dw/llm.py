@@ -135,6 +135,10 @@ def clarify_intent(question: str, context: dict) -> Dict[str, object]:
 
 
 def _build_prompt(question: str, ctx: dict, intent: Dict[str, object]) -> str:
+    prompt_builder = ctx.get("prompt_builder")
+    if callable(prompt_builder):
+        return prompt_builder(question, ctx, intent)
+
     allowed_cols = ctx.get("allowed_columns", [])
     allowed_binds = ctx.get("allowed_binds", [])
     table = ctx.get("table") or ctx.get("contract_table") or "Contract"
@@ -146,15 +150,26 @@ def _build_prompt(question: str, ctx: dict, intent: Dict[str, object]) -> str:
         f"Allowed columns: {', '.join(allowed_cols)}",
         "Oracle syntax only (NVL, TRIM, LISTAGG WITHIN GROUP, FETCH FIRST N ROWS ONLY). SELECT/CTE only.",
         f"Allowed binds: {', '.join(allowed_binds)}",
-        "If the question does not specify which columns to show, SELECT ALL columns (use SELECT *).",
-        "Only add a row limit (FETCH FIRST :top_n ROWS ONLY) if the user explicitly asks for top N.",
+    ]
+
+    if intent.get("agg") == "count":
+        lines.append("Return a single COUNT query: SELECT COUNT(*) AS CNT ...")
+        lines.append("Do not select other columns.")
+    else:
+        if intent.get("wants_all_columns", True):
+            lines.append("If the question does not specify which columns to show, SELECT ALL columns (use SELECT *).")
+        else:
+            lines.append("If unsure, default to SELECT *.")
+        lines.append("Only add a row limit (FETCH FIRST :top_n ROWS ONLY) if the user explicitly asks for Top N.")
+
+    lines.extend([
         "Add date filter ONLY if user asks. For windows use :date_start and :date_end.",
         f"Default window column: {default_date_col}.",
         "No prose, comments, or explanations.",
         "",
         f"Question:\n{question}\n",
         "```sql",
-    ]
+    ])
     return "\n".join(lines)
 
 
@@ -216,15 +231,28 @@ def nl_to_sql_with_llm(
     if val1.get("ok"):
         return result
 
-    repair_prompt = (
-        f"Errors: {json.dumps(val1['errors'])}\n"
-        "Fix and return only Oracle SQL in ```sql block.\n"
+    repair_lines = [
+        f"Errors: {json.dumps(val1['errors'])}",
+        "Fix and return only Oracle SQL in ```sql block.",
         f'Table: "{ctx.get("table") or ctx.get("contract_table") or "Contract"}". '
         f"Allowed columns: {', '.join(ctx.get('allowed_columns', []))}. "
-        f"Allowed binds: {', '.join(ctx.get('allowed_binds', []))}.\n"
-        f"Default window column: {intent.get('date_column') or ctx.get('default_date_col', 'REQUEST_DATE')}.\n"
-        f"Question:\n{question}\n\nPrevious SQL:\n```sql\n{sql1}\n```\n```sql\n"
+        f"Allowed binds: {', '.join(ctx.get('allowed_binds', []))}.",
+    ]
+    if intent.get("agg") == "count":
+        repair_lines.append("Return a single COUNT query: SELECT COUNT(*) AS CNT ... Do not select other columns.")
+    else:
+        if intent.get("wants_all_columns", True):
+            repair_lines.append("If the question does not specify which columns to show, SELECT ALL columns (use SELECT *).")
+        else:
+            repair_lines.append("If unsure, default to SELECT *.")
+        repair_lines.append("Only add a row limit (FETCH FIRST :top_n ROWS ONLY) if the user explicitly asks for Top N.")
+    repair_lines.extend(
+        [
+            f"Default window column: {intent.get('date_column') or ctx.get('default_date_col', 'REQUEST_DATE')}.",
+            f"Question:\n{question}\n\nPrevious SQL:\n```sql\n{sql1}\n```\n```sql\n",
+        ]
     )
+    repair_prompt = "\n".join(repair_lines)
     log_event(log, "dw", "sql_prompt_repair", {"size": len(repair_prompt)})
     try:
         raw2 = mdl.generate(repair_prompt, max_new_tokens=160, stop=["```"])
