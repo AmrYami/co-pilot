@@ -51,6 +51,7 @@ sys.modules.setdefault("sqlglot.exp", sqlglot_stub.exp)
 
 
 from apps.dw import app as app_module  # noqa: E402  # pylint: disable=wrong-import-position
+from apps.dw.nlu_normalizer import NET_VALUE_EXPR
 
 
 def _freeze_today(monkeypatch, target: date) -> None:
@@ -96,7 +97,7 @@ def test_normalize_intent_top_value_last_month(monkeypatch):
     _freeze_today(monkeypatch, date(2023, 2, 10))
     intent = app_module._normalize_intent("top 10 stakeholders by contract value last month", {})
     assert intent["top_n"] == 10
-    assert intent["sort_by"] == "CONTRACT_VALUE_NET_OF_VAT"
+    assert intent["sort_by"] == NET_VALUE_EXPR
     assert intent["sort_desc"] is True
     assert intent["explicit_dates"] == {"start": "2023-01-01", "end": "2023-01-31"}
 

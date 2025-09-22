@@ -15,6 +15,11 @@ from flask import Blueprint, jsonify, request
 from sqlalchemy import text
 
 from apps.dw.intent import DWIntent, extract_intent
+from apps.dw.nlu_normalizer import (
+    DEFAULT_TZ as NLU_DEFAULT_TZ,
+    NET_VALUE_EXPR,
+    normalize as normalize_nl,
+)
 from apps.dw.sql_compose import compose_sql
 from core.datasources import DatasourceRegistry
 from core.settings import Settings
@@ -426,82 +431,98 @@ def _parse_top_n(text: str) -> int | None:
         return None
 
 
-def _month_bounds_for_last_month(today: date) -> tuple[date, date]:
-    first_this = today.replace(day=1)
-    last_month_last_day = first_this - timedelta(days=1)
-    last_month_first_day = last_month_last_day.replace(day=1)
-    return last_month_first_day, last_month_last_day
-
-
 def _iso(d: date) -> str:
     return d.isoformat()
 
 
 def _normalize_intent(question: str, parsed: dict) -> dict:
+    parsed = parsed or {}
     text = (question or "").strip()
-    intent = {
-        "has_time_window": parsed.get("has_time_window"),
-        "date_column": parsed.get("date_column"),
-        "explicit_dates": parsed.get("explicit_dates"),
-        "top_n": parsed.get("top_n"),
-        "agg": None,
-        "wants_all_columns": True,
-        "sort_by": None,
-        "sort_desc": False,
-    }
-
-    question_has_top = bool(TOP_N_RE.search(text))
-    intent["user_requested_top_n"] = question_has_top
-
-    if COUNT_RE.search(text):
-        intent["agg"] = "count"
-        intent["wants_all_columns"] = False
-
-    if intent.get("top_n") is None:
-        match = TOP_N_RE.search(text)
-        if match:
-            try:
-                intent["top_n"] = int(match.group(1))
-            except Exception:
-                pass
-    if intent.get("top_n"):
-        if VALUE_RE.search(text):
-            intent["sort_by"] = "CONTRACT_VALUE_NET_OF_VAT"
-            intent["sort_desc"] = True
-        intent["wants_all_columns"] = True
 
     today = date.today()
+    now_dt = datetime.datetime.combine(
+        today,
+        datetime.time(0, tzinfo=NLU_DEFAULT_TZ),
+    )
+    nl_intent = normalize_nl(text, now=now_dt)
 
-    if not intent.get("explicit_dates"):
-        match = NEXT_DAYS_RE.search(text)
-        if match:
-            try:
-                n_days = int(match.group(2))
-                start = today
-                end = today + timedelta(days=n_days)
-                intent["explicit_dates"] = {"start": _iso(start), "end": _iso(end)}
-                intent["has_time_window"] = True
-            except Exception:
-                pass
+    result: dict[str, Any] = {
+        "agg": nl_intent.agg,
+        "wants_all_columns": nl_intent.wants_all_columns,
+        "date_column": nl_intent.date_column,
+        "has_time_window": nl_intent.has_time_window,
+        "explicit_dates": None,
+        "top_n": nl_intent.top_n,
+        "sort_by": nl_intent.sort_by,
+        "sort_desc": nl_intent.sort_desc,
+        "user_requested_top_n": nl_intent.user_requested_top_n,
+        "group_by": nl_intent.group_by,
+        "measure_sql": nl_intent.measure_sql,
+        "notes": nl_intent.notes or {},
+    }
 
-    if not intent.get("explicit_dates") and LAST_MONTH_RE.search(text):
-        start, end = _month_bounds_for_last_month(today)
-        intent["explicit_dates"] = {"start": _iso(start), "end": _iso(end)}
-        intent["has_time_window"] = True
+    if parsed.get("agg"):
+        result["agg"] = parsed["agg"]
 
-    if not intent.get("date_column"):
-        lowered = text.lower()
-        if "end_date" in lowered or "expir" in lowered:
-            intent["date_column"] = "END_DATE"
-        elif "start_date" in lowered:
-            intent["date_column"] = "START_DATE"
-        else:
-            intent["date_column"] = "REQUEST_DATE"
+    if parsed.get("wants_all_columns") is not None:
+        result["wants_all_columns"] = bool(parsed.get("wants_all_columns"))
 
-    if intent.get("date_column"):
-        intent["date_column"] = str(intent["date_column"]).upper()
+    if parsed.get("date_column"):
+        result["date_column"] = str(parsed["date_column"])
 
-    return intent
+    if parsed.get("has_time_window") is not None:
+        result["has_time_window"] = parsed.get("has_time_window")
+
+    parsed_top = parsed.get("top_n")
+    if parsed_top is not None:
+        result["top_n"] = parsed_top
+
+    if parsed.get("sort_by"):
+        result["sort_by"] = parsed.get("sort_by")
+
+    if parsed.get("sort_desc") is not None:
+        result["sort_desc"] = bool(parsed.get("sort_desc"))
+
+    if parsed.get("user_requested_top_n") is not None:
+        result["user_requested_top_n"] = bool(parsed.get("user_requested_top_n"))
+
+    if parsed.get("group_by"):
+        result["group_by"] = parsed.get("group_by")
+
+    if parsed.get("measure_sql"):
+        result["measure_sql"] = parsed.get("measure_sql")
+
+    explicit = parsed.get("explicit_dates")
+    if not explicit and nl_intent.date_start and nl_intent.date_end:
+        explicit = {"start": nl_intent.date_start, "end": nl_intent.date_end}
+    if isinstance(explicit, dict):
+        result["explicit_dates"] = explicit
+        if result["has_time_window"] is None:
+            result["has_time_window"] = True
+    else:
+        result["explicit_dates"] = None
+
+    if not result.get("date_column"):
+        result["date_column"] = "REQUEST_DATE"
+
+    result["date_column"] = str(result["date_column"]).upper()
+
+    if result.get("agg"):
+        result["wants_all_columns"] = False
+
+    if result.get("measure_sql") is None and result.get("agg") in {"sum", "avg", "min", "max"}:
+        result["measure_sql"] = NET_VALUE_EXPR
+
+    if result.get("top_n") and result.get("sort_by") is None:
+        result["sort_by"] = NET_VALUE_EXPR
+
+    if result.get("top_n") and not result.get("user_requested_top_n"):
+        # If top_n inferred from clarifier ensure flag follows parsed hints
+        result["user_requested_top_n"] = bool(parsed.get("user_requested_top_n"))
+
+    result.setdefault("notes", {})
+
+    return result
 
 
 def _parse_date_yyyy_mm_dd(s: str) -> datetime.datetime:
