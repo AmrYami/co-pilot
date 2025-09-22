@@ -1,0 +1,29 @@
+[
+  {
+    "q": "Contracts with END_DATE in the next 90 days.",
+    "shape": "select_all_window",
+    "date_col": "END_DATE"
+  },
+  {
+    "q": "contracts expiring in 30 days (count)",
+    "shape": "count_window",
+    "date_col": "END_DATE"
+  },
+  {
+    "q": "top 10 stakeholders by contract value last 3 months",
+    "shape": "group_topn",
+    "group_dim": "CONTRACT_STAKEHOLDER_1",
+    "value": "net"
+  },
+  {
+    "q": "Total gross value of contracts per owner department last quarter",
+    "shape": "group_sum",
+    "group_dim": "OWNER_DEPARTMENT",
+    "value": "gross"
+  },
+  {
+    "q": "contracts last month",
+    "shape": "select_all_window",
+    "date_col": "REQUEST_DATE"
+  }
+]

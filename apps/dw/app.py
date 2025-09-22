@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 import csv
+import datetime
 import json
 import os
 import pathlib
 import re
 from calendar import monthrange
 from collections.abc import Mapping
-from datetime import date, datetime, timedelta
-from typing import Any, Dict, Optional, Tuple
+from datetime import date, timedelta
+from typing import Any, Dict, List, Optional, Tuple
 
 from flask import Blueprint, jsonify, request
 from sqlalchemy import text
@@ -153,6 +154,203 @@ def _should_select_all_columns(q: str, group_col: Optional[str], measure: str) -
     return True
 
 
+# --- DW Intent helpers -------------------------------------------------------
+
+_DIMENSION_MAP = {
+    # user phrase -> column
+    r"\bstakeholder(s)?\b": "CONTRACT_STAKEHOLDER_1",
+    r"\bowner\s+department\b": "OWNER_DEPARTMENT",
+    r"\bdepartment\b": "OWNER_DEPARTMENT",
+    r"\bentity\b": "ENTITY_NO",
+    r"\bowner\b": "CONTRACT_OWNER",
+}
+
+_VALUE_COL_NET = "NVL(CONTRACT_VALUE_NET_OF_VAT, 0)"  # "contract value" / "net value"
+_VALUE_COL_GROSS = "NVL(CONTRACT_VALUE_NET_OF_VAT, 0) + NVL(VAT, 0)"  # "gross value"
+
+_TOP_RE = re.compile(r"\btop\s+(\d+)\b", re.I)
+_LAST_N_MONTHS = re.compile(r"\blast\s+(\d+)\s+month", re.I)
+_LAST_3_MONTHS = re.compile(r"\blast\s+3\s+months?\b", re.I)
+
+
+def _detect_top_n(q: str) -> Optional[int]:
+    m = _TOP_RE.search(q or "")
+    return int(m.group(1)) if m else None
+
+
+def _detect_dimension(q: str) -> Optional[str]:
+    t = (q or "").lower()
+    for pat, col in _DIMENSION_MAP.items():
+        if re.search(pat, t):
+            return col
+    return None
+
+
+def _wants_count(q: str) -> bool:
+    text = (q or "").lower()
+    return " count" in (" " + text) or "(count" in text or text.strip().endswith("(count)")
+
+
+def _mentions_gross(q: str) -> bool:
+    return "gross value" in (q or "").lower()
+
+
+def _mentions_contract_value(q: str) -> bool:
+    t = (q or "").lower()
+    return "contract value" in t or "value of contracts" in t
+
+
+def _default_window_for(q: str) -> Tuple[str, Optional[str], Optional[str]]:
+    """
+    Returns (date_col, start_iso, end_iso). If last 3 months is mentioned, compute start/end.
+    Otherwise None start/end (caller may inject).
+    Default date col: REQUEST_DATE.
+    """
+
+    date_col = "REQUEST_DATE"
+    ql = (q or "").lower()
+
+    m = _LAST_N_MONTHS.search(ql)
+    if m:
+        n = max(1, min(24, int(m.group(1))))
+        today = datetime.date.today()
+        start_month = today
+        for _ in range(n):
+            year = start_month.year
+            month = start_month.month - 1
+            if month == 0:
+                month = 12
+                year -= 1
+            days_in_month = [
+                31,
+                29 if year % 4 == 0 and (year % 100 != 0 or year % 400 == 0) else 28,
+                31,
+                30,
+                31,
+                30,
+                31,
+                31,
+                30,
+                31,
+                30,
+                31,
+            ][month - 1]
+            day = min(start_month.day, days_in_month)
+            start_month = datetime.date(year, month, day)
+        start_iso = start_month.isoformat()
+        end_iso = today.isoformat()
+        return date_col, start_iso, end_iso
+
+    if _LAST_3_MONTHS.search(ql):
+        today = datetime.date.today()
+        start_month = today
+        for _ in range(3):
+            year = start_month.year
+            month = start_month.month - 1
+            if month == 0:
+                month = 12
+                year -= 1
+            days_in_month = [
+                31,
+                29 if year % 4 == 0 and (year % 100 != 0 or year % 400 == 0) else 28,
+                31,
+                30,
+                31,
+                30,
+                31,
+                31,
+                30,
+                31,
+                30,
+                31,
+            ][month - 1]
+            day = min(start_month.day, days_in_month)
+            start_month = datetime.date(year, month, day)
+        return date_col, start_month.isoformat(), today.isoformat()
+
+    return date_col, None, None
+
+
+def _sanitize_sql(text: str) -> Optional[str]:
+    """
+    Keep only the first SELECT/WITH statement from the model output.
+    Remove backticks, fences, instructions, and anything before SELECT/WITH.
+    """
+
+    if not text:
+        return None
+    cleaned = text.strip().replace("```sql", "```").replace("```SQL", "```")
+    if cleaned.startswith("```"):
+        cleaned = cleaned.strip("` \n")
+    match = re.search(r"(?is)\b(SELECT|WITH)\b", cleaned)
+    if not match:
+        return None
+    cleaned = cleaned[match.start() :].strip()
+    return cleaned or None
+
+
+def _fallback_dw_sql(
+    question: str,
+    date_col: str,
+    start_iso: Optional[str],
+    end_iso: Optional[str],
+    top_n: Optional[int],
+    wants_count: bool,
+    group_dim: Optional[str],
+    *,
+    table_name: str = '"Contract"',
+) -> Tuple[str, Dict[str, Any]]:
+    """
+    Deterministic query generator when the model output is invalid.
+    - If group_dim or wants_count: aggregate projection
+    - Else: SELECT * (show all columns)
+    """
+
+    binds: Dict[str, Any] = {}
+    where_parts: List[str] = []
+
+    table_literal = table_name.strip()
+    if not table_literal.startswith('"'):
+        table_literal = f'"{table_literal.strip("\"")}"'
+
+    if start_iso and end_iso:
+        where_parts.append(f"{date_col} BETWEEN :date_start AND :date_end")
+        binds["date_start"] = start_iso
+        binds["date_end"] = end_iso
+
+    where_clause = f"\nWHERE {' AND '.join(where_parts)}" if where_parts else ""
+
+    value_expr = _VALUE_COL_GROSS if _mentions_gross(question) else _VALUE_COL_NET
+
+    if wants_count or group_dim:
+        if wants_count and not group_dim:
+            sql = f"""SELECT COUNT(*) AS CNT
+FROM {table_literal}{where_clause}"""
+            return sql, binds
+
+        dimension = group_dim or ""
+        agg_alias = "TOTAL_VALUE"
+        sql = f"""SELECT
+  {dimension} AS DIMENSION,
+  SUM({value_expr}) AS {agg_alias}
+FROM {table_literal}{where_clause}
+GROUP BY {dimension}
+ORDER BY {agg_alias} DESC"""
+        if top_n and top_n > 0:
+            sql += "\nFETCH FIRST :top_n ROWS ONLY"
+            binds["top_n"] = int(top_n)
+        return sql, binds
+
+    sql = f"""SELECT *
+FROM {table_literal}{where_clause}"""
+    if top_n and top_n > 0:
+        sql += "\nFETCH FIRST :top_n ROWS ONLY"
+        binds["top_n"] = int(top_n)
+    if start_iso and end_iso:
+        sql += f"\nORDER BY {date_col} ASC"
+    return sql, binds
+
+
 def _find_json_objects(text: str) -> list[str]:
     """Return every balanced {...} substring in order."""
 
@@ -283,12 +481,12 @@ def _normalize_intent(question: str, parsed: dict) -> dict:
     return intent
 
 
-def _parse_date_yyyy_mm_dd(s: str) -> datetime:
-    return datetime.strptime(s, "%Y-%m-%d")
+def _parse_date_yyyy_mm_dd(s: str) -> datetime.datetime:
+    return datetime.datetime.strptime(s, "%Y-%m-%d")
 
 
-def _fmt_date_yyyy_mm_dd(dt: datetime) -> str:
-    return dt.strftime("%Y-%m-%d")
+def _fmt_date_yyyy_mm_dd(dt_obj: datetime.datetime) -> str:
+    return dt_obj.strftime("%Y-%m-%d")
 
 
 def _maybe_autowiden_and_rerun(
@@ -328,7 +526,7 @@ def _maybe_autowiden_and_rerun(
         if window_days > threshold_days:
             return rows, binds, None
 
-        today = datetime.utcnow().date()
+        today = datetime.datetime.utcnow().date()
         new_start = today
         new_end = today + timedelta(days=widen_to_days)
 
@@ -790,7 +988,7 @@ def _write_csv(rows, headers) -> str:
         return None
     out_dir = pathlib.Path(os.environ.get("DW_EXPORT_DIR", "/tmp/dw_exports"))
     out_dir.mkdir(parents=True, exist_ok=True)
-    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    ts = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     path = out_dir / f"dw_{ts}.csv"
     with path.open("w", newline="", encoding="utf-8") as fh:
         writer = csv.writer(fh)
@@ -1150,6 +1348,60 @@ def answer():
             res["debug"] = debug_payload
         return jsonify(res)
 
+    deterministic_fallback_used = False
+    sanitized_sql = _sanitize_sql(sql_final)
+    if sanitized_sql:
+        sql_final = sanitized_sql
+    else:
+        date_col_for_fallback = (
+            (intent.get("date_column") or "REQUEST_DATE").strip() or "REQUEST_DATE"
+        )
+        date_col_for_fallback = date_col_for_fallback.upper()
+        if not intent.get("date_column"):
+            intent["date_column"] = date_col_for_fallback
+        start_iso = date_start
+        end_iso = date_end
+        explicit_dates_value = intent.get("explicit_dates")
+        if isinstance(explicit_dates_value, dict):
+            start_iso = explicit_dates_value.get("start") or start_iso
+            end_iso = explicit_dates_value.get("end") or end_iso
+        else:
+            inferred_col, inferred_start, inferred_end = _default_window_for(q)
+            if not intent.get("date_column"):
+                date_col_for_fallback = inferred_col
+            if not (start_iso and end_iso) and inferred_start and inferred_end:
+                start_iso, end_iso = inferred_start, inferred_end
+
+        top_n_detected = intent.get("top_n") or _detect_top_n(q) or topn_req
+        if isinstance(top_n_detected, str) and top_n_detected.isdigit():
+            top_n_detected = int(top_n_detected)
+        group_dim = group_col or _detect_dimension(q)
+        wants_count = intent.get("agg") == "count" or _wants_count(q)
+        fallback_sql_text, forced_binds = _fallback_dw_sql(
+            question=q,
+            date_col=date_col_for_fallback,
+            start_iso=start_iso,
+            end_iso=end_iso,
+            top_n=top_n_detected if isinstance(top_n_detected, int) else None,
+            wants_count=wants_count,
+            group_dim=group_dim,
+            table_name=table_name,
+        )
+        sql_final = fallback_sql_text
+        deterministic_fallback_used = True
+        used_rule_fallback = True
+        fallback_sql = fallback_sql_text
+        date_start = start_iso or date_start
+        date_end = end_iso or date_end
+        if forced_binds:
+            fallback_bind_values.update(forced_binds)
+        if start_iso and end_iso:
+            fallback_bind_values.setdefault("date_start", start_iso)
+            fallback_bind_values.setdefault("date_end", end_iso)
+        if isinstance(top_n_detected, int) and top_n_detected > 0:
+            topn_req = top_n_detected
+            fallback_bind_values.setdefault("top_n", top_n_detected)
+
     if not used_rule_fallback and date_start and date_end:
         lower_sql = sql_final.lower()
         forced_sql: Optional[str] = None
@@ -1371,7 +1623,7 @@ def answer():
 
         if isinstance(window, dict) and window.get("start") and window.get("end"):
             def _coerce_date(value):
-                if isinstance(value, datetime):
+                if isinstance(value, datetime.datetime):
                     return value.date()
                 if isinstance(value, date):
                     return value
@@ -1461,7 +1713,7 @@ def answer():
         window_days = (end_dt - start_dt).days
         if window_days <= 0:
             return None, window_days
-        today_date = datetime.utcnow().date()
+        today_date = datetime.datetime.utcnow().date()
         description = f"{window_days}-day window"
         if start_dt == today_date:
             description = f"next {window_days} days"
@@ -1501,14 +1753,14 @@ def answer():
     rows: list[Any] = []
     headers: list[str] = []
     error = None
-    started = datetime.utcnow()
+    started = datetime.datetime.utcnow()
     try:
         rows, headers = _oracle_exec(sql_final, exec_binds)
     except Exception as exc:
         error = str(exc)
         log_event(log, "dw", "oracle_error", {"error": error})
 
-    duration_ms = int((datetime.utcnow() - started).total_seconds() * 1000)
+    duration_ms = int((datetime.datetime.utcnow() - started).total_seconds() * 1000)
     log_event(
         log,
         "dw",
@@ -1636,6 +1888,7 @@ def answer():
         "binds": binds_public,
         "wants_all_columns": wants_all_columns,
         "used_rule_fallback": used_rule_fallback,
+        "used_deterministic_fallback": deterministic_fallback_used,
         "used_projection_rewrite": projection_rewrite_applied,
         "used_limit_strip": limit_strip_applied,
         "intent_projection_rewrite": intent_rewrite_meta["used_projection_rewrite"],
@@ -1701,6 +1954,7 @@ def answer():
         debug_payload["limit_strip_applied"] = limit_strip_applied
         debug_payload["wants_all_columns"] = wants_all_columns
         debug_payload["used_rule_fallback"] = used_rule_fallback
+        debug_payload["used_deterministic_fallback"] = deterministic_fallback_used
         debug_payload["intent_projection_rewrite"] = intent_rewrite_meta["used_projection_rewrite"]
         debug_payload["intent_limit_inject"] = intent_rewrite_meta["used_limit_inject"]
         debug_payload["intent_order_inject"] = intent_rewrite_meta["used_order_inject"]
