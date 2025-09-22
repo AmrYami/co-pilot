@@ -23,7 +23,6 @@ python3 check_exllamav2.py
 
 
 
-
 # fresh shell
 # GPU visibility
 export LLM_GPU=0,1
