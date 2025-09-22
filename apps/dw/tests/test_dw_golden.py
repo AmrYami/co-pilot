@@ -114,9 +114,25 @@ def test_maybe_rewrite_sql_for_top_n():
         "top_n": 10,
         "sort_by": "CONTRACT_VALUE_NET_OF_VAT",
         "sort_desc": True,
+        "user_requested_top_n": True,
     }
     rewritten, meta, _ = app_module._maybe_rewrite_sql_for_intent(sql, intent)
     assert "ORDER BY CONTRACT_VALUE_NET_OF_VAT DESC" in rewritten
     assert "FETCH FIRST :top_n ROWS ONLY" in rewritten
     assert meta["used_limit_inject"] is True
+    assert meta["used_order_inject"] is True
+
+
+def test_maybe_rewrite_sql_skips_limit_when_not_requested():
+    sql = 'SELECT * FROM "Contract"'
+    intent = {
+        "top_n": 10,
+        "sort_by": "CONTRACT_VALUE_NET_OF_VAT",
+        "sort_desc": True,
+        "user_requested_top_n": False,
+    }
+    rewritten, meta, _ = app_module._maybe_rewrite_sql_for_intent(sql, intent)
+    assert "ORDER BY CONTRACT_VALUE_NET_OF_VAT DESC" in rewritten
+    assert "FETCH FIRST :top_n ROWS ONLY" not in rewritten
+    assert meta["used_limit_inject"] is False
     assert meta["used_order_inject"] is True
