@@ -51,6 +51,19 @@ _BAD_PREFIXES = (
 
 _BIND_RE = re.compile(r":([A-Za-z_][A-Za-z0-9_]*)")
 
+_ALL_COL_HINTS = [
+    "all columns",
+    "all fields",
+    "everything",
+    "full details",
+    "entire row",
+    "كل الأعمدة",
+    "كل الحقول",
+    "كل التفاصيل",
+    "الكل",
+    "كل السجلات",
+]
+
 
 def extract_bind_names(sql: str) -> list[str]:
     """Return a sorted list of distinct bind names (Oracle style :name)."""
@@ -265,6 +278,80 @@ def inject_between_date_filter(sql: str, fully_qualified_col: str, start_iso: st
     if _WHERE_RE.search(base):
         return f"{base} AND {cond}"
     return f"{base} WHERE {cond}"
+
+
+def wants_all_columns_from_question(
+    question: str, allowed_cols: list[str] | None = None
+) -> bool:
+    """Return True when the question implies the full projection should be returned."""
+
+    text = (question or "").strip().lower()
+    if not text:
+        return True
+
+    if any(hint in text for hint in _ALL_COL_HINTS):
+        return True
+
+    if allowed_cols:
+        lowered_cols = [col.lower() for col in allowed_cols]
+        for col in lowered_cols:
+            if re.search(rf"\b{re.escape(col)}\b", text):
+                return False
+
+    agg_tokens = [
+        "sum",
+        "avg",
+        "average",
+        "count",
+        "min",
+        "max",
+        "distinct",
+        "group by",
+        "top ",
+        "أعلى",
+        "أكثر",
+        "مجموع",
+        "متوسط",
+        "عدد",
+    ]
+    if any(token in text for token in agg_tokens):
+        return False
+
+    return True
+
+
+def rewrite_projection_to_star(sql: str, table_name: str | None = None) -> str:
+    """Rewrite the outer-most SELECT list to use a star projection."""
+
+    if not sql or not sql.strip():
+        return sql
+
+    try:
+        tree = sqlglot.parse_one(sql, read="oracle")
+    except Exception:
+        return sql
+
+    selects = list(tree.find_all(exp.Select))
+    if not selects:
+        return sql
+
+    select_expr = selects[-1]
+
+    alias_id = None
+    from_clause = select_expr.args.get("from")
+    if from_clause and from_clause.expressions:
+        first_source = from_clause.expressions[0]
+        alias = first_source.alias
+        if alias and alias.this:
+            alias_id = alias.this.copy()
+
+    star_expr = exp.Star(this=alias_id) if alias_id is not None else exp.Star()
+    select_expr.set("expressions", [star_expr])
+
+    try:
+        return tree.sql(dialect="oracle")
+    except Exception:
+        return sql
 
 
 def ensure_limit_100(sql: str) -> str:

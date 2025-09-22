@@ -21,8 +21,10 @@ from core.sql_utils import (
     extract_bind_names,
     extract_json_bracket,
     looks_like_instruction,
+    rewrite_projection_to_star,
     sanitize_oracle_sql,
     validate_oracle_sql,
+    wants_all_columns_from_question,
 )
 from core.logging_utils import get_logger, log_event
 
@@ -143,31 +145,7 @@ log = get_logger("main")
 
 # --- Helpers for UX rules --------------------------------------------------
 
-_RE_SELECT_FROM = re.compile(r"(?is)(\bSELECT\b)(.+?)(\bFROM\b)")
 _RE_FETCH_FIRST = re.compile(r"(?is)\s*FETCH\s+FIRST\s+(?:\d+|:\w+)\s+ROWS\s+ONLY\s*")
-
-
-def _question_mentions_columns(question: str, allowed_cols: list[str]) -> bool:
-    """Return True if the question explicitly names any allowed column."""
-
-    lowered = (question or "").lower()
-    for col in allowed_cols:
-        if col.lower() in lowered:
-            return True
-    return False
-
-
-def _ensure_full_projection(sql: str) -> str:
-    """Force the first SELECT list to be '*' (avoids partial projections)."""
-
-    text = (sql or "").lstrip()
-    if text.upper().startswith("WITH"):
-        return sql
-
-    def _repl(match) -> str:
-        return f"{match.group(1)} * {match.group(3)}"
-
-    return _RE_SELECT_FROM.sub(_repl, sql, count=1)
 
 
 def _remove_row_limit(sql: str) -> str:
@@ -265,9 +243,9 @@ def derive_window_from_text(q: str) -> dict:
 SQL_ONLY_STRICT_TEMPLATE = """Write only an Oracle query. Start with SELECT or WITH.
 No code fences. No comments. No explanations. No extra text.
 Table: "{table}"
-Allowed columns: {allowed_columns}
+{allowed_columns_line}
 Allowed binds: {allowed_binds}
-If the question does not specify which columns to show, SELECT ALL columns (use SELECT *).
+{projection_hint}
 Only add a row limit (FETCH FIRST :top_n ROWS ONLY) if the user explicitly asks for top N.
 Use Oracle syntax. For a time window, filter with :date_start and :date_end on {date_column}.
 Question:
@@ -459,8 +437,18 @@ def answer():
 
     intent = _heuristic_fill(q, intent, default_date_col)
 
-    user_specified_columns = _question_mentions_columns(q, ALLOWED_COLUMNS)
-    wants_all_columns = not user_specified_columns
+    wants_all_columns = wants_all_columns_from_question(q, ALLOWED_COLUMNS)
+    used_projection_rewrite = False
+
+    def _enforce_star(sql_text: str) -> str:
+        nonlocal used_projection_rewrite
+        if not wants_all_columns or not sql_text:
+            return sql_text
+        rewritten = rewrite_projection_to_star(sql_text, table_name)
+        if rewritten and rewritten != sql_text:
+            used_projection_rewrite = True
+            return rewritten
+        return sql_text
 
     if intent.get("explicit_dates") and intent.get("has_time_window") is None:
         intent["has_time_window"] = True
@@ -501,10 +489,17 @@ def answer():
             strict_raw = ""
             log_event(log, "dw", "llm_raw_strict", {"size": 0, "skipped": True})
             return strict_raw
+        allowed_columns_line = ""
+        if not wants_all_columns:
+            allowed_columns_line = f"Allowed columns: {', '.join(ALLOWED_COLUMNS)}"
+        projection_hint = (
+            "If the question does not specify which columns to show, SELECT ALL columns (use SELECT *)."
+        )
         strict_prompt = SQL_ONLY_STRICT_TEMPLATE.format(
             table=table_name,
-            allowed_columns=", ".join(ALLOWED_COLUMNS),
+            allowed_columns_line=allowed_columns_line,
             allowed_binds=", ".join(ALLOWED_BINDS),
+            projection_hint=projection_hint,
             date_column=intent.get("date_column") or default_date_col,
             question=q,
         )
@@ -647,8 +642,7 @@ def answer():
     if top_n_int is not None:
         intent["top_n"] = top_n_int
 
-    if wants_all_columns:
-        sql_final = _ensure_full_projection(sql_final)
+    sql_final = _enforce_star(sql_final)
     if top_n_int is None:
         sql_final = _remove_row_limit(sql_final)
 
@@ -671,11 +665,13 @@ def answer():
             alt_sql = sanitize_oracle_sql(strict_raw, raw1 or raw2 or sql_from_llm)
             if alt_sql:
                 sql_final = alt_sql
+                sql_final = _enforce_star(sql_final)
                 parse_error = _oracle_parse_error(sql_final)
     if parse_error:
         synthesized = _maybe_synthesize("parse_error")
         if synthesized:
             sql_final = synthesized
+            sql_final = _enforce_star(sql_final)
             parse_error = _oracle_parse_error(sql_final)
 
     sql_payload = {"size": len(sql_final)}
@@ -1039,6 +1035,7 @@ def answer():
         "clarifier_intent": intent,
         "binds": binds_public,
         "wants_all_columns": wants_all_columns,
+        "used_projection_rewrite": used_projection_rewrite,
     }
     if widen_meta:
         meta["autowiden"] = widen_meta
