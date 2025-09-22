@@ -14,6 +14,8 @@ from typing import Any, Dict, List, Optional, Tuple
 from flask import Blueprint, jsonify, request
 from sqlalchemy import text
 
+from apps.dw.intent import DWIntent, extract_intent
+from apps.dw.sql_compose import compose_sql
 from core.datasources import DatasourceRegistry
 from core.settings import Settings
 from core.model_loader import get_model
@@ -873,6 +875,51 @@ def _quarter_bounds(offset: int = 0, today: date | None = None) -> tuple[date, d
     return start, end
 
 
+def _window_dates_from_compiler(
+    question: str, intent_obj: DWIntent, *, today: date | None = None
+) -> tuple[Optional[str], Optional[str]]:
+    """Resolve window placeholders for the deterministic DW compiler."""
+
+    if not intent_obj or not intent_obj.window_key:
+        return None, None
+
+    today = today or date.today()
+    key = intent_obj.window_key
+
+    if key == "last_month":
+        start, end = _month_bounds(-1, today)
+        return start.isoformat(), end.isoformat()
+
+    if key == "last_quarter":
+        start, end = _quarter_bounds(-1, today)
+        return start.isoformat(), end.isoformat()
+
+    if key == "last_3_months":
+        _, end = _month_bounds(-1, today)
+        start = end.replace(day=1)
+        for _ in range(2):
+            prev_month_end = start - timedelta(days=1)
+            start = prev_month_end.replace(day=1)
+        return start.isoformat(), end.isoformat()
+
+    if key == "next_n_days":
+        days = intent_obj.window_param or 0
+        if days <= 0:
+            match = re.search(r"\bnext\s+(\d{1,3})\s+days?\b", (question or "").lower())
+            if match:
+                try:
+                    days = int(match.group(1))
+                except ValueError:
+                    days = 0
+        if days <= 0:
+            return None, None
+        start = today
+        end = today + timedelta(days=days)
+        return start.isoformat(), end.isoformat()
+
+    return None, None
+
+
 def derive_window_from_text(q: str) -> dict:
     """Best-effort parser for common date windows from free-form text."""
 
@@ -1112,6 +1159,7 @@ def answer():
         parsed = parsed_from_clarifier
 
     intent = _normalize_intent(q, parsed)
+    compiler_intent = extract_intent(q)
 
     if override_explicit_dates:
         intent["explicit_dates"] = override_explicit_dates
@@ -1121,15 +1169,30 @@ def answer():
     elif date_column_override:
         intent["date_column"] = date_column_override
 
+    if override_date_column:
+        compiler_intent.date_column = override_date_column
+
     intent = _heuristic_fill(q, intent, default_date_col)
+
+    if intent.get("date_column"):
+        compiler_intent.date_column = intent.get("date_column")
+    if compiler_intent.date_column:
+        compiler_intent.date_column = str(compiler_intent.date_column).upper()
 
     measure = _detect_measure(q)
     if intent.get("agg") == "count":
         measure = "count"
+        compiler_intent.agg = "count"
     elif measure == "count":
         intent["agg"] = "count"
+        compiler_intent.agg = "count"
+
+    if measure in {"gross", "net"}:
+        compiler_intent.measure = measure
 
     group_col = _extract_group_by(q)
+    if not compiler_intent.dimension and group_col:
+        compiler_intent.dimension = group_col
     topn_req = _extract_topn(q)
     question_requested_topn = bool(top_n_from_text or topn_req)
 
@@ -1149,21 +1212,55 @@ def answer():
 
     if question_requested_topn:
         intent["user_requested_top_n"] = True
+        compiler_intent.user_requested_top_n = True
 
     if isinstance(topn_req, int) and topn_req <= 0:
         topn_req = None
 
+    if isinstance(topn_req, int) and topn_req > 0:
+        compiler_intent.top_n = topn_req
+
     wants_all_default = _should_select_all_columns(q, group_col, measure)
     intent["wants_all_columns"] = wants_all_default
+    compiler_intent.wants_all_columns = wants_all_default
 
     explicit_dates = intent.get("explicit_dates") if isinstance(intent.get("explicit_dates"), dict) else {}
     date_start = explicit_dates.get("start")
     date_end = explicit_dates.get("end")
     date_col = (intent.get("date_column") or default_date_col or "REQUEST_DATE").upper()
 
+    compiler_date_start = date_start
+    compiler_date_end = date_end
+    if not (compiler_date_start and compiler_date_end):
+        c_start, c_end = _window_dates_from_compiler(q, compiler_intent)
+        if c_start and c_end:
+            compiler_date_start = c_start
+            compiler_date_end = c_end
+        elif compiler_intent.window_key:
+            compiler_intent.window_key = None
+    elif not compiler_intent.window_key:
+        compiler_intent.window_key = "explicit"
+
     fallback_sql: Optional[str] = None
     fallback_bind_values: dict[str, Any] = {}
-    if date_start and date_end and (measure == "count" or group_col):
+
+    prefer_compiler = (
+        bool(compiler_intent.dimension)
+        or compiler_intent.agg == "count"
+        or compiler_intent.user_requested_top_n
+    )
+
+    if prefer_compiler:
+        compiler_binds: dict[str, Any] = {}
+        if compiler_intent.window_key and compiler_date_start and compiler_date_end:
+            compiler_binds["date_start"] = compiler_date_start
+            compiler_binds["date_end"] = compiler_date_end
+        if compiler_intent.user_requested_top_n and compiler_intent.top_n:
+            compiler_binds["top_n"] = compiler_intent.top_n
+        fallback_sql = compose_sql(compiler_intent, table=table_name)
+        fallback_bind_values = compiler_binds
+
+    if fallback_sql is None and date_start and date_end and (measure == "count" or group_col):
         fallback_bind_values = {"date_start": date_start, "date_end": date_end}
         if question_requested_topn and topn_req:
             fallback_bind_values["top_n"] = topn_req
