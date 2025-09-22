@@ -38,7 +38,20 @@ import sqlglot
 parse_one = getattr(sqlglot, "parse_one", lambda sql, read=None: None)
 exp = getattr(sqlglot, "expressions", None) or getattr(sqlglot, "exp", None)
 
-JSON_BLOCK_RE = re.compile(r"<<JSON>>\s*(\{.*?\})\s*<</JSON>>", re.S | re.I)
+_JSON_BLOCK_RE = re.compile(r"<<JSON>>\s*(\{.*?\})\s*<</JSON>>", re.S | re.I)
+_ALLOWED_INTENT_KEYS = {
+    "agg",
+    "date_column",
+    "explicit_dates",
+    "group_by",
+    "has_time_window",
+    "measure_sql",
+    "sort_by",
+    "sort_desc",
+    "top_n",
+    "user_requested_top_n",
+    "wants_all_columns",
+}
 TOP_N_RE = re.compile(r"\btop\s+(\d{1,4})\b", re.I)
 NEXT_DAYS_RE = re.compile(r"\b(next|within|in)\s+(\d{1,4})\s+days?\b", re.I)
 LAST_MONTH_RE = re.compile(r"\blast\s+month\b", re.I)
@@ -98,9 +111,9 @@ def _metric_expr(measure: str) -> Tuple[str, str]:
         return (
             "NVL(CONTRACT_VALUE_NET_OF_VAT,0) + CASE WHEN NVL(VAT,0) BETWEEN 0 AND 1 "
             "THEN NVL(CONTRACT_VALUE_NET_OF_VAT,0) * NVL(VAT,0) ELSE NVL(VAT,0) END",
-            "TOTAL_GROSS_VALUE",
+            "GROSS_VALUE",
         )
-    return ("NVL(CONTRACT_VALUE_NET_OF_VAT,0)", "TOTAL_CONTRACT_VALUE")
+    return ("NVL(CONTRACT_VALUE_NET_OF_VAT,0)", "NET_VALUE")
 
 
 def _build_count_sql(
@@ -198,6 +211,99 @@ def _detect_dimension(q: str) -> Optional[str]:
         if re.search(pat, t):
             return col
     return None
+
+
+_DIM_SYNONYMS = [
+    (re.compile(r"\bstakeholder(s)?\b", re.I), "CONTRACT_STAKEHOLDER_1"),
+    (re.compile(r"\bowner\s+department\b", re.I), "OWNER_DEPARTMENT"),
+    (re.compile(r"\bdepartment\b", re.I), "OWNER_DEPARTMENT"),
+    (re.compile(r"\bentity\b", re.I), "ENTITY_NO"),
+    (re.compile(r"\bowner\b", re.I), "CONTRACT_OWNER"),
+]
+
+_VALUE_EXPR_NET = "NVL(CONTRACT_VALUE_NET_OF_VAT,0)"
+_VALUE_EXPR_GROSS = (
+    "NVL(CONTRACT_VALUE_NET_OF_VAT,0) + CASE WHEN NVL(VAT,0) BETWEEN 0 AND 1 "
+    "THEN NVL(CONTRACT_VALUE_NET_OF_VAT,0) * NVL(VAT,0) ELSE NVL(VAT,0) END"
+)
+
+
+def _pick_dimension(question: str, preset: str | None = None) -> Optional[str]:
+    if preset:
+        return preset
+    text = question or ""
+    for regex, column in _DIM_SYNONYMS:
+        if regex.search(text):
+            return column
+    return None
+
+
+def _metric_for_question(question: str, measure_hint: str | None = None) -> tuple[str, str, bool]:
+    lowered = (question or "").lower()
+    if measure_hint == "count" or "count" in lowered or "(count)" in lowered:
+        return "COUNT(*)", "CNT", True
+    if measure_hint == "gross" or "gross" in lowered:
+        return _VALUE_EXPR_GROSS, "GROSS_VALUE", False
+    if measure_hint == "net" or "net" in lowered or "contract value" in lowered:
+        return _VALUE_EXPR_NET, "NET_VALUE", False
+    if "contract value" in lowered or "value of contracts" in lowered:
+        return _VALUE_EXPR_NET, "NET_VALUE", False
+    return _VALUE_EXPR_NET, "NET_VALUE", False
+
+
+def _build_grouped_template_sql(
+    question: str,
+    *,
+    table: str,
+    date_col: str,
+    date_start: Optional[str],
+    date_end: Optional[str],
+    dimension_hint: Optional[str],
+    measure_hint: Optional[str],
+    top_n: Optional[int],
+    user_requested_top_n: bool,
+) -> tuple[str, dict[str, Any], Optional[str], str, bool]:
+    dimension = _pick_dimension(question, preset=dimension_hint)
+    if not dimension or not date_start or not date_end:
+        return "", {}, None, "", False
+
+    metric_expr, metric_alias, is_count = _metric_for_question(question, measure_hint)
+
+    table_literal = (table or "Contract").strip()
+    if not table_literal:
+        table_literal = "Contract"
+    if not table_literal.startswith('"'):
+        table_literal = f'"{table_literal.strip("\"")}"'
+
+    normalized_date_col = (date_col or "REQUEST_DATE").strip() or "REQUEST_DATE"
+    normalized_date_col = normalized_date_col.upper()
+
+    group_expr = dimension
+    if dimension.upper() == "OWNER_DEPARTMENT":
+        group_expr = "NVL(OWNER_DEPARTMENT, '(Unknown)')"
+
+    select_parts = [f"{group_expr} AS GROUP_KEY"]
+    if is_count:
+        select_parts.append("COUNT(*) AS CNT")
+    else:
+        select_parts.append(f"SUM({metric_expr}) AS {metric_alias}")
+
+    lines = [
+        "SELECT",
+        "  " + ",\n  ".join(select_parts),
+        f"FROM {table_literal}",
+        f"WHERE {normalized_date_col} BETWEEN :date_start AND :date_end",
+        f"GROUP BY {group_expr}",
+        f"ORDER BY {'CNT' if is_count else metric_alias} DESC",
+    ]
+
+    binds: dict[str, Any] = {"date_start": date_start, "date_end": date_end}
+    if user_requested_top_n and isinstance(top_n, int) and top_n > 0:
+        lines.append("FETCH FIRST :top_n ROWS ONLY")
+        binds["top_n"] = int(top_n)
+
+    sql_text = "\n".join(lines)
+    return sql_text, binds, dimension, ("CNT" if is_count else metric_alias), is_count
 
 
 def _wants_count(q: str) -> bool:
@@ -354,7 +460,7 @@ FROM {table_literal}{where_clause}"""
         dimension = group_dim or ""
         if dimension.upper() == "OWNER_DEPARTMENT":
             dimension = "NVL(OWNER_DEPARTMENT, '(Unknown)')"
-        agg_alias = "TOTAL_GROSS_VALUE" if _mentions_gross(question) else "TOTAL_CONTRACT_VALUE"
+        agg_alias = "GROSS_VALUE" if _mentions_gross(question) else "NET_VALUE"
         sql = (
             "SELECT\n"
             f"  {dimension} AS DIMENSION,\n"
@@ -396,28 +502,34 @@ def _find_json_objects(text: str) -> list[str]:
     return objs
 
 
+def _filter_intent_keys(candidate: dict | None) -> dict:
+    if not isinstance(candidate, dict):
+        return {}
+    return {k: candidate.get(k) for k in _ALLOWED_INTENT_KEYS if k in candidate}
+
+
 def _parse_clarifier_output(raw: str) -> dict:
     """Robustly parse clarifier JSON even if the model ignored the tags."""
 
     if not raw:
         return {}
 
-    match = JSON_BLOCK_RE.search(raw)
-    if match:
+    matches = list(_JSON_BLOCK_RE.finditer(raw))
+    for match in reversed(matches):
         try:
-            obj = json.loads(match.group(1))
-            if obj:
-                return obj
+            filtered = _filter_intent_keys(json.loads(match.group(1)))
         except Exception:
-            pass
+            filtered = {}
+        if filtered:
+            return filtered
 
     for candidate in reversed(_find_json_objects(raw)):
         try:
-            data = json.loads(candidate)
-            if isinstance(data, dict) and data:
-                return data
+            filtered = _filter_intent_keys(json.loads(candidate))
         except Exception:
-            continue
+            filtered = {}
+        if filtered:
+            return filtered
     return {}
 
 
@@ -1283,30 +1395,70 @@ def answer():
         fallback_sql = compose_sql(compiler_intent, table=table_name)
         fallback_bind_values = compiler_binds
 
-    if fallback_sql is None and date_start and date_end and (measure == "count" or group_col):
-        fallback_bind_values = {"date_start": date_start, "date_end": date_end}
-        if question_requested_topn and topn_req:
-            fallback_bind_values["top_n"] = topn_req
-        table_literal = table_name.strip()
-        if measure == "count":
-            fallback_sql = _build_count_sql(
-                table=table_literal,
-                date_col=date_col,
-                start=date_start,
-                end=date_end,
-                group_col=group_col,
-                topn=topn_req if question_requested_topn else None,
-            )
-        elif group_col:
-            fallback_sql = _build_agg_sql(
-                table=table_literal,
-                date_col=date_col,
-                start=date_start,
-                end=date_end,
-                group_col=group_col,
-                measure=measure,
-                topn=topn_req if question_requested_topn else None,
-            )
+    agg_date_start = date_start or compiler_date_start
+    agg_date_end = date_end or compiler_date_end
+    dimension_hint = group_col or intent.get("group_by") or compiler_intent.dimension
+    if isinstance(dimension_hint, str):
+        dimension_hint = dimension_hint.strip().upper() or None
+    else:
+        dimension_hint = None
+    top_n_for_group = topn_req if question_requested_topn else None
+    grouped_sql = ""
+    grouped_binds: dict[str, Any] = {}
+    grouped_dimension: Optional[str] = None
+    metric_alias = ""
+    is_count_metric = False
+    if dimension_hint:
+        grouped_sql, grouped_binds, grouped_dimension, metric_alias, is_count_metric = _build_grouped_template_sql(
+            q,
+            table=table_name,
+            date_col=date_col,
+            date_start=agg_date_start,
+            date_end=agg_date_end,
+            dimension_hint=dimension_hint,
+            measure_hint=measure,
+            top_n=top_n_for_group,
+            user_requested_top_n=question_requested_topn,
+        )
+    if grouped_sql:
+        fallback_sql = grouped_sql
+        fallback_bind_values = grouped_binds
+        date_start = agg_date_start
+        date_end = agg_date_end
+        intent["wants_all_columns"] = False
+        intent["group_by"] = grouped_dimension
+        if metric_alias and not intent.get("sort_by"):
+            intent["sort_by"] = metric_alias
+        if is_count_metric:
+            intent["agg"] = "count"
+            compiler_intent.agg = "count"
+        else:
+            if not intent.get("agg"):
+                intent["agg"] = "sum"
+            if not compiler_intent.agg:
+                compiler_intent.agg = "sum"
+        if grouped_dimension:
+            compiler_intent.dimension = grouped_dimension
+        if agg_date_start and agg_date_end:
+            intent.setdefault("has_time_window", True)
+            explicit_dates_obj = intent.get("explicit_dates")
+            if not isinstance(explicit_dates_obj, dict) or not explicit_dates_obj.get("start") or not explicit_dates_obj.get("end"):
+                intent["explicit_dates"] = {"start": agg_date_start, "end": agg_date_end}
+        if question_requested_topn and isinstance(top_n_for_group, int) and top_n_for_group > 0:
+            intent["top_n"] = top_n_for_group
+            intent["user_requested_top_n"] = True
+            compiler_intent.top_n = top_n_for_group
+            compiler_intent.user_requested_top_n = True
+        log_event(
+            log,
+            "dw",
+            "deterministic_grouped_sql",
+            {
+                "dimension": grouped_dimension,
+                "metric_alias": metric_alias,
+                "top_n": top_n_for_group,
+            },
+        )
 
     explicit_projection = _mentions_specific_projection(q)
     if explicit_projection:
