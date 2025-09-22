@@ -38,6 +38,121 @@ COUNT_RE = re.compile(r"\b(count|how many|عدد)\b", re.I)
 VALUE_RE = re.compile(r"\b(value|net\s*of\s*vat|amount|القيمة)\b", re.I)
 
 
+DW_DIM_MAP = {
+    "owner department": "OWNER_DEPARTMENT",
+    "department": "OWNER_DEPARTMENT",
+    "entity": "ENTITY_NO",
+    "owner": "CONTRACT_OWNER",
+    "stakeholder": "CONTRACT_STAKEHOLDER_1",
+}
+
+_TOPN_RE = re.compile(r"\btop\s+(\d{1,4})\b", re.I)
+_BY_PER_RE = re.compile(
+    r"\b(?:by|per)\s+([a-zA-Z_ ]+?)(?=(?:\s+(?:last|next|this)\b|[.,]|$))", re.I
+)
+
+
+def _extract_group_by(q: str) -> Optional[str]:
+    match = _BY_PER_RE.search(q or "")
+    if not match:
+        return None
+    phrase = re.sub(r"\s+", " ", match.group(1).strip().lower())
+    for alias, col in DW_DIM_MAP.items():
+        if alias in phrase:
+            return col
+    return None
+
+
+def _detect_measure(q: str) -> str:
+    lowered = (q or "").lower()
+    if "gross" in lowered:
+        return "gross"
+    if "net" in lowered:
+        return "net"
+    if "count" in lowered or "(count)" in lowered:
+        return "count"
+    return "value"
+
+
+def _extract_topn(q: str) -> Optional[int]:
+    match = _TOPN_RE.search(q or "")
+    if not match:
+        return None
+    try:
+        value = int(match.group(1))
+    except Exception:
+        return None
+    return value if value > 0 else None
+
+
+def _metric_expr(measure: str) -> Tuple[str, str]:
+    if measure == "gross":
+        return (
+            "NVL(CONTRACT_VALUE_NET_OF_VAT,0) + NVL(VAT,0)",
+            "TOTAL_GROSS_VALUE",
+        )
+    return ("NVL(CONTRACT_VALUE_NET_OF_VAT,0)", "TOTAL_CONTRACT_VALUE")
+
+
+def _build_count_sql(
+    table: str,
+    date_col: str,
+    start: str,
+    end: str,
+    group_col: Optional[str],
+    topn: Optional[int],
+) -> str:
+    select_parts: list[str] = []
+    group_parts: list[str] = []
+    if group_col:
+        select_parts.append(f"{group_col} AS GROUP_KEY")
+        group_parts.append(group_col)
+    select_parts.append("COUNT(*) AS CNT")
+    sql_lines = [
+        "SELECT",
+        "  " + ",\n  ".join(select_parts),
+        f'FROM "{table}"' if not table.startswith('"') else f"FROM {table}",
+        f"WHERE {date_col} BETWEEN :date_start AND :date_end",
+    ]
+    if group_parts:
+        sql_lines.append("GROUP BY " + ", ".join(group_parts))
+        sql_lines.append("ORDER BY CNT DESC")
+        if topn:
+            sql_lines.append("FETCH FIRST :top_n ROWS ONLY")
+    return "\n".join(sql_lines)
+
+
+def _build_agg_sql(
+    table: str,
+    date_col: str,
+    start: str,
+    end: str,
+    group_col: str,
+    measure: str,
+    topn: Optional[int],
+) -> str:
+    expr, alias = _metric_expr(measure)
+    table_literal = f'"{table}"' if not table.startswith('"') else table
+    lines = [
+        "SELECT",
+        f"  {group_col} AS GROUP_KEY,",
+        f"  SUM({expr}) AS {alias}",
+        f"FROM {table_literal}",
+        f"WHERE {date_col} BETWEEN :date_start AND :date_end",
+        f"GROUP BY {group_col}",
+        f"ORDER BY {alias} DESC",
+    ]
+    if topn:
+        lines.append("FETCH FIRST :top_n ROWS ONLY")
+    return "\n".join(lines)
+
+
+def _should_select_all_columns(q: str, group_col: Optional[str], measure: str) -> bool:
+    if group_col or measure == "count":
+        return False
+    return True
+
+
 def _find_json_objects(text: str) -> list[str]:
     """Return every balanced {...} substring in order."""
 
@@ -393,7 +508,22 @@ def _build_oracle_prompt(
             lines.append("If the question does not specify which columns to show, SELECT ALL columns (use SELECT *).")
         else:
             lines.append("If unsure, default to SELECT *.")
-        lines.append("Only add a row limit (FETCH FIRST :top_n ROWS ONLY) if the user explicitly asks for Top N.")
+
+    lines.extend(
+        [
+            "If the question says \"by\" or \"per <dimension>\", you MUST aggregate and GROUP BY that column.",
+            "Dimension mapping:",
+            "- \"owner department\" -> OWNER_DEPARTMENT",
+            "- \"department\" -> OWNER_DEPARTMENT",
+            "- \"entity\" -> ENTITY_NO",
+            "- \"owner\" -> CONTRACT_OWNER",
+            "- \"stakeholder\" -> CONTRACT_STAKEHOLDER_1",
+            "If the question mentions \"gross value\", define GROSS_VALUE := NVL(CONTRACT_VALUE_NET_OF_VAT,0) + NVL(VAT,0) and use SUM(GROSS_VALUE).",
+            "If it mentions \"net value\" or just \"contract value\", use SUM(NVL(CONTRACT_VALUE_NET_OF_VAT,0)).",
+            "If the question asks for count (contains the word 'count' or '(count)'), return COUNT(*) (and include the dimension in SELECT if grouped).",
+            "Only add a row limit (FETCH FIRST :top_n ROWS ONLY) if the user explicitly asks for Top N.",
+        ]
+    )
 
     default_col = intent.get("date_column") or "REQUEST_DATE"
     lines.append("Add date filter ONLY if user asks. For windows use :date_start and :date_end.")
@@ -426,7 +556,21 @@ def _build_oracle_prompt_strict(
     else:
         if intent.get("wants_all_columns", True):
             parts.append("If the question does not specify which columns to show, SELECT *.")
-        parts.append("Only add row limit (FETCH FIRST :top_n ROWS ONLY) when Top N is asked explicitly.")
+    parts.extend(
+        [
+            "If the question says \"by\" or \"per <dimension>\", you MUST aggregate and GROUP BY that column.",
+            "Dimension mapping:",
+            "- \"owner department\" -> OWNER_DEPARTMENT",
+            "- \"department\" -> OWNER_DEPARTMENT",
+            "- \"entity\" -> ENTITY_NO",
+            "- \"owner\" -> CONTRACT_OWNER",
+            "- \"stakeholder\" -> CONTRACT_STAKEHOLDER_1",
+            "If the question mentions \"gross value\", define GROSS_VALUE := NVL(CONTRACT_VALUE_NET_OF_VAT,0) + NVL(VAT,0) and use SUM(GROSS_VALUE).",
+            "If it mentions \"net value\" or just \"contract value\", use SUM(NVL(CONTRACT_VALUE_NET_OF_VAT,0)).",
+            "If the question asks for count (contains the word 'count' or '(count)'), return COUNT(*) (and include the dimension in SELECT if grouped).",
+            "Only add row limit (FETCH FIRST :top_n ROWS ONLY) when Top N is asked explicitly.",
+        ]
+    )
     default_col = intent.get("date_column") or "REQUEST_DATE"
     parts.append(f"Use :date_start and :date_end on {default_col} when a time window is implied.")
     parts.append("Question:")
@@ -755,8 +899,66 @@ def answer():
 
     intent = _heuristic_fill(q, intent, default_date_col)
 
-    if top_n_from_text and not intent.get("top_n"):
-        intent["top_n"] = top_n_from_text
+    measure = _detect_measure(q)
+    if intent.get("agg") == "count":
+        measure = "count"
+    elif measure == "count":
+        intent["agg"] = "count"
+
+    group_col = _extract_group_by(q)
+    topn_req = _extract_topn(q)
+
+    if intent.get("top_n") is not None:
+        try:
+            topn_int = int(intent["top_n"])
+        except Exception:
+            topn_int = None
+        if topn_int is not None:
+            topn_req = topn_int
+            intent["top_n"] = topn_int
+    elif top_n_from_text:
+        topn_req = top_n_from_text
+        intent["top_n"] = topn_req
+    elif topn_req is not None:
+        intent["top_n"] = topn_req
+
+    if isinstance(topn_req, int) and topn_req <= 0:
+        topn_req = None
+
+    wants_all_default = _should_select_all_columns(q, group_col, measure)
+    intent["wants_all_columns"] = wants_all_default
+
+    explicit_dates = intent.get("explicit_dates") if isinstance(intent.get("explicit_dates"), dict) else {}
+    date_start = explicit_dates.get("start")
+    date_end = explicit_dates.get("end")
+    date_col = (intent.get("date_column") or default_date_col or "REQUEST_DATE").upper()
+
+    fallback_sql: Optional[str] = None
+    fallback_bind_values: dict[str, Any] = {}
+    if date_start and date_end and (measure == "count" or group_col):
+        fallback_bind_values = {"date_start": date_start, "date_end": date_end}
+        if topn_req:
+            fallback_bind_values["top_n"] = topn_req
+        table_literal = table_name.strip()
+        if measure == "count":
+            fallback_sql = _build_count_sql(
+                table=table_literal,
+                date_col=date_col,
+                start=date_start,
+                end=date_end,
+                group_col=group_col,
+                topn=topn_req,
+            )
+        elif group_col:
+            fallback_sql = _build_agg_sql(
+                table=table_literal,
+                date_col=date_col,
+                start=date_start,
+                end=date_end,
+                group_col=group_col,
+                measure=measure,
+                topn=topn_req,
+            )
 
     explicit_projection = _mentions_specific_projection(q)
     if explicit_projection:
@@ -766,6 +968,9 @@ def answer():
         intent["wants_all_columns"] = False
 
     wants_all_columns = bool(intent.get("wants_all_columns", True))
+
+    if top_n_from_text and not intent.get("top_n"):
+        intent["top_n"] = top_n_from_text
 
     if intent.get("explicit_dates") and intent.get("has_time_window") is None:
         intent["has_time_window"] = True
@@ -781,11 +986,16 @@ def answer():
             {"size": len(clarifier_raw), "text": clarifier_raw[:900]},
         )
 
-    try:
-        llm_out = nl_to_sql_with_llm(q, ctx, intent=intent)
-    except Exception as exc:  # pragma: no cover - defensive guard
-        log.exception("dw nl_to_sql_with_llm failed")
-        llm_out = {"errors": [f"llm_generate:{type(exc).__name__}:{exc}"]}
+    used_rule_fallback = bool(fallback_sql)
+
+    if used_rule_fallback:
+        llm_out = {"prompt": "", "raw1": fallback_sql, "sql": fallback_sql}
+    else:
+        try:
+            llm_out = nl_to_sql_with_llm(q, ctx, intent=intent)
+        except Exception as exc:  # pragma: no cover - defensive guard
+            log.exception("dw nl_to_sql_with_llm failed")
+            llm_out = {"errors": [f"llm_generate:{type(exc).__name__}:{exc}"]}
 
     d = _as_dict(llm_out) or _llm_out_default()
     prompt_text = d.get("prompt", "") or ""
@@ -939,6 +1149,38 @@ def answer():
                 debug_payload["errors"] = errors
             res["debug"] = debug_payload
         return jsonify(res)
+
+    if not used_rule_fallback and date_start and date_end:
+        lower_sql = sql_final.lower()
+        forced_sql: Optional[str] = None
+        table_literal = table_name.strip()
+        if measure == "count" and "count(" not in lower_sql:
+            forced_sql = _build_count_sql(
+                table=table_literal,
+                date_col=date_col,
+                start=date_start,
+                end=date_end,
+                group_col=group_col,
+                topn=topn_req,
+            )
+        elif group_col and "group by" not in lower_sql:
+            forced_sql = _build_agg_sql(
+                table=table_literal,
+                date_col=date_col,
+                start=date_start,
+                end=date_end,
+                group_col=group_col,
+                measure=measure,
+                topn=topn_req,
+            )
+        if forced_sql:
+            sql_final = forced_sql
+            used_rule_fallback = True
+            fallback_sql = forced_sql
+            if not fallback_bind_values:
+                fallback_bind_values = {"date_start": date_start, "date_end": date_end}
+            if topn_req and "top_n" not in fallback_bind_values:
+                fallback_bind_values["top_n"] = topn_req
 
     requested_top_n = intent.get("top_n") if isinstance(intent, dict) else None
     top_n_raw = requested_top_n
@@ -1109,6 +1351,10 @@ def answer():
 
     raw_bind_values = derive_bind_values(q, needed_canonical, intent) or {}
     bind_values: dict[str, object] = dict(raw_bind_values)
+
+    if used_rule_fallback and fallback_bind_values:
+        for key, value in fallback_bind_values.items():
+            bind_values.setdefault(key, value)
 
     needs_dates = {"date_start", "date_end"} & set(needed_canonical)
     if needs_dates:
@@ -1389,6 +1635,7 @@ def answer():
         "clarifier_intent": intent,
         "binds": binds_public,
         "wants_all_columns": wants_all_columns,
+        "used_rule_fallback": used_rule_fallback,
         "used_projection_rewrite": projection_rewrite_applied,
         "used_limit_strip": limit_strip_applied,
         "intent_projection_rewrite": intent_rewrite_meta["used_projection_rewrite"],
@@ -1453,6 +1700,7 @@ def answer():
         debug_payload["projection_rewrite_applied"] = projection_rewrite_applied
         debug_payload["limit_strip_applied"] = limit_strip_applied
         debug_payload["wants_all_columns"] = wants_all_columns
+        debug_payload["used_rule_fallback"] = used_rule_fallback
         debug_payload["intent_projection_rewrite"] = intent_rewrite_meta["used_projection_rewrite"]
         debug_payload["intent_limit_inject"] = intent_rewrite_meta["used_limit_inject"]
         debug_payload["intent_order_inject"] = intent_rewrite_meta["used_order_inject"]
