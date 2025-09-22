@@ -101,6 +101,7 @@ from .llm import clarify_intent, derive_bind_values, nl_to_sql_with_llm
 from .validator import WHITELIST_BINDS, basic_checks
 
 
+# Columns exposed by the DW endpoint (referenced in prompts and heuristics)
 ALLOWED_COLUMNS = [
     "CONTRACT_ID",
     "CONTRACT_OWNER",
@@ -138,6 +139,41 @@ ALLOWED_BINDS = sorted(WHITELIST_BINDS)
 
 dw_bp = Blueprint("dw", __name__, url_prefix="/dw")
 log = get_logger("main")
+
+
+# --- Helpers for UX rules --------------------------------------------------
+
+_RE_SELECT_FROM = re.compile(r"(?is)(\bSELECT\b)(.+?)(\bFROM\b)")
+_RE_FETCH_FIRST = re.compile(r"(?is)\s*FETCH\s+FIRST\s+(?:\d+|:\w+)\s+ROWS\s+ONLY\s*")
+
+
+def _question_mentions_columns(question: str, allowed_cols: list[str]) -> bool:
+    """Return True if the question explicitly names any allowed column."""
+
+    lowered = (question or "").lower()
+    for col in allowed_cols:
+        if col.lower() in lowered:
+            return True
+    return False
+
+
+def _ensure_full_projection(sql: str) -> str:
+    """Force the first SELECT list to be '*' (avoids partial projections)."""
+
+    text = (sql or "").lstrip()
+    if text.upper().startswith("WITH"):
+        return sql
+
+    def _repl(match) -> str:
+        return f"{match.group(1)} * {match.group(3)}"
+
+    return _RE_SELECT_FROM.sub(_repl, sql, count=1)
+
+
+def _remove_row_limit(sql: str) -> str:
+    """Strip trailing FETCH FIRST ... ROWS ONLY clauses."""
+
+    return _RE_FETCH_FIRST.sub(" ", sql or "")
 
 
 # --- Helpers to compute date ranges ---------------------------------------------------------
@@ -231,6 +267,8 @@ No code fences. No comments. No explanations. No extra text.
 Table: "{table}"
 Allowed columns: {allowed_columns}
 Allowed binds: {allowed_binds}
+If the question does not specify which columns to show, SELECT ALL columns (use SELECT *).
+Only add a row limit (FETCH FIRST :top_n ROWS ONLY) if the user explicitly asks for top N.
 Use Oracle syntax. For a time window, filter with :date_start and :date_end on {date_column}.
 Question:
 {question}
@@ -421,6 +459,9 @@ def answer():
 
     intent = _heuristic_fill(q, intent, default_date_col)
 
+    user_specified_columns = _question_mentions_columns(q, ALLOWED_COLUMNS)
+    wants_all_columns = not user_specified_columns
+
     if intent.get("explicit_dates") and intent.get("has_time_window") is None:
         intent["has_time_window"] = True
     if intent.get("has_time_window") and intent.get("date_column") is None:
@@ -593,6 +634,23 @@ def answer():
                 debug_payload["errors"] = errors
             res["debug"] = debug_payload
         return jsonify(res)
+
+    top_n_raw = intent.get("top_n") if isinstance(intent, dict) else None
+    if isinstance(top_n_raw, str):
+        try:
+            top_n_raw = int(top_n_raw)
+        except Exception:
+            top_n_raw = None
+    top_n_int = top_n_raw if isinstance(top_n_raw, int) else None
+    if top_n_int is not None and top_n_int <= 0:
+        top_n_int = None
+    if top_n_int is not None:
+        intent["top_n"] = top_n_int
+
+    if wants_all_columns:
+        sql_final = _ensure_full_projection(sql_final)
+    if top_n_int is None:
+        sql_final = _remove_row_limit(sql_final)
 
     def _oracle_parse_error(sql_text: str) -> str | None:
         if not sql_text:
@@ -980,6 +1038,7 @@ def answer():
         "suggested_date_column": intent.get("date_column") or default_date_col,
         "clarifier_intent": intent,
         "binds": binds_public,
+        "wants_all_columns": wants_all_columns,
     }
     if widen_meta:
         meta["autowiden"] = widen_meta

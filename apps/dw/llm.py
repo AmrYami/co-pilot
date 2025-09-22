@@ -146,6 +146,8 @@ def _build_prompt(question: str, ctx: dict, intent: Dict[str, object]) -> str:
         f"Allowed columns: {', '.join(allowed_cols)}",
         "Oracle syntax only (NVL, TRIM, LISTAGG WITHIN GROUP, FETCH FIRST N ROWS ONLY). SELECT/CTE only.",
         f"Allowed binds: {', '.join(allowed_binds)}",
+        "If the question does not specify which columns to show, SELECT ALL columns (use SELECT *).",
+        "Only add a row limit (FETCH FIRST :top_n ROWS ONLY) if the user explicitly asks for top N.",
         "Add date filter ONLY if user asks. For windows use :date_start and :date_end.",
         f"Default window column: {default_date_col}.",
         "No prose, comments, or explanations.",
