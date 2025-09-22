@@ -1139,6 +1139,8 @@ def answer():
         "allowed_binds": ALLOWED_BINDS,
         "default_date_col": default_date_col,
         "prompt_builder": _prompt_builder,
+        "settings": settings,
+        "all_columns_default": True,
     }
 
     with mem.begin() as conn:

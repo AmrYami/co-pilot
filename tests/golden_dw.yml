@@ -1,0 +1,24 @@
+cases:
+  - id: count_end_next_30
+    q: "contracts expiring in 30 days (count)"
+    binds_like:
+      date_start: TODAY
+      date_end: TODAY+30
+    expect_sql_contains:
+      - "WHERE END_DATE BETWEEN :date_start AND :date_end"
+      - "COUNT("
+    expect_rows_like:
+      - [0]
+
+  - id: top20_stakeholders_gross_last_month
+    q: "Top 20 stakeholders by gross contract value last month"
+    expect_sql_contains:
+      - "GROUP BY CONTRACT_STAKEHOLDER_1"
+      - "ORDER BY TOTAL_VALUE DESC"
+      - "FETCH FIRST :top_n ROWS ONLY"
+
+  - id: gross_owner_department_last_quarter
+    q: "Total gross value of contracts per owner department last quarter"
+    expect_sql_contains:
+      - "GROUP BY OWNER_DEPARTMENT"
+      - "SUM("
