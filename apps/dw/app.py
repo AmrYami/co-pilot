@@ -25,6 +25,24 @@ from core.sql_utils import (
     validate_oracle_sql,
 )
 from core.logging_utils import get_logger, log_event
+import sqlglot
+
+
+parse_one = getattr(sqlglot, "parse_one", lambda sql, read=None: None)
+exp = getattr(sqlglot, "expressions", None) or getattr(sqlglot, "exp", None)
+
+TOPN_RE = re.compile(r"\btop\s+(\d+)\b", re.I)
+VALUE_RE = re.compile(r"\b(contract\s*value|value|amount|net)\b", re.I)
+
+
+def _parse_top_n(text: str) -> int | None:
+    match = TOPN_RE.search(text or "")
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except Exception:
+        return None
 
 
 def _parse_date_yyyy_mm_dd(s: str) -> datetime:
@@ -225,6 +243,49 @@ def _strip_limits(sql: str) -> str:
     sql = re.sub(r"(?is)\s+offset\s+\d+\s+rows", "", sql)
     sql = re.sub(r"(?is)\s+limit\s+(?::\w+|\d+)\b", "", sql)
     return sql.strip()
+
+
+def enforce_topn_sort(sql: str, intent: dict, question: str) -> tuple[str, bool]:
+    """Ensure top-N queries sort by contract value and apply FETCH FIRST :top_n."""
+
+    top_n = intent.get("top_n") if isinstance(intent, dict) else None
+    if not top_n:
+        return sql, False
+
+    if not VALUE_RE.search(question or ""):
+        return sql, False
+
+    metric_col = "CONTRACT_VALUE_NET_OF_VAT"
+
+    try:
+        tree = parse_one(sql, read="oracle")
+        if not tree:
+            raise ValueError("sqlglot returned None")
+
+        order_expr = exp.Order(
+            expressions=[exp.Ordered(this=exp.to_identifier(metric_col), desc=True)]
+        )
+        tree.set("order", order_expr)
+
+        if not tree.args.get("limit"):
+            tree.set("limit", exp.Fetch(this=exp.Parameter(this="top_n")))
+
+        return tree.sql(dialect="oracle"), True
+
+    except Exception:
+        out = sql or ""
+        if re.search(r"\border\s+by\b", out, re.I):
+            out = re.sub(
+                r"order\s+by\s+.*?$",
+                f"ORDER BY {metric_col} DESC",
+                out,
+                flags=re.I | re.S,
+            )
+        else:
+            out = out.rstrip() + f"\nORDER BY {metric_col} DESC"
+        if not re.search(r"fetch\s+first\s+.*rows\s+only", out, re.I) and ":top_n" not in out:
+            out = out.rstrip() + "\nFETCH FIRST :top_n ROWS ONLY"
+        return out, True
 
 
 # --- Helpers to compute date ranges ---------------------------------------------------------
@@ -431,6 +492,7 @@ def answer():
 
     body = request.get_json(force=True, silent=False) or {}
     q = (body.get("question") or "").strip()
+    top_n_from_text = _parse_top_n(q)
     auth_email = body.get("auth_email")
     prefixes = body.get("prefixes") or []
     include_debug = DW_INCLUDE_DEBUG or (request.args.get("debug") == "true")
@@ -510,8 +572,13 @@ def answer():
 
     intent = _heuristic_fill(q, intent, default_date_col)
 
+    if top_n_from_text and not intent.get("top_n"):
+        intent["top_n"] = top_n_from_text
+
     explicit_projection = _mentions_specific_projection(q)
     wants_all_columns = not explicit_projection
+    if intent.get("top_n"):
+        wants_all_columns = False
 
     if intent.get("explicit_dates") and intent.get("has_time_window") is None:
         intent["has_time_window"] = True
@@ -719,11 +786,12 @@ def answer():
 
     projection_rewrite_applied = False
     limit_strip_applied = False
+    used_topn_enforce = False
 
     def _apply_projection_and_limits(sql_text: str) -> str:
         nonlocal projection_rewrite_applied, limit_strip_applied
         sql_clean = _strip_code_fences(sql_text)
-        if wants_all_columns and _is_simple_contract_select(sql_clean):
+        if wants_all_columns and not user_requested_top_n and _is_simple_contract_select(sql_clean):
             rewritten = _rewrite_projection_to_star(sql_clean)
             if rewritten != sql_clean:
                 projection_rewrite_applied = True
@@ -764,6 +832,12 @@ def answer():
             sql_final = synthesized
             sql_final = _apply_projection_and_limits(sql_final)
             parse_error = _oracle_parse_error(sql_final)
+
+    enforced_sql, enforced = enforce_topn_sort(sql_final, intent, q)
+    if enforced:
+        sql_final = enforced_sql
+        used_topn_enforce = True
+        parse_error = _oracle_parse_error(sql_final)
 
     sql_payload = {"size": len(sql_final)}
     sql_payload["sql"] = sql_final[:900] if include_debug else "<hidden>"
@@ -1128,6 +1202,8 @@ def answer():
         "wants_all_columns": wants_all_columns,
         "used_projection_rewrite": projection_rewrite_applied,
         "used_limit_strip": limit_strip_applied,
+        "used_topn_enforce": used_topn_enforce,
+        "top_n_from_text": top_n_from_text,
     }
     if widen_meta:
         meta["autowiden"] = widen_meta
@@ -1186,6 +1262,7 @@ def answer():
         debug_payload["projection_rewrite_applied"] = projection_rewrite_applied
         debug_payload["limit_strip_applied"] = limit_strip_applied
         debug_payload["wants_all_columns"] = wants_all_columns
+        debug_payload["used_topn_enforce"] = used_topn_enforce
         resp["debug"] = debug_payload
     return jsonify(resp)
 
