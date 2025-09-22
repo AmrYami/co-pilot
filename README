@@ -47,6 +47,9 @@ flask run
 
 
 
+test cases:
+python -m tests.run_golden --cases tests/golden/dw_cases.yaml
+
 
 
 
