@@ -893,6 +893,55 @@ dw_bp = Blueprint("dw", __name__, url_prefix="/dw")
 log = get_logger("main")
 
 
+try:
+    from core.nlu.dw_intent import parse_intent as _dw_parse_intent
+    from core.sql_nlg.oracle_dw import build_sql as _dw_build_sql
+except Exception:  # pragma: no cover - optional dependency guard
+    _dw_parse_intent = None
+    _dw_build_sql = None
+
+
+def _push_clarifier_if_needed(
+    question: str,
+    intent: dict,
+    settings: Settings,
+    *,
+    defaults: dict,
+) -> dict:
+    """Invoke the clarifier once to backfill missing intent fields."""
+
+    lowered = (question or "").lower()
+    needs_window = intent.get("has_time_window") is None
+    needs_expiry_fix = "expir" in lowered and intent.get("date_column") != "END_DATE"
+    if not (needs_window or needs_expiry_fix):
+        return intent
+
+    try:
+        default_date_col = (
+            intent.get("date_column")
+            or defaults.get("date_column")
+            or settings.get("DW_DATE_COLUMN", scope="namespace")
+            or "REQUEST_DATE"
+        )
+        clarifier_ctx = {
+            "default_date_col": default_date_col,
+            "settings": settings,
+            "all_columns_default": bool(defaults.get("select_all_default", True)),
+        }
+        clarifier = clarify_intent(question, clarifier_ctx)
+    except Exception:
+        return intent
+
+    if isinstance(clarifier, dict):
+        payload = clarifier.get("intent") or clarifier
+        if isinstance(payload, dict):
+            for key, value in payload.items():
+                if intent.get(key) in (None, "", [], {}):
+                    intent[key] = value
+
+    return intent
+
+
 _STAR_SAFE_TABLE = r'"?Contract"?'
 _DATE_COLS = {"end_date", "start_date", "request_date"}
 _PROJECTION_COLS = {
@@ -1545,6 +1594,190 @@ def answer():
             "prefixes": prefixes,
         },
     )
+
+    if _dw_parse_intent and _dw_build_sql and q:
+        dw_defaults = {
+            "date_column": default_date_col,
+            "select_all_default": select_all_default,
+        }
+        try:
+            deterministic_intent = _dw_parse_intent(
+                q,
+                defaults=dw_defaults,
+                now=datetime.datetime.utcnow(),
+            )
+            deterministic_payload = deterministic_intent.to_dict()
+            deterministic_payload = _push_clarifier_if_needed(
+                q,
+                deterministic_payload,
+                settings,
+                defaults=dw_defaults,
+            )
+            log_event(
+                log,
+                "dw",
+                "deterministic_preplan_intent",
+                json.loads(json.dumps({"intent": deterministic_payload}, default=str)),
+            )
+            deterministic_sql, deterministic_binds = _dw_build_sql(
+                deterministic_payload,
+                table=table_name or "Contract",
+            )
+        except Exception as exc:
+            log_event(
+                log,
+                "dw",
+                "deterministic_preplan_skip",
+                {"error": str(exc)[:200]},
+            )
+            deterministic_sql = ""
+            deterministic_binds = {}
+        else:
+            if deterministic_sql:
+                try:
+                    parse_one(deterministic_sql, read="oracle")
+                except Exception as exc:
+                    log_event(
+                        log,
+                        "dw",
+                        "deterministic_preplan_skip",
+                        {
+                            "error": f"parse:{str(exc)[:200]}",
+                            "sql": deterministic_sql[:120],
+                        },
+                    )
+                    deterministic_sql = ""
+            if deterministic_sql:
+                try:
+                    validate_oracle_sql(deterministic_sql)
+                except Exception as exc:
+                    log_event(
+                        log,
+                        "dw",
+                        "deterministic_preplan_skip",
+                        {
+                            "error": str(exc)[:200],
+                            "sql": deterministic_sql[:120],
+                        },
+                    )
+                    deterministic_sql = ""
+            if deterministic_sql:
+                try:
+                    oracle_engine = ds_registry.engine(None)
+                    exec_start = datetime.datetime.utcnow()
+                    with oracle_engine.begin() as oc:
+                        rs = oc.execute(text(deterministic_sql), deterministic_binds)
+                        columns = list(rs.keys())
+                        fetched_rows = rs.fetchall()
+                    duration_ms = int(
+                        (datetime.datetime.utcnow() - exec_start).total_seconds() * 1000
+                    )
+                    rows_data = [list(row) for row in fetched_rows]
+                    csv_path_obj = _write_csv(rows_data, columns)
+                    csv_path = str(csv_path_obj) if csv_path_obj else None
+
+                    log_event(log, "dw", "sql_prompt", {"prompt": ""})
+                    log_event(
+                        log,
+                        "dw",
+                        "final_sql",
+                        {"size": len(deterministic_sql), "sql": deterministic_sql},
+                    )
+
+                    binds_public = {
+                        key: (
+                            value.isoformat() if hasattr(value, "isoformat") else value
+                        )
+                        for key, value in deterministic_binds.items()
+                    }
+
+                    validation_payload = {
+                        "ok": True,
+                        "errors": [],
+                        "binds": list(deterministic_binds.keys()),
+                        "bind_names": list(deterministic_binds.keys()),
+                    }
+                    log_event(log, "dw", "validation", validation_payload)
+
+                    meta = {
+                        "rowcount": len(rows_data),
+                        "wants_all_columns": deterministic_payload.get(
+                            "wants_all_columns"
+                        ),
+                        "used_deterministic_planner": True,
+                        "clarifier_intent": deterministic_payload,
+                        "binds": binds_public,
+                        "duration_ms": duration_ms,
+                        "details_rowcount": 0,
+                        "used_autodetail": False,
+                    }
+
+                    resp = {
+                        "ok": True,
+                        "inquiry_id": inq_id,
+                        "sql": deterministic_sql,
+                        "rows": rows_data[:200],
+                        "columns": columns,
+                        "csv_path": csv_path,
+                        "meta": meta,
+                    }
+
+                    log_event(
+                        log,
+                        "dw",
+                        "deterministic_sql_success",
+                        {
+                            "rows": len(rows_data),
+                            "columns": columns,
+                            "top_n": deterministic_payload.get("top_n"),
+                            "group_by": deterministic_payload.get("group_by"),
+                            "planner": "preplan",
+                        },
+                    )
+
+                    with mem.begin() as conn:
+                        conn.execute(
+                            text(
+                                """
+                            UPDATE mem_inquiries
+                               SET status='answered', answered_by=:by, answered_at=NOW(), updated_at=NOW(),
+                                   last_sql=:sql, last_error=NULL
+                             WHERE id=:id
+                        """
+                            ),
+                            {"by": auth_email, "sql": deterministic_sql, "id": inq_id},
+                        )
+                    log_event(
+                        log,
+                        "dw",
+                        "inquiry_status",
+                        {
+                            "id": inq_id,
+                            "from": "open",
+                            "to": "answered",
+                            "rows": len(rows_data),
+                        },
+                    )
+
+                    if include_debug:
+                        resp["debug"] = {
+                            "intent": deterministic_payload,
+                            "prompt": "",
+                            "raw1": deterministic_sql,
+                            "validation": validation_payload,
+                        }
+
+                    return jsonify(resp)
+                except Exception as exc:
+                    log_event(
+                        log,
+                        "dw",
+                        "deterministic_preplan_skip",
+                        {
+                            "error": str(exc)[:200],
+                            "sql": deterministic_sql[:120],
+                        },
+                    )
 
     deterministic_attempted = False
 
