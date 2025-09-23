@@ -4,13 +4,17 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 import re
 from typing import Any, Dict, Optional, Tuple
+from calendar import monthrange
 
 try:
     import dateparser  # type: ignore
 except Exception:  # pragma: no cover - optional dependency
     dateparser = None
 
-from dateutil.relativedelta import relativedelta
+try:  # pragma: no cover - optional dependency
+    from dateutil.relativedelta import relativedelta
+except Exception:  # pragma: no cover - graceful fallback when dateutil missing
+    relativedelta = None  # type: ignore[assignment]
 
 COL_START = "START_DATE"
 COL_END = "END_DATE"
@@ -53,6 +57,22 @@ def _today() -> date:
     return date.today()
 
 
+def _shift_months_basic(d: date, months: int) -> date:
+    month_index = d.month - 1 + months
+    year = d.year + month_index // 12
+    month = (month_index % 12) + 1
+    day = min(d.day, monthrange(year, month)[1])
+    return date(year, month, day)
+
+
+def _shift_years_basic(d: date, years: int) -> date:
+    try:
+        return d.replace(year=d.year + years)
+    except ValueError:
+        # handle Feb 29 in leap years gracefully
+        return d.replace(month=2, day=28, year=d.year + years)
+
+
 def _parse_last_n(expr: str) -> Optional[Tuple[int, str]]:
     match = re.search(
         r"last\s+(\d+)\s+(day|days|week|weeks|month|months|quarter|quarters|year|years)",
@@ -81,11 +101,17 @@ def _calc_window_from_last(n: int, unit: str, today: date) -> Tuple[date, date]:
     if unit.startswith("week"):
         return today - timedelta(days=7 * n), today
     if unit.startswith("month"):
-        return today - relativedelta(months=n), today
+        if relativedelta:
+            return today - relativedelta(months=n), today
+        return _shift_months_basic(today, -n), today
     if unit.startswith("quarter"):
-        return today - relativedelta(months=3 * n), today
+        if relativedelta:
+            return today - relativedelta(months=3 * n), today
+        return _shift_months_basic(today, -3 * n), today
     if unit.startswith("year"):
-        return today - relativedelta(years=n), today
+        if relativedelta:
+            return today - relativedelta(years=n), today
+        return _shift_years_basic(today, -n), today
     return today - timedelta(days=30), today
 
 
@@ -104,9 +130,13 @@ def _last_quarter(today: date) -> Tuple[date, date]:
         year = today.year - 1
     else:
         year = today.year
-    prev_q_end = date(year, prev_q_end_month, 1) + relativedelta(day=31)
-    prev_q_start = prev_q_end - relativedelta(months=2)
-    prev_q_start = prev_q_start.replace(day=1)
+    if relativedelta:
+        prev_q_end = date(year, prev_q_end_month, 1) + relativedelta(day=31)
+        prev_q_start = prev_q_end - relativedelta(months=2)
+        prev_q_start = prev_q_start.replace(day=1)
+    else:
+        prev_q_end = _shift_months_basic(date(year, prev_q_end_month, 1), 1) - timedelta(days=1)
+        prev_q_start = _shift_months_basic(prev_q_end.replace(day=1), -2)
     return prev_q_start, prev_q_end
 
 
