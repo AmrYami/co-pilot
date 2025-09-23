@@ -218,7 +218,8 @@ def _dw_sql_from_intent(
     end = explicit_dates.get("end") if explicit_dates else None
 
     binds: Dict[str, Any] = {}
-    if intent.get("has_time_window") and start and end:
+    has_window = bool(start and end)
+    if has_window:
         binds["date_start"] = start
         binds["date_end"] = end
 
@@ -235,7 +236,7 @@ def _dw_sql_from_intent(
     else:
         measure_alias = "MEASURE"
 
-    where_clause = f"WHERE {date_col} BETWEEN :date_start AND :date_end" if binds else ""
+    where_clause = f"WHERE {date_col} BETWEEN :date_start AND :date_end" if has_window else ""
 
     group_expr = group_by
     if group_by and group_by.upper() == "OWNER_DEPARTMENT":
@@ -262,9 +263,6 @@ def _dw_sql_from_intent(
         ]
         if where_clause:
             lines.append(where_clause)
-        if top_n:
-            binds["top_n"] = top_n
-            lines.append("FETCH FIRST :top_n ROWS ONLY")
         return "\n".join(lines), binds
 
     if group_by and group_expr:
@@ -918,6 +916,25 @@ _PROJECTION_COLS = {
     "requester",
 }
 
+_EXPIRY_HINT = re.compile(
+    r"\b(expir|expires|expiring|expiry|ending|ends|due|mature|maturity)\b",
+    re.I,
+)
+_START_HINT = re.compile(
+    r"\b(start|starting|starts|commenc|begin|beginning)\b",
+    re.I,
+)
+
+
+def _semantic_date_column(question: str, default_col: str | None = None) -> str:
+    text = (question or "").strip()
+    if _EXPIRY_HINT.search(text):
+        return "END_DATE"
+    if _START_HINT.search(text):
+        return "START_DATE"
+    fallback = (default_col or "REQUEST_DATE").strip() or "REQUEST_DATE"
+    return fallback.upper()
+
 
 def _mentions_specific_projection(question: str) -> bool:
     """Return True when the question asks for specific non-date columns."""
@@ -1271,6 +1288,7 @@ def _heuristic_fill(question: str, intent: dict, default_date_col: str) -> dict:
         return {}
 
     upper = (question or "").upper()
+    question_text = question or ""
 
     derived_window = derive_window_from_text(question or "")
     if derived_window and not intent.get("explicit_dates"):
@@ -1294,6 +1312,16 @@ def _heuristic_fill(question: str, intent: dict, default_date_col: str) -> dict:
 
     if intent.get("has_time_window") and intent.get("date_column") is None:
         intent["date_column"] = default_date_col
+
+    if _EXPIRY_HINT.search(question_text):
+        intent["date_column"] = "END_DATE"
+    elif _START_HINT.search(question_text):
+        intent["date_column"] = "START_DATE"
+    elif not intent.get("date_column"):
+        intent["date_column"] = _semantic_date_column(question_text, default_date_col)
+
+    if intent.get("date_column"):
+        intent["date_column"] = str(intent["date_column"]).upper()
 
     return intent
 
