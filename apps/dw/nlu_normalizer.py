@@ -9,7 +9,6 @@ simple measure selection (gross vs net value).
 from __future__ import annotations
 
 from calendar import monthrange
-from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import re
 from typing import Any, Dict, Optional, Tuple
@@ -47,29 +46,7 @@ NET_VALUE_EXPR = "NVL(CONTRACT_VALUE_NET_OF_VAT,0)"
 
 # ---- Datamodel ----
 
-
-@dataclass
-class NLIntent:
-    """Intent extracted from a natural language prompt."""
-
-    # selection
-    wants_all_columns: bool = False
-    # aggregation
-    agg: Optional[str] = None  # 'count'|'sum'|'avg'|'min'|'max'|None
-    measure_sql: Optional[str] = None  # e.g., GROSS/NET expr
-    # grouping & sorting
-    group_by: Optional[str] = None  # column name
-    sort_by: Optional[str] = None  # column or measure
-    sort_desc: bool = True
-    top_n: Optional[int] = None
-    user_requested_top_n: bool = False
-    # time window
-    has_time_window: Optional[bool] = None
-    date_column: str = DEFAULT_DATE_COL
-    date_start: Optional[str] = None  # ISO YYYY-MM-DD
-    date_end: Optional[str] = None
-    # debug
-    notes: Dict[str, Any] | None = None
+from core.nlu.schema import NLIntent, TimeWindow
 
 
 # ---- Helpers ----
@@ -119,6 +96,22 @@ def _to_int(tok: str) -> Optional[int]:
     if t.isdigit():
         return int(t)
     return _NUM_WORDS.get(t) or _AR_NUM_WORDS.get(t)
+
+
+def _ensure_window(intent: NLIntent) -> TimeWindow:
+    if intent.explicit_dates is None:
+        intent.explicit_dates = TimeWindow()
+    return intent.explicit_dates
+
+
+def _set_window(intent: NLIntent, *, start: Optional[str] = None, end: Optional[str] = None) -> None:
+    window = _ensure_window(intent)
+    if start is not None:
+        window.start = start
+    if end is not None:
+        window.end = end
+    if window.start and window.end:
+        intent.has_time_window = True
 
 
 def _month_range(dt: datetime) -> Tuple[datetime, datetime]:
@@ -244,26 +237,21 @@ def normalize(question: str, now: Optional[datetime] = None) -> NLIntent:
     # Explicit phrases
     if "last month" in ql or "الشهر الماضي" in ql:
         start, end = _month_range(now.replace(day=1) - timedelta(days=1))
-        intent.date_start, intent.date_end = start.date().isoformat(), end.date().isoformat()
-        intent.has_time_window = True
+        _set_window(intent, start=start.date().isoformat(), end=end.date().isoformat())
     elif "next month" in ql or "الشهر القادم" in ql:
         probe = now.replace(day=28) + timedelta(days=4)
         start, end = _month_range(probe)
-        intent.date_start, intent.date_end = start.date().isoformat(), end.date().isoformat()
-        intent.has_time_window = True
+        _set_window(intent, start=start.date().isoformat(), end=end.date().isoformat())
     elif "this month" in ql or "هذا الشهر" in ql:
         start, end = _month_range(now)
-        intent.date_start, intent.date_end = start.date().isoformat(), end.date().isoformat()
-        intent.has_time_window = True
+        _set_window(intent, start=start.date().isoformat(), end=end.date().isoformat())
     elif "last quarter" in ql or "الربع الماضي" in ql:
         start, end = _last_quarter_range(now)
-        intent.date_start, intent.date_end = start.date().isoformat(), end.date().isoformat()
-        intent.has_time_window = True
+        _set_window(intent, start=start.date().isoformat(), end=end.date().isoformat())
     elif "this quarter" in ql or "الربع الحالي" in ql:
         current_q = (now.month - 1) // 3 + 1
         start, end = _quarter_range(now.year, current_q, tz)
-        intent.date_start, intent.date_end = start.date().isoformat(), end.date().isoformat()
-        intent.has_time_window = True
+        _set_window(intent, start=start.date().isoformat(), end=end.date().isoformat())
     elif "next quarter" in ql or "الربع القادم" in ql:
         current_q = (now.month - 1) // 3 + 1
         next_q = current_q + 1
@@ -272,30 +260,24 @@ def normalize(question: str, now: Optional[datetime] = None) -> NLIntent:
             next_q = 1
             year += 1
         start, end = _quarter_range(year, next_q, tz)
-        intent.date_start, intent.date_end = start.date().isoformat(), end.date().isoformat()
-        intent.has_time_window = True
+        _set_window(intent, start=start.date().isoformat(), end=end.date().isoformat())
     elif "last year" in ql or "السنة الماضية" in ql or "العام الماضي" in ql:
         start, end = _year_range(now.year - 1, tz)
-        intent.date_start, intent.date_end = start.date().isoformat(), end.date().isoformat()
-        intent.has_time_window = True
+        _set_window(intent, start=start.date().isoformat(), end=end.date().isoformat())
     elif "this year" in ql or "هذه السنة" in ql or "هذا العام" in ql or "العام الحالي" in ql:
         start, end = _year_range(now.year, tz)
-        intent.date_start, intent.date_end = start.date().isoformat(), end.date().isoformat()
-        intent.has_time_window = True
+        _set_window(intent, start=start.date().isoformat(), end=end.date().isoformat())
     elif "next year" in ql or "السنة القادمة" in ql or "العام القادم" in ql:
         start, end = _year_range(now.year + 1, tz)
-        intent.date_start, intent.date_end = start.date().isoformat(), end.date().isoformat()
-        intent.has_time_window = True
+        _set_window(intent, start=start.date().isoformat(), end=end.date().isoformat())
     else:
         q_match = re.search(r"\bq([1-4])\s*(?:/|\-)?\s*(\d{4})\b", q, re.I)
         if q_match:
             quarter = int(q_match.group(1))
             year = int(q_match.group(2))
             start, end = _quarter_range(year, quarter, tz)
-            intent.date_start, intent.date_end = start.date().isoformat(), end.date().isoformat()
-            intent.has_time_window = True
+            _set_window(intent, start=start.date().isoformat(), end=end.date().isoformat())
         else:
-            # “last 3 months”, “next 30 days”, Arabic forms: "آخر ٣ شهور", "القادم 30 يوم"
             n_window = re.search(
                 r"\b(last|next|within|in|القادم|الماضي|السابقة)\s+(\d+|\w+)\s+"
                 r"(day|days|week|weeks|month|months|year|years|يوم|أيام|اسبوع|أسابيع|شهر|شهور|سنة|سنوات)\b",
@@ -311,14 +293,11 @@ def normalize(question: str, now: Optional[datetime] = None) -> NLIntent:
                         if direction == "last":
                             start_probe = _shift_month(now, -n)
                             start = start_probe.replace(hour=0, minute=0, second=0, microsecond=0, day=1)
-                            intent.date_start = start.date().isoformat()
-                            intent.date_end = now.date().isoformat()
+                            _set_window(intent, start=start.date().isoformat(), end=now.date().isoformat())
                         else:
                             end_probe = _shift_month(now, n)
                             end = _month_range(end_probe)[1]
-                            intent.date_start = now.date().isoformat()
-                            intent.date_end = end.date().isoformat()
-                        intent.has_time_window = True
+                            _set_window(intent, start=now.date().isoformat(), end=end.date().isoformat())
                     else:
                         scale = 1
                         if re.search(r"week|اسبوع|أسابيع", unit, re.I):
@@ -327,15 +306,18 @@ def normalize(question: str, now: Optional[datetime] = None) -> NLIntent:
                             scale = 365
                         delta = timedelta(days=scale * n)
                         if direction == "last":
-                            intent.date_start = (now - delta).date().isoformat()
-                            intent.date_end = now.date().isoformat()
+                            _set_window(intent, start=(now - delta).date().isoformat(), end=now.date().isoformat())
                         else:
-                            intent.date_start = now.date().isoformat()
-                            intent.date_end = (now + delta).date().isoformat()
-                        intent.has_time_window = True
+                            _set_window(intent, start=now.date().isoformat(), end=(now + delta).date().isoformat())
 
-            # Freeform (fallback) using dateparser
-            if (not intent.date_start or not intent.date_end) and dateparser:
+            if (
+                dateparser
+                and (
+                    not intent.explicit_dates
+                    or not intent.explicit_dates.start
+                    or not intent.explicit_dates.end
+                )
+            ):
                 m = re.search(r"\bbetween\s+(.+?)\s+and\s+(.+)$", ql, re.I) or re.search(
                     r"\bfrom\s+(.+?)\s+(?:to|-)\s+(.+)$", ql, re.I
                 )
@@ -343,9 +325,7 @@ def normalize(question: str, now: Optional[datetime] = None) -> NLIntent:
                     ds = dateparser.parse(m.group(1), settings={"RELATIVE_BASE": now})
                     de = dateparser.parse(m.group(2), settings={"RELATIVE_BASE": now})
                     if ds and de:
-                        intent.date_start = ds.date().isoformat()
-                        intent.date_end = de.date().isoformat()
-                        intent.has_time_window = True
+                        _set_window(intent, start=ds.date().isoformat(), end=de.date().isoformat())
 
     # Choose date column if user mentions END_DATE/START_DATE explicitly or via keywords
     if re.search(r"\bEND_DATE\b", q, re.I) or "تاريخ الانتهاء" in q or re.search(r"expir", q, re.I):

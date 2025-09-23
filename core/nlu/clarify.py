@@ -5,7 +5,7 @@ from __future__ import annotations
 from .dates import parse_time_window
 from .number import extract_top_n
 from .slots import extract_group_by, wants_count
-from .types import NLIntent, TimeWindow
+from .schema import NLIntent, TimeWindow
 
 
 def infer_intent(
@@ -19,19 +19,20 @@ def infer_intent(
 
     has_window = bool(time_window_data.get("start") and time_window_data.get("end"))
 
-    time_window = TimeWindow(
-        start=time_window_data.get("start"),
-        end=time_window_data.get("end"),
-        inferred=inferred,
-        column=time_window_data.get("column"),
-    )
+    explicit = None
+    if any([time_window_data.get("start"), time_window_data.get("end")]):
+        explicit = TimeWindow(
+            start=time_window_data.get("start"),
+            end=time_window_data.get("end"),
+        )
 
     intent = NLIntent(
-        has_time_window=has_window,
-        time_window=time_window if any([time_window.start, time_window.end]) else None,
+        has_time_window=has_window if inferred else None,
+        explicit_dates=explicit,
         top_n=top_n,
         group_by=group_by,
         wants_all_columns=all_columns_default,
+        date_column=time_window_data.get("column") or default_date_col,
     )
 
     if wants_count(text):
