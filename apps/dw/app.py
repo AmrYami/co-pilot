@@ -23,6 +23,7 @@ from apps.dw.nlu_normalizer import (
 )
 from apps.dw.sql_compose import compose_sql
 from apps.dw.sql_rules import build_sql
+from apps.dw.sqlbuilder import build_dw_sql
 from core.datasources import DatasourceRegistry
 from core.settings import Settings
 from core.model_loader import get_model
@@ -1371,6 +1372,14 @@ def answer():
     table_name = settings.get("DW_CONTRACT_TABLE", scope="namespace") or "Contract"
     default_date_col = settings.get("DW_DATE_COLUMN", scope="namespace") or "REQUEST_DATE"
 
+    table_literal_raw = (table_name or "Contract").strip()
+    if not table_literal_raw:
+        table_literal_raw = "Contract"
+    if table_literal_raw.startswith('"'):
+        table_literal_for_builder = table_literal_raw
+    else:
+        table_literal_for_builder = f'"{table_literal_raw.strip("\"")}"'
+
     select_all_setting = settings.get("DW_SELECT_ALL_DEFAULT", scope="namespace")
     if isinstance(select_all_setting, bool):
         select_all_default = select_all_setting
@@ -1378,6 +1387,19 @@ def answer():
         select_all_default = DW_SELECT_ALL_DEFAULT
     else:
         select_all_default = str(select_all_setting).strip().lower() not in {
+            "",
+            "0",
+            "false",
+            "no",
+        }
+
+    autodetail_setting = settings.get("DW_TOPN_AUTODETAIL", scope="namespace")
+    if isinstance(autodetail_setting, bool):
+        autodetail = autodetail_setting
+    elif autodetail_setting is None:
+        autodetail = True
+    else:
+        autodetail = str(autodetail_setting).strip().lower() not in {
             "",
             "0",
             "false",
@@ -1483,6 +1505,177 @@ def answer():
             "prefixes": prefixes,
         },
     )
+
+    try:
+        deterministic_intent = parse_intent(
+            q,
+            default_date_col=default_date_col,
+            select_all_default=select_all_default,
+        )
+        built_payload = build_dw_sql(
+            deterministic_intent,
+            table=table_literal_for_builder,
+            select_all_default=select_all_default,
+            auto_detail=autodetail,
+        )
+    except Exception as exc:  # pragma: no cover - defensive fallback
+        built_payload = None
+        log_event(
+            log,
+            "dw",
+            "deterministic_sql_skip",
+            {"error": str(exc)[:200]},
+        )
+
+    if built_payload:
+        sql = built_payload.get("sql") or ""
+        binds = dict(built_payload.get("binds") or {})
+        validation_errors: list[str] = []
+        validation_ok = True
+        try:
+            validate_oracle_sql(sql)
+        except Exception as exc:  # pragma: no cover - validation failure fallback
+            validation_ok = False
+            validation_errors = [str(exc)]
+
+        if validation_ok and sql:
+            try:
+                oracle_engine = ds_registry.engine(None)
+                exec_start = datetime.datetime.utcnow()
+                with oracle_engine.begin() as oc:
+                    rs = oc.execute(text(sql), binds)
+                    columns = list(rs.keys())
+                    fetched_rows = rs.fetchall()
+                duration_ms = int(
+                    (datetime.datetime.utcnow() - exec_start).total_seconds() * 1000
+                )
+                rows_data = [list(row) for row in fetched_rows]
+                csv_path_obj = _write_csv(rows_data, columns)
+                csv_path = str(csv_path_obj) if csv_path_obj else None
+
+                validation_payload = {
+                    "ok": True,
+                    "errors": [],
+                    "binds": list(binds.keys()),
+                    "bind_names": list(binds.keys()),
+                }
+                log_event(log, "dw", "sql_prompt", {"prompt": ""})
+                log_event(log, "dw", "final_sql", {"size": len(sql), "sql": sql})
+                log_event(log, "dw", "validation", validation_payload)
+
+                detail_csv_path = None
+                details_rowcount = 0
+                if built_payload.get("detail") and built_payload.get("detail_sql"):
+                    detail_sql = built_payload.get("detail_sql")
+                    try:
+                        with oracle_engine.begin() as oc:
+                            drs = oc.execute(text(detail_sql), binds)
+                            detail_columns = list(drs.keys())
+                            detail_rows = drs.fetchall()
+                        detail_data = [list(row) for row in detail_rows]
+                        detail_csv_obj = _write_csv(detail_data, detail_columns)
+                        detail_csv_path = str(detail_csv_obj) if detail_csv_obj else None
+                        details_rowcount = len(detail_data)
+                    except Exception as exc:  # pragma: no cover - detail failure fallback
+                        log_event(
+                            log,
+                            "dw",
+                            "deterministic_detail_skip",
+                            {"error": str(exc)[:200]},
+                        )
+
+                binds_public = {
+                    key: (value.isoformat() if hasattr(value, "isoformat") else value)
+                    for key, value in binds.items()
+                }
+                meta = {
+                    "rowcount": len(rows_data),
+                    "wants_all_columns": bool(
+                        deterministic_intent.wants_all_columns
+                        if deterministic_intent.wants_all_columns is not None
+                        else select_all_default
+                    ),
+                    "used_deterministic_planner": True,
+                    "clarifier_intent": deterministic_intent.model_dump(exclude_none=True),
+                    "binds": binds_public,
+                    "duration_ms": duration_ms,
+                    "details_rowcount": details_rowcount,
+                    "used_autodetail": bool(detail_csv_path),
+                }
+                resp = {
+                    "ok": True,
+                    "inquiry_id": inq_id,
+                    "sql": sql,
+                    "rows": rows_data[:200],
+                    "columns": columns,
+                    "csv_path": csv_path,
+                    "meta": meta,
+                }
+                if detail_csv_path:
+                    resp["details_csv_path"] = detail_csv_path
+
+                log_event(
+                    log,
+                    "dw",
+                    "deterministic_sql_success",
+                    {
+                        "rows": len(rows_data),
+                        "columns": columns,
+                        "top_n": binds.get("top_n"),
+                        "group_by": deterministic_intent.group_by,
+                    },
+                )
+
+                with mem.begin() as conn:
+                    conn.execute(
+                        text(
+                            """
+                        UPDATE mem_inquiries
+                           SET status='answered', answered_by=:by, answered_at=NOW(), updated_at=NOW(),
+                               last_sql=:sql, last_error=NULL
+                         WHERE id=:id
+                    """
+                        ),
+                        {"by": auth_email, "sql": sql, "id": inq_id},
+                    )
+                log_event(
+                    log,
+                    "dw",
+                    "inquiry_status",
+                    {"id": inq_id, "from": "open", "to": "answered", "rows": len(rows_data)},
+                )
+
+                if include_debug:
+                    resp["debug"] = {
+                        "intent": deterministic_intent.model_dump(exclude_none=True),
+                        "prompt": "",
+                        "raw1": sql,
+                        "validation": validation_payload,
+                    }
+
+                return jsonify(resp)
+            except Exception as exc:  # pragma: no cover - execution failure fallback
+                validation_ok = False
+                validation_errors = [str(exc)]
+                log_event(
+                    log,
+                    "dw",
+                    "deterministic_sql_skip",
+                    {"error": str(exc)[:200], "sql": sql[:120]},
+                )
+
+        if not validation_ok:
+            log_event(
+                log,
+                "dw",
+                "validation",
+                {
+                    "ok": False,
+                    "errors": validation_errors,
+                    "binds": list(binds.keys()),
+                    "bind_names": list(binds.keys()),
+                },
+            )
 
     clarifier = clarify_intent(q, ctx)
     clarifier_raw = ""
