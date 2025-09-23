@@ -15,6 +15,14 @@ from typing import Any, Dict, List, Optional, Tuple
 from flask import Blueprint, jsonify, request
 from sqlalchemy import text
 
+from apps.dw.heuristics import (
+    COL_END as POLICY_COL_END,
+    COL_REQ as POLICY_COL_REQ,
+    COL_START as POLICY_COL_START,
+    DWIntent as PolicyDWIntent,
+    build_sql as build_policy_sql,
+    parse_intent as parse_policy_intent,
+)
 from apps.dw.intent import (
     DWIntent as PlannerDWIntent,
     parse_intent as parse_new_dw_intent,
@@ -1507,6 +1515,41 @@ def _write_csv(rows, headers) -> str:
     return path
 
 
+def _policy_intent_payload(intent: PolicyDWIntent | None) -> dict[str, Any]:
+    if not intent:
+        return {}
+
+    if intent.expiring_days is not None:
+        date_column = POLICY_COL_END
+    elif intent.use_requested_date:
+        date_column = POLICY_COL_REQ
+    else:
+        date_column = f"{POLICY_COL_START}/{POLICY_COL_END} overlap"
+
+    payload = {
+        "agg": intent.agg,
+        "group_by": intent.group_by,
+        "measure_sql": intent.measure_sql,
+        "sort_by": intent.sort_by,
+        "sort_desc": intent.sort_desc,
+        "top_n": intent.top_n,
+        "user_requested_top_n": intent.user_requested_top_n,
+        "wants_all_columns": intent.wants_all_columns,
+        "use_requested_date": intent.use_requested_date,
+        "expiring_days": intent.expiring_days,
+        "date_column": date_column,
+        "explicit_dates": {
+            "start": intent.window_start.isoformat() if intent.window_start else None,
+            "end": intent.window_end.isoformat() if intent.window_end else None,
+        },
+    }
+
+    if intent.notes:
+        payload["notes"] = dict(intent.notes)
+
+    return payload
+
+
 @dw_bp.route("/answer", methods=["POST"])
 def answer():
     settings = _settings()
@@ -1672,6 +1715,212 @@ def answer():
             "prefixes": prefixes,
         },
     )
+
+    policy_intent: Optional[PolicyDWIntent] = None
+    policy_payload: Dict[str, Any] = {}
+    policy_sql = ""
+    policy_binds: Dict[str, Any] = {}
+
+    if q:
+        try:
+            policy_intent = parse_policy_intent(q)
+            policy_intent.notes.setdefault("source", "policy_heuristics")
+
+            if override_explicit_dates:
+                start_override = override_explicit_dates.get("start")
+                end_override = override_explicit_dates.get("end")
+                try:
+                    if start_override:
+                        policy_intent.window_start = date.fromisoformat(start_override)
+                    if end_override:
+                        policy_intent.window_end = date.fromisoformat(end_override)
+                    policy_intent.expiring_days = None
+                except Exception:
+                    pass
+                if override_date_column:
+                    policy_intent.use_requested_date = override_date_column == "REQUEST_DATE"
+            elif date_column_override:
+                policy_intent.use_requested_date = date_column_override == "REQUEST_DATE"
+
+            policy_payload = _policy_intent_payload(policy_intent)
+            log_event(
+                log,
+                "dw",
+                "policy_heuristic_intent",
+                json.loads(json.dumps({"intent": policy_payload}, default=str)),
+            )
+
+            policy_can_execute = bool(
+                policy_intent.expiring_days is not None
+                or (policy_intent.window_start and policy_intent.window_end)
+                or policy_intent.agg
+                or policy_intent.group_by
+            )
+
+            if policy_can_execute:
+                policy_sql, policy_binds = build_policy_sql(
+                    policy_intent,
+                    table=table_literal_for_builder,
+                )
+                log_event(
+                    log,
+                    "dw",
+                    "policy_heuristic_sql",
+                    {
+                        "size": len(policy_sql),
+                        "binds": list(policy_binds.keys()),
+                    },
+                )
+            else:
+                log_event(
+                    log,
+                    "dw",
+                    "policy_heuristic_skip",
+                    {"reason": "insufficient_constraints"},
+                )
+                policy_sql = ""
+                policy_binds = {}
+        except Exception as exc:
+            log_event(
+                log,
+                "dw",
+                "policy_heuristic_skip",
+                {"error": str(exc)[:200]},
+            )
+            policy_sql = ""
+            policy_binds = {}
+            policy_payload = {}
+
+    if policy_sql:
+        try:
+            parse_one(policy_sql, read="oracle")
+        except Exception as exc:
+            log_event(
+                log,
+                "dw",
+                "policy_heuristic_skip",
+                {"error": f"parse:{str(exc)[:200]}", "sql": policy_sql[:120]},
+            )
+            policy_sql = ""
+
+    if policy_sql:
+        try:
+            validate_oracle_sql(policy_sql)
+        except Exception as exc:
+            log_event(
+                log,
+                "dw",
+                "policy_heuristic_skip",
+                {"error": str(exc)[:200], "sql": policy_sql[:120]},
+            )
+            policy_sql = ""
+
+    if policy_sql:
+        try:
+            oracle_engine = ds_registry.engine(None)
+            exec_start = datetime.datetime.utcnow()
+            with oracle_engine.begin() as oc:
+                rs = oc.execute(text(policy_sql), policy_binds)
+                policy_columns = list(rs.keys())
+                policy_rows = rs.fetchall()
+            duration_ms = int((datetime.datetime.utcnow() - exec_start).total_seconds() * 1000)
+            rows_data = [list(row) for row in policy_rows]
+            csv_path_obj = _write_csv(rows_data, policy_columns)
+            csv_path = str(csv_path_obj) if csv_path_obj else None
+
+            log_event(log, "dw", "sql_prompt", {"prompt": ""})
+            log_event(
+                log,
+                "dw",
+                "final_sql",
+                {"size": len(policy_sql), "sql": policy_sql},
+            )
+
+            binds_public = {
+                key: (value.isoformat() if hasattr(value, "isoformat") else value)
+                for key, value in policy_binds.items()
+            }
+
+            validation_payload = {
+                "ok": True,
+                "errors": [],
+                "binds": list(policy_binds.keys()),
+                "bind_names": list(policy_binds.keys()),
+            }
+            log_event(log, "dw", "validation", validation_payload)
+
+            clarifier_payload = policy_payload or _policy_intent_payload(policy_intent)
+            meta = {
+                "rowcount": len(rows_data),
+                "wants_all_columns": bool(policy_intent and policy_intent.wants_all_columns),
+                "used_policy_heuristics": True,
+                "clarifier_intent": clarifier_payload,
+                "binds": binds_public,
+                "duration_ms": duration_ms,
+                "details_rowcount": 0,
+                "used_autodetail": False,
+            }
+
+            response_payload = {
+                "ok": True,
+                "inquiry_id": inq_id,
+                "sql": policy_sql,
+                "rows": rows_data[:200],
+                "columns": policy_columns,
+                "csv_path": csv_path,
+                "meta": meta,
+            }
+
+            log_event(
+                log,
+                "dw",
+                "deterministic_sql_success",
+                {
+                    "rows": len(rows_data),
+                    "columns": policy_columns,
+                    "top_n": clarifier_payload.get("top_n") if clarifier_payload else None,
+                    "group_by": clarifier_payload.get("group_by") if clarifier_payload else None,
+                    "planner": "policy",
+                },
+            )
+
+            with mem.begin() as conn:
+                conn.execute(
+                    text(
+                        """
+                    UPDATE mem_inquiries
+                       SET status='answered', answered_by=:by, answered_at=NOW(), updated_at=NOW(),
+                           last_sql=:sql, last_error=NULL
+                     WHERE id=:id
+                """
+                    ),
+                    {"by": auth_email, "sql": policy_sql, "id": inq_id},
+                )
+
+            log_event(
+                log,
+                "dw",
+                "inquiry_status",
+                {"id": inq_id, "from": "open", "to": "answered", "rows": len(rows_data)},
+            )
+
+            if include_debug:
+                debug_payload = {
+                    "intent": clarifier_payload,
+                    "prompt": "",
+                    "raw1": policy_sql,
+                    "validation": validation_payload,
+                }
+                response_payload["debug"] = debug_payload
+
+            return jsonify(response_payload)
+        except Exception as exc:
+            log_event(
+                log,
+                "dw",
+                "policy_heuristic_skip",
+                {"error": str(exc)[:200], "sql": policy_sql[:120]},
+            )
 
     if _dw_parse_intent and _dw_build_sql and q:
         dw_defaults = {
