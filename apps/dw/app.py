@@ -43,6 +43,12 @@ from apps.dw.nlu import parse_intent as parse_fast_intent
 from apps.dw.sql_compose import compose_sql
 from apps.dw.sql_rules import build_sql
 from apps.dw.sqlbuilder import build_dw_sql
+from apps.dw.lexicon import (
+    DIMENSION_MAP,
+    EXPIRE_WORDS,
+    PROJECTION_MAP,
+    REQUESTED_WORDS,
+)
 from core.datasources import DatasourceRegistry
 from core.settings import Settings
 from core.model_loader import get_model
@@ -56,6 +62,7 @@ from core.sql_utils import (
 from core.logging_utils import get_logger, log_event
 from core.nlu.parse import parse_intent as parse_core_intent
 from core.nlu.schema import TimeWindow
+from core.nlu.projection import extract_projection
 import sqlglot
 
 
@@ -320,6 +327,181 @@ def _dw_sql_from_intent(
         binds["top_n"] = top_n
         lines.append("FETCH FIRST :top_n ROWS ONLY")
     return "\n".join(lines), binds
+
+
+def _dw_build_sql_from_intent(
+    intent: Mapping[str, Any] | None,
+    question: str,
+    *,
+    table: str | None = None,
+) -> tuple[str, dict, dict]:
+    if not isinstance(intent, Mapping):
+        return "", {}, {}
+
+    table_literal = (table or '"Contract"').strip() or '"Contract"'
+    if not table_literal.startswith('"'):
+        table_literal = f'"{table_literal.strip("\"")}"'
+
+    q_norm = (question or "").lower()
+    binds: dict[str, object] = {}
+    meta: dict[str, object] = {"used_deterministic_planner": True}
+
+    has_time_window = bool(intent.get("has_time_window"))
+    explicit_dates = intent.get("explicit_dates") or {}
+    if not isinstance(explicit_dates, dict):
+        explicit_dates = {}
+    top_n = intent.get("top_n")
+    user_requested_top_n = bool(intent.get("user_requested_top_n"))
+    group_by = intent.get("group_by")
+    agg = (intent.get("agg") or "").lower() if intent.get("agg") else None
+    wants_all = bool(intent.get("wants_all_columns", False))
+
+    date_col = (intent.get("date_column") or "").upper() or None
+    if date_col == "REQUEST_DATE" and not REQUESTED_WORDS.search(question or ""):
+        date_col = None
+
+    where_clause = ""
+
+    if EXPIRE_WORDS.search(question or ""):
+        date_col = "END_DATE"
+        has_time_window = True
+        if not explicit_dates:
+            today = datetime.datetime.utcnow().date()
+            explicit_dates = {
+                "start": today.isoformat(),
+                "end": (today + timedelta(days=30)).isoformat(),
+            }
+    elif REQUESTED_WORDS.search(question or ""):
+        date_col = "REQUEST_DATE"
+
+    if has_time_window:
+        start = explicit_dates.get("start") if isinstance(explicit_dates, dict) else None
+        end = explicit_dates.get("end") if isinstance(explicit_dates, dict) else None
+        if date_col == "REQUEST_DATE":
+            if not (start and end):
+                today = datetime.datetime.utcnow().date().replace(day=1)
+                prev_end = today - timedelta(days=1)
+                prev_start = prev_end.replace(day=1)
+                start = prev_start.isoformat()
+                end = prev_end.isoformat()
+            where_clause = "WHERE REQUEST_DATE BETWEEN :date_start AND :date_end"
+        else:
+            if not (start and end):
+                today = datetime.datetime.utcnow().date().replace(day=1)
+                prev_end = today - timedelta(days=1)
+                prev_start = prev_end.replace(day=1)
+                start = prev_start.isoformat()
+                end = prev_end.isoformat()
+            where_clause = "WHERE START_DATE <= :date_end AND END_DATE >= :date_start"
+
+        if not (start and end):
+            return "", {}, {}
+
+        binds["date_start"] = start
+        binds["date_end"] = end
+
+    if not group_by:
+        match = re.search(r"\b(?:by|per)\s+([a-z_ ]+)", q_norm)
+        if match:
+            phrase = match.group(1).strip()
+            for alias, column in sorted(
+                DIMENSION_MAP.items(), key=lambda kv: -len(kv[0])
+            ):
+                if alias in phrase:
+                    group_by = column
+                    break
+    if not group_by and "status" in q_norm:
+        group_by = DIMENSION_MAP.get("status")
+
+    projection = extract_projection(question, PROJECTION_MAP)
+    meta["projection"] = projection
+    if projection:
+        wants_all = False
+
+    measure = intent.get("measure_sql")
+    if not measure:
+        if "gross" in q_norm:
+            measure = (
+                "NVL(CONTRACT_VALUE_NET_OF_VAT,0) + "
+                "CASE WHEN NVL(VAT,0) BETWEEN 0 AND 1 "
+                "THEN NVL(CONTRACT_VALUE_NET_OF_VAT,0) * NVL(VAT,0) "
+                "ELSE NVL(VAT,0) END"
+            )
+        else:
+            measure = "NVL(CONTRACT_VALUE_NET_OF_VAT,0)"
+
+    sql_text = ""
+
+    if group_by:
+        if agg in (None, "", "sum"):
+            select_measure = f"SUM({measure}) AS MEASURE"
+            order_clause = "ORDER BY MEASURE DESC"
+        elif agg == "count":
+            select_measure = "COUNT(*) AS CNT"
+            order_clause = "ORDER BY CNT DESC"
+        elif agg == "avg":
+            select_measure = f"AVG({measure}) AS MEASURE"
+            order_clause = "ORDER BY MEASURE DESC"
+        else:
+            return "", {}, {}
+
+        sql_lines = [
+            "SELECT",
+            f"  {group_by} AS GROUP_KEY,",
+            f"  {select_measure}",
+            f"FROM {table_literal}",
+        ]
+        if where_clause:
+            sql_lines.append(where_clause)
+        sql_lines.append(f"GROUP BY {group_by}")
+        sql_lines.append(order_clause)
+        if user_requested_top_n and top_n:
+            sql_lines.append("FETCH FIRST :top_n ROWS ONLY")
+            try:
+                binds["top_n"] = int(top_n)
+            except Exception:
+                return "", {}, {}
+        meta["mode"] = "grouped"
+        meta["group_by"] = group_by
+        sql_text = "\n".join(sql_lines)
+    else:
+        if projection:
+            columns: list[str] = []
+            for column in projection:
+                if column == "__GROSS__":
+                    columns.append(
+                        "NVL(CONTRACT_VALUE_NET_OF_VAT,0) + "
+                        "CASE WHEN NVL(VAT,0) BETWEEN 0 AND 1 "
+                        "THEN NVL(CONTRACT_VALUE_NET_OF_VAT,0) * NVL(VAT,0) "
+                        "ELSE NVL(VAT,0) END AS GROSS_VALUE"
+                    )
+                else:
+                    columns.append(column)
+            select_cols = ", ".join(columns)
+        else:
+            select_cols = "*" if wants_all else "*"
+
+        sql_lines = [f"SELECT {select_cols}", f"FROM {table_literal}"]
+        if where_clause:
+            sql_lines.append(where_clause)
+        if has_time_window:
+            if date_col == "REQUEST_DATE":
+                order_col = "REQUEST_DATE"
+            elif date_col == "END_DATE":
+                order_col = "END_DATE"
+            else:
+                order_col = "END_DATE"
+            sql_lines.append(f"ORDER BY {order_col} ASC")
+        if user_requested_top_n and top_n:
+            sql_lines.append("FETCH FIRST :top_n ROWS ONLY")
+            try:
+                binds["top_n"] = int(top_n)
+            except Exception:
+                return "", {}, {}
+        meta["mode"] = "list"
+        sql_text = "\n".join(sql_lines)
+
+    return sql_text.strip(), binds, meta
 
 
 def _build_sql_from_planner(intent: PlannerDWIntent, table: str) -> tuple[str, dict[str, object]] | None:
@@ -2886,6 +3068,146 @@ def answer():
     wants_all_default = _should_select_all_columns(q, group_col, measure)
     intent["wants_all_columns"] = wants_all_default
     compiler_intent.wants_all_columns = wants_all_default
+
+    builder_sql, builder_binds, builder_meta = _dw_build_sql_from_intent(
+        intent,
+        q,
+        table=table_literal_for_builder,
+    )
+    if builder_sql:
+        try:
+            parse_one(builder_sql, read="oracle")
+        except Exception as exc:
+            log_event(
+                log,
+                "dw",
+                "deterministic_lexicon_skip",
+                {"error": f"parse:{str(exc)[:200]}", "sql": builder_sql[:120]},
+            )
+        else:
+            try:
+                validate_oracle_sql(builder_sql)
+            except Exception as exc:
+                log_event(
+                    log,
+                    "dw",
+                    "deterministic_lexicon_skip",
+                    {"error": str(exc)[:200], "sql": builder_sql[:120]},
+                )
+            else:
+                try:
+                    oracle_engine = ds_registry.engine(None)
+                    exec_start = datetime.datetime.utcnow()
+                    with oracle_engine.begin() as oc:
+                        rs = oc.execute(text(builder_sql), builder_binds)
+                        columns = list(rs.keys())
+                        fetched_rows = rs.fetchall()
+                    duration_ms = int(
+                        (datetime.datetime.utcnow() - exec_start).total_seconds() * 1000
+                    )
+                except Exception as exc:
+                    log_event(
+                        log,
+                        "dw",
+                        "deterministic_lexicon_skip",
+                        {"error": str(exc)[:200], "sql": builder_sql[:120]},
+                    )
+                else:
+                    rows_data = [list(row) for row in fetched_rows]
+                    csv_path_obj = _write_csv(rows_data, columns)
+                    csv_path = str(csv_path_obj) if csv_path_obj else None
+
+                    log_event(log, "dw", "sql_prompt", {"prompt": ""})
+                    log_event(
+                        log,
+                        "dw",
+                        "final_sql",
+                        {"size": len(builder_sql), "sql": builder_sql},
+                    )
+
+                    binds_public = {
+                        key: (value.isoformat() if hasattr(value, "isoformat") else value)
+                        for key, value in builder_binds.items()
+                    }
+
+                    validation_payload = {
+                        "ok": True,
+                        "errors": [],
+                        "binds": list(builder_binds.keys()),
+                        "bind_names": list(builder_binds.keys()),
+                    }
+                    log_event(log, "dw", "validation", validation_payload)
+
+                    clarifier_payload = json.loads(
+                        json.dumps(intent, default=str)
+                    )
+                    meta = {
+                        "rowcount": len(rows_data),
+                        "wants_all_columns": bool(intent.get("wants_all_columns")),
+                        "used_deterministic_planner": True,
+                        "clarifier_intent": clarifier_payload,
+                        "binds": binds_public,
+                        "duration_ms": duration_ms,
+                        "details_rowcount": 0,
+                        "used_autodetail": False,
+                    }
+                    for key, value in (builder_meta or {}).items():
+                        if key == "used_deterministic_planner":
+                            continue
+                        meta[key] = value
+
+                    response_payload = {
+                        "ok": True,
+                        "inquiry_id": inq_id,
+                        "sql": builder_sql,
+                        "rows": rows_data[:200],
+                        "columns": columns,
+                        "csv_path": csv_path,
+                        "meta": meta,
+                    }
+
+                    log_event(
+                        log,
+                        "dw",
+                        "deterministic_sql_success",
+                        {
+                            "rows": len(rows_data),
+                            "columns": columns,
+                            "top_n": builder_binds.get("top_n"),
+                            "group_by": builder_meta.get("group_by") if builder_meta else None,
+                            "planner": "lexicon",
+                        },
+                    )
+
+                    with mem.begin() as conn:
+                        conn.execute(
+                            text(
+                                """
+                        UPDATE mem_inquiries
+                           SET status='answered', answered_by=:by, answered_at=NOW(), updated_at=NOW(),
+                               last_sql=:sql, last_error=NULL
+                         WHERE id=:id
+                    """
+                            ),
+                            {"by": auth_email, "sql": builder_sql, "id": inq_id},
+                        )
+
+                    log_event(
+                        log,
+                        "dw",
+                        "inquiry_status",
+                        {"id": inq_id, "from": "open", "to": "answered", "rows": len(rows_data)},
+                    )
+
+                    if include_debug:
+                        response_payload["debug"] = {
+                            "intent": clarifier_payload,
+                            "prompt": "",
+                            "raw1": builder_sql,
+                            "validation": validation_payload,
+                        }
+
+                    return jsonify(response_payload)
 
     explicit_dates = intent.get("explicit_dates") if isinstance(intent.get("explicit_dates"), dict) else {}
     date_start = explicit_dates.get("start")
