@@ -21,6 +21,8 @@ from apps.dw.nlu_normalizer import (
     NET_VALUE_EXPR,
     normalize as normalize_nl,
 )
+from apps.dw.nlu import build_sql as build_fast_sql
+from apps.dw.nlu import parse_intent as parse_fast_intent
 from apps.dw.sql_compose import compose_sql
 from apps.dw.sql_rules import build_sql
 from apps.dw.sqlbuilder import build_dw_sql
@@ -1533,6 +1535,158 @@ def answer():
             "prefixes": prefixes,
         },
     )
+
+    fast_intent = None
+    try:
+        fast_intent = parse_fast_intent(
+            q,
+            default_date_col=default_date_col,
+        )
+    except Exception as exc:  # pragma: no cover - defensive fallback
+        log_event(
+            log,
+            "dw",
+            "deterministic_fast_skip",
+            {"error": str(exc)[:200]},
+        )
+
+    if fast_intent:
+        fast_sql, fast_binds = build_fast_sql(fast_intent, table=table_name)
+        if fast_sql:
+            try:
+                validate_oracle_sql(fast_sql)
+                oracle_engine = ds_registry.engine(None)
+                exec_start = datetime.datetime.utcnow()
+                with oracle_engine.begin() as oc:
+                    rs = oc.execute(text(fast_sql), fast_binds)
+                    columns = list(rs.keys())
+                    fetched_rows = rs.fetchall()
+                duration_ms = int(
+                    (datetime.datetime.utcnow() - exec_start).total_seconds() * 1000
+                )
+                rows_data = [list(row) for row in fetched_rows]
+                csv_path_obj = _write_csv(rows_data, columns)
+                csv_path = str(csv_path_obj) if csv_path_obj else None
+
+                validation_payload = {
+                    "ok": True,
+                    "errors": [],
+                    "binds": list(fast_binds.keys()),
+                    "bind_names": list(fast_binds.keys()),
+                }
+                log_event(log, "dw", "sql_prompt", {"prompt": ""})
+                log_event(
+                    log,
+                    "dw",
+                    "final_sql",
+                    {"size": len(fast_sql), "sql": fast_sql},
+                )
+                log_event(log, "dw", "validation", validation_payload)
+
+                binds_public = {
+                    key: (value.isoformat() if hasattr(value, "isoformat") else value)
+                    for key, value in fast_binds.items()
+                }
+
+                explicit_dates_meta = None
+                if (
+                    fast_intent.has_time_window
+                    and fast_intent.explicit_start
+                    and fast_intent.explicit_end
+                ):
+                    explicit_dates_meta = {
+                        "start": fast_intent.explicit_start.date().isoformat(),
+                        "end": fast_intent.explicit_end.date().isoformat(),
+                    }
+
+                clarifier_meta = {
+                    "has_time_window": fast_intent.has_time_window,
+                    "date_column": fast_intent.date_column,
+                    "explicit_dates": explicit_dates_meta,
+                    "agg": fast_intent.agg,
+                    "group_by": fast_intent.group_by,
+                    "top_n": fast_intent.top_n,
+                    "user_requested_top_n": fast_intent.user_requested_top_n,
+                    "wants_all_columns": fast_intent.wants_all_columns,
+                    "sort_by": fast_intent.sort_by,
+                    "sort_desc": fast_intent.sort_desc,
+                }
+
+                meta = {
+                    "rowcount": len(rows_data),
+                    "wants_all_columns": fast_intent.wants_all_columns,
+                    "used_deterministic_planner": True,
+                    "clarifier_intent": clarifier_meta,
+                    "binds": binds_public,
+                    "duration_ms": duration_ms,
+                    "details_rowcount": 0,
+                    "used_autodetail": False,
+                }
+
+                resp = {
+                    "ok": True,
+                    "inquiry_id": inq_id,
+                    "sql": fast_sql,
+                    "rows": rows_data[:200],
+                    "columns": columns,
+                    "csv_path": csv_path,
+                    "meta": meta,
+                }
+
+                log_event(
+                    log,
+                    "dw",
+                    "deterministic_sql_success",
+                    {
+                        "rows": len(rows_data),
+                        "columns": columns,
+                        "top_n": fast_intent.top_n,
+                        "group_by": fast_intent.group_by,
+                    },
+                )
+
+                with mem.begin() as conn:
+                    conn.execute(
+                        text(
+                            """
+                        UPDATE mem_inquiries
+                           SET status='answered', answered_by=:by, answered_at=NOW(), updated_at=NOW(),
+                               last_sql=:sql, last_error=NULL
+                         WHERE id=:id
+                    """
+                        ),
+                        {"by": auth_email, "sql": fast_sql, "id": inq_id},
+                    )
+                log_event(
+                    log,
+                    "dw",
+                    "inquiry_status",
+                    {"id": inq_id, "from": "open", "to": "answered", "rows": len(rows_data)},
+                )
+
+                if include_debug:
+                    resp["debug"] = {
+                        "intent": clarifier_meta,
+                        "prompt": "",
+                        "raw1": fast_sql,
+                        "validation": validation_payload,
+                    }
+
+                return jsonify(resp)
+            except Exception as exc:  # pragma: no cover - validation or execution failure
+                log_event(
+                    log,
+                    "dw",
+                    "deterministic_fast_skip",
+                    {"error": str(exc)[:200], "sql": str(fast_sql)[:120]},
+                )
+        else:
+            log_event(
+                log,
+                "dw",
+                "deterministic_fast_skip",
+                {"error": "no_sql"},
+            )
 
     try:
         deterministic_intent = parse_intent(
