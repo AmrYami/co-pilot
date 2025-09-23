@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
-    from apps.dw.intent import DWIntent
+    from apps.dw.intent_legacy import DWIntent
 
 
 def _table_literal(table: str) -> str:
