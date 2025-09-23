@@ -1272,6 +1272,9 @@ def _env_truthy(name: str, default: bool = False) -> bool:
 NAMESPACE = os.environ.get("DW_NAMESPACE", "dw::common")
 DW_INCLUDE_DEBUG = _env_truthy("DW_INCLUDE_DEBUG", default=True)
 DW_SELECT_ALL_DEFAULT = _env_truthy("DW_SELECT_ALL_DEFAULT", default=True)
+DW_ACCURACY_FIRST = _env_truthy("DW_ACCURACY_FIRST", default=False)
+DW_DISABLE_TRIVIAL_COUNT = _env_truthy("DW_DISABLE_TRIVIAL_COUNT", default=False)
+DW_REQUIRE_WINDOW_FOR_EXPIRE = _env_truthy("DW_REQUIRE_WINDOW_FOR_EXPIRE", default=True)
 
 
 def _as_dict(value) -> dict:
@@ -1541,7 +1544,7 @@ def answer():
     # Lightweight deterministic intent parsing to guard quick answers
     # ------------------------------------------------------------------
     dw_light_intent = parse_intent_dw(q)
-    mentions_expire = "expir" in q.lower() or "due" in q.lower()
+    lower_q = q.lower()
     deterministic_sql = None
     deterministic_binds: Dict[str, Any] = {}
     try:
@@ -1550,7 +1553,6 @@ def answer():
             table=table_name or "Contract",
         )
     except Exception as exc:
-        # Defensive: if builder fails we should fall back to the standard flow
         log_event(
             log,
             "dw",
@@ -1560,7 +1562,51 @@ def answer():
         deterministic_sql = None
         deterministic_binds = {}
 
-    if deterministic_sql and (not mentions_expire or dw_light_intent.has_time_window):
+    if deterministic_sql:
+        if (
+            DW_DISABLE_TRIVIAL_COUNT
+            and dw_light_intent.agg == "count"
+            and not (
+                dw_light_intent.explicit_dates
+                and dw_light_intent.has_time_window
+            )
+        ):
+            log_event(
+                log,
+                "dw",
+                "deterministic_fast_skip",
+                {"reason": "trivial_count_disabled"},
+            )
+            deterministic_sql = None
+        elif (
+            DW_REQUIRE_WINDOW_FOR_EXPIRE
+            and "expir" in lower_q
+            and not (
+                dw_light_intent.explicit_dates
+                and dw_light_intent.has_time_window
+            )
+        ):
+            log_event(
+                log,
+                "dw",
+                "deterministic_fast_skip",
+                {"reason": "expiring_without_window"},
+            )
+            deterministic_sql = None
+
+    if deterministic_sql:
+        try:
+            parse_one(deterministic_sql, read="oracle")
+        except Exception as exc:
+            log_event(
+                log,
+                "dw",
+                "deterministic_fast_skip",
+                {"error": f"parse:{str(exc)[:200]}", "sql": deterministic_sql[:120]},
+            )
+            deterministic_sql = None
+
+    if deterministic_sql:
         try:
             validate_oracle_sql(deterministic_sql)
         except Exception as exc:  # pragma: no cover - validation failure fallback
@@ -1688,18 +1734,19 @@ def answer():
                 )
 
     fast_intent = None
-    try:
-        fast_intent = parse_fast_intent(
-            q,
-            default_date_col=default_date_col,
-        )
-    except Exception as exc:  # pragma: no cover - defensive fallback
-        log_event(
-            log,
-            "dw",
-            "deterministic_fast_skip",
-            {"error": str(exc)[:200]},
-        )
+    if not DW_ACCURACY_FIRST:
+        try:
+            fast_intent = parse_fast_intent(
+                q,
+                default_date_col=default_date_col,
+            )
+        except Exception as exc:  # pragma: no cover - defensive fallback
+            log_event(
+                log,
+                "dw",
+                "deterministic_fast_skip",
+                {"error": str(exc)[:200]},
+            )
 
     if fast_intent:
         fast_sql, fast_binds = build_fast_sql(fast_intent, table=table_name)
