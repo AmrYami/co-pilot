@@ -175,6 +175,133 @@ def _build_agg_sql(
     return "\n".join(lines)
 
 
+def _dw_sql_from_intent(
+    intent: Mapping[str, Any] | None,
+    *,
+    table_name: str,
+    default_date_col: str,
+) -> Tuple[Optional[str], Dict[str, Any]]:
+    if not isinstance(intent, Mapping):
+        return None, {}
+
+    table_literal = (table_name or "Contract").strip()
+    if not table_literal:
+        table_literal = "Contract"
+    if not table_literal.startswith('"'):
+        table_literal = f'"{table_literal.strip("\"")}"'
+
+    date_col_raw = (intent.get("date_column") or default_date_col or "REQUEST_DATE")
+    date_col = str(date_col_raw).strip().upper() or "REQUEST_DATE"
+
+    group_by_raw = intent.get("group_by")
+    group_by: Optional[str] = None
+    if isinstance(group_by_raw, str):
+        group_by_clean = group_by_raw.strip()
+        if group_by_clean:
+            group_by = group_by_clean.upper()
+
+    agg = str(intent.get("agg") or "").lower()
+
+    top_n_raw = intent.get("top_n")
+    top_n: Optional[int] = None
+    if isinstance(top_n_raw, int):
+        top_n = top_n_raw if top_n_raw > 0 else None
+    elif isinstance(top_n_raw, str) and top_n_raw.strip().isdigit():
+        candidate = int(top_n_raw.strip())
+        if candidate > 0:
+            top_n = candidate
+
+    explicit_dates = intent.get("explicit_dates") if isinstance(intent.get("explicit_dates"), Mapping) else None
+    start = explicit_dates.get("start") if explicit_dates else None
+    end = explicit_dates.get("end") if explicit_dates else None
+
+    binds: Dict[str, Any] = {}
+    if intent.get("has_time_window") and start and end:
+        binds["date_start"] = start
+        binds["date_end"] = end
+
+    measure_expr = intent.get("measure_sql") if isinstance(intent.get("measure_sql"), str) else None
+    measure = measure_expr.strip() if isinstance(measure_expr, str) and measure_expr.strip() else NET_VALUE_EXPR
+
+    measure_clean = re.sub(r"\s+", "", measure.upper())
+    gross_clean = re.sub(r"\s+", "", _VALUE_COL_GROSS.upper())
+    net_clean = re.sub(r"\s+", "", NET_VALUE_EXPR.upper())
+    if measure_clean == gross_clean:
+        measure_alias = "GROSS_VALUE"
+    elif measure_clean == net_clean:
+        measure_alias = "NET_VALUE"
+    else:
+        measure_alias = "MEASURE"
+
+    where_clause = f"WHERE {date_col} BETWEEN :date_start AND :date_end" if binds else ""
+
+    group_expr = group_by
+    if group_by and group_by.upper() == "OWNER_DEPARTMENT":
+        group_expr = "NVL(OWNER_DEPARTMENT, '(Unknown)')"
+
+    if agg == "count":
+        if group_by and group_expr:
+            lines = [
+                f"SELECT {group_expr} AS GROUP_KEY, COUNT(*) AS CNT",
+                f"FROM {table_literal}",
+            ]
+            if where_clause:
+                lines.append(where_clause)
+            lines.append(f"GROUP BY {group_expr}")
+            lines.append("ORDER BY CNT DESC")
+            if top_n:
+                binds["top_n"] = top_n
+                lines.append("FETCH FIRST :top_n ROWS ONLY")
+            return "\n".join(lines), binds
+
+        lines = [
+            "SELECT COUNT(*) AS CNT",
+            f"FROM {table_literal}",
+        ]
+        if where_clause:
+            lines.append(where_clause)
+        if top_n:
+            binds["top_n"] = top_n
+            lines.append("FETCH FIRST :top_n ROWS ONLY")
+        return "\n".join(lines), binds
+
+    if group_by and group_expr:
+        lines = [
+            f"SELECT {group_expr} AS GROUP_KEY, SUM({measure}) AS {measure_alias}",
+            f"FROM {table_literal}",
+        ]
+        if where_clause:
+            lines.append(where_clause)
+        lines.append(f"GROUP BY {group_expr}")
+        lines.append(f"ORDER BY {measure_alias} DESC")
+        if top_n:
+            binds["top_n"] = top_n
+            lines.append("FETCH FIRST :top_n ROWS ONLY")
+        return "\n".join(lines), binds
+
+    sort_by = intent.get("sort_by") if isinstance(intent.get("sort_by"), str) else None
+    sort_desc = bool(intent.get("sort_desc")) if intent.get("sort_desc") is not None else False
+
+    order_column = sort_by.strip() if sort_by else date_col
+    if not order_column:
+        order_column = date_col
+
+    if sort_desc:
+        order_direction = "DESC"
+    else:
+        order_direction = "DESC" if top_n else "ASC"
+
+    lines = [
+        f"SELECT * FROM {table_literal}",
+    ]
+    if where_clause:
+        lines.append(where_clause)
+    lines.append(f"ORDER BY {order_column} {order_direction}")
+    if top_n:
+        binds["top_n"] = top_n
+        lines.append("FETCH FIRST :top_n ROWS ONLY")
+    return "\n".join(lines), binds
+
 def _should_select_all_columns(q: str, group_col: Optional[str], measure: str) -> bool:
     if group_col or measure == "count":
         return False
@@ -1461,6 +1588,8 @@ def answer():
 
     fallback_sql: Optional[str] = None
     fallback_bind_values: dict[str, Any] = {}
+    deterministic_sql_text: Optional[str] = None
+    deterministic_exec_cache: Optional[Dict[str, Any]] = None
 
     if rule_sql:
         fallback_sql = rule_sql
@@ -1563,6 +1692,59 @@ def answer():
         intent["has_time_window"] = True
     if intent.get("has_time_window") and intent.get("date_column") is None:
         intent["date_column"] = default_date_col
+
+    det_candidate_sql, det_candidate_binds = _dw_sql_from_intent(
+        intent,
+        table_name=table_name,
+        default_date_col=default_date_col,
+    )
+    if det_candidate_sql:
+        det_exec_binds = dict(det_candidate_binds)
+        try:
+            validate_oracle_sql(det_candidate_sql)
+            det_start_time = datetime.datetime.utcnow()
+            oracle_engine = ds_registry.engine(None)
+            with oracle_engine.begin() as oc:
+                det_rs = oc.execute(text(det_candidate_sql), det_exec_binds)
+                det_headers = list(det_rs.keys())
+                det_rows = det_rs.fetchall()
+            det_duration_ms = int(
+                (datetime.datetime.utcnow() - det_start_time).total_seconds() * 1000
+            )
+            deterministic_sql_text = det_candidate_sql
+            deterministic_exec_cache = {
+                "sql": det_candidate_sql,
+                "rows": det_rows,
+                "headers": det_headers,
+                "binds": dict(det_exec_binds),
+                "duration_ms": det_duration_ms,
+            }
+            fallback_sql = det_candidate_sql
+            fallback_bind_values = dict(det_exec_binds)
+            if "date_start" in det_exec_binds and not date_start:
+                date_start = det_exec_binds["date_start"]
+            if "date_end" in det_exec_binds and not date_end:
+                date_end = det_exec_binds["date_end"]
+            log_event(
+                log,
+                "dw",
+                "deterministic_sql_success",
+                {
+                    "rows": len(det_rows),
+                    "columns": det_headers,
+                    "top_n": det_exec_binds.get("top_n"),
+                    "group_by": intent.get("group_by"),
+                },
+            )
+        except Exception as exc:
+            log_event(
+                log,
+                "dw",
+                "deterministic_sql_skip",
+                {"error": str(exc), "sql": det_candidate_sql[:120]},
+            )
+            deterministic_sql_text = None
+            deterministic_exec_cache = None
 
     log_event(log, "dw", "clarifier_intent_adjusted", json.loads(json.dumps(intent, default=str)))
     if clarifier_raw and include_debug:
@@ -1737,7 +1919,7 @@ def answer():
             res["debug"] = debug_payload
         return jsonify(res)
 
-    deterministic_fallback_used = bool(rule_sql)
+    deterministic_fallback_used = bool(rule_sql) or bool(deterministic_sql_text)
     sanitized_sql = _sanitize_sql(sql_final)
     if sanitized_sql:
         sql_final = sanitized_sql
@@ -2134,18 +2316,34 @@ def answer():
     headers: list[str] = []
     error = None
     started = datetime.datetime.utcnow()
-    try:
-        rows, headers = _oracle_exec(sql_final, exec_binds)
-    except Exception as exc:
-        error = str(exc)
-        log_event(log, "dw", "oracle_error", {"error": error})
+    duration_ms = 0
+    used_cached_execution = False
 
-    duration_ms = int((datetime.datetime.utcnow() - started).total_seconds() * 1000)
+    if deterministic_exec_cache and deterministic_exec_cache.get("sql") == sql_final:
+        cache_binds_raw = deterministic_exec_cache.get("binds") or {}
+        normalized_cache = {k: _as_loggable(v) for k, v in cache_binds_raw.items()}
+        normalized_exec = {k: _as_loggable(v) for k, v in exec_binds.items()}
+        if normalized_cache == normalized_exec:
+            cached_rows = deterministic_exec_cache.get("rows") or []
+            cached_headers = deterministic_exec_cache.get("headers") or []
+            rows = list(cached_rows)
+            headers = list(cached_headers)
+            duration_ms = int(deterministic_exec_cache.get("duration_ms") or 0)
+            used_cached_execution = True
+
+    if not used_cached_execution:
+        try:
+            rows, headers = _oracle_exec(sql_final, exec_binds)
+        except Exception as exc:
+            error = str(exc)
+            log_event(log, "dw", "oracle_error", {"error": error})
+        duration_ms = int((datetime.datetime.utcnow() - started).total_seconds() * 1000)
+
     log_event(
         log,
         "dw",
         "execution_result",
-        {"rows": len(rows), "cols": headers, "ms": duration_ms},
+        {"rows": len(rows), "cols": headers, "ms": duration_ms, "cached": used_cached_execution},
     )
 
     initial_rowcount = len(rows)
