@@ -15,6 +15,7 @@ from flask import Blueprint, jsonify, request
 from sqlalchemy import text
 
 from apps.dw.intent import DWIntent, extract_intent
+from apps.dw.intent_sql import build_grouped_stakeholder_sql
 from apps.dw.nlu_normalizer import (
     DEFAULT_TZ as NLU_DEFAULT_TZ,
     NET_VALUE_EXPR,
@@ -1590,6 +1591,9 @@ def answer():
     fallback_bind_values: dict[str, Any] = {}
     deterministic_sql_text: Optional[str] = None
     deterministic_exec_cache: Optional[Dict[str, Any]] = None
+    csv_override: Optional[Dict[str, Any]] = None
+    deterministic_details_sql: Optional[str] = None
+    deterministic_extra_duration_ms = 0
 
     if rule_sql:
         fallback_sql = rule_sql
@@ -1693,11 +1697,115 @@ def answer():
     if intent.get("has_time_window") and intent.get("date_column") is None:
         intent["date_column"] = default_date_col
 
-    det_candidate_sql, det_candidate_binds = _dw_sql_from_intent(
-        intent,
-        table_name=table_name,
-        default_date_col=default_date_col,
-    )
+    stakeholder_group = (intent.get("group_by") or "").upper()
+    if not stakeholder_group and compiler_intent.dimension:
+        stakeholder_group = str(compiler_intent.dimension or "").upper()
+
+    if not deterministic_sql_text:
+        if stakeholder_group in {"CONTRACT_STAKEHOLDER_1", "STAKEHOLDER", "STAKEHOLDER_1"}:
+            requested_top_n = intent.get("top_n") or compiler_intent.top_n or topn_req
+            if isinstance(requested_top_n, str):
+                try:
+                    requested_top_n = int(requested_top_n)
+                except Exception:
+                    requested_top_n = None
+            if isinstance(requested_top_n, int) and requested_top_n <= 0:
+                requested_top_n = None
+            branch_top_n = requested_top_n or (10 if question_requested_topn else None)
+            window_start = date_start or compiler_date_start
+            window_end = date_end or compiler_date_end
+            if branch_top_n and window_start and window_end:
+                table_for_helper = table_name.strip().strip('"') or "Contract"
+                slots_setting = settings.get_int(
+                    "DW_STAKEHOLDER_SLOTS", scope="namespace", default=8
+                )
+                if not isinstance(slots_setting, int) or slots_setting <= 0:
+                    slots_setting = 8
+                wants_gross = "gross" in (q or "").lower()
+                try:
+                    summary_sql, details_sql = build_grouped_stakeholder_sql(
+                        table=table_for_helper,
+                        date_col=date_col,
+                        gross=wants_gross,
+                        slots=slots_setting,
+                    )
+                    binds = {
+                        "date_start": window_start,
+                        "date_end": window_end,
+                        "top_n": branch_top_n,
+                    }
+                    det_start_time = datetime.datetime.utcnow()
+                    oracle_engine = ds_registry.engine(None)
+                    with oracle_engine.begin() as oc:
+                        det_rs = oc.execute(text(summary_sql), binds)
+                        det_headers = list(det_rs.keys())
+                        det_rows = det_rs.fetchall()
+                    det_duration_ms = int(
+                        (datetime.datetime.utcnow() - det_start_time).total_seconds() * 1000
+                    )
+                    det_details_start = datetime.datetime.utcnow()
+                    with oracle_engine.begin() as oc:
+                        det_detail_rs = oc.execute(text(details_sql), binds)
+                        detail_headers = list(det_detail_rs.keys())
+                        detail_rows = det_detail_rs.fetchall()
+                    det_details_ms = int(
+                        (datetime.datetime.utcnow() - det_details_start).total_seconds()
+                        * 1000
+                    )
+                    deterministic_sql_text = summary_sql
+                    deterministic_exec_cache = {
+                        "sql": summary_sql,
+                        "rows": det_rows,
+                        "headers": det_headers,
+                        "binds": dict(binds),
+                        "duration_ms": det_duration_ms,
+                    }
+                    csv_override = {
+                        "rows": detail_rows,
+                        "headers": detail_headers,
+                    }
+                    deterministic_details_sql = details_sql
+                    deterministic_extra_duration_ms = det_details_ms
+                    fallback_sql = summary_sql
+                    fallback_bind_values = dict(binds)
+                    intent["wants_all_columns"] = True
+                    wants_all_columns = True
+                    if not date_start:
+                        date_start = window_start
+                    if not date_end:
+                        date_end = window_end
+                    log_event(
+                        log,
+                        "dw",
+                        "deterministic_sql_success",
+                        {
+                            "rows": len(det_rows),
+                            "columns": det_headers,
+                            "top_n": binds.get("top_n"),
+                            "group_by": "STAKEHOLDER",
+                        },
+                    )
+                except Exception as exc:
+                    log_event(
+                        log,
+                        "dw",
+                        "deterministic_sql_skip",
+                        {"error": str(exc), "sql": (summary_sql if 'summary_sql' in locals() else "")[:120]},
+                    )
+                    deterministic_sql_text = None
+                    deterministic_exec_cache = None
+                    csv_override = None
+                    deterministic_details_sql = None
+                    deterministic_extra_duration_ms = 0
+
+    det_candidate_sql: Optional[str] = None
+    det_candidate_binds: dict[str, Any] = {}
+    if not deterministic_sql_text:
+        det_candidate_sql, det_candidate_binds = _dw_sql_from_intent(
+            intent,
+            table_name=table_name,
+            default_date_col=default_date_col,
+        )
     if det_candidate_sql:
         det_exec_binds = dict(det_candidate_binds)
         try:
@@ -2339,6 +2447,8 @@ def answer():
             log_event(log, "dw", "oracle_error", {"error": error})
         duration_ms = int((datetime.datetime.utcnow() - started).total_seconds() * 1000)
 
+    duration_ms += deterministic_extra_duration_ms
+
     log_event(
         log,
         "dw",
@@ -2395,8 +2505,13 @@ def answer():
         return jsonify({"ok": False, "error": error, "inquiry_id": inq_id, "status": "failed"})
 
     csv_path = None
-    if rows:
-        csv_path = _write_csv(rows, headers)
+    csv_rows = rows
+    csv_headers = headers
+    if csv_override:
+        csv_rows = csv_override.get("rows") or []
+        csv_headers = csv_override.get("headers") or csv_headers
+    if csv_rows:
+        csv_path = _write_csv(csv_rows, csv_headers)
         if csv_path:
             log_event(log, "dw", "csv_export", {"path": str(csv_path)})
 
@@ -2536,6 +2651,8 @@ def answer():
         debug_payload["intent_projection_rewrite"] = intent_rewrite_meta["used_projection_rewrite"]
         debug_payload["intent_limit_inject"] = intent_rewrite_meta["used_limit_inject"]
         debug_payload["intent_order_inject"] = intent_rewrite_meta["used_order_inject"]
+        if deterministic_details_sql:
+            debug_payload["details_sql"] = deterministic_details_sql
         resp["debug"] = debug_payload
     return jsonify(resp)
 
