@@ -1,373 +1,236 @@
 from __future__ import annotations
-
-import re
-from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
-from typing import Any, Dict, Optional, Tuple
-
-try:  # precise month/quarter arithmetic if available
+from dataclasses import dataclass
+from calendar import monthrange
+from datetime import date, timedelta
+try:  # pragma: no cover - optional dependency
     from dateutil.relativedelta import relativedelta
 except Exception:  # pragma: no cover - optional dependency
     relativedelta = None  # type: ignore[assignment]
+import re
+from typing import Optional, Literal
 
-try:  # natural language time expressions
-    import dateparser
-except Exception:  # pragma: no cover - optional dependency
-    dateparser = None  # type: ignore[assignment]
-
-try:  # text numbers (e.g., "ten")
-    from word2number import w2n
-except Exception:  # pragma: no cover - optional dependency
-    w2n = None  # type: ignore[assignment]
-
-DIMENSION_MAP = {
-    "owner department": "OWNER_DEPARTMENT",
-    "department": "OWNER_DEPARTMENT",
-    "entity": "ENTITY_NO",
-    "owner": "CONTRACT_OWNER",
-    "stakeholder": "CONTRACT_STAKEHOLDER_1",
-    "stakeholders": "CONTRACT_STAKEHOLDER_1",
-}
-
-WINDOW_HINTS = [
-    (r"\blast\s+month\b", ("last_month", None)),
-    (r"\blast\s+3\s+months?\b", ("last_3_months", None)),
-    (r"\blast\s+quarter\b", ("last_quarter", None)),
-    (r"\bnext\s+(\d+)\s+days\b", ("next_n_days", "END_DATE")),
-    (r"\bexpir\w+\b", (None, "END_DATE")),
-]
+# --------- Public shape the rest of the app uses ----------
+WindowKind = Literal["start_only", "end_only", "overlap"]
 
 
 @dataclass
 class DWIntent:
-    agg: Optional[str] = None  # 'count' | 'sum' | None
-    dimension: Optional[str] = None  # mapped DB column
-    measure: str = "gross"  # 'gross'|'net'
-    user_requested_top_n: bool = False
-    top_n: Optional[int] = None
-    date_column: Optional[str] = None  # REQUEST_DATE | END_DATE | START_DATE
-    window_key: Optional[str] = None  # 'last_month' | 'last_3_months' | 'last_quarter' | 'next_n_days'
-    wants_all_columns: bool = False
-    window_param: Optional[int] = None  # e.g., number of days for next_n_days
-
-
-def extract_intent(q: str) -> DWIntent:
-    t = (q or "").strip().lower()
-    intent = DWIntent()
-
-    # count?
-    if "count" in t or "(count)" in t:
-        intent.agg = "count"
-
-    # by/per <dimension>
-    m = re.search(r"\b(?:by|per)\s+([a-z\s_]+)", t)
-    if m:
-        key = m.group(1).strip()
-        for k, col in DIMENSION_MAP.items():
-            if k in key:
-                intent.dimension = col
-                break
-
-    # “top N …”
-    m = re.search(r"\btop\s+(\d+)\b", t)
-    if m:
-        intent.user_requested_top_n = True
-        intent.top_n = int(m.group(1))
-
-    # gross vs net
-    if "gross" in t:
-        intent.measure = "gross"
-    elif "net" in t:
-        intent.measure = "net"
-
-    # date hints
-    for pat, (wkey, force_col) in WINDOW_HINTS:
-        mm = re.search(pat, t)
-        if mm:
-            if wkey == "next_n_days":
-                intent.window_key = "next_n_days"
-                try:
-                    intent.window_param = int(mm.group(1))
-                except (ValueError, IndexError, TypeError):
-                    intent.window_param = None
-                intent.date_column = force_col or intent.date_column
-            else:
-                intent.window_key = wkey
-            if force_col:
-                intent.date_column = force_col
-            break
-
-    # default date column
-    if intent.date_column is None:
-        intent.date_column = "REQUEST_DATE"
-
-    # wants all columns only if not aggregating and no dimension
-    if intent.agg is None and intent.dimension is None:
-        if any(w in t for w in ["list", "show", "contracts with", "all columns"]):
-            intent.wants_all_columns = True
-
-    return intent
-
-
-_NUM_WORDS: Dict[str, int] = {
-    "one": 1,
-    "two": 2,
-    "three": 3,
-    "four": 4,
-    "five": 5,
-    "six": 6,
-    "seven": 7,
-    "eight": 8,
-    "nine": 9,
-    "ten": 10,
-    "eleven": 11,
-    "twelve": 12,
-    "thirteen": 13,
-    "fourteen": 14,
-    "fifteen": 15,
-    "sixteen": 16,
-    "seventeen": 17,
-    "eighteen": 18,
-    "nineteen": 19,
-    "twenty": 20,
-    "thirty": 30,
-    "forty": 40,
-    "fifty": 50,
-    "sixty": 60,
-    "seventy": 70,
-    "eighty": 80,
-    "ninety": 90,
-    "hundred": 100,
-}
-
-
-def _num_from_text(token: str) -> Optional[int]:
-    token = (token or "").strip().lower()
-    if not token:
-        return None
-    if token.isdigit():
-        return int(token)
-    if w2n:
-        try:
-            return w2n.word_to_num(token)
-        except Exception:  # pragma: no cover - permissive
-            pass
-    return _NUM_WORDS.get(token)
-
-
-@dataclass
-class NLIntent:
-    agg: Optional[str] = None
-    measure_sql: Optional[str] = None
-    group_by: Optional[str] = None
+    q: str
+    # core
+    agg: Optional[str] = None            # 'count' | 'sum' | 'avg' | None
+    measure_sql: Optional[str] = None    # e.g., NVL(CONTRACT_VALUE_NET_OF_VAT,0) or gross formula
+    group_by: Optional[str] = None       # column to group by if "by/per …"
     sort_by: Optional[str] = None
-    sort_desc: Optional[bool] = None
+    sort_desc: bool = False
     top_n: Optional[int] = None
-    user_requested_top_n: Optional[bool] = None
-    wants_all_columns: bool = False
+    user_requested_top_n: bool = False
+    wants_all_columns: bool = True
+
+    # time
     has_time_window: bool = False
-    date_column: Optional[str] = None
-    explicit_dates: Optional[Dict[str, str]] = None
-    notes: Dict[str, Any] = field(default_factory=dict)
+    explicit_dates: Optional[dict] = None  # {"start": "YYYY-MM-DD", "end": "YYYY-MM-DD"}
+    horizon_days: Optional[int] = None
+    # date semantics
+    date_column: Optional[str] = None    # REQUEST_DATE | START_DATE | END_DATE (only for start_only/end_only)
+    window_kind: WindowKind = "overlap"  # 'overlap' for active contracts in window
 
 
-_DET_DIM_SYNONYMS: Dict[str, str] = {
-    r"\bowner department\b": "OWNER_DEPARTMENT",
-    r"\bdepartment\b": "OWNER_DEPARTMENT",
-    r"\bentity\b": "ENTITY_NO",
-    r"\bstakeholder\b": "CONTRACT_STAKEHOLDER_1",
-    r"\bowner\b": "CONTRACT_OWNER",
-}
+# --------- Keyword lexicons ----------
+RE_EXPIRE = re.compile(r'\b(expir(?:e|ing|y)|ending|due)\b', re.I)
+RE_START  = re.compile(r'\b(start(?:s|ed|ing)?|signed|activate(?:d)?)\b', re.I)
+RE_REQUEST= re.compile(r'\b(request(?:ed)?|submitted|appl(?:y|ied))\b', re.I)
+RE_BY     = re.compile(r'\bby\s+([a-z_ ]+)|per\s+([a-z_ ]+)', re.I)
+RE_TOPN   = re.compile(r'\btop\s+(\d+)\b', re.I)
+RE_COUNT  = re.compile(r'\bcount\b|\(count\)', re.I)
+RE_GROSS  = re.compile(r'\bgross\b', re.I)
+RE_NET    = re.compile(r'\bnet\b|\bcontract value\b', re.I)
+
+# windows like "last 3 months", "next 90 days"
+RE_LAST_NEXT = re.compile(r'\b(last|next)\s+(\d+)\s+(day|days|week|weeks|month|months|quarter|quarters|year|years)\b', re.I)
+RE_LAST_MONTH   = re.compile(r'\blast\s+month\b', re.I)
+RE_LAST_QUARTER = re.compile(r'\blast\s+quarter\b', re.I)
+
+# synonyms to canonical DW columns
+DIM_SYNONYMS = [
+    (re.compile(r'\bstakeholder\b', re.I), "CONTRACT_STAKEHOLDER_1"),
+    (re.compile(r'\bowner department\b|\bdepartment\b', re.I), "OWNER_DEPARTMENT"),
+    (re.compile(r'\bowner\b', re.I), "CONTRACT_OWNER"),
+    (re.compile(r'\bentity\b', re.I), "ENTITY_NO"),
+]
 
 
-def _last_month_bounds(today: date) -> Tuple[date, date]:
-    first_this = date(today.year, today.month, 1)
-    last_month_end = first_this - timedelta(days=1)
-    last_month_start = date(last_month_end.year, last_month_end.month, 1)
-    return last_month_start, last_month_end
+def _month_bounds(d: date) -> tuple[date, date]:
+    first = d.replace(day=1)
+    prev_last = first - timedelta(days=1)
+    prev_first = prev_last.replace(day=1)
+    return prev_first, prev_last
 
 
-def _last_quarter_bounds(today: date) -> Tuple[date, date]:
-    quarter = (today.month - 1) // 3 + 1
-    first_this_q = date(today.year, 3 * (quarter - 1) + 1, 1)
-    last_q_end = first_this_q - timedelta(days=1)
-    last_q_start = date(last_q_end.year, 3 * ((last_q_end.month - 1) // 3) + 1, 1)
-    return last_q_start, last_q_end
+def _quarter_bounds(d: date) -> tuple[date, date]:
+    q = (d.month - 1) // 3 + 1
+    # start of this quarter
+    q_start = date(d.year, (3 * (q - 1)) + 1, 1)
+    # last day of previous quarter
+    prev_q_end = q_start - timedelta(days=1)
+    # previous quarter start
+    prev_q = (prev_q_end.month - 1) // 3 + 1
+    prev_q_start = date(prev_q_end.year, (3 * (prev_q - 1)) + 1, 1)
+    return prev_q_start, prev_q_end
 
 
-def _iso(d: date) -> str:
-    return d.isoformat()
+def _shift_months_basic(d: date, months: int) -> date:
+    month_index = d.month - 1 + months
+    year = d.year + month_index // 12
+    month = (month_index % 12) + 1
+    day = min(d.day, monthrange(year, month)[1])
+    return date(year, month, day)
 
 
-def parse_dw_intent(q: str, *, default_date_col: str = "REQUEST_DATE") -> NLIntent:
-    text = (q or "").strip()
-    lowered = text.lower()
-    today = datetime.now().date()
-    intent = NLIntent(notes={"q": q, "dateparser_available": bool(dateparser)})
+def _shift_years_basic(d: date, years: int) -> date:
+    try:
+        return d.replace(year=d.year + years)
+    except ValueError:
+        # handle Feb 29 -> Feb 28
+        return d.replace(month=2, day=28, year=d.year + years)
 
-    if "(count)" in lowered or re.search(r"\bcount\b", lowered):
+
+def _roll_bounds(d: date, last_or_next: str, n: int, unit: str) -> tuple[date, date]:
+    last = last_or_next.lower() == "last"
+    unit = unit.lower()
+    if unit.startswith("day"):
+        if last:
+            return d - timedelta(days=n), d
+        else:
+            return d, d + timedelta(days=n)
+    if unit.startswith("week"):
+        if last:
+            return d - timedelta(weeks=n), d
+        else:
+            return d, d + timedelta(weeks=n)
+    if unit.startswith("month"):
+        if last:
+            start_base = d.replace(day=1)
+            if relativedelta:
+                start = start_base - relativedelta(months=n)
+            else:
+                start = _shift_months_basic(start_base, -n)
+            end   = d
+            return start, end
+        else:
+            if relativedelta:
+                return d, d + relativedelta(months=n)
+            return d, _shift_months_basic(d, n)
+    if unit.startswith("quarter"):
+        months = 3 * n
+        if last:
+            start_base = d.replace(day=1)
+            if relativedelta:
+                start = start_base - relativedelta(months=months)
+            else:
+                start = _shift_months_basic(start_base, -months)
+            end   = d
+            return start, end
+        else:
+            if relativedelta:
+                return d, d + relativedelta(months=months)
+            return d, _shift_months_basic(d, months)
+    if unit.startswith("year"):
+        if last:
+            if relativedelta:
+                return d - relativedelta(years=n), d
+            return _shift_years_basic(d, -n), d
+        else:
+            if relativedelta:
+                return d, d + relativedelta(years=n)
+            return d, _shift_years_basic(d, n)
+    return d, d
+
+
+def parse_intent(q: str, default_date_col: str = "START_DATE") -> DWIntent:
+    """Heuristic DW intent:
+    - choose window kind (start_only, end_only, overlap)
+    - extract last/next windows (days/weeks/months/quarters/years) and calendar buckets
+    - map group-by dimension
+    """
+    today = date.today()
+    t = (q or "").strip()
+    intent = DWIntent(q=t)
+
+    # group-by
+    m = RE_BY.search(t)
+    if m:
+        grp = m.group(1) or m.group(2)
+        if grp:
+            for rx, col in DIM_SYNONYMS:
+                if rx.search(grp):
+                    intent.group_by = col
+                    break
+
+    # agg
+    if RE_COUNT.search(t):
         intent.agg = "count"
 
-    if "gross" in lowered:
-        intent.agg = intent.agg or "sum"
-        intent.measure_sql = (
-            "NVL(CONTRACT_VALUE_NET_OF_VAT,0) + "
-            "CASE WHEN NVL(VAT,0) BETWEEN 0 AND 1 "
-            "THEN NVL(CONTRACT_VALUE_NET_OF_VAT,0) * NVL(VAT,0) ELSE NVL(VAT,0) END"
-        )
-    elif any(key in lowered for key in ["contract value", "net value", "value"]):
-        intent.agg = intent.agg or "sum"
+    # measure: gross vs net (default to net if no keyword)
+    if RE_GROSS.search(t):
+        intent.measure_sql = "NVL(CONTRACT_VALUE_NET_OF_VAT,0) + CASE WHEN NVL(VAT,0) BETWEEN 0 AND 1 THEN NVL(CONTRACT_VALUE_NET_OF_VAT,0)*NVL(VAT,0) ELSE NVL(VAT,0) END"
+    else:
         intent.measure_sql = "NVL(CONTRACT_VALUE_NET_OF_VAT,0)"
 
-    match = re.search(r"\b(?:by|per)\s+([a-zA-Z_ ]+)", lowered)
-    if match:
-        dim_raw = match.group(1).strip()
-        for pattern, column in _DET_DIM_SYNONYMS.items():
-            if re.search(pattern, dim_raw):
-                intent.group_by = column
-                break
-        if not intent.group_by and "stakeholder" in dim_raw:
-            intent.group_by = "CONTRACT_STAKEHOLDER_1"
+    # Top N
+    mt = RE_TOPN.search(t)
+    if mt:
+        intent.top_n = int(mt.group(1))
+        intent.user_requested_top_n = True
+        # default sort by measure desc for topN if no explicit sort
+        intent.sort_by = intent.measure_sql
+        intent.sort_desc = True
 
-    match = re.search(r"\b(top|highest|bottom|lowest)\s+([a-zA-Z0-9\-]+)", lowered)
-    if match:
-        number = _num_from_text(match.group(2))
-        if number:
-            intent.top_n = number
-            intent.user_requested_top_n = True
-            keyword = match.group(1)
-            if keyword in {"top", "highest"}:
-                intent.sort_desc = True
-            elif keyword in {"bottom", "lowest"}:
-                intent.sort_desc = False
-
-    match = re.search(r"\b(expir(?:e|ing)s?|due|ending)\s+in\s+([a-zA-Z0-9\-]+)\s+day", lowered)
-    if match:
-        number = _num_from_text(match.group(2)) or 30
-        start = today
-        end = today + timedelta(days=number)
-        intent.has_time_window = True
+    # window semantics
+    if RE_EXPIRE.search(t):
+        intent.window_kind = "end_only"
         intent.date_column = "END_DATE"
-        intent.explicit_dates = {"start": _iso(start), "end": _iso(end)}
+    elif RE_START.search(t):
+        intent.window_kind = "start_only"
+        intent.date_column = "START_DATE"
+    elif RE_REQUEST.search(t):
+        intent.window_kind = "start_only"  # single column filter
+        intent.date_column = "REQUEST_DATE"
+    else:
+        # generic contracts + time → treat as active overlap
+        intent.window_kind = "overlap"
+        intent.date_column = None
 
-    if not intent.has_time_window:
-        match = re.search(
-            r"\b(next|within)\s+([a-zA-Z0-9\-]+)\s+(day|days|week|weeks|month|months)\b",
-            lowered,
-        )
-        if match:
-            number = _num_from_text(match.group(2)) or 1
-            unit = match.group(3)
-            start = today
-            if unit.startswith("day"):
-                end = today + timedelta(days=number)
-            elif unit.startswith("week"):
-                end = today + timedelta(days=7 * number)
-            else:
-                if relativedelta:
-                    end = today + relativedelta(months=+number)
-                else:
-                    end = today + timedelta(days=30 * number)
+    # calendar buckets
+    if RE_LAST_MONTH.search(t):
+        s, e = _month_bounds(today)
+        intent.has_time_window = True
+        intent.explicit_dates = {"start": s.isoformat(), "end": e.isoformat()}
+    elif RE_LAST_QUARTER.search(t):
+        s, e = _quarter_bounds(today)
+        intent.has_time_window = True
+        intent.explicit_dates = {"start": s.isoformat(), "end": e.isoformat()}
+    else:
+        mrel = RE_LAST_NEXT.search(t)
+        if mrel:
+            which, n, unit = mrel.groups()
+            n = int(n)
+            s, e = _roll_bounds(today, which, n, unit)
             intent.has_time_window = True
-            intent.date_column = "END_DATE" if "expir" in lowered else default_date_col
-            intent.explicit_dates = {"start": _iso(start), "end": _iso(end)}
+            intent.explicit_dates = {"start": s.isoformat(), "end": e.isoformat()}
 
-    if not intent.has_time_window:
-        if "last quarter" in lowered:
-            start, end = _last_quarter_bounds(today)
-            intent.has_time_window = True
-            intent.date_column = default_date_col
-            intent.explicit_dates = {"start": _iso(start), "end": _iso(end)}
-        elif "last month" in lowered:
-            start, end = _last_month_bounds(today)
-            intent.has_time_window = True
-            intent.date_column = default_date_col
-            intent.explicit_dates = {"start": _iso(start), "end": _iso(end)}
-        else:
-            match = re.search(r"\blast\s+([a-zA-Z0-9\-]+)\s+months?\b", lowered)
-            if match:
-                number = _num_from_text(match.group(1)) or 1
-                last_month_start, last_month_end = _last_month_bounds(today)
-                if relativedelta:
-                    start = date(last_month_start.year, last_month_start.month, 1) + relativedelta(
-                        months=-(number - 1)
-                    )
-                else:
-                    start = date(last_month_start.year, last_month_start.month, 1)
-                end = last_month_end
-                intent.has_time_window = True
-                intent.date_column = default_date_col
-                intent.explicit_dates = {"start": _iso(start), "end": _iso(end)}
+    # If we still don't have any time window but the user said "last/next X" with no match above,
+    # you could drop to the clarifier. We keep intent as-is and let caller decide.
 
-    if intent.top_n and not intent.sort_by:
-        if intent.measure_sql:
-            intent.sort_by = intent.measure_sql
-            if intent.sort_desc is None:
-                intent.sort_desc = True
-
-    if not intent.group_by and not intent.agg:
-        intent.wants_all_columns = True
-
-    if intent.has_time_window and not intent.date_column:
+    # default date column if we landed on start_only without explicit, or if caller requests it
+    if intent.window_kind in ("start_only", "end_only") and not intent.date_column:
+        intent.date_column = default_date_col
+    elif intent.window_kind == "overlap" and not intent.has_time_window and default_date_col:
         intent.date_column = default_date_col
 
+    # wants_all_columns only when not aggregated
+    if intent.group_by or intent.agg in ("count", "sum", "avg"):
+        intent.wants_all_columns = False
+    else:
+        intent.wants_all_columns = True
+
     return intent
-
-
-def build_sql_for_intent(intent: NLIntent, *, table: str = "Contract") -> Tuple[str, Dict[str, Any]]:
-    binds: Dict[str, Any] = {}
-    where_clause = ""
-
-    if intent.has_time_window and intent.explicit_dates and intent.date_column:
-        binds["date_start"] = intent.explicit_dates["start"]
-        binds["date_end"] = intent.explicit_dates["end"]
-        where_clause = f"WHERE {intent.date_column} BETWEEN :date_start AND :date_end"
-
-    raw_table = (table or "Contract").strip().strip('"')
-    table_literal = f'"{raw_table}"'
-
-    if intent.agg == "count" and not intent.group_by:
-        sql = f"SELECT COUNT(*) AS CNT FROM {table_literal}"
-        if where_clause:
-            sql = f"{sql}\n{where_clause}"
-        return sql, binds
-
-    if intent.group_by and intent.measure_sql:
-        lines = [
-            "SELECT",
-            f"  {intent.group_by} AS GROUP_KEY,",
-            f"  SUM({intent.measure_sql}) AS MEASURE_VAL",
-            f"FROM {table_literal}",
-        ]
-        if where_clause:
-            lines.append(where_clause)
-        lines.append(f"GROUP BY {intent.group_by}")
-        if intent.sort_by:
-            order_col = "MEASURE_VAL" if intent.sort_by == intent.measure_sql else intent.sort_by
-            direction = "DESC" if intent.sort_desc or intent.sort_desc is None else "ASC"
-            lines.append(f"ORDER BY {order_col} {direction}")
-        if intent.top_n:
-            binds["top_n"] = intent.top_n
-            lines.append("FETCH FIRST :top_n ROWS ONLY")
-        return "\n".join(lines), binds
-
-    if intent.wants_all_columns:
-        sql = f"SELECT * FROM {table_literal}"
-        if where_clause:
-            sql = f"{sql}\n{where_clause}"
-        if intent.date_column:
-            sql = f"{sql}\nORDER BY {intent.date_column} ASC"
-        return sql, binds
-
-    projection = ["CONTRACT_ID", "CONTRACT_OWNER"]
-    if intent.date_column:
-        projection.append(intent.date_column)
-    sql = f"SELECT {', '.join(projection)} FROM {table_literal}"
-    if where_clause:
-        sql = f"{sql}\n{where_clause}"
-    if intent.date_column:
-        sql = f"{sql}\nORDER BY {intent.date_column} ASC"
-    if intent.top_n:
-        binds["top_n"] = intent.top_n
-        sql = f"{sql}\nFETCH FIRST :top_n ROWS ONLY"
-    return sql, binds

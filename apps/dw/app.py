@@ -16,10 +16,12 @@ from flask import Blueprint, jsonify, request
 from sqlalchemy import text
 
 from apps.dw.intent import (
+    DWIntent as PlannerDWIntent,
+    parse_intent as parse_new_dw_intent,
+)
+from apps.dw.intent_legacy import (
     DWIntent,
     extract_intent,
-    build_sql_for_intent,
-    parse_dw_intent,
 )
 from apps.dw.intent_dw import build_sql_from_intent, parse_intent_dw
 from apps.dw.intent_sql import build_grouped_stakeholder_sql
@@ -44,7 +46,7 @@ from core.sql_utils import (
     validate_oracle_sql,
 )
 from core.logging_utils import get_logger, log_event
-from core.nlu.parse import parse_intent
+from core.nlu.parse import parse_intent as parse_core_intent
 from core.nlu.schema import TimeWindow
 import sqlglot
 
@@ -310,6 +312,82 @@ def _dw_sql_from_intent(
         binds["top_n"] = top_n
         lines.append("FETCH FIRST :top_n ROWS ONLY")
     return "\n".join(lines), binds
+
+
+def _build_sql_from_planner(intent: PlannerDWIntent, table: str) -> tuple[str, dict[str, object]] | None:
+    """Attempt deterministic SQL construction from the new DW planner intent."""
+
+    binds: dict[str, object] = {}
+    where_clause = ""
+
+    if intent.has_time_window and intent.explicit_dates:
+        ds = intent.explicit_dates.get("start") if isinstance(intent.explicit_dates, dict) else None
+        de = intent.explicit_dates.get("end") if isinstance(intent.explicit_dates, dict) else None
+        if ds and de:
+            binds["date_start"] = ds
+            binds["date_end"] = de
+
+            if intent.window_kind == "end_only":
+                where_clause = "WHERE END_DATE BETWEEN :date_start AND :date_end"
+            elif intent.window_kind == "start_only":
+                column = intent.date_column or "START_DATE"
+                where_clause = f"WHERE {column} BETWEEN :date_start AND :date_end"
+            else:
+                where_clause = (
+                    "WHERE START_DATE <= :date_end "
+                    "AND (END_DATE IS NULL OR END_DATE >= :date_start)"
+                )
+
+    table_literal = f'"{table}"' if table and not table.startswith('"') else table or '"Contract"'
+
+    if intent.group_by:
+        group_key = intent.group_by
+        if intent.agg == "count":
+            select_sql = f"{group_key} AS GROUP_KEY, COUNT(*) AS CNT"
+            order_sql = "CNT DESC"
+        else:
+            measure = intent.measure_sql or "NVL(CONTRACT_VALUE_NET_OF_VAT,0)"
+            select_sql = f"{group_key} AS GROUP_KEY, SUM({measure}) AS MEASURE"
+            order_sql = "MEASURE DESC"
+
+        sql_parts = [
+            "SELECT",
+            f"  {select_sql}",
+            f"FROM {table_literal}",
+        ]
+        if where_clause:
+            sql_parts.append(where_clause)
+        sql_parts.append(f"GROUP BY {group_key}")
+
+        if intent.user_requested_top_n and intent.top_n:
+            sql_parts.append(f"ORDER BY {order_sql}")
+            sql_parts.append("FETCH FIRST :top_n ROWS ONLY")
+            binds["top_n"] = intent.top_n
+        else:
+            sql_parts.append(f"ORDER BY {order_sql}")
+
+        return "\n".join(sql_parts), binds
+
+    if intent.agg == "count":
+        sql_parts = [f"SELECT COUNT(*) AS CNT", f"FROM {table_literal}"]
+        if where_clause:
+            sql_parts.append(where_clause)
+        return "\n".join(sql_parts), binds
+
+    if not intent.group_by and not intent.agg:
+        select_cols = "*"
+        sql_parts = [f"SELECT {select_cols}", f"FROM {table_literal}"]
+        if where_clause:
+            sql_parts.append(where_clause)
+        if intent.sort_by:
+            direction = "DESC" if intent.sort_desc else "ASC"
+            sql_parts.append(f"ORDER BY {intent.sort_by} {direction}")
+        if intent.user_requested_top_n and intent.top_n:
+            binds["top_n"] = intent.top_n
+            sql_parts.append("FETCH FIRST :top_n ROWS ONLY")
+        return "\n".join(sql_parts), binds
+
+    return None
 
 def _should_select_all_columns(q: str, group_col: Optional[str], measure: str) -> bool:
     if group_col or measure == "count":
@@ -1495,7 +1573,7 @@ def answer():
             "no",
         }
 
-    rule_intent = parse_intent(
+    rule_intent = parse_core_intent(
         q,
         default_date_col=default_date_col,
         select_all_default=select_all_default,
@@ -1782,74 +1860,79 @@ def answer():
     deterministic_attempted = False
 
     # ------------------------------------------------------------------
-    # Deterministic planner v2: parse intent first, then build SQL
+    # Deterministic planner: heuristic window + grouping before LLM
     # ------------------------------------------------------------------
-    det_v2_intent = parse_dw_intent(q, default_date_col=default_date_col)
-    det_v2_payload = asdict(det_v2_intent)
+    planner_intent = parse_new_dw_intent(q, default_date_col=default_date_col)
+
+    if override_explicit_dates:
+        planner_intent.explicit_dates = {
+            "start": override_explicit_dates.get("start"),
+            "end": override_explicit_dates.get("end"),
+        }
+        planner_intent.has_time_window = True
+        if override_date_column:
+            planner_intent.date_column = override_date_column
+            upper_col = override_date_column.upper()
+            if upper_col == "END_DATE":
+                planner_intent.window_kind = "end_only"
+            elif upper_col in {"START_DATE", "REQUEST_DATE"}:
+                planner_intent.window_kind = "start_only"
+    elif date_column_override:
+        planner_intent.date_column = date_column_override
+
+    planner_payload = asdict(planner_intent)
     log_event(
         log,
         "dw",
         "deterministic_intent_v2",
-        {"intent": det_v2_payload},
+        {"intent": planner_payload},
     )
 
-    det_v2_use = any(
-        [
-            det_v2_intent.has_time_window,
-            det_v2_intent.agg is not None,
-            det_v2_intent.group_by is not None,
-            det_v2_intent.top_n is not None,
-            det_v2_intent.wants_all_columns,
-        ]
-    )
+    planner_sql: Optional[str] = None
+    planner_binds: Dict[str, Any] = {}
+    try:
+        planned = _build_sql_from_planner(planner_intent, table_name or "Contract")
+    except Exception as exc:
+        log_event(
+            log,
+            "dw",
+            "deterministic_v2_skip",
+            {"error": f"planner_error:{str(exc)[:200]}"},
+        )
+        planned = None
 
-    det_v2_sql: Optional[str] = None
-    det_v2_binds: Dict[str, Any] = {}
-    if det_v2_use:
+    if planned:
+        planner_sql, planner_binds = planned
         deterministic_attempted = True
-        try:
-            det_v2_sql, det_v2_binds = build_sql_for_intent(
-                det_v2_intent,
-                table=table_name or "Contract",
-            )
-        except Exception as exc:  # pragma: no cover - defensive
-            log_event(
-                log,
-                "dw",
-                "deterministic_v2_skip",
-                {"error": f"intent_builder_error:{str(exc)[:200]}"},
-            )
-            det_v2_sql = None
-            det_v2_binds = {}
 
-    if det_v2_sql:
+    if planner_sql:
         try:
-            parse_one(det_v2_sql, read="oracle")
-        except Exception as exc:  # pragma: no cover - validation fallback
+            parse_one(planner_sql, read="oracle")
+        except Exception as exc:
             log_event(
                 log,
                 "dw",
                 "deterministic_v2_skip",
-                {"error": f"parse:{str(exc)[:200]}", "sql": det_v2_sql[:120]},
+                {"error": f"parse:{str(exc)[:200]}", "sql": planner_sql[:120]},
             )
-            det_v2_sql = None
+            planner_sql = None
 
-    if det_v2_sql:
+    if planner_sql:
         try:
-            validate_oracle_sql(det_v2_sql)
-        except Exception as exc:  # pragma: no cover - validation failure fallback
+            validate_oracle_sql(planner_sql)
+        except Exception as exc:
             log_event(
                 log,
                 "dw",
                 "deterministic_v2_skip",
-                {"error": str(exc)[:200], "sql": det_v2_sql[:120]},
+                {"error": str(exc)[:200], "sql": planner_sql[:120]},
             )
         else:
             try:
                 oracle_engine = ds_registry.engine(None)
                 exec_start = datetime.datetime.utcnow()
                 with oracle_engine.begin() as oc:
-                    rs = oc.execute(text(det_v2_sql), det_v2_binds)
+                    rs = oc.execute(text(planner_sql), planner_binds)
                     columns = list(rs.keys())
                     fetched_rows = rs.fetchall()
                 duration_ms = int(
@@ -1864,26 +1947,26 @@ def answer():
                     log,
                     "dw",
                     "final_sql",
-                    {"size": len(det_v2_sql), "sql": det_v2_sql},
+                    {"size": len(planner_sql), "sql": planner_sql},
                 )
 
                 binds_public = {
                     key: (value.isoformat() if hasattr(value, "isoformat") else value)
-                    for key, value in det_v2_binds.items()
+                    for key, value in planner_binds.items()
                 }
 
                 validation_payload = {
                     "ok": True,
                     "errors": [],
-                    "binds": list(det_v2_binds.keys()),
-                    "bind_names": list(det_v2_binds.keys()),
+                    "binds": list(planner_binds.keys()),
+                    "bind_names": list(planner_binds.keys()),
                 }
                 log_event(log, "dw", "validation", validation_payload)
 
-                clarifier_meta = det_v2_payload
+                clarifier_meta = planner_payload
                 meta = {
                     "rowcount": len(rows_data),
-                    "wants_all_columns": det_v2_intent.wants_all_columns,
+                    "wants_all_columns": planner_intent.wants_all_columns,
                     "used_deterministic_planner": True,
                     "clarifier_intent": clarifier_meta,
                     "binds": binds_public,
@@ -1895,7 +1978,7 @@ def answer():
                 resp = {
                     "ok": True,
                     "inquiry_id": inq_id,
-                    "sql": det_v2_sql,
+                    "sql": planner_sql,
                     "rows": rows_data[:200],
                     "columns": columns,
                     "csv_path": csv_path,
@@ -1909,9 +1992,9 @@ def answer():
                     {
                         "rows": len(rows_data),
                         "columns": columns,
-                        "top_n": det_v2_intent.top_n,
-                        "group_by": det_v2_intent.group_by,
-                        "planner": "v2",
+                        "top_n": planner_intent.top_n,
+                        "group_by": planner_intent.group_by,
+                        "planner": "planner_v3",
                     },
                 )
 
@@ -1925,7 +2008,7 @@ def answer():
                          WHERE id=:id
                     """
                         ),
-                        {"by": auth_email, "sql": det_v2_sql, "id": inq_id},
+                        {"by": auth_email, "sql": planner_sql, "id": inq_id},
                     )
                 log_event(
                     log,
@@ -1938,17 +2021,17 @@ def answer():
                     resp["debug"] = {
                         "intent": clarifier_meta,
                         "prompt": "",
-                        "raw1": det_v2_sql,
+                        "raw1": planner_sql,
                         "validation": validation_payload,
                     }
 
                 return jsonify(resp)
-            except Exception as exc:  # pragma: no cover - execution failure fallback
+            except Exception as exc:
                 log_event(
                     log,
                     "dw",
                     "deterministic_v2_skip",
-                    {"error": str(exc)[:200], "sql": det_v2_sql[:120]},
+                    {"error": str(exc)[:200], "sql": planner_sql[:120]},
                 )
 
     # ------------------------------------------------------------------
@@ -2299,7 +2382,7 @@ def answer():
             )
 
     try:
-        deterministic_intent = parse_intent(
+        deterministic_intent = parse_core_intent(
             q,
             default_date_col=default_date_col,
             select_all_default=select_all_default,
