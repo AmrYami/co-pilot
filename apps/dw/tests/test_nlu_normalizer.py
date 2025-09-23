@@ -9,8 +9,9 @@ def test_normalize_count_last_month():
     assert intent.agg == "count"
     assert intent.wants_all_columns is False
     assert intent.has_time_window is True
-    assert intent.date_start == "2024-01-01"
-    assert intent.date_end == "2024-01-31"
+    assert intent.explicit_dates
+    assert intent.explicit_dates.start == "2024-01-01"
+    assert intent.explicit_dates.end == "2024-01-31"
     assert intent.date_column == "REQUEST_DATE"
 
 
@@ -30,8 +31,9 @@ def test_normalize_expiring_next_two_weeks():
     intent = normalize("contracts expiring next 2 weeks", now=now)
     assert intent.date_column == "END_DATE"
     assert intent.has_time_window is True
-    assert intent.date_start == "2023-01-10"
-    assert intent.date_end == "2023-01-24"
+    assert intent.explicit_dates
+    assert intent.explicit_dates.start == "2023-01-10"
+    assert intent.explicit_dates.end == "2023-01-24"
 
 
 def test_normalize_arabic_top_entities_this_year():
@@ -41,5 +43,6 @@ def test_normalize_arabic_top_entities_this_year():
     assert intent.group_by == "ENTITY_NO"
     assert intent.measure_sql == NET_VALUE_EXPR
     assert intent.has_time_window is True
-    assert intent.date_start == "2023-01-01"
-    assert intent.date_end == "2023-12-31"
+    assert intent.explicit_dates
+    assert intent.explicit_dates.start == "2023-01-01"
+    assert intent.explicit_dates.end == "2023-12-31"

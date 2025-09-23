@@ -8,7 +8,7 @@ from typing import Dict, Optional
 from core.logging_utils import get_logger, log_event
 from core.model_loader import get_model
 from core.nlu.clarify import infer_intent
-from core.nlu.types import NLIntent, TimeWindow
+from core.nlu.types import NLIntent
 from .validator import basic_checks, extract_sql
 
 _MONTH_WORDS = re.compile(r"\blast\s+month\b", re.IGNORECASE)
@@ -26,17 +26,17 @@ def _intent_payload(intent: NLIntent, default_col: str) -> Dict[str, object]:
     payload["sort_desc"] = intent.sort_desc
     payload["wants_all_columns"] = intent.wants_all_columns
 
-    tw: Optional[TimeWindow] = intent.time_window
-    if tw and tw.start and tw.end:
-        payload["explicit_dates"] = {"start": tw.start, "end": tw.end}
+    window = intent.explicit_dates
+    if window and window.start and window.end:
+        payload["explicit_dates"] = {"start": window.start, "end": window.end}
         payload["has_time_window"] = (
             True if intent.has_time_window is None else intent.has_time_window
         )
-        payload["date_column"] = (tw.column or default_col).upper()
+        payload["date_column"] = (intent.date_column or default_col).upper()
     else:
         payload["explicit_dates"] = None
         payload["has_time_window"] = intent.has_time_window
-        column = (tw.column if tw else None) or default_col
+        column = intent.date_column or default_col
         payload["date_column"] = column.upper() if isinstance(column, str) else column
 
     return payload

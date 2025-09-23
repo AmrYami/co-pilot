@@ -21,6 +21,7 @@ from apps.dw.nlu_normalizer import (
     normalize as normalize_nl,
 )
 from apps.dw.sql_compose import compose_sql
+from apps.dw.sql_rules import build_sql
 from core.datasources import DatasourceRegistry
 from core.settings import Settings
 from core.model_loader import get_model
@@ -32,6 +33,8 @@ from core.sql_utils import (
     validate_oracle_sql,
 )
 from core.logging_utils import get_logger, log_event
+from core.nlu.parse import parse_intent
+from core.nlu.schema import TimeWindow
 import sqlglot
 
 
@@ -605,8 +608,11 @@ def _normalize_intent(question: str, parsed: dict) -> dict:
         result["measure_sql"] = parsed.get("measure_sql")
 
     explicit = parsed.get("explicit_dates")
-    if not explicit and nl_intent.date_start and nl_intent.date_end:
-        explicit = {"start": nl_intent.date_start, "end": nl_intent.date_end}
+    if not explicit and nl_intent.explicit_dates and nl_intent.explicit_dates.start and nl_intent.explicit_dates.end:
+        explicit = {
+            "start": nl_intent.explicit_dates.start,
+            "end": nl_intent.explicit_dates.end,
+        }
     if isinstance(explicit, dict):
         result["explicit_dates"] = explicit
         if result["has_time_window"] is None:
@@ -1116,6 +1122,7 @@ def _env_truthy(name: str, default: bool = False) -> bool:
 
 NAMESPACE = os.environ.get("DW_NAMESPACE", "dw::common")
 DW_INCLUDE_DEBUG = _env_truthy("DW_INCLUDE_DEBUG", default=True)
+DW_SELECT_ALL_DEFAULT = _env_truthy("DW_SELECT_ALL_DEFAULT", default=True)
 
 
 def _as_dict(value) -> dict:
@@ -1236,6 +1243,75 @@ def answer():
     table_name = settings.get("DW_CONTRACT_TABLE", scope="namespace") or "Contract"
     default_date_col = settings.get("DW_DATE_COLUMN", scope="namespace") or "REQUEST_DATE"
 
+    select_all_setting = settings.get("DW_SELECT_ALL_DEFAULT", scope="namespace")
+    if isinstance(select_all_setting, bool):
+        select_all_default = select_all_setting
+    elif select_all_setting is None:
+        select_all_default = DW_SELECT_ALL_DEFAULT
+    else:
+        select_all_default = str(select_all_setting).strip().lower() not in {
+            "",
+            "0",
+            "false",
+            "no",
+        }
+
+    rule_intent = parse_intent(
+        q,
+        default_date_col=default_date_col,
+        select_all_default=select_all_default,
+    )
+    rule_intent.notes.setdefault("source", "rule")
+
+    if override_explicit_dates:
+        rule_intent.explicit_dates = TimeWindow(
+            start=override_explicit_dates.get("start"),
+            end=override_explicit_dates.get("end"),
+        )
+        rule_intent.has_time_window = True
+        if override_date_column:
+            rule_intent.date_column = override_date_column
+    elif date_column_override:
+        rule_intent.date_column = date_column_override
+
+    if rule_intent.date_column:
+        rule_intent.date_column = str(rule_intent.date_column).upper()
+
+    rule_sql: Optional[str] = None
+    rule_binds: dict[str, object] = {}
+    coverage = any(
+        [
+            bool(rule_intent.group_by),
+            bool(rule_intent.agg),
+            bool(rule_intent.top_n),
+            bool(rule_intent.measure_sql),
+            bool(rule_intent.explicit_dates and rule_intent.explicit_dates.start and rule_intent.explicit_dates.end),
+        ]
+    )
+    if coverage:
+        table_literal = (table_name or "Contract").strip()
+        if not table_literal.startswith('"'):
+            table_literal = f'"{table_literal.strip("\"")}"'
+        try:
+            candidate_sql, candidate_binds = build_sql(rule_intent, table=table_literal)
+            if candidate_sql:
+                validate_oracle_sql(candidate_sql)
+                rule_sql = candidate_sql
+                rule_binds = candidate_binds
+        except Exception:
+            rule_sql = None
+            rule_binds = {}
+
+    rule_intent_payload = {}
+    try:
+        dumped = rule_intent.model_dump(exclude_none=True)
+    except Exception:
+        dumped = {}
+    if isinstance(dumped, dict):
+        for key in _ALLOWED_INTENT_KEYS:
+            if key in dumped:
+                rule_intent_payload[key] = dumped[key]
+
     def _prompt_builder(question_text: str, _ctx: dict, intent_data: dict | None) -> str:
         return _build_oracle_prompt(
             question_text,
@@ -1292,6 +1368,13 @@ def answer():
     parsed = _parse_clarifier_output(clarifier_raw) or {}
     if not parsed and parsed_from_clarifier:
         parsed = parsed_from_clarifier
+    if rule_intent_payload:
+        merged = dict(rule_intent_payload)
+        if isinstance(parsed, dict):
+            for key, value in parsed.items():
+                if value is not None:
+                    merged[key] = value
+        parsed = merged
 
     intent = _normalize_intent(q, parsed)
     compiler_intent = extract_intent(q)
@@ -1379,13 +1462,17 @@ def answer():
     fallback_sql: Optional[str] = None
     fallback_bind_values: dict[str, Any] = {}
 
+    if rule_sql:
+        fallback_sql = rule_sql
+        fallback_bind_values = dict(rule_binds)
+
     prefer_compiler = (
         bool(compiler_intent.dimension)
         or compiler_intent.agg == "count"
         or compiler_intent.user_requested_top_n
     )
 
-    if prefer_compiler:
+    if prefer_compiler and not fallback_sql:
         compiler_binds: dict[str, Any] = {}
         if compiler_intent.window_key and compiler_date_start and compiler_date_end:
             compiler_binds["date_start"] = compiler_date_start
@@ -1650,7 +1737,7 @@ def answer():
             res["debug"] = debug_payload
         return jsonify(res)
 
-    deterministic_fallback_used = False
+    deterministic_fallback_used = bool(rule_sql)
     sanitized_sql = _sanitize_sql(sql_final)
     if sanitized_sql:
         sql_final = sanitized_sql

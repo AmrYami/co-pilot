@@ -1,6 +1,6 @@
 """Lightweight deterministic NLU helpers."""
 
-from .types import NLIntent, TimeWindow
+from .schema import NLIntent, TimeWindow
 from .clarify import infer_intent
 
 __all__ = [
