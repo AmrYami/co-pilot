@@ -1,88 +1,54 @@
+from datetime import datetime, timezone
 import pathlib
 import sys
-import types
-
 
 ROOT = pathlib.Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
 
-
-flask_stub = types.ModuleType("flask")
-
-
-class _Blueprint:
-    def __init__(self, *args, **kwargs):
-        pass
-
-    def route(self, *args, **kwargs):
-        def decorator(fn):
-            return fn
-
-        return decorator
+from apps.dw.builder import build_sql
+from apps.dw.intent import parse_intent
 
 
-flask_stub.Blueprint = _Blueprint
-flask_stub.jsonify = lambda *args, **kwargs: {}
-flask_stub.request = types.SimpleNamespace(args={}, json=None)
-sys.modules.setdefault("flask", flask_stub)
-
-sqlalchemy_stub = types.ModuleType("sqlalchemy")
-sqlalchemy_stub.text = lambda sql: sql
-sqlalchemy_stub.create_engine = lambda *args, **kwargs: None
-sys.modules.setdefault("sqlalchemy", sqlalchemy_stub)
-sqlalchemy_engine_stub = types.ModuleType("sqlalchemy.engine")
-sqlalchemy_engine_stub.Engine = object
-sys.modules.setdefault("sqlalchemy.engine", sqlalchemy_engine_stub)
-
-torch_stub = types.ModuleType("torch")
-torch_stub.float16 = "float16"
-torch_stub.float32 = "float32"
-torch_stub.float8 = "float8"
-torch_stub.device = lambda device: device
-torch_stub.cuda = types.SimpleNamespace(is_available=lambda: False)
-sys.modules.setdefault("torch", torch_stub)
-
-sqlglot_stub = types.ModuleType("sqlglot")
-sqlglot_stub.parse_one = lambda sql, read=None: None
-sqlglot_stub.exp = types.SimpleNamespace()
-sys.modules.setdefault("sqlglot", sqlglot_stub)
-sys.modules.setdefault("sqlglot.exp", sqlglot_stub.exp)
+def _set_now(monkeypatch, when: datetime) -> None:
+    monkeypatch.setattr("apps.dw.intent.today_utc", lambda: when)
 
 
-from apps.dw.app import (
-    _is_simple_contract_select,
-    _mentions_specific_projection,
-    _rewrite_projection_to_star,
-    _strip_limits,
-)
+def test_build_sql_top_n_group(monkeypatch):
+    now = datetime(2023, 6, 1, tzinfo=timezone.utc)
+    _set_now(monkeypatch, now)
+    intent = parse_intent("Top 5 stakeholders by contract value last 3 months")
+    sql, binds = build_sql(intent)
+    assert "GROUP BY CONTRACT_STAKEHOLDER_1" in sql
+    assert "ORDER BY MEASURE DESC" in sql
+    assert "FETCH FIRST :top_n ROWS ONLY" in sql
+    assert binds["date_start"] == "2023-03-01"
+    assert binds["date_end"] == "2023-06-01"
+    assert binds["top_n"] == 5
 
 
-def test_mentions_specific_projection():
-    assert not _mentions_specific_projection("Contracts with END_DATE in next 90 days")
-    assert _mentions_specific_projection(
-        "Show CONTRACT_ID and CONTRACT_OWNER for next 90 days"
+def test_build_sql_projection(monkeypatch):
+    now = datetime(2023, 8, 5, tzinfo=timezone.utc)
+    _set_now(monkeypatch, now)
+    intent = parse_intent(
+        "List all contracts requested last month (contract_id, contract_owner, request_date)"
     )
-    assert _mentions_specific_projection(
-        "Need contract owner and contract id details"
-    )
+    sql, binds = build_sql(intent)
+    assert sql.startswith('SELECT CONTRACT_ID, CONTRACT_OWNER, REQUEST_DATE FROM "Contract"')
+    assert binds == {"date_start": "2023-07-01", "date_end": "2023-07-31"}
 
 
-def test_rewrite_to_star_simple():
-    sql = (
-        'SELECT CONTRACT_ID, CONTRACT_OWNER FROM "Contract" '
-        "WHERE END_DATE BETWEEN :date_start AND :date_end ORDER BY END_DATE"
-    )
-    assert _is_simple_contract_select(sql)
-    out = _rewrite_projection_to_star(sql)
-    assert out.startswith('SELECT * FROM "Contract"')
+def test_build_sql_expiring(monkeypatch):
+    now = datetime(2024, 1, 15, tzinfo=timezone.utc)
+    _set_now(monkeypatch, now)
+    intent = parse_intent("Contracts expiring in 30 days")
+    sql, binds = build_sql(intent)
+    assert "END_DATE BETWEEN :date_start AND :date_end" in sql
+    assert binds == {"date_start": "2023-12-16", "date_end": "2024-01-15"}
 
 
-def test_dont_touch_cte():
-    sql = 'WITH x AS (SELECT 1 FROM dual) SELECT * FROM "Contract"'
-    assert not _is_simple_contract_select(sql)
-
-
-def test_strip_limits():
-    sql = 'SELECT * FROM "Contract" FETCH FIRST 10 ROWS ONLY'
-    assert _strip_limits(sql) == 'SELECT * FROM "Contract"'
+def test_build_sql_count_by_status():
+    intent = parse_intent("Count of contracts by status")
+    sql, binds = build_sql(intent)
+    assert sql.strip().upper() == 'SELECT COUNT(*) AS CNT FROM "CONTRACT"'
+    assert binds == {}
