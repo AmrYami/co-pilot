@@ -12,7 +12,11 @@ from collections.abc import Mapping
 from datetime import date, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
-from flask import Blueprint, jsonify, request
+try:  # pragma: no cover - test stubs may not expose current_app
+    from flask import Blueprint, jsonify, request, current_app
+except Exception:  # pragma: no cover - fallback for test harness stubs
+    current_app = None  # type: ignore[assignment]
+    from flask import Blueprint, jsonify, request  # type: ignore
 from sqlalchemy import text
 
 from apps.dw.heuristics import (
@@ -50,6 +54,7 @@ from apps.dw.lexicon import (
     REQUESTED_WORDS,
 )
 from core.datasources import DatasourceRegistry
+from core.pipeline import Pipeline
 from core.settings import Settings
 from core.model_loader import get_model
 from core.sql_exec import get_mem_engine
@@ -59,6 +64,7 @@ from core.sql_utils import (
     sanitize_oracle_sql,
     validate_oracle_sql,
 )
+from core.inquiries import insert_alert, log_run, record_rating
 from core.logging_utils import get_logger, log_event
 from core.nlu.parse import parse_intent as parse_core_intent
 from core.nlu.schema import TimeWindow
@@ -96,6 +102,7 @@ DW_DIM_MAP = {
     "entity": "ENTITY_NO",
     "owner": "CONTRACT_OWNER",
     "stakeholder": "CONTRACT_STAKEHOLDER_1",
+    "status": "CONTRACT_STATUS",
 }
 
 _TOPN_RE = re.compile(r"\btop\s+(\d{1,4})\b", re.I)
@@ -1592,12 +1599,57 @@ def _env_truthy(name: str, default: bool = False) -> bool:
     return value.strip().lower() not in {"", "0", "false", "no"}
 
 
+def _env_int(name: str, default: int = 0) -> int:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
 NAMESPACE = os.environ.get("DW_NAMESPACE", "dw::common")
 DW_INCLUDE_DEBUG = _env_truthy("DW_INCLUDE_DEBUG", default=True)
 DW_SELECT_ALL_DEFAULT = _env_truthy("DW_SELECT_ALL_DEFAULT", default=True)
 DW_ACCURACY_FIRST = _env_truthy("DW_ACCURACY_FIRST", default=False)
 DW_DISABLE_TRIVIAL_COUNT = _env_truthy("DW_DISABLE_TRIVIAL_COUNT", default=False)
 DW_REQUIRE_WINDOW_FOR_EXPIRE = _env_truthy("DW_REQUIRE_WINDOW_FOR_EXPIRE", default=True)
+DW_MAX_RERUNS = max(0, _env_int("DW_MAX_RERUNS", 1))
+
+
+def _attach_feedback_fields(payload: Dict[str, Any], run_id: Optional[int], attempt_no: int) -> Dict[str, Any]:
+    if run_id is not None:
+        payload["run_id"] = run_id
+    payload["attempt_no"] = attempt_no
+    payload["rate_url"] = "/dw/rate"
+    return payload
+
+
+def _log_attempt(
+    mem_engine,
+    *,
+    namespace: str,
+    question: str,
+    sql_text: str,
+    status: str,
+    attempt_no: int,
+    meta: Optional[Dict[str, Any]] = None,
+    binds: Optional[Dict[str, Any]] = None,
+) -> Optional[int]:
+    context_pack: Dict[str, Any] = {"attempt_no": attempt_no}
+    if binds:
+        context_pack["binds"] = binds
+    if meta:
+        context_pack["meta"] = meta
+    return log_run(
+        mem_engine,
+        namespace,
+        question,
+        sql_text,
+        status,
+        context_pack,
+    )
 
 
 def _as_dict(value) -> dict:
@@ -4182,25 +4234,6 @@ def answer():
             ).scalar_one()
         log_event(log, "dw", "snippet_saved", {"id": snippet_id})
 
-    with mem.begin() as conn:
-        conn.execute(
-            text(
-                """
-            UPDATE mem_inquiries
-               SET status='answered', answered_by=:by, answered_at=NOW(), updated_at=NOW(),
-                   last_sql=:sql, last_error=NULL
-             WHERE id=:id
-        """
-            ),
-            {"by": auth_email, "sql": sql_final, "id": inq_id},
-        )
-    log_event(
-        log,
-        "dw",
-        "inquiry_status",
-        {"id": inq_id, "from": "open", "to": "answered", "rows": len(rows)},
-    )
-
     rowcount = len(rows)
 
     binds_public = {
@@ -4231,6 +4264,17 @@ def answer():
     if widen_meta:
         meta["autowiden"] = widen_meta
 
+    run_id = _log_attempt(
+        mem,
+        namespace=NAMESPACE,
+        question=q,
+        sql_text=sql_final,
+        status="complete",
+        attempt_no=1,
+        meta=meta,
+        binds={k: _as_loggable(v) for k, v in bind_values.items()},
+    )
+
     resp = {
         "ok": True,
         "inquiry_id": inq_id,
@@ -4239,6 +4283,26 @@ def answer():
         "csv_path": str(csv_path) if csv_path else None,
         "meta": meta,
     }
+    resp = _attach_feedback_fields(resp, run_id, attempt_no=1)
+
+    with mem.begin() as conn:
+        conn.execute(
+            text(
+                """
+            UPDATE mem_inquiries
+               SET status='answered', answered_by=:by, answered_at=NOW(), updated_at=NOW(),
+                   last_sql=:sql, last_error=NULL, run_id=COALESCE(:run_id, run_id)
+             WHERE id=:id
+        """
+            ),
+            {"by": auth_email, "sql": sql_final, "id": inq_id, "run_id": run_id},
+        )
+    log_event(
+        log,
+        "dw",
+        "inquiry_status",
+        {"id": inq_id, "from": "open", "to": "answered", "rows": len(rows)},
+    )
 
     message: Optional[str] = None
     suggestions: list[str] = []
@@ -4294,6 +4358,168 @@ def answer():
             debug_payload["details_sql"] = deterministic_details_sql
         resp["debug"] = debug_payload
     return jsonify(resp)
+
+
+@dw_bp.route("/rate", methods=["POST"])
+def rate():
+    data = request.get_json(force=True, silent=True) or {}
+    try:
+        inquiry_id = int(data.get("inquiry_id") or 0)
+        rating = int(data.get("rating") or 0)
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "invalid_input"}), 400
+
+    if not inquiry_id or rating < 1 or rating > 5:
+        return jsonify({"ok": False, "error": "invalid_input"}), 400
+
+    comment = data.get("comment")
+    if comment is not None:
+        comment = str(comment).strip() or None
+
+    settings = _settings()
+    mem = get_mem_engine(settings)
+
+    record_rating(mem, inquiry_id, rating, comment)
+
+    with mem.begin() as conn:
+        row = conn.execute(
+            text(
+                """
+            SELECT namespace, question, auth_email, prefixes, datasource
+              FROM mem_inquiries
+             WHERE id = :id
+            """
+            ),
+            {"id": inquiry_id},
+        ).mappings().first()
+
+    if not row:
+        return jsonify({"ok": False, "error": "inquiry_not_found"}), 404
+
+    namespace = row.get("namespace") or NAMESPACE
+    question = row.get("question") or ""
+
+    if rating >= 3:
+        return jsonify({"ok": True, "message": "Thanks for rating!", "inquiry_id": inquiry_id})
+
+    rerun_count = 0
+    try:
+        with mem.begin() as conn:
+            rerun_count = conn.execute(
+                text(
+                    """
+                SELECT COUNT(*)
+                  FROM mem_runs
+                 WHERE namespace = :ns
+                   AND input_query = :q
+                   AND (context_pack->>'attempt_no')::int >= 2
+                """
+                ),
+                {"ns": namespace, "q": question},
+            ).scalar() or 0
+    except Exception:
+        rerun_count = 0
+
+    if DW_MAX_RERUNS and rerun_count >= DW_MAX_RERUNS:
+        return jsonify(
+            {
+                "ok": True,
+                "message": "Thanks for the feedback! We've already retried this question.",
+                "inquiry_id": inquiry_id,
+            }
+        )
+
+    prefixes_raw = row.get("prefixes")
+    prefixes: List[str]
+    if isinstance(prefixes_raw, str):
+        try:
+            decoded = json.loads(prefixes_raw)
+            prefixes = [str(p) for p in decoded if p is not None]
+        except Exception:
+            prefixes = []
+    elif isinstance(prefixes_raw, (list, tuple)):
+        prefixes = [str(p) for p in prefixes_raw if p is not None]
+    else:
+        prefixes = []
+
+    pipeline = current_app.config.get("PIPELINE") if current_app else None
+    if not pipeline:
+        pipeline = Pipeline(settings=settings, namespace=namespace)
+
+    try:
+        result = pipeline.answer(
+            question=question,
+            prefixes=prefixes,
+            auth_email=row.get("auth_email"),
+            namespace=namespace,
+            datasource=row.get("datasource"),
+            app_tag="dw_retry",
+            context={"retry_reason": "low_rating"},
+        )
+    except Exception as exc:
+        result = {
+            "ok": False,
+            "status": "error",
+            "error": str(exc),
+            "sql": "",
+            "rows": [],
+            "columns": [],
+        }
+    result = dict(result or {})
+    result.setdefault("meta", {})
+    result.setdefault("rows", [])
+    result.setdefault("columns", [])
+    result.setdefault("sql", "")
+    result["inquiry_id"] = inquiry_id
+
+    status = "complete" if result.get("ok") else "failed"
+    attempt_no = rerun_count + 2
+    run_id = _log_attempt(
+        mem,
+        namespace=namespace,
+        question=question,
+        sql_text=result.get("sql") or "",
+        status=status,
+        attempt_no=attempt_no,
+        meta=result.get("meta"),
+    )
+    result = _attach_feedback_fields(result, run_id, attempt_no)
+    meta = result.setdefault("meta", {})
+    meta.setdefault("retry_reason", "low_rating")
+    meta["attempt_no"] = attempt_no
+
+    with mem.begin() as conn:
+        conn.execute(
+            text(
+                """
+            UPDATE mem_inquiries
+               SET run_id = COALESCE(:run_id, run_id),
+                   clarification_rounds = COALESCE(clarification_rounds, 0) + 1,
+                   updated_at = NOW()
+             WHERE id = :id
+        """
+            ),
+            {"run_id": run_id, "id": inquiry_id},
+        )
+
+    rowcount = result.get("rowcount")
+    if not result.get("ok") or (isinstance(rowcount, int) and rowcount == 0):
+        try:
+            insert_alert(
+                mem,
+                namespace,
+                "low_rating_rerun_failed",
+                {
+                    "inquiry_id": inquiry_id,
+                    "question": question,
+                    "rating": rating,
+                    "attempt_run_id": run_id,
+                },
+            )
+        except Exception:
+            pass
+
+    return jsonify(result)
 
 
 def create_dw_blueprint(*args, **kwargs):

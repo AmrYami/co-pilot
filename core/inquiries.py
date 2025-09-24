@@ -9,7 +9,14 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
-from sqlalchemy.engine import Engine, Row
+try:  # pragma: no cover - allow lightweight stubs during testing
+    from sqlalchemy.engine import Engine, Row
+except Exception:  # pragma: no cover - fallback to satisfy type checking in tests
+    class Engine:  # type: ignore[override]
+        pass
+
+    class Row:  # type: ignore[override]
+        pass
 from sqlalchemy import text
 import json
 try:
@@ -335,14 +342,118 @@ def create_or_update_inquiry(
     return int(row[0]) if row else 0
 
 
-def set_feedback(mem_engine: Engine, *, inquiry_id: int, satisfied: bool, rating: Optional[int], comment: Optional[str]) -> None:
+def record_rating(
+    mem_engine: Engine,
+    inquiry_id: int,
+    rating: int,
+    comment: Optional[str] = None,
+) -> None:
+    """Persist a user rating (1..5) with an optional free-text comment.
+
+    The helper keeps any existing feedback comment unless a new one is supplied
+    and refreshes the ``updated_at`` timestamp to simplify audit queries.
+    """
+
+    sql = text(
+        """
+        UPDATE mem_inquiries
+           SET rating = :rating,
+               feedback_comment = COALESCE(:comment, feedback_comment),
+               updated_at = NOW()
+         WHERE id = :inquiry_id
+        """
+    )
+    with mem_engine.begin() as con:
+        con.execute(
+            sql,
+            {"rating": rating, "comment": comment, "inquiry_id": inquiry_id},
+        )
+
+
+def set_feedback(
+    mem_engine: Engine,
+    *,
+    inquiry_id: int,
+    satisfied: bool,
+    rating: Optional[int],
+    comment: Optional[str],
+) -> None:
     """Stores user feedback (satisfied / rating / comment)."""
     with mem_engine.begin() as con:
-        con.execute(text("""
+        con.execute(
+            text(
+                """
             UPDATE mem_inquiries
                SET satisfied=:sat, rating=:rate, feedback_comment=:c, updated_at=NOW()
              WHERE id=:id
-        """), {"id": inquiry_id, "sat": satisfied, "rate": rating, "c": comment})
+        """
+            ),
+            {"id": inquiry_id, "sat": satisfied, "rate": rating, "c": comment},
+        )
+
+
+def insert_alert(
+    mem_engine: Engine,
+    namespace: str,
+    event_type: str,
+    payload: Dict[str, Any],
+) -> None:
+    """Insert a queued alert row for asynchronous notification channels."""
+
+    sql = text(
+        """
+        INSERT INTO mem_alerts(namespace, event_type, recipient, payload, status, created_at)
+        VALUES (:ns, :et, NULL, CAST(:payload AS jsonb), 'queued', NOW())
+        """
+    )
+    with mem_engine.begin() as con:
+        con.execute(sql, {"ns": namespace, "et": event_type, "payload": json.dumps(payload)})
+
+
+def log_run(
+    mem_engine: Engine,
+    namespace: str,
+    question: str,
+    sql_text: str,
+    status: str,
+    context_pack: Optional[Dict[str, Any]] = None,
+) -> Optional[int]:
+    """Create a lightweight ``mem_runs`` entry and return its identifier.
+
+    The helper attempts to persist a JSON ``context_pack`` whenever the column is
+    available.  When older schemas without that column are in use we gracefully
+    fall back to a simplified insert so integrations remain backwards
+    compatible.
+    """
+
+    ctx_json = json.dumps(context_pack or {}, default=str)
+    primary = text(
+        """
+        INSERT INTO mem_runs(namespace, input_query, sql_text, status, context_pack, created_at)
+        VALUES (:ns, :q, :sql, :status, CAST(:ctx AS jsonb), NOW())
+        RETURNING id
+        """
+    )
+    fallback = text(
+        """
+        INSERT INTO mem_runs(namespace, input_query, sql_text, status, created_at)
+        VALUES (:ns, :q, :sql, :status, NOW())
+        RETURNING id
+        """
+    )
+
+    with mem_engine.begin() as con:
+        try:
+            row = con.execute(
+                primary,
+                {"ns": namespace, "q": question, "sql": sql_text, "status": status, "ctx": ctx_json},
+            ).fetchone()
+        except Exception:
+            row = con.execute(
+                fallback,
+                {"ns": namespace, "q": question, "sql": sql_text, "status": status},
+            ).fetchone()
+    return int(row[0]) if row else None
 
 
 def list_inquiries(mem_engine: Engine, *, namespace: str, status: Optional[str], limit: int = 50) -> List[Dict[str, Any]]:

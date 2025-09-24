@@ -227,6 +227,15 @@ def parse_intent(q: str, default_date_col: str = "START_DATE") -> DWIntent:
     elif intent.window_kind == "overlap" and not intent.has_time_window and default_date_col:
         intent.date_column = default_date_col
 
+    # Group-by heuristics: default to aggregates to avoid projecting every column.
+    if intent.group_by and not intent.agg:
+        if RE_COUNT.search(t):
+            intent.agg = "count"
+        elif intent.group_by == "CONTRACT_STATUS":
+            intent.agg = "count"
+        else:
+            intent.agg = "sum"
+
     # wants_all_columns only when not aggregated
     if intent.group_by or intent.agg in ("count", "sum", "avg"):
         intent.wants_all_columns = False
