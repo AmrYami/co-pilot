@@ -1,4 +1,10 @@
 from datetime import datetime
+import pathlib
+import sys
+
+ROOT = pathlib.Path(__file__).resolve().parents[3]
+if str(ROOT) not in sys.path:
+    sys.path.append(str(ROOT))
 
 from apps.dw.nlu_normalizer import DEFAULT_TZ, NET_VALUE_EXPR, normalize
 
