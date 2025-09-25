@@ -50,6 +50,7 @@ class NLIntent:
     measure_sql: Optional[str] = None
     wants_all_columns: Optional[bool] = None
     user_requested_top_n: Optional[bool] = None
+    full_text_search: bool = False
     notes: Dict[str, Any] = field(default_factory=dict)
     expire: Optional[bool] = None
 

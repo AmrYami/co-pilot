@@ -58,6 +58,7 @@ def answer():
     prefixes = data.get("prefixes") or []
     auth_email = (data.get("auth_email") or "").strip()
     namespace = data.get("namespace") or NAMESPACE
+    fts_requested = data.get("full_text_search")
 
     if not question:
         return jsonify({"ok": False, "error": "question required"}), 400
@@ -81,7 +82,13 @@ def answer():
         json.dumps({"id": inquiry_id, "q": question, "email": auth_email, "ns": namespace, "prefixes": prefixes}),
     )
 
-    result = run_attempt(question, namespace, attempt_no=1, strategy="deterministic")
+    result = run_attempt(
+        question,
+        namespace,
+        attempt_no=1,
+        strategy="deterministic",
+        full_text_search=fts_requested,
+    )
 
     with mem_engine.begin() as cx:
         cx.execute(
