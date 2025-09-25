@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 from typing import Any, Dict, Tuple
 
 try:  # pragma: no cover - allow tests to import without Flask installed
@@ -44,65 +43,15 @@ except Exception:  # pragma: no cover - lightweight fallback used in tests
 from core.settings import Settings
 
 from .config import get_dw_fts_columns
-from .intent import parse_intent
-from .sqlgen import build_sql
+from .intent import NLIntent, parse_intent
+from .sql_builder import build_sql
 from .rating import rate_bp
-from .fts import build_oracle_fts, tokenize as fts_tokenize
 
 NAMESPACE = os.getenv("DW_NAMESPACE", "dw::common")
 
 
 dw_bp = Blueprint("dw", __name__)
 dw_bp.register_blueprint(rate_bp, url_prefix="")
-
-
-def _apply_fts_if_needed(
-    sql: str,
-    binds: Dict[str, Any],
-    question: str,
-    settings: Settings,
-    table_name: str,
-) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
-    debug: Dict[str, Any] = {
-        "enabled": False,
-        "tokens": None,
-        "columns": None,
-        "binds": None,
-        "error": None,
-    }
-    try:
-        columns = get_dw_fts_columns(settings, table_name)
-        debug["columns"] = columns
-        if not columns:
-            return sql, binds, debug
-
-        tokens = fts_tokenize(question or "")
-        debug["tokens"] = tokens
-        if not tokens:
-            return sql, binds, debug
-
-        fragment, fts_binds = build_oracle_fts(table_name, columns, tokens)
-        if not fragment:
-            return sql, binds, debug
-
-        sql_upper = sql.upper()
-        order_idx = sql_upper.find(" ORDER BY ")
-        head = sql if order_idx < 0 else sql[:order_idx]
-        tail = "" if order_idx < 0 else sql[order_idx:]
-
-        if re.search(r"\bWHERE\b", head, flags=re.I):
-            head = head.rstrip() + f"\n  AND {fragment}\n"
-        else:
-            head = head.rstrip() + f"\nWHERE {fragment}\n"
-
-        merged_binds = dict(binds)
-        merged_binds.update(fts_binds)
-        debug["binds"] = list(merged_binds.keys())
-        debug["enabled"] = True
-        return head + tail, merged_binds, debug
-    except Exception as exc:  # pragma: no cover - defensive guard
-        debug["error"] = str(exc)
-        return sql, binds, debug
 
 
 def _execute_oracle(sql: str, binds: Dict[str, Any]):
@@ -122,6 +71,32 @@ def _execute_oracle(sql: str, binds: Dict[str, Any]):
         rows = [list(r) for r in rs.fetchall()]
     meta["rowcount"] = len(rows)
     return rows, cols, meta
+
+
+def _quote_table(name: str) -> str:
+    n = (name or "Contract").strip()
+    if n.startswith("\"") and n.endswith("\""):
+        return n
+    return f'"{n}"'
+
+
+def _intent_debug(intent: NLIntent) -> Dict[str, Any]:
+    return {
+        "agg": intent.agg,
+        "date_column": intent.date_column,
+        "expire": intent.expire,
+        "explicit_dates": intent.explicit_dates,
+        "full_text_search": intent.full_text_search,
+        "fts_tokens": intent.fts_tokens,
+        "group_by": intent.group_by,
+        "has_time_window": intent.has_time_window,
+        "measure_sql": intent.measure_sql,
+        "sort_by": intent.sort_by,
+        "sort_desc": intent.sort_desc,
+        "top_n": intent.top_n,
+        "user_requested_top_n": intent.user_requested_top_n,
+        "wants_all_columns": intent.wants_all_columns,
+    }
 
 
 @dw_bp.post("/answer")
@@ -159,16 +134,15 @@ def answer():
         json.dumps({"id": inquiry_id, "q": question, "email": auth_email, "ns": namespace, "prefixes": prefixes}),
     )
 
-    select_all_default = bool(
-        settings.get("DW_SELECT_ALL_DEFAULT", scope="namespace", default=True)
-    )
-    intent = parse_intent(
-        question,
-        default_measure="NVL(CONTRACT_VALUE_NET_OF_VAT,0)",
-        select_all_default=select_all_default,
-        accuracy_first=True,
-    )
-    intent.full_text_search = full_text_search
+    contract_table = settings.get("DW_CONTRACT_TABLE", "Contract")
+    contract_table_sql = _quote_table(str(contract_table))
+
+    prefer_overlap_default = True
+    require_window_flag = settings.get("DW_REQUIRE_WINDOW_FOR_EXPIRE", scope="namespace", default=1)
+    try:
+        require_window_for_expire = bool(int(str(require_window_flag)))
+    except Exception:
+        require_window_for_expire = bool(require_window_flag)
 
     overlap_flag = settings.get("DW_OVERLAP_STRICT", scope="namespace", default=1)
     try:
@@ -176,31 +150,41 @@ def answer():
     except Exception:
         overlap_strict = bool(overlap_flag)
 
-    final_sql, binds = build_sql(intent, strict_overlap=overlap_strict)
+    intent = parse_intent(
+        question,
+        prefer_overlap_default=prefer_overlap_default,
+        require_window_for_expire=require_window_for_expire,
+        full_text_search=full_text_search,
+    )
 
+    fts_columns = get_dw_fts_columns(settings, contract_table)
+    sql, binds = build_sql(
+        intent,
+        table=contract_table_sql,
+        overlap_strict=overlap_strict,
+        fts_columns=fts_columns if full_text_search else None,
+    )
+
+    rows, cols, exec_meta = _execute_oracle(sql, binds)
+
+    ft_bind_keys = [k for k in binds.keys() if k.startswith("ft_")]
     fts_meta: Dict[str, Any] = {
-        "enabled": False,
-        "tokens": None,
-        "columns": None,
-        "binds": None,
+        "enabled": full_text_search and bool(intent.fts_tokens),
+        "tokens": intent.fts_tokens,
+        "columns": fts_columns if full_text_search else None,
+        "binds": ft_bind_keys or None,
         "error": None,
     }
-    if full_text_search:
-        contract_table = settings.get("DW_CONTRACT_TABLE", "Contract")
-        final_sql, binds, fts_meta = _apply_fts_if_needed(
-            final_sql,
-            binds,
-            question,
-            settings,
-            contract_table,
-        )
-        if fts_meta.get("tokens"):
-            intent.fts_tokens = fts_meta["tokens"]
 
-    rows, cols, exec_meta = _execute_oracle(final_sql, binds)
+    debug = {
+        "intent": _intent_debug(intent),
+        "prompt": "",
+        "validation": exec_meta.get("validation", {}),
+        "fts": fts_meta,
+    }
 
     result: Dict[str, Any] = {
-        "sql": final_sql,
+        "sql": sql,
         "rows": rows,
         "columns": cols,
         "csv_path": exec_meta.get("csv_path"),
@@ -212,12 +196,7 @@ def answer():
             "strategy": "deterministic",
             "fts": fts_meta,
         },
-        "debug": {
-            "intent": intent.__dict__,
-            "prompt": "",
-            "validation": exec_meta.get("validation", {}),
-            "fts": fts_meta,
-        },
+        "debug": debug,
         "ok": True,
     }
 
