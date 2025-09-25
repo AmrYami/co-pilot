@@ -6,7 +6,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
 
-from apps.dw.intent import parse_intent
+from apps.dw.intent import parse_intent_legacy
 
 
 def _set_now(monkeypatch, when: datetime) -> None:
@@ -16,7 +16,7 @@ def _set_now(monkeypatch, when: datetime) -> None:
 def test_parse_intent_last_month(monkeypatch):
     now = datetime(2023, 2, 10, tzinfo=timezone.utc)
     _set_now(monkeypatch, now)
-    intent = parse_intent("top 10 stakeholders by contract value last month")
+    intent = parse_intent_legacy("top 10 stakeholders by contract value last month")
     assert intent.top_n == 10
     assert intent.user_requested_top_n is True
     assert intent.group_by == "CONTRACT_STAKEHOLDER_1"
@@ -27,14 +27,14 @@ def test_parse_intent_last_month(monkeypatch):
 def test_parse_intent_expiring_window(monkeypatch):
     now = datetime(2023, 5, 1, tzinfo=timezone.utc)
     _set_now(monkeypatch, now)
-    intent = parse_intent("contracts expiring in 30 days")
+    intent = parse_intent_legacy("contracts expiring in 30 days")
     assert intent.expire is True
     assert intent.date_column == "END_DATE"
     assert intent.explicit_dates == {"start": "2023-04-01", "end": "2023-05-01"}
 
 
 def test_parse_intent_by_status_sets_count():
-    intent = parse_intent("Count of contracts by status")
+    intent = parse_intent_legacy("Count of contracts by status")
     assert intent.agg == "count"
     assert intent.group_by == "CONTRACT_STATUS"
 
@@ -42,7 +42,7 @@ def test_parse_intent_by_status_sets_count():
 def test_parse_intent_projection(monkeypatch):
     now = datetime(2023, 7, 15, tzinfo=timezone.utc)
     _set_now(monkeypatch, now)
-    intent = parse_intent(
+    intent = parse_intent_legacy(
         "List all contracts requested last month (contract_id, contract_owner, request_date)"
     )
     assert intent.date_column == "REQUEST_DATE"

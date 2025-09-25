@@ -40,7 +40,9 @@ except Exception:  # pragma: no cover - lightweight fallback used in tests
     def text(sql: str):  # type: ignore
         return sql
 
-from .attempts import run_attempt
+from .intent import parse_intent
+from .sqlgen import build_sql
+from .fts import build_fts_clause
 from .rating import rate_bp
 
 NAMESPACE = os.getenv("DW_NAMESPACE", "dw::common")
@@ -48,6 +50,25 @@ NAMESPACE = os.getenv("DW_NAMESPACE", "dw::common")
 
 dw_bp = Blueprint("dw", __name__)
 dw_bp.register_blueprint(rate_bp, url_prefix="")
+
+
+def _execute_oracle(sql: str, binds: Dict[str, Any]):
+    app = current_app
+    rows: list[list[Any]] = []
+    cols: list[str] = []
+    meta: Dict[str, Any] = {
+        "validation": {"ok": True, "errors": [], "binds": list(binds.keys())},
+        "csv_path": None,
+    }
+    engine = app.config.get("DW_ENGINE") if app else None  # type: ignore[assignment]
+    if engine is None:
+        return rows, cols, meta
+    with engine.connect() as cx:  # type: ignore[union-attr]
+        rs = cx.execute(text(sql), binds)
+        cols = list(rs.keys()) if hasattr(rs, "keys") else []
+        rows = [list(r) for r in rs.fetchall()]
+    meta["rowcount"] = len(rows)
+    return rows, cols, meta
 
 
 @dw_bp.post("/answer")
@@ -82,13 +103,55 @@ def answer():
         json.dumps({"id": inquiry_id, "q": question, "email": auth_email, "ns": namespace, "prefixes": prefixes}),
     )
 
-    result = run_attempt(
-        question,
-        namespace,
-        attempt_no=1,
-        strategy="deterministic",
-        full_text_search=fts_requested,
-    )
+    intent = parse_intent(question, full_text_search=bool(fts_requested))
+    sql, binds = build_sql(intent)
+
+    fts_meta: Dict[str, Any] = {
+        "enabled": intent.full_text_search,
+        "tokens": None,
+        "columns": None,
+        "binds": None,
+        "error": None,
+    }
+    if intent.full_text_search:
+        try:
+            where_fts, binds_fts, toks, cols_used = build_fts_clause(question, columns=None)
+            intent.fts_tokens = toks
+            fts_meta["tokens"] = toks
+            fts_meta.setdefault("columns", cols_used)
+            if where_fts:
+                if " WHERE " in sql:
+                    sql = sql.replace(" WHERE ", f" WHERE {where_fts} AND ", 1)
+                else:
+                    sql = sql + "\nWHERE " + where_fts
+                binds.update(binds_fts)
+                fts_meta.update({"tokens": toks, "binds": list(binds_fts.keys())})
+        except Exception as exc:  # pragma: no cover - defensive guard
+            fts_meta["error"] = str(exc)
+
+    rows, cols, exec_meta = _execute_oracle(sql, binds)
+
+    result: Dict[str, Any] = {
+        "sql": sql,
+        "rows": rows,
+        "columns": cols,
+        "csv_path": exec_meta.get("csv_path"),
+        "meta": {
+            "binds": binds,
+            "wants_all_columns": intent.wants_all_columns,
+            "rowcount": len(rows),
+            "attempt_no": 1,
+            "strategy": "deterministic",
+            "fts": fts_meta,
+        },
+        "debug": {
+            "intent": intent.__dict__,
+            "prompt": "",
+            "validation": exec_meta.get("validation", {}),
+            "fts": fts_meta,
+        },
+        "ok": True,
+    }
 
     with mem_engine.begin() as cx:
         cx.execute(

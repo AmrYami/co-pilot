@@ -17,7 +17,7 @@ except Exception:  # pragma: no cover
         return sql
 
 from .builder import build_sql
-from .intent import NLIntent, parse_intent
+from .intent import NLIntent, parse_intent_legacy
 from .search import (
     build_fulltext_where,
     extract_search_tokens,
@@ -51,7 +51,7 @@ def run_attempt(
 ) -> Dict[str, Any]:
     app = current_app
     logger = getattr(app, "logger", None)
-    intent: NLIntent = parse_intent(question)
+    intent: NLIntent = parse_intent_legacy(question)
     allow_fts = is_fulltext_allowed()
     if allow_fts:
         default_on = env_flag("DW_FTS_DEFAULT_ON", False)
