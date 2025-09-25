@@ -43,10 +43,11 @@ except Exception:  # pragma: no cover - lightweight fallback used in tests
 
 from core.settings import Settings
 
+from .config import get_dw_fts_columns
 from .intent import parse_intent
 from .sqlgen import build_sql
 from .rating import rate_bp
-from .fts import build_oracle_fts_predicate, tokenize as fts_tokenize
+from .fts import build_oracle_fts, tokenize as fts_tokenize
 
 NAMESPACE = os.getenv("DW_NAMESPACE", "dw::common")
 
@@ -70,7 +71,7 @@ def _apply_fts_if_needed(
         "error": None,
     }
     try:
-        columns = settings.get_fts_columns(table_name)
+        columns = get_dw_fts_columns(settings, table_name)
         debug["columns"] = columns
         if not columns:
             return sql, binds, debug
@@ -80,13 +81,7 @@ def _apply_fts_if_needed(
         if not tokens:
             return sql, binds, debug
 
-        tokens_mode = (settings.get("DW_FTS_TOKENS_MODE", "all") or "all").lower()
-        fragment, fts_binds = build_oracle_fts_predicate(
-            tokens,
-            columns,
-            bind_prefix="fts",
-            tokens_mode=tokens_mode,
-        )
+        fragment, fts_binds = build_oracle_fts(table_name, columns, tokens)
         if not fragment:
             return sql, binds, debug
 
@@ -164,8 +159,24 @@ def answer():
         json.dumps({"id": inquiry_id, "q": question, "email": auth_email, "ns": namespace, "prefixes": prefixes}),
     )
 
-    intent = parse_intent(question, full_text_search=full_text_search)
-    final_sql, binds = build_sql(intent)
+    select_all_default = bool(
+        settings.get("DW_SELECT_ALL_DEFAULT", scope="namespace", default=True)
+    )
+    intent = parse_intent(
+        question,
+        default_measure="NVL(CONTRACT_VALUE_NET_OF_VAT,0)",
+        select_all_default=select_all_default,
+        accuracy_first=True,
+    )
+    intent.full_text_search = full_text_search
+
+    overlap_flag = settings.get("DW_OVERLAP_STRICT", scope="namespace", default=1)
+    try:
+        overlap_strict = bool(int(str(overlap_flag)))
+    except Exception:
+        overlap_strict = bool(overlap_flag)
+
+    final_sql, binds = build_sql(intent, strict_overlap=overlap_strict)
 
     fts_meta: Dict[str, Any] = {
         "enabled": False,
