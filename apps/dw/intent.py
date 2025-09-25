@@ -1,161 +1,115 @@
 from __future__ import annotations
+
 from dataclasses import dataclass, field
 import re
-from datetime import date, timedelta
+from typing import Any, Dict, Optional
 
-_RE_REQUESTED = re.compile(r"\b(requested|request\s*date)\b", re.I)
-_RE_GROSS     = re.compile(r"\bgross\b", re.I)
-_RE_NET       = re.compile(r"\b(net|contract\s*value)\b", re.I)
-_RE_COUNT     = re.compile(r"\bcount\b|\(count\)", re.I)
-_RE_BY_STATUS = re.compile(r"\bby\s+status\b", re.I)
-_RE_CONTRACTS = re.compile(r"\bcontracts?\b", re.I)
-_RE_STAKE     = re.compile(r"\bstakeholder(s)?\b", re.I)
-_RE_OWNER     = re.compile(r"\b(owner|contract\s*owner)\b", re.I)
-_RE_DEPT      = re.compile(r"\b(owner\s*department|department|dept|department_oul|oul)\b", re.I)
-_RE_ENTITY    = re.compile(r"\bentity\b", re.I)
-_RE_TOPN      = re.compile(r"\btop\s+(\d+)\b", re.I)
-
-DIM_MAP = {
-    "stakeholder": "CONTRACT_STAKEHOLDER_1",
-    "owner": "CONTRACT_OWNER",
+DIM_SYNONYMS = {
     "owner department": "OWNER_DEPARTMENT",
     "department": "OWNER_DEPARTMENT",
-    "department_oul": "DEPARTMENT_OUL",
+    "manager": "DEPARTMENT_OUL",
     "oul": "DEPARTMENT_OUL",
-    "entity": "ENTITY_NO"
+    "contract owner": "CONTRACT_OWNER",
+    "owner": "CONTRACT_OWNER",
+    "entity": "ENTITY",
+    "entity no": "ENTITY_NO",
+    "stakeholder": "CONTRACT_STAKEHOLDER_1",
+    "stakeholders": "CONTRACT_STAKEHOLDER_1",
 }
+
+BY_RE = re.compile(r"\b(?:by|per)\s+([a-z0-9_ \-]+)\b", re.I)
+REQUESTED_RE = re.compile(r"\b(request|requested|request\s+date|طلب)\b", re.I)
+EXPIRE_RE = re.compile(r"\b(expire|expiry|expiring|ينتهي)\b", re.I)
+COUNT_RE = re.compile(r"\bcount\b|\(count\)", re.I)
+GROSS_RE = re.compile(r"\bgross\b", re.I)
+NET_RE = re.compile(r"\bnet\b|\bcontract\s*value\b", re.I)
+TOP_RE = re.compile(r"\btop\s+(\d+)\b", re.I)
+
 
 @dataclass
 class DWIntent:
-    raw: str
-    # window
-    has_time_window: bool = False
-    date_column: str | None = None      # REQUEST_DATE | START_DATE | END_DATE | OVERLAP
-    explicit_dates: dict | None = None  # {"start":"YYYY-MM-DD","end":"YYYY-MM-DD"}
-    expire: bool | None = None
-    # selection / aggregation
-    agg: str | None = None              # "count" | "sum" | None
+    agg: str | None = None
     group_by: str | None = None
-    wants_all_columns: bool = True
-    # value semantics
-    gross: bool = False
-    net: bool = False
-    measure_sql: str | None = None
-    # ranking
     sort_by: str | None = None
-    sort_desc: bool | None = True
+    sort_desc: bool | None = None
     top_n: int | None = None
+    date_column: str | None = None
+    has_time_window: bool | None = None
+    explicit_dates: dict | None = None
+    wants_all_columns: bool | None = None
     user_requested_top_n: bool | None = None
-    # fts
-    full_text_search: bool = False
+    full_text_search: bool | None = None
+    expire: bool | None = None
+    measure_sql: str | None = None
     fts_tokens: list[str] = field(default_factory=list)
 
-def _last_month_bounds(today: date) -> tuple[str, str]:
-    first_this = today.replace(day=1)
-    last_of_prev = first_this - timedelta(days=1)
-    first_prev = last_of_prev.replace(day=1)
-    return (first_prev.isoformat(), last_of_prev.isoformat())
+
+def _map_dimension(text: str) -> str | None:
+    key = (text or "").strip().lower()
+    if not key:
+        return None
+    return DIM_SYNONYMS.get(key)
 
 
-def _months_ago(first_day: date, months: int) -> date:
-    year = first_day.year
-    month = first_day.month - months
-    while month <= 0:
-        month += 12
-        year -= 1
-    return date(year, month, 1)
+def parse_intent(
+    question: str,
+    *,
+    default_measure: str = "NVL(CONTRACT_VALUE_NET_OF_VAT,0)",
+    select_all_default: bool = True,
+    accuracy_first: bool = True,
+) -> DWIntent:
+    q = (question or "").strip()
+    ql = q.lower()
+    intent = DWIntent()
+    intent.measure_sql = default_measure
+    intent.wants_all_columns = bool(select_all_default)
 
+    if COUNT_RE.search(q):
+        intent.agg = "count"
+        intent.wants_all_columns = False
 
-def _last_n_months_bounds(today: date, n: int) -> tuple[str, str]:
-    first_this = today.replace(day=1)
-    start_date = _months_ago(first_this, n)
-    end_date = today
-    return (start_date.isoformat(), end_date.isoformat())
-
-def parse_intent(q: str, *, today: date | None = None, full_text_search: bool = False) -> DWIntent:
-    today = today or date.today()
-    t = q.strip()
-    it = DWIntent(raw=t, full_text_search=full_text_search)
-
-    # time windows
-    m_top = _RE_TOPN.search(t)
-    if m_top:
-        it.top_n = int(m_top.group(1))
-        it.user_requested_top_n = True
-
-    # “last month / last 3 months” quick picks
-    if re.search(r"\blast\s+month\b", t, re.I):
-        it.has_time_window = True
-        it.explicit_dates = {"start": _last_month_bounds(today)[0], "end": _last_month_bounds(today)[1]}
-    m_last_n = re.search(r"\blast\s+(\d+)\s+months?\b", t, re.I)
-    if m_last_n:
-        it.has_time_window = True
-        n = int(m_last_n.group(1))
-        it.explicit_dates = {"start": _last_n_months_bounds(today, n)[0], "end": _last_n_months_bounds(today, n)[1]}
-
-    # Decide the date dimension
-    if _RE_REQUESTED.search(t):
-        it.date_column = "REQUEST_DATE"
-    else:
-        it.date_column = "OVERLAP"  # default accuracy-first window
-
-    # grouping vs row-level
-    if _RE_STAKE.search(t):
-        it.group_by = DIM_MAP["stakeholder"]
-    elif _RE_OWNER.search(t):
-        it.group_by = DIM_MAP["owner"]
-    elif _RE_DEPT.search(t):
-        # tie-break: prefer OUL if explicitly mentioned
-        if "oul" in t.lower():
-            it.group_by = DIM_MAP["oul"]
-        else:
-            it.group_by = DIM_MAP["owner department"]
-    elif _RE_ENTITY.search(t):
-        it.group_by = DIM_MAP["entity"]
-    elif _RE_BY_STATUS.search(t):
-        it.group_by = "CONTRACT_STATUS"
-    elif _RE_CONTRACTS.search(t):
-        it.group_by = None  # rows, not grouping
-
-    # aggregation intent
-    if _RE_COUNT.search(t):
-        it.agg = "count"
-        it.wants_all_columns = False
-    # value semantics
-    it.gross = bool(_RE_GROSS.search(t))
-    it.net   = bool(_RE_NET.search(t)) or not it.gross
-
-    # measurement & ordering
-    if it.gross:
-        it.measure_sql = (
+    if GROSS_RE.search(q):
+        intent.measure_sql = (
             "NVL(CONTRACT_VALUE_NET_OF_VAT,0) + "
             "CASE WHEN NVL(VAT,0) BETWEEN 0 AND 1 "
             "THEN NVL(CONTRACT_VALUE_NET_OF_VAT,0) * NVL(VAT,0) ELSE NVL(VAT,0) END"
         )
-    else:
-        it.measure_sql = "NVL(CONTRACT_VALUE_NET_OF_VAT,0)"
-    if "top" in t.lower() or "highest" in t.lower():
-        it.sort_by = it.measure_sql
-        it.sort_desc = True
+    elif NET_RE.search(q):
+        intent.measure_sql = default_measure
 
-    # default: if nothing said about columns, ask for all (non-aggregated)
-    if it.group_by or it.agg:
-        it.wants_all_columns = False
-    else:
-        it.wants_all_columns = True
+    if "top" in ql or "highest" in ql:
+        intent.sort_by = intent.measure_sql
+        intent.sort_desc = True
+        intent.user_requested_top_n = True
+        m = TOP_RE.search(q)
+        if m:
+            try:
+                intent.top_n = int(m.group(1))
+            except Exception:
+                pass
 
-    return it
+    match = BY_RE.search(q)
+    if match:
+        group_raw = match.group(1)
+        group_raw = re.split(r"\b(last|next|this)\b", group_raw, maxsplit=1)[0]
+        group_raw = group_raw.strip(" ,")
+        mapped = _map_dimension(group_raw)
+        if mapped:
+            intent.group_by = mapped
+
+    intent.date_column = "OVERLAP" if accuracy_first else "REQUEST_DATE"
+    if REQUESTED_RE.search(ql):
+        intent.date_column = "REQUEST_DATE"
+    if EXPIRE_RE.search(ql):
+        intent.expire = True
+
+    if intent.group_by or intent.agg:
+        intent.wants_all_columns = False
+
+    return intent
+
 
 # Legacy NLIntent still available for modules/tests that depend on it
-from typing import Any, Dict, Optional
-
-from .utils import (
-    last_month,
-    last_n_days,
-    last_n_months,
-    mentions_requested,
-    today_utc,
-)
 
 _TOP = re.compile(r"\btop\s*(\d+)\b", re.I)
 _COUNT = re.compile(r"\bcount\b|\(count\)", re.I)
@@ -220,6 +174,15 @@ def normalize_dimension(dim: str) -> Optional[str]:
 def _set_window(intent: NLIntent, start: str, end: str) -> None:
     intent.has_time_window = True
     intent.explicit_dates = {"start": start, "end": end}
+
+
+from .utils import (  # noqa: E402  (import after dataclass definitions)
+    last_month,
+    last_n_days,
+    last_n_months,
+    mentions_requested,
+    today_utc,
+)
 
 
 def parse_intent_legacy(q: str) -> NLIntent:

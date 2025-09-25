@@ -1,8 +1,32 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from core.nlu.schema import NLIntent
+
+
+def overlap_predicate(strict: bool = True) -> str:
+    """Return the contract overlap predicate with optional NULL tolerance."""
+
+    if strict:
+        return "(START_DATE <= :date_end AND END_DATE >= :date_start)"
+    return (
+        "((START_DATE IS NULL OR START_DATE <= :date_end) "
+        "AND (END_DATE IS NULL OR END_DATE >= :date_start))"
+    )
+
+
+def select_all(table: str) -> str:
+    return f'SELECT * FROM "{table}"'
+
+
+def order_limit(order_sql: str | None, top_n: int | None) -> str:
+    parts: List[str] = []
+    if order_sql:
+        parts.append(f"ORDER BY {order_sql}")
+    if top_n:
+        parts.append("FETCH FIRST :top_n ROWS ONLY")
+    return "\n".join(parts)
 
 
 def _intent_dates(intent: NLIntent) -> tuple[Optional[str], Optional[str]]:

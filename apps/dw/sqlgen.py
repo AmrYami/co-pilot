@@ -1,6 +1,6 @@
 from __future__ import annotations
 import os
-from typing import Tuple, Dict, Any, List
+from typing import Tuple, Dict, Any, List, Optional
 from .intent import DWIntent
 
 
@@ -19,13 +19,15 @@ def _strict_overlap() -> bool:
     return bool(_env_flag("DW_OVERLAP_REQUIRE_BOTH_DATES", 1))
 
 
-def _overlap_predicate() -> str:
-    if _strict_overlap():
+def _overlap_predicate(strict: Optional[bool] = None) -> str:
+    if strict is None:
+        strict = _strict_overlap()
+    if strict:
         return "(START_DATE <= :date_end AND END_DATE >= :date_start)"
     return "((START_DATE IS NULL OR START_DATE <= :date_end) AND (END_DATE IS NULL OR END_DATE >= :date_start))"
 
 
-def _date_filter(intent: DWIntent) -> Tuple[str, Dict[str, Any]]:
+def _date_filter(intent: DWIntent, *, strict_overlap: Optional[bool] = None) -> Tuple[str, Dict[str, Any]]:
     if not intent.has_time_window and not intent.explicit_dates:
         return ("", {})
     binds: Dict[str, Any] = {}
@@ -34,7 +36,7 @@ def _date_filter(intent: DWIntent) -> Tuple[str, Dict[str, Any]]:
         binds["date_start"] = intent.explicit_dates["start"]
         binds["date_end"] = intent.explicit_dates["end"]
         return (where, binds)
-    where = _overlap_predicate()
+    where = _overlap_predicate(strict_overlap)
     binds["date_start"] = intent.explicit_dates["start"]
     binds["date_end"] = intent.explicit_dates["end"]
     return (where, binds)
@@ -52,13 +54,13 @@ def _select_star_or_projection(intent: DWIntent) -> str:
     return "*"
 
 
-def build_sql(intent: DWIntent) -> Tuple[str, Dict[str, Any]]:
+def build_sql(intent: DWIntent, strict_overlap: Optional[bool] = None) -> Tuple[str, Dict[str, Any]]:
     table = _contract_table()
     select_clause = _select_star_or_projection(intent)
     where_parts: List[str] = []
     binds: Dict[str, Any] = {}
 
-    w_sql, w_binds = _date_filter(intent)
+    w_sql, w_binds = _date_filter(intent, strict_overlap=strict_overlap)
     if w_sql:
         where_parts.append(w_sql)
     binds.update(w_binds)
