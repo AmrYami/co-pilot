@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any, Dict, Optional
+import re
+from typing import Any, Dict, List, Optional
 
 from sqlalchemy import text
 
@@ -211,19 +212,60 @@ class Settings:
     ) -> Any:
         value = self.get(
             key,
-            default=default,
+            default=None,
             scope=scope,
             scope_id=scope_id,
             namespace=namespace,
         )
+        if value is None:
+            return default
         if isinstance(value, (dict, list)):
             return value
         if isinstance(value, str):
             try:
                 return json.loads(value)
             except Exception:
-                return value
-        return default if value is None else value
+                return default
+        return value
+
+    _IDENT_RGX = re.compile(r"[^0-9A-Za-z_]")
+
+    @classmethod
+    def _sanitize_ident(cls, s: str) -> str:
+        return cls._IDENT_RGX.sub("", str(s or "")).upper()
+
+    def get_fts_columns(self, table_name: str) -> List[str]:
+        """
+        Resolve the list of columns to use for FTS for a given table name.
+        Order of precedence:
+          1. mem_settings DW_FTS_COLUMNS mapping {table: [cols], "*": [cols]}
+          2. DW_FTS_COLUMNS environment variable (comma-separated)
+        """
+
+        mapping = self.get_json("DW_FTS_COLUMNS", default={}) or {}
+        if not isinstance(mapping, dict):
+            mapping = {}
+
+        cols: Optional[List[str]] = None
+        table_key = str(table_name or "")
+        for key in (table_key, table_key.upper(), table_key.lower()):
+            val = mapping.get(key)
+            if isinstance(val, list):
+                cols = val
+                break
+
+        if cols is None:
+            wildcard = mapping.get("*")
+            if isinstance(wildcard, list):
+                cols = wildcard
+
+        if not cols:
+            raw = os.getenv("DW_FTS_COLUMNS", "")
+            if raw:
+                cols = [c.strip() for c in raw.split(",") if c.strip()]
+
+        cols = cols or []
+        return [self._sanitize_ident(col) for col in cols]
 
     # ------------------------------------------------------------------
     def get_str(
