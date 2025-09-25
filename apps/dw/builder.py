@@ -4,16 +4,10 @@ from __future__ import annotations
 from typing import Dict, Tuple
 
 from .intent import NLIntent
+from .sql_builders import window_predicate
 from .utils import env_flag
 
 TABLE = '"Contract"'
-
-
-def _overlap_where(date_start_bind: str, date_end_bind: str) -> str:
-    return (
-        f"( (START_DATE IS NULL OR START_DATE <= :{date_end_bind}) "
-        f"AND (END_DATE   IS NULL OR END_DATE   >= :{date_start_bind}) )"
-    )
 
 
 def build_sql(intent: NLIntent) -> Tuple[str, Dict[str, str]]:
@@ -25,14 +19,10 @@ def build_sql(intent: NLIntent) -> Tuple[str, Dict[str, str]]:
     if intent.explicit_dates:
         binds["date_start"] = intent.explicit_dates["start"]
         binds["date_end"] = intent.explicit_dates["end"]
-
         if intent.expire:
             where_clauses.append("END_DATE BETWEEN :date_start AND :date_end")
         else:
-            if intent.date_column == "REQUEST_DATE":
-                where_clauses.append("REQUEST_DATE BETWEEN :date_start AND :date_end")
-            else:
-                where_clauses.append(_overlap_where("date_start", "date_end"))
+            where_clauses.append(window_predicate(intent.date_column or "OVERLAP"))
 
     is_agg = False
     if intent.agg == "count":
@@ -48,13 +38,7 @@ def build_sql(intent: NLIntent) -> Tuple[str, Dict[str, str]]:
         select_cols = f"{intent.group_by} AS GROUP_KEY, SUM({measure}) AS MEASURE"
         order_clause = "ORDER BY MEASURE DESC"
     elif intent.user_requested_top_n:
-        is_agg = True
-        select_cols = (
-            "CONTRACT_STAKEHOLDER_1 AS GROUP_KEY, SUM({measure}) AS MEASURE".format(
-                measure=measure
-            )
-        )
-        order_clause = "ORDER BY MEASURE DESC"
+        order_clause = f"ORDER BY {measure} DESC"
 
     if is_agg:
         sql = f"SELECT\n  {select_cols}\nFROM {TABLE}"
@@ -78,7 +62,7 @@ def build_sql(intent: NLIntent) -> Tuple[str, Dict[str, str]]:
         group_col = select_cols.split(" AS GROUP_KEY")[0].split(",")[0].strip()
         sql += "\nGROUP BY " + group_col
 
-    if is_agg and order_clause:
+    if order_clause:
         sql += "\n" + order_clause
 
     if intent.user_requested_top_n and intent.top_n:
