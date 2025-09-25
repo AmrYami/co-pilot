@@ -1,8 +1,228 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import date, timedelta
+from calendar import monthrange
 import re
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
+
+# ---------------------------------------------------------------------------
+# Deterministic NL intent parsing used by the /dw/answer deterministic flow.
+# ---------------------------------------------------------------------------
+
+DIM_MAP: Dict[str, str] = {
+    "owner department": "OWNER_DEPARTMENT",
+    "department": "OWNER_DEPARTMENT",
+    "department_oul": "DEPARTMENT_OUL",
+    "owner": "CONTRACT_OWNER",
+    "stakeholder": "CONTRACT_STAKEHOLDER_1",
+    "status": "CONTRACT_STATUS",
+    "entity": "ENTITY",
+    "entity no": "ENTITY_NO",
+}
+
+GROSS_SQL = (
+    "NVL(CONTRACT_VALUE_NET_OF_VAT,0) + "
+    "CASE WHEN NVL(VAT,0) BETWEEN 0 AND 1 "
+    "THEN NVL(CONTRACT_VALUE_NET_OF_VAT,0) * NVL(VAT,0) "
+    "ELSE NVL(VAT,0) END"
+)
+
+NET_SQL = "NVL(CONTRACT_VALUE_NET_OF_VAT,0)"
+
+TOP_RE = re.compile(r"\btop\s+(\d+)\b", re.I)
+LAST_N_MONTHS_RE = re.compile(r"\blast\s+(\d+)\s+months?\b", re.I)
+NEXT_N_DAYS_RE = re.compile(r"\bnext\s+(\d+)\s+days?\b", re.I)
+EXPIRING_IN_RE = re.compile(r"\bexpir(?:e|es|ing)\s+in\s+(\d+)\s+days?\b", re.I)
+BETWEEN_RE = re.compile(
+    r"\bbetween\s+(\d{4}-\d{2}-\d{2})\s+and\s+(\d{4}-\d{2}-\d{2})",
+    re.I,
+)
+
+
+def _add_months(dt: date, months: int) -> date:
+    month_index = dt.month - 1 + months
+    year = dt.year + month_index // 12
+    month = month_index % 12 + 1
+    day = min(dt.day, monthrange(year, month)[1])
+    return date(year, month, day)
+
+
+def _month_bounds(dt: date) -> tuple[date, date]:
+    first = dt.replace(day=1)
+    next_first = _add_months(first, 1)
+    last = next_first - timedelta(days=1)
+    return first, last
+
+
+def _last_month_bounds(today: Optional[date] = None) -> tuple[date, date]:
+    today = today or date.today()
+    first_this, _ = _month_bounds(today)
+    last_prev = first_this - timedelta(days=1)
+    first_prev = last_prev.replace(day=1)
+    return first_prev, last_prev
+
+
+def _last_n_months_bounds(n: int, today: Optional[date] = None) -> tuple[date, date]:
+    today = today or date.today()
+    start = _add_months(today, -n)
+    return start, today
+
+
+def _last_quarter_bounds(today: Optional[date] = None) -> tuple[date, date]:
+    today = today or date.today()
+    q = (today.month - 1) // 3 + 1
+    prev_q = q - 1 if q > 1 else 4
+    year = today.year if q > 1 else today.year - 1
+    start_month = 3 * (prev_q - 1) + 1
+    start = date(year, start_month, 1)
+    _, end = _month_bounds(_add_months(start, 2))
+    return start, end
+
+
+@dataclass
+class NLIntent:
+    # core
+    has_time_window: Optional[bool] = None
+    date_column: Optional[str] = None
+    explicit_dates: Optional[Dict[str, str]] = None
+    expire: Optional[bool] = None
+    # aggregation / grouping
+    agg: Optional[str] = None
+    group_by: Optional[str] = None
+    measure_sql: Optional[str] = None
+    sort_by: Optional[str] = None
+    sort_desc: Optional[bool] = True
+    top_n: Optional[int] = None
+    user_requested_top_n: Optional[bool] = None
+    # projection / search
+    wants_all_columns: Optional[bool] = True
+    full_text_search: Optional[bool] = False
+    fts_tokens: Optional[List[str]] = None
+    # notes / extras
+    notes: Dict[str, Any] = field(default_factory=dict)
+
+
+def parse_intent(
+    question: str,
+    *,
+    prefer_overlap_default: bool = True,
+    require_window_for_expire: bool = True,
+    full_text_search: bool = False,
+) -> NLIntent:
+    q = (question or "").strip()
+    ql = q.lower()
+    today = date.today()
+    intent = NLIntent(notes={"q": q}, full_text_search=full_text_search)
+
+    # --- Top N ------------------------------------------------------------
+    if m := TOP_RE.search(ql):
+        try:
+            intent.top_n = int(m.group(1))
+        except Exception:
+            intent.top_n = None
+        else:
+            intent.user_requested_top_n = True
+
+    # --- Aggregations & measure ------------------------------------------
+    if "gross" in ql:
+        intent.measure_sql = GROSS_SQL
+        intent.agg = "sum"
+        intent.sort_by = GROSS_SQL
+    elif "contract value" in ql or "net" in ql:
+        intent.measure_sql = NET_SQL
+        intent.agg = "sum" if (" by " in ql or " per " in ql) else intent.agg
+        intent.sort_by = NET_SQL
+    if "count" in ql or "(count)" in ql:
+        intent.agg = "count"
+        intent.wants_all_columns = False
+
+    # --- Group by / per dimension ----------------------------------------
+    if " by " in ql or " per " in ql:
+        gb: Optional[str] = None
+        if "status" in ql:
+            gb = DIM_MAP["status"]
+        elif "owner department" in ql or "department" in ql:
+            gb = DIM_MAP["department"]
+        elif "department_oul" in ql:
+            gb = DIM_MAP["department_oul"]
+        elif "stakeholder" in ql:
+            gb = DIM_MAP["stakeholder"]
+        elif "owner" in ql:
+            gb = DIM_MAP["owner"]
+        elif "entity no" in ql:
+            gb = DIM_MAP["entity no"]
+        elif "entity" in ql:
+            gb = DIM_MAP["entity"]
+        if gb:
+            intent.group_by = gb
+            intent.wants_all_columns = False
+
+    # --- Window detection -------------------------------------------------
+    if m := BETWEEN_RE.search(ql):
+        start_s, end_s = m.group(1), m.group(2)
+        intent.has_time_window = True
+        intent.explicit_dates = {"start": start_s, "end": end_s}
+
+    if "last month" in ql:
+        s, e = _last_month_bounds(today)
+        intent.has_time_window = True
+        intent.explicit_dates = {"start": s.isoformat(), "end": e.isoformat()}
+    elif m := LAST_N_MONTHS_RE.search(ql):
+        n = int(m.group(1))
+        s, e = _last_n_months_bounds(n, today)
+        intent.has_time_window = True
+        intent.explicit_dates = {"start": s.isoformat(), "end": e.isoformat()}
+    elif "last quarter" in ql:
+        s, e = _last_quarter_bounds(today)
+        intent.has_time_window = True
+        intent.explicit_dates = {"start": s.isoformat(), "end": e.isoformat()}
+    elif m := NEXT_N_DAYS_RE.search(ql):
+        n = int(m.group(1))
+        s = today
+        e = today + timedelta(days=n)
+        intent.has_time_window = True
+        intent.explicit_dates = {"start": s.isoformat(), "end": e.isoformat()}
+    elif m := EXPIRING_IN_RE.search(ql):
+        n = int(m.group(1))
+        s = today
+        e = today + timedelta(days=n)
+        intent.has_time_window = True
+        intent.explicit_dates = {"start": s.isoformat(), "end": e.isoformat()}
+        intent.expire = True
+
+    # --- Date column selection -------------------------------------------
+    if "request" in ql or "requested" in ql:
+        intent.date_column = "REQUEST_DATE"
+    else:
+        intent.date_column = "OVERLAP" if prefer_overlap_default else "REQUEST_DATE"
+
+    if intent.expire:
+        intent.date_column = "END_DATE"
+        if require_window_for_expire and not intent.explicit_dates:
+            s = today
+            e = today + timedelta(days=30)
+            intent.has_time_window = True
+            intent.explicit_dates = {"start": s.isoformat(), "end": e.isoformat()}
+
+    # projection defaults --------------------------------------------------
+    if intent.agg or intent.group_by:
+        intent.wants_all_columns = False
+    elif intent.wants_all_columns is None:
+        intent.wants_all_columns = True
+
+    # basic FTS tokens if requested ---------------------------------------
+    if full_text_search:
+        words = re.findall(r"[A-Za-z0-9_]{3,}", q)
+        tokens = [w.upper() for w in words if w]
+        intent.fts_tokens = tokens or None
+
+    return intent
+
+
+# ---------------------------------------------------------------------------
+# Legacy helpers retained for compatibility with existing modules/tests.
+# ---------------------------------------------------------------------------
 
 DIM_SYNONYMS = {
     "owner department": "OWNER_DEPARTMENT",
@@ -23,7 +243,7 @@ EXPIRE_RE = re.compile(r"\b(expire|expiry|expiring|ينتهي)\b", re.I)
 COUNT_RE = re.compile(r"\bcount\b|\(count\)", re.I)
 GROSS_RE = re.compile(r"\bgross\b", re.I)
 NET_RE = re.compile(r"\bnet\b|\bcontract\s*value\b", re.I)
-TOP_RE = re.compile(r"\btop\s+(\d+)\b", re.I)
+TOP_RE_V1 = re.compile(r"\btop\s+(\d+)\b", re.I)
 
 
 @dataclass
@@ -41,20 +261,13 @@ class DWIntent:
     full_text_search: bool | None = None
     expire: bool | None = None
     measure_sql: str | None = None
-    fts_tokens: list[str] = field(default_factory=list)
+    fts_tokens: List[str] = field(default_factory=list)
 
 
-def _map_dimension(text: str) -> str | None:
-    key = (text or "").strip().lower()
-    if not key:
-        return None
-    return DIM_SYNONYMS.get(key)
-
-
-def parse_intent(
+def parse_intent_v1(
     question: str,
     *,
-    default_measure: str = "NVL(CONTRACT_VALUE_NET_OF_VAT,0)",
+    default_measure: str = NET_SQL,
     select_all_default: bool = True,
     accuracy_first: bool = True,
 ) -> DWIntent:
@@ -69,11 +282,7 @@ def parse_intent(
         intent.wants_all_columns = False
 
     if GROSS_RE.search(q):
-        intent.measure_sql = (
-            "NVL(CONTRACT_VALUE_NET_OF_VAT,0) + "
-            "CASE WHEN NVL(VAT,0) BETWEEN 0 AND 1 "
-            "THEN NVL(CONTRACT_VALUE_NET_OF_VAT,0) * NVL(VAT,0) ELSE NVL(VAT,0) END"
-        )
+        intent.measure_sql = GROSS_SQL
     elif NET_RE.search(q):
         intent.measure_sql = default_measure
 
@@ -81,7 +290,7 @@ def parse_intent(
         intent.sort_by = intent.measure_sql
         intent.sort_desc = True
         intent.user_requested_top_n = True
-        m = TOP_RE.search(q)
+        m = TOP_RE_V1.search(q)
         if m:
             try:
                 intent.top_n = int(m.group(1))
@@ -93,7 +302,7 @@ def parse_intent(
         group_raw = match.group(1)
         group_raw = re.split(r"\b(last|next|this)\b", group_raw, maxsplit=1)[0]
         group_raw = group_raw.strip(" ,")
-        mapped = _map_dimension(group_raw)
+        mapped = DIM_SYNONYMS.get(group_raw.lower())
         if mapped:
             intent.group_by = mapped
 
@@ -109,8 +318,7 @@ def parse_intent(
     return intent
 
 
-# Legacy NLIntent still available for modules/tests that depend on it
-
+# Legacy NL intent helpers (used in tests/attempt flows)
 _TOP = re.compile(r"\btop\s*(\d+)\b", re.I)
 _COUNT = re.compile(r"\bcount\b|\(count\)", re.I)
 _GROSS = re.compile(r"\bgross\b", re.I)
@@ -134,22 +342,13 @@ _OUL = re.compile(r"\b(oul|manager|department_oul)\b", re.I)
 _ENTITY = re.compile(r"\b(entity|entity\s*no)\b", re.I)
 
 
-@dataclass
-class NLIntent:
-    date_column: Optional[str] = None
-    explicit_dates: Optional[Dict[str, str]] = None
-    has_time_window: Optional[bool] = None
-    top_n: Optional[int] = None
-    sort_by: Optional[str] = None
-    sort_desc: Optional[bool] = None
-    group_by: Optional[str] = None
-    agg: Optional[str] = None
-    measure_sql: Optional[str] = None
-    wants_all_columns: Optional[bool] = None
-    user_requested_top_n: Optional[bool] = None
-    full_text_search: bool = False
-    notes: Dict[str, Any] = field(default_factory=dict)
-    expire: Optional[bool] = None
+from .utils import (  # noqa: E402
+    last_month,
+    last_n_days,
+    last_n_months,
+    mentions_requested,
+    today_utc,
+)
 
 
 def normalize_dimension(dim: str) -> Optional[str]:
@@ -176,15 +375,6 @@ def _set_window(intent: NLIntent, start: str, end: str) -> None:
     intent.explicit_dates = {"start": start, "end": end}
 
 
-from .utils import (  # noqa: E402  (import after dataclass definitions)
-    last_month,
-    last_n_days,
-    last_n_months,
-    mentions_requested,
-    today_utc,
-)
-
-
 def parse_intent_legacy(q: str) -> NLIntent:
     q = (q or "").strip()
     now = today_utc()
@@ -199,12 +389,9 @@ def parse_intent_legacy(q: str) -> NLIntent:
         intent.agg = "count"
 
     if _GROSS.search(q):
-        intent.measure_sql = (
-            "NVL(CONTRACT_VALUE_NET_OF_VAT,0) + CASE WHEN NVL(VAT,0) BETWEEN 0 AND 1 "
-            "THEN NVL(CONTRACT_VALUE_NET_OF_VAT,0) * NVL(VAT,0) ELSE NVL(VAT,0) END"
-        )
+        intent.measure_sql = GROSS_SQL
     else:
-        intent.measure_sql = "NVL(CONTRACT_VALUE_NET_OF_VAT,0)"
+        intent.measure_sql = NET_SQL
 
     if _STAKE.search(q):
         intent.group_by = "CONTRACT_STAKEHOLDER_1"
@@ -277,3 +464,8 @@ def parse_intent_legacy(q: str) -> NLIntent:
             intent.wants_all_columns = False
 
     return intent
+
+
+# Backwards-compatible alias for callers that previously imported parse_intent
+# expecting the DWIntent-based parser.
+parse_intent_dw = parse_intent_v1
