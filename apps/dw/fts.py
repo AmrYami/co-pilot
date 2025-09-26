@@ -1,43 +1,34 @@
-from __future__ import annotations
-
 import re
-from typing import Dict, List, Tuple
+from typing import List, Dict, Any, Tuple
 
-_STOP = {
-    "and",
-    "or",
-    "of",
-    "the",
-    "a",
-    "an",
-    "by",
-    "for",
-    "to",
-    "in",
-    "on",
-    "at",
-    "last",
-    "next",
-}
+_RE_TOKEN = re.compile(r"[A-Za-z0-9_]{2,}")
+_STOP = {"the", "and", "or", "of", "a", "an", "by", "per", "for", "to", "in", "on"}
 
 
 def tokenize(q: str) -> List[str]:
-    text = (q or "").lower()
-    text = re.sub(r"[^0-9a-zA-Z\u0600-\u06FF\s]+", " ", text)
-    toks = [w for w in text.split() if w and w not in _STOP]
-    return toks[:6]
+    toks = [t.upper() for t in _RE_TOKEN.findall(q or "") if t.lower() not in _STOP]
+    return toks
 
 
-def build_oracle_fts(table: str, cols: List[str], toks: List[str]) -> Tuple[str, Dict[str, str]]:
-    if not cols or not toks:
+def load_columns(settings, table: str) -> List[str]:
+    cfg = settings.get("DW_FTS_COLUMNS") or {}
+    if isinstance(cfg, str):
+        # If stored as text JSON by caller, Settings already parses to object; just be safe
+        return []
+    cols = cfg.get(table) or cfg.get("*") or []
+    return cols
+
+
+def build_predicate(cols: List[str], tokens: List[str]) -> Tuple[str, Dict[str, Any]]:
+    if not cols or not tokens:
         return "", {}
-
-    clauses: List[str] = []
-    binds: Dict[str, str] = {}
-    for idx, tok in enumerate(toks, start=1):
-        bind_name = f"kw{idx}"
-        binds[bind_name] = f"%{tok.upper()}%"
-        ors = [f"UPPER(NVL({col}, '')) LIKE :{bind_name}" for col in cols]
-        clauses.append("(" + " OR ".join(ors) + ")")
-
-    return "(" + " AND ".join(clauses) + ")", binds
+    ors = []
+    binds: Dict[str, Any] = {}
+    k = 0
+    for c in cols:
+        for t in tokens:
+            k += 1
+            name = f"fts{k}"
+            ors.append(f"UPPER({c}) LIKE :{name}")
+            binds[name] = f"%{t}%"
+    return "(" + " OR ".join(ors) + ")", binds
