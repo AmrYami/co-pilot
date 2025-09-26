@@ -1,6 +1,9 @@
 from __future__ import annotations
 import re
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, TYPE_CHECKING
+from apps.dw.tables import for_namespace
+from apps.dw.tables.base import TableSpec
+from apps.dw.tables.contract import ContractSpec
 from pydantic import BaseModel
 from word2number import w2n
 from dateutil.relativedelta import relativedelta
@@ -82,9 +85,20 @@ def _ytd_bounds(year: int, today: date) -> tuple[date, date]:
     return start, end
 
 
-def parse_intent(question: str, *, today: Optional[date] = None, wants_all_columns_default: bool = True) -> NLIntent:
+if TYPE_CHECKING:
+    from core.settings import Settings
+
+
+def parse_intent_legacy(
+    question: str,
+    *,
+    today: Optional[date] = None,
+    wants_all_columns_default: bool = True,
+    spec: Optional[TableSpec] = None,
+) -> NLIntent:
     q = (question or "").strip()
     today = today or date.today()
+    use_spec = spec or ContractSpec
     it = NLIntent(notes={"q": q}, wants_all_columns=wants_all_columns_default)
 
     # 1) windows
@@ -142,13 +156,9 @@ def parse_intent(question: str, *, today: Optional[date] = None, wants_all_colum
     # 5) metrics
     # default measure: net value; "gross" uses net + VAT (handling rate vs absolute)
     if _RE_GROSS.search(q):
-        it.measure_sql = (
-            "NVL(CONTRACT_VALUE_NET_OF_VAT,0) + "
-            "CASE WHEN NVL(VAT,0) BETWEEN 0 AND 1 "
-            "THEN NVL(CONTRACT_VALUE_NET_OF_VAT,0)*NVL(VAT,0) ELSE NVL(VAT,0) END"
-        )
+        it.measure_sql = use_spec.gross_expr()
     else:
-        it.measure_sql = "NVL(CONTRACT_VALUE_NET_OF_VAT,0)"
+        it.measure_sql = use_spec.net_expr()
 
     # 6) aggregations
     if _RE_COUNT.search(q) or "(count)" in q.lower():
@@ -157,22 +167,16 @@ def parse_intent(question: str, *, today: Optional[date] = None, wants_all_colum
     # 7) group-by phrases ("by X" / "per X")
     m = _RE_BY.search(q) or _RE_PER.search(q)
     if m:
-        dim = m.group(1).strip().lower()
-        # quick mapping
-        if "department" in dim and "owner" in dim:
-            it.group_by = "OWNER_DEPARTMENT"
-        elif dim == "department":
-            it.group_by = "OWNER_DEPARTMENT"
-        elif "entity" in dim and "no" in dim:
-            it.group_by = "ENTITY_NO"
-        elif "entity" in dim:
-            it.group_by = "ENTITY"
-        elif "owner" in dim:
-            it.group_by = "CONTRACT_OWNER"
-        elif "stakeholder" in dim:
-            it.group_by = "CONTRACT_STAKEHOLDER_1"  # builder will upcast to 1..N slots if requested
-        elif "status" in dim:
-            it.group_by = "CONTRACT_STATUS"
+        dim = (m.group(1) or "").strip().lower()
+        mapped = use_spec.synonym(dim)
+        if mapped:
+            it.group_by = mapped
+
+    # ensure status/count pairing
+    if not it.group_by and "status" in q.lower():
+        mapped = use_spec.synonym("status")
+        if mapped:
+            it.group_by = mapped
 
     # 8) sort desc by measure when "top" present
     if it.top_n:
@@ -180,3 +184,58 @@ def parse_intent(question: str, *, today: Optional[date] = None, wants_all_colum
         it.sort_desc = True
 
     return it
+
+
+def parse_intent(question: str, settings: "Settings") -> Dict[str, Any]:
+    spec = for_namespace(settings)
+    wants_all_default = settings.get_bool("DW_SELECT_ALL_DEFAULT", True)
+    legacy = parse_intent_legacy(question, wants_all_columns_default=wants_all_default, spec=spec)
+    intent = legacy.model_dump()
+
+    q = (question or "").strip()
+    notes = intent.get("notes")
+    if not isinstance(notes, dict):
+        notes = {}
+    notes.setdefault("q", q)
+    intent["notes"] = notes
+
+    intent.update(
+        {
+            "raw": q,
+            "table": spec.name,
+            "wants_all_columns": bool(intent.get("wants_all_columns", wants_all_default)),
+        }
+    )
+
+    # Date column defaults based on language cues and table configuration
+    if intent.get("expire"):
+        intent["date_column"] = "END_DATE"
+    elif intent.get("date_column") == "REQUEST_DATE":
+        intent["date_column"] = "REQUEST_DATE"
+    elif intent.get("date_column") == "OVERLAP" or intent.get("date_column") is None:
+        intent["date_column"] = spec.default_date_mode or "OVERLAP"
+
+    if _RE_REQUESTED.search(q):
+        intent["date_column"] = "REQUEST_DATE"
+
+    # Measures (net/gross)
+    if _RE_GROSS.search(q):
+        intent["measure_sql"] = spec.gross_expr()
+    elif _RE_NET.search(q):
+        intent["measure_sql"] = spec.net_expr()
+    else:
+        intent["measure_sql"] = intent.get("measure_sql") or spec.net_expr()
+
+    # Grouping synonyms via TableSpec
+    if not intent.get("group_by"):
+        m = _RE_BY.search(q) or _RE_PER.search(q)
+        if m:
+            dim = (m.group(1) or "").strip().lower()
+            mapped = spec.synonym(dim)
+            if mapped:
+                intent["group_by"] = mapped
+
+    intent.setdefault("full_text_search", False)
+    intent.setdefault("fts_tokens", [])
+
+    return intent

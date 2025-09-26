@@ -44,7 +44,7 @@ from core.settings import Settings
 from apps.dw.explain import build_explanation, explain_interpretation
 from apps.dw.fts import build_predicate, load_columns, tokenize
 from .intent import parse_intent
-from .sql_builder import build_sql
+from .planner_det import build_sql
 from .rating import rate_bp
 
 NAMESPACE = os.getenv("DW_NAMESPACE", "dw::common")
@@ -137,11 +137,8 @@ def answer():
     contract_table = settings.get("DW_CONTRACT_TABLE", "Contract")
     contract_table_name = str(contract_table)
 
-    wants_all_default = settings.get_bool("DW_SELECT_ALL_DEFAULT", True)
-    intent = parse_intent(question, wants_all_columns_default=wants_all_default)
-    intent.full_text_search = full_text_search
-
-    intent_dict = intent.model_dump()
+    intent = parse_intent(question, settings)
+    intent["full_text_search"] = full_text_search
 
     # Full-text search setup
     fts_meta = {"enabled": False, "tokens": None, "columns": None, "binds": None, "error": None}
@@ -152,13 +149,13 @@ def answer():
             tokens = tokenize(question)
             cols = load_columns(settings, table=contract_table_name)
             fts_meta.update({"enabled": True, "tokens": tokens, "columns": cols})
-            intent_dict["fts_tokens"] = tokens
+            intent["fts_tokens"] = tokens
             if cols and tokens:
                 fts_where, fts_bind = build_predicate(cols, tokens)
         except Exception as exc:  # pragma: no cover - defensive log only
             fts_meta["error"] = str(exc)
 
-    sql, binds, builder_meta = build_sql(intent_dict, settings, table=contract_table_name)
+    sql, binds, planner_explain = build_sql(intent, settings)
 
     if fts_where:
         upper_sql = sql.upper()
@@ -181,10 +178,10 @@ def answer():
     ft_bind_keys = [k for k in binds.keys() if k.startswith("fts")]
     fts_meta.update({"binds": ft_bind_keys or None})
 
-    explain = explain_interpretation(intent_dict, binds, table=contract_table_name)
+    explain = explain_interpretation(intent, binds, table=contract_table_name)
 
     debug = {
-        "intent": _intent_debug(intent_dict),
+        "intent": _intent_debug(intent),
         "prompt": "",
         "validation": exec_meta.get("validation", {}),
         "fts": fts_meta,
@@ -197,16 +194,16 @@ def answer():
         "csv_path": exec_meta.get("csv_path"),
         "meta": {
             "binds": binds,
-            "wants_all_columns": intent_dict.get("wants_all_columns"),
+            "wants_all_columns": intent.get("wants_all_columns"),
             "rowcount": len(rows),
             "attempt_no": 1,
             "strategy": "deterministic",
             "fts": fts_meta,
-            "builder": builder_meta,
+            "builder": {"planner": "deterministic", "explain": planner_explain},
         },
         "debug": debug,
         "ok": True,
-        "explain": explain,
+        "explain": explain or planner_explain,
     }
 
     include_explain_req = data.get("include_explain")
@@ -220,7 +217,7 @@ def answer():
         columns_selected = meta_obj.get("projection_columns") or cols
         try:
             result["explain"] = build_explanation(
-                intent=_intent_debug(intent_dict),
+                intent=_intent_debug(intent),
                 binds=meta_obj.get("binds", {}),
                 fts_meta=meta_obj.get("fts", {}),
                 table=str(contract_table_name),
