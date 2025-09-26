@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional, Tuple
 
-from apps.dw.intent import NLIntent, GROSS_SQL, NET_SQL
+from apps.dw.intent import NLIntent, NET_SQL
 
 
 def _window_predicate(intent: NLIntent, overlap_strict: bool) -> Optional[str]:
@@ -58,32 +58,61 @@ def build_sql(
     if where_parts:
         where_sql = "WHERE " + " AND ".join(where_parts)
 
-    if intent.group_by:
-        measure = intent.measure_sql or NET_SQL
-        sql = (
-            f"SELECT {intent.group_by} AS GROUP_KEY, SUM({measure}) AS MEASURE\n"
-            f"FROM {table}\n"
-            f"{where_sql}\n"
-            f"GROUP BY {intent.group_by}\n"
-            f"ORDER BY MEASURE DESC"
-        )
-        if intent.top_n:
-            binds["top_n"] = intent.top_n
-            sql += "\nFETCH FIRST :top_n ROWS ONLY"
-        return sql, binds
+    agg = intent.agg
+    group_by = intent.group_by
+    top_n = intent.top_n
+    measure = intent.measure_sql or NET_SQL
+    projection = intent.projection
+    wants_all = intent.wants_all_columns if intent.wants_all_columns is not None else True
 
-    if intent.agg == "count" and not intent.group_by:
-        sql = f"SELECT COUNT(*) AS CNT FROM {table}\n{where_sql}"
-        return sql, binds
+    if agg == "count":
+        if group_by:
+            select_cols = [f"{group_by} AS GROUP_KEY", "COUNT(*) AS CNT"]
+        else:
+            select_cols = ["COUNT(*) AS CNT"]
+    elif group_by:
+        select_cols = [f"{group_by} AS GROUP_KEY", f"SUM({measure}) AS MEASURE"]
+    else:
+        if projection:
+            select_cols = projection
+        elif wants_all:
+            select_cols = ["*"]
+        else:
+            select_cols = [
+                "CONTRACT_ID",
+                "CONTRACT_OWNER",
+                "REQUEST_DATE",
+                "START_DATE",
+                "END_DATE",
+            ]
 
-    projection = "*" if intent.wants_all_columns else "CONTRACT_ID, CONTRACT_OWNER, REQUEST_DATE, START_DATE, END_DATE"
-    order_by = intent.sort_by or "REQUEST_DATE"
-    sql = (
-        f"SELECT {projection} FROM {table}\n"
-        f"{where_sql}\n"
-        f"ORDER BY {order_by} DESC"
-    )
-    if intent.top_n:
-        binds["top_n"] = intent.top_n
-        sql += "\nFETCH FIRST :top_n ROWS ONLY"
+    sql_lines: List[str] = ["SELECT", "  " + ",\n  ".join(select_cols), f"FROM {table}"]
+    if where_sql:
+        sql_lines.append(where_sql)
+
+    if agg and group_by:
+        sql_lines.append(f"GROUP BY {group_by}")
+
+    order_clause = ""
+    if agg == "count" and group_by:
+        order_clause = "ORDER BY CNT DESC"
+    elif group_by:
+        order_expr = intent.sort_by or "MEASURE"
+        direction = "DESC" if intent.sort_desc is not False else "ASC"
+        order_clause = f"ORDER BY {order_expr if intent.sort_by else 'MEASURE'} {direction}"
+    elif agg == "count":
+        order_clause = ""
+    else:
+        order_expr = intent.sort_by or (measure if top_n else "REQUEST_DATE")
+        direction = "DESC" if intent.sort_desc is not False else "ASC"
+        order_clause = f"ORDER BY {order_expr} {direction}"
+
+    if order_clause:
+        sql_lines.append(order_clause)
+
+    if top_n:
+        binds["top_n"] = top_n
+        sql_lines.append("FETCH FIRST :top_n ROWS ONLY")
+
+    sql = "\n".join(sql_lines)
     return sql, binds
