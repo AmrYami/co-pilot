@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from datetime import date, timedelta
 from calendar import monthrange
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 # ---------------------------------------------------------------------------
 # Deterministic NL intent parsing used by the /dw/answer deterministic flow.
@@ -12,13 +12,21 @@ from typing import Any, Dict, List, Optional
 
 DIM_MAP: Dict[str, str] = {
     "owner department": "OWNER_DEPARTMENT",
+    "owner departments": "OWNER_DEPARTMENT",
     "department": "OWNER_DEPARTMENT",
+    "departments": "OWNER_DEPARTMENT",
+    "department oul": "DEPARTMENT_OUL",
     "department_oul": "DEPARTMENT_OUL",
+    "manager": "DEPARTMENT_OUL",
+    "contract owner": "CONTRACT_OWNER",
     "owner": "CONTRACT_OWNER",
     "stakeholder": "CONTRACT_STAKEHOLDER_1",
+    "stakeholders": "CONTRACT_STAKEHOLDER_1",
     "status": "CONTRACT_STATUS",
     "entity": "ENTITY",
     "entity no": "ENTITY_NO",
+    "entity number": "ENTITY_NO",
+    "entity #": "ENTITY_NO",
 }
 
 GROSS_SQL = (
@@ -75,14 +83,51 @@ def _pick_date_column(q: str, *, prefer_overlap_default: bool = True) -> str:
         return "REQUEST_DATE"
     return "OVERLAP" if prefer_overlap_default else "REQUEST_DATE"
 
-TOP_RE = re.compile(r"\btop\s+(\d+)\b", re.I)
-LAST_N_MONTHS_RE = re.compile(r"\blast\s+(\d+)\s+months?\b", re.I)
-NEXT_N_DAYS_RE = re.compile(r"\bnext\s+(\d+)\s+days?\b", re.I)
-EXPIRING_IN_RE = re.compile(r"\bexpir(?:e|es|ing)\s+in\s+(\d+)\s+days?\b", re.I)
+_NUM_WORDS = {
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+    "eleven": 11,
+    "twelve": 12,
+}
+
+
+def _word_to_int(token: str) -> Optional[int]:
+    token = token.strip().lower()
+    if not token:
+        return None
+    if token.isdigit():
+        try:
+            return int(token)
+        except Exception:
+            return None
+    return _NUM_WORDS.get(token)
+
+
+TOP_RE = re.compile(r"\btop\s+(\d+|[a-z]+)\b", re.I)
+LAST_N_DAYS_RE = re.compile(r"\blast\s+(\d+|[a-z]+)\s+days?\b", re.I)
+LAST_N_WEEKS_RE = re.compile(r"\blast\s+(\d+|[a-z]+)\s+weeks?\b", re.I)
+LAST_WEEK_RE = re.compile(r"\blast\s+week\b", re.I)
+LAST_N_MONTHS_RE = re.compile(r"\blast\s+(\d+|[a-z]+)\s+months?\b", re.I)
+LAST_12_MONTHS_RE = re.compile(r"\blast\s+(?:12|twelve)\s+months?\b", re.I)
+LAST_MONTH_RE = re.compile(r"\blast\s+month\b", re.I)
+LAST_N_QUARTERS_RE = re.compile(r"\blast\s+(\d+|[a-z]+)\s+quarters?\b", re.I)
+NEXT_N_DAYS_RE = re.compile(r"\bnext\s+(\d+|[a-z]+)\s+days?\b", re.I)
+EXPIRING_IN_RE = re.compile(r"\bexpir(?:e|es|ing)\s+in\s+(\d+|[a-z]+)\s+days?\b", re.I)
 BETWEEN_RE = re.compile(
     r"\bbetween\s+(\d{4}-\d{2}-\d{2})\s+and\s+(\d{4}-\d{2}-\d{2})",
     re.I,
 )
+LAST_QUARTER_RE = re.compile(r"\blast\s+quarter\b", re.I)
+YEAR_YTD_RE = re.compile(r"\b(20\d{2})\s*ytd\b", re.I)
+IN_YEAR_RE = re.compile(r"\bin\s*(20\d{2})\b", re.I)
 
 
 def _add_months(dt: date, months: int) -> date:
@@ -110,8 +155,9 @@ def _last_month_bounds(today: Optional[date] = None) -> tuple[date, date]:
 
 def _last_n_months_bounds(n: int, today: Optional[date] = None) -> tuple[date, date]:
     today = today or date.today()
-    start = _add_months(today, -n)
-    return start, today
+    end = today
+    start_month = _add_months(today.replace(day=1), -n)
+    return start_month, end
 
 
 def _last_quarter_bounds(today: Optional[date] = None) -> tuple[date, date]:
@@ -122,6 +168,30 @@ def _last_quarter_bounds(today: Optional[date] = None) -> tuple[date, date]:
     start_month = 3 * (prev_q - 1) + 1
     start = date(year, start_month, 1)
     _, end = _month_bounds(_add_months(start, 2))
+    return start, end
+
+
+def _last_n_quarters_bounds(n: int, today: Optional[date] = None) -> tuple[date, date]:
+    today = today or date.today()
+    current_q = (today.month - 1) // 3 + 1
+    start_month = 3 * (current_q - 1) + 1
+    first_this_q = date(today.year, start_month, 1)
+    end = today
+    start = _add_months(first_this_q, -(3 * n))
+    return start, end
+
+
+def _last_week_bounds(today: Optional[date] = None) -> tuple[date, date]:
+    today = today or date.today()
+    end = today
+    start = today - timedelta(days=7)
+    return start, end
+
+
+def _last_n_days_bounds(n: int, today: Optional[date] = None) -> tuple[date, date]:
+    today = today or date.today()
+    end = today
+    start = today - timedelta(days=n)
     return start, end
 
 
@@ -167,14 +237,15 @@ def parse_intent(
 
     # --- Top N ------------------------------------------------------------
     if m := TOP_RE.search(ql):
-        try:
-            intent.top_n = int(m.group(1))
-        except Exception:
-            intent.top_n = None
-        else:
+        raw_top = m.group(1)
+        n_val = _word_to_int(raw_top)
+        if n_val is not None:
+            intent.top_n = n_val
             intent.user_requested_top_n = True
+            intent.sort_desc = True
 
     # --- Aggregations & measure ------------------------------------------
+    intent.measure_sql = intent.measure_sql or NET_SQL
     if "gross" in ql:
         intent.measure_sql = GROSS_SQL
         intent.agg = "sum"
@@ -189,24 +260,22 @@ def parse_intent(
 
     # --- Group by / per dimension ----------------------------------------
     if " by " in ql or " per " in ql:
-        gb: Optional[str] = None
-        if "status" in ql:
-            gb = DIM_MAP["status"]
-        elif "owner department" in ql or "department" in ql:
-            gb = DIM_MAP["department"]
-        elif "department_oul" in ql:
-            gb = DIM_MAP["department_oul"]
-        elif "stakeholder" in ql:
-            gb = DIM_MAP["stakeholder"]
-        elif "owner" in ql:
-            gb = DIM_MAP["owner"]
-        elif "entity no" in ql:
-            gb = DIM_MAP["entity no"]
-        elif "entity" in ql:
-            gb = DIM_MAP["entity"]
-        if gb:
-            intent.group_by = gb
-            intent.wants_all_columns = False
+        match = re.search(r"\b(?:by|per)\s+([a-z0-9_ \-]+)", q, re.I)
+        if match:
+            raw_dim = match.group(1)
+            raw_dim = re.split(r"\b(last|next|this)\b", raw_dim, maxsplit=1)[0]
+            raw_dim = raw_dim.split(" for ", 1)[0]
+            raw_dim = raw_dim.split(" in ", 1)[0]
+            raw_dim = raw_dim.split(" of ", 1)[0]
+            raw_dim = raw_dim.strip().lower()
+            raw_dim = raw_dim.rstrip(",")
+            gb = DIM_MAP.get(raw_dim)
+            if gb:
+                intent.group_by = gb
+                intent.wants_all_columns = False
+                if intent.agg is None:
+                    intent.agg = "sum"
+                    intent.sort_by = intent.sort_by or intent.measure_sql
 
     # --- Window detection -------------------------------------------------
     if m := BETWEEN_RE.search(ql):
@@ -214,43 +283,82 @@ def parse_intent(
         intent.has_time_window = True
         intent.explicit_dates = {"start": start_s, "end": end_s}
 
-    if "last month" in ql:
+    def _set_dates(bounds: Tuple[date, date]) -> None:
+        start, end = bounds
+        intent.has_time_window = True
+        intent.explicit_dates = {"start": start.isoformat(), "end": end.isoformat()}
+
+    if LAST_MONTH_RE.search(ql):
         s, e = _last_month_bounds(today)
-        intent.has_time_window = True
-        intent.explicit_dates = {"start": s.isoformat(), "end": e.isoformat()}
+        _set_dates((s, e))
     elif m := LAST_N_MONTHS_RE.search(ql):
-        n = int(m.group(1))
-        s, e = _last_n_months_bounds(n, today)
-        intent.has_time_window = True
-        intent.explicit_dates = {"start": s.isoformat(), "end": e.isoformat()}
-    elif "last quarter" in ql:
+        n_raw = m.group(1)
+        n_val = _word_to_int(n_raw)
+        if n_val:
+            s, e = _last_n_months_bounds(n_val, today)
+            _set_dates((s, e))
+    elif LAST_QUARTER_RE.search(ql):
         s, e = _last_quarter_bounds(today)
-        intent.has_time_window = True
-        intent.explicit_dates = {"start": s.isoformat(), "end": e.isoformat()}
+        _set_dates((s, e))
+    elif m := LAST_N_QUARTERS_RE.search(ql):
+        n_raw = m.group(1)
+        n_val = _word_to_int(n_raw)
+        if n_val:
+            s, e = _last_n_quarters_bounds(n_val, today)
+            _set_dates((s, e))
+    elif LAST_WEEK_RE.search(ql):
+        s, e = _last_week_bounds(today)
+        _set_dates((s, e))
+    elif m := LAST_N_WEEKS_RE.search(ql):
+        n_raw = m.group(1)
+        n_val = _word_to_int(n_raw)
+        if n_val:
+            s, e = _last_n_days_bounds(n_val * 7, today)
+            _set_dates((s, e))
+    elif m := LAST_N_DAYS_RE.search(ql):
+        n_raw = m.group(1)
+        n_val = _word_to_int(n_raw)
+        if n_val:
+            s, e = _last_n_days_bounds(n_val, today)
+            _set_dates((s, e))
     elif m := NEXT_N_DAYS_RE.search(ql):
-        n = int(m.group(1))
-        s = today
-        e = today + timedelta(days=n)
-        intent.has_time_window = True
-        intent.explicit_dates = {"start": s.isoformat(), "end": e.isoformat()}
+        n_raw = m.group(1)
+        n_val = _word_to_int(n_raw)
+        if n_val:
+            s = today
+            e = today + timedelta(days=n_val)
+            _set_dates((s, e))
     elif m := EXPIRING_IN_RE.search(ql):
-        n = int(m.group(1))
-        s = today
-        e = today + timedelta(days=n)
-        intent.has_time_window = True
-        intent.explicit_dates = {"start": s.isoformat(), "end": e.isoformat()}
+        n_raw = m.group(1)
+        n_val = _word_to_int(n_raw)
+        if n_val:
+            s = today
+            e = today + timedelta(days=n_val)
+            _set_dates((s, e))
         intent.expire = True
+    elif m := YEAR_YTD_RE.search(ql):
+        year = int(m.group(1))
+        start = date(year, 1, 1)
+        end = today
+        _set_dates((start, end))
+    elif m := IN_YEAR_RE.search(ql):
+        year = int(m.group(1))
+        start = date(year, 1, 1)
+        end = date(year, 12, 31)
+        _set_dates((start, end))
 
     # --- Date column selection -------------------------------------------
     intent.date_column = _pick_date_column(q, prefer_overlap_default=prefer_overlap_default)
+
+    if intent.has_time_window and intent.explicit_dates and LAST_12_MONTHS_RE.search(ql):
+        intent.date_column = "REQUEST_DATE"
 
     if intent.expire:
         intent.date_column = "END_DATE"
         if require_window_for_expire and not intent.explicit_dates:
             s = today
             e = today + timedelta(days=30)
-            intent.has_time_window = True
-            intent.explicit_dates = {"start": s.isoformat(), "end": e.isoformat()}
+            _set_dates((s, e))
 
     # projection defaults --------------------------------------------------
     if intent.agg or intent.group_by:
