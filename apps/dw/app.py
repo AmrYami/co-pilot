@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from typing import Any, Dict, List
 
 try:  # pragma: no cover - allow tests to import without Flask installed
@@ -41,10 +42,11 @@ except Exception:  # pragma: no cover - lightweight fallback used in tests
 
 from core.settings import Settings
 
-from apps.dw.explain import build_explanation, explain_interpretation
-from apps.dw.fts import build_predicate, load_columns, tokenize
-from .intent import parse_intent
-from .planner_det import build_sql
+from .engine.clarify import parse_intent
+from .engine.build_sql import build_sql
+from .engine.explain import build_explain
+from .engine.fts import build_fts_where
+from .engine.table_profiles import CONTRACT_TABLE, fts_columns
 from .rating import rate_bp
 
 NAMESPACE = os.getenv("DW_NAMESPACE", "dw::common")
@@ -52,6 +54,21 @@ NAMESPACE = os.getenv("DW_NAMESPACE", "dw::common")
 
 dw_bp = Blueprint("dw", __name__)
 dw_bp.register_blueprint(rate_bp, url_prefix="")
+
+
+def _resolve_dw_engine(app):
+    engine = app.config.get("DW_ENGINE") if app else None  # type: ignore[assignment]
+    if engine is not None:
+        return engine
+    pipeline = app.config.get("PIPELINE") if app else None
+    if pipeline is None:
+        pipeline = app.config.get("pipeline") if app else None
+    if pipeline is None:
+        return None
+    try:
+        return pipeline.ds.engine(None)  # type: ignore[attr-defined]
+    except Exception:  # pragma: no cover - defensive fallback
+        return getattr(pipeline, "app_engine", None)
 
 
 def _execute_oracle(sql: str, binds: Dict[str, Any]):
@@ -62,7 +79,7 @@ def _execute_oracle(sql: str, binds: Dict[str, Any]):
         "validation": {"ok": True, "errors": [], "binds": list(binds.keys())},
         "csv_path": None,
     }
-    engine = app.config.get("DW_ENGINE") if app else None  # type: ignore[assignment]
+    engine = _resolve_dw_engine(app)
     if engine is None:
         return rows, cols, meta
     with engine.connect() as cx:  # type: ignore[union-attr]
@@ -99,23 +116,42 @@ def _intent_debug(intent) -> Dict[str, Any]:
     return {k: data.get(k) for k in keep}
 
 
+def _coerce_prefixes(raw) -> List[str]:
+    if not raw:
+        return []
+    if isinstance(raw, (list, tuple, set)):
+        return [str(p) for p in raw if p is not None]
+    return [str(raw)]
+
+
+def _tokenize_fts(text_value: str) -> List[str]:
+    lowered = (text_value or "").lower()
+    return [tok for tok in re.findall(r"[a-z0-9']+", lowered) if tok]
+
+
 @dw_bp.post("/answer")
 def answer():
     app = current_app
     data = request.get_json(force=True) or {}
     question = (data.get("question") or "").strip()
-    prefixes = data.get("prefixes") or []
+    prefixes = _coerce_prefixes(data.get("prefixes"))
     auth_email = (data.get("auth_email") or "").strip()
-    namespace = data.get("namespace") or NAMESPACE
-    fts_requested = data.get("full_text_search")
-    full_text_search = bool(fts_requested)
+    namespace = (data.get("namespace") or NAMESPACE).strip() or NAMESPACE
+    full_text_search = bool(data.get("full_text_search"))
+    include_explain_req = data.get("include_explain")
+    explain_flag = data.get("explain")
 
     if not question:
         return jsonify({"ok": False, "error": "question required"}), 400
 
-    mem_engine = app.config["MEM_ENGINE"]
-    settings = Settings(namespace=namespace)
-    settings.mem_engine = lambda: mem_engine
+    pipeline = app.config.get("PIPELINE") or app.config.get("pipeline")
+    settings = getattr(pipeline, "settings", None) if pipeline else None
+    if settings is None:
+        settings = app.config.get("SETTINGS") or Settings(namespace=namespace)
+
+    mem_engine = app.config.get("MEM_ENGINE") or getattr(pipeline, "mem_engine", None)
+    if mem_engine is None:
+        return jsonify({"ok": False, "error": "mem_engine_unavailable"}), 503
 
     with mem_engine.begin() as cx:
         row = cx.execute(
@@ -126,36 +162,46 @@ def answer():
             RETURNING id
         """
             ),
-            {"ns": namespace, "pfx": json.dumps(prefixes), "q": question, "mail": auth_email},
+            {
+                "ns": namespace,
+                "pfx": json.dumps(prefixes),
+                "q": question,
+                "mail": auth_email,
+            },
         ).fetchone()
     inquiry_id = int(row[0]) if row else None
-    app.logger.info(
-        "[dw] inquiry_start: %s",
-        json.dumps({"id": inquiry_id, "q": question, "email": auth_email, "ns": namespace, "prefixes": prefixes}),
-    )
 
-    contract_table = settings.get("DW_CONTRACT_TABLE", "Contract")
-    contract_table_name = str(contract_table)
+    strict_overlap = bool(int(settings.get("DW_OVERLAP_STRICT", "1") or 1))
 
-    intent = parse_intent(question, settings)
-    intent["full_text_search"] = full_text_search
+    intent = parse_intent(question)
+    intent.full_text_search = full_text_search
+    intent.explain_on = True if explain_flag is None else bool(explain_flag)
+    if not intent.measure_sql:
+        from .engine.table_profiles import net_sql  # local import to avoid cycle
 
-    # Full-text search setup
-    fts_meta = {"enabled": False, "tokens": None, "columns": None, "binds": None, "error": None}
+        intent.measure_sql = net_sql()
+
+    fts_meta: Dict[str, Any] = {
+        "enabled": full_text_search,
+        "tokens": None,
+        "columns": None,
+        "binds": None,
+        "error": None,
+    }
     fts_where = ""
-    fts_bind = {}
+    fts_bind: Dict[str, Any] = {}
     if full_text_search:
         try:
-            tokens = tokenize(question)
-            cols = load_columns(settings, table=contract_table_name)
-            fts_meta.update({"enabled": True, "tokens": tokens, "columns": cols})
-            intent["fts_tokens"] = tokens
-            if cols and tokens:
-                fts_where, fts_bind = build_predicate(cols, tokens)
+            columns = fts_columns(settings, table_name=CONTRACT_TABLE)
+            tokens = intent.fts_tokens or _tokenize_fts(question)
+            intent.fts_tokens = tokens
+            fts_meta.update({"columns": columns, "tokens": tokens})
+            if columns and tokens:
+                fts_where, fts_bind = build_fts_where(tokens, columns)
         except Exception as exc:  # pragma: no cover - defensive log only
             fts_meta["error"] = str(exc)
 
-    sql, binds, planner_explain = build_sql(intent, settings)
+    sql, binds = build_sql(intent, strict_overlap=strict_overlap)
 
     if fts_where:
         upper_sql = sql.upper()
@@ -175,15 +221,33 @@ def answer():
 
     rows, cols, exec_meta = _execute_oracle(sql, binds)
 
-    ft_bind_keys = [k for k in binds.keys() if k.startswith("fts")]
-    fts_meta.update({"binds": ft_bind_keys or None})
-
-    explain = explain_interpretation(intent, binds, table=contract_table_name)
+    fts_meta["binds"] = list(fts_bind.keys()) or None
 
     debug = {
         "intent": _intent_debug(intent),
-        "prompt": "",
         "validation": exec_meta.get("validation", {}),
+        "fts": fts_meta,
+    }
+
+    include_explain_default = getattr(settings, "get_bool", lambda *a, **k: True)(
+        "DW_INCLUDE_EXPLAIN", True
+    )
+    include_explain = (
+        bool(include_explain_req)
+        if include_explain_req is not None
+        else bool(include_explain_default)
+    )
+
+    explain_text = None
+    if intent.explain_on and include_explain:
+        explain_text = build_explain(intent)
+
+    result_meta = {
+        "binds": binds,
+        "wants_all_columns": intent.wants_all_columns,
+        "rowcount": len(rows),
+        "attempt_no": 1,
+        "strategy": "deterministic",
         "fts": fts_meta,
     }
 
@@ -192,42 +256,12 @@ def answer():
         "rows": rows,
         "columns": cols,
         "csv_path": exec_meta.get("csv_path"),
-        "meta": {
-            "binds": binds,
-            "wants_all_columns": intent.get("wants_all_columns"),
-            "rowcount": len(rows),
-            "attempt_no": 1,
-            "strategy": "deterministic",
-            "fts": fts_meta,
-            "builder": {"planner": "deterministic", "explain": planner_explain},
-        },
+        "meta": result_meta,
         "debug": debug,
         "ok": True,
-        "explain": explain or planner_explain,
     }
-
-    include_explain_req = data.get("include_explain")
-    include_explain_default = settings.get_bool("DW_INCLUDE_EXPLAIN", True)
-    include_explain = include_explain_req if include_explain_req is not None else include_explain_default
-
-    if include_explain and not result.get("explain"):
-        meta_obj = result.get("meta")
-        if not isinstance(meta_obj, dict):
-            meta_obj = {}
-        columns_selected = meta_obj.get("projection_columns") or cols
-        try:
-            result["explain"] = build_explanation(
-                intent=_intent_debug(intent),
-                binds=meta_obj.get("binds", {}),
-                fts_meta=meta_obj.get("fts", {}),
-                table=str(contract_table_name),
-                cols_selected=columns_selected or [],
-                strategy=meta_obj.get("strategy", ""),
-                default_date_basis=settings.get("DW_DATE_COLUMN", "REQUEST_DATE"),
-            )
-        except Exception as _e:  # pragma: no cover - defensive logging only
-            if isinstance(result.get("debug"), dict):
-                result["debug"]["explain_error"] = str(_e)
+    if explain_text:
+        result["explain"] = explain_text
 
     with mem_engine.begin() as cx:
         cx.execute(
@@ -240,9 +274,11 @@ def answer():
             {
                 "ns": namespace,
                 "q": question,
-                "ctx": json.dumps({"inquiry_id": inquiry_id, "attempt_no": 1, "strategy": "deterministic"}),
+                "ctx": json.dumps(
+                    {"inquiry_id": inquiry_id, "attempt_no": 1, "strategy": "deterministic"}
+                ),
                 "sql": result["sql"],
-                "rows": len(result["rows"]),
+                "rows": len(result.get("rows", [])),
             },
         )
         cx.execute(
