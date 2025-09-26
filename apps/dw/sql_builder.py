@@ -16,7 +16,7 @@ def _window_predicate(intent: NLIntent, overlap_strict: bool) -> Optional[str]:
     if col == "END_DATE":
         return "END_DATE BETWEEN :date_start AND :date_end"
     if overlap_strict:
-        return "(START_DATE <= :date_end AND END_DATE >= :date_start)"
+        return "(START_DATE IS NOT NULL AND END_DATE IS NOT NULL AND START_DATE <= :date_end AND END_DATE >= :date_start)"
     return "((START_DATE IS NULL OR START_DATE <= :date_end) AND (END_DATE IS NULL OR END_DATE >= :date_start))"
 
 
