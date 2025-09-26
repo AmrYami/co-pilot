@@ -30,6 +30,51 @@ GROSS_SQL = (
 
 NET_SQL = "NVL(CONTRACT_VALUE_NET_OF_VAT,0)"
 
+# Map common synonyms -> canonical column names
+_PROJECTION_MAP: Dict[str, str] = {
+    r"\bcontract\s*id\b": "CONTRACT_ID",
+    r"\bowner\b": "CONTRACT_OWNER",
+    r"\bowner\s*department\b": "OWNER_DEPARTMENT",
+    r"\bdepartment\s*oul\b": "DEPARTMENT_OUL",
+    r"\bentity\b": "ENTITY",
+    r"\bentity\s*no\b": "ENTITY_NO",
+    r"\brequest\s*date\b": "REQUEST_DATE",
+    r"\bstart\s*date\b": "START_DATE",
+    r"\bend\s*date\b": "END_DATE",
+    r"\bstatus\b": "CONTRACT_STATUS",
+}
+
+
+def _detect_projection_list(q: str) -> Optional[List[str]]:
+    """Return canonical column list if the user enumerates columns."""
+
+    m = re.search(r"\(([^)]+)\)", q)
+    if not m:
+        return None
+    raw = m.group(1)
+    parts = [
+        p.strip().lower()
+        for p in re.split(r"[;,/]|\band\b", raw, flags=re.I)
+        if p.strip()
+    ]
+    cols: List[str] = []
+    for token in parts:
+        for pat, col in _PROJECTION_MAP.items():
+            if re.search(pat, token, re.I):
+                cols.append(col)
+                break
+    return cols or None
+
+
+def _pick_date_column(q: str, *, prefer_overlap_default: bool = True) -> str:
+    """REQUEST_DATE only for explicit 'requested'; 'expiring' -> END_DATE; else OVERLAP."""
+
+    if re.search(r"\bexpir(?:e|ing|y)\b", q, re.I):
+        return "END_DATE"
+    if re.search(r"\brequest(ed)?\b", q, re.I) or re.search(r"\bREQUEST_DATE\b", q):
+        return "REQUEST_DATE"
+    return "OVERLAP" if prefer_overlap_default else "REQUEST_DATE"
+
 TOP_RE = re.compile(r"\btop\s+(\d+)\b", re.I)
 LAST_N_MONTHS_RE = re.compile(r"\blast\s+(\d+)\s+months?\b", re.I)
 NEXT_N_DAYS_RE = re.compile(r"\bnext\s+(\d+)\s+days?\b", re.I)
@@ -97,6 +142,7 @@ class NLIntent:
     user_requested_top_n: Optional[bool] = None
     # projection / search
     wants_all_columns: Optional[bool] = True
+    projection: Optional[List[str]] = None
     full_text_search: Optional[bool] = False
     fts_tokens: Optional[List[str]] = None
     # notes / extras
@@ -114,6 +160,10 @@ def parse_intent(
     ql = q.lower()
     today = date.today()
     intent = NLIntent(notes={"q": q}, full_text_search=full_text_search)
+
+    if proj := _detect_projection_list(q):
+        intent.projection = proj
+        intent.wants_all_columns = False
 
     # --- Top N ------------------------------------------------------------
     if m := TOP_RE.search(ql):
@@ -192,10 +242,7 @@ def parse_intent(
         intent.expire = True
 
     # --- Date column selection -------------------------------------------
-    if "request" in ql or "requested" in ql:
-        intent.date_column = "REQUEST_DATE"
-    else:
-        intent.date_column = "OVERLAP" if prefer_overlap_default else "REQUEST_DATE"
+    intent.date_column = _pick_date_column(q, prefer_overlap_default=prefer_overlap_default)
 
     if intent.expire:
         intent.date_column = "END_DATE"
