@@ -35,10 +35,28 @@ except Exception:  # pragma: no cover - simple stub used in unit tests
     request = _StubRequest()  # type: ignore[assignment]
 
 try:  # pragma: no cover - optional dependency in tests
-    from sqlalchemy import text
+    from sqlalchemy import bindparam, text
+    from sqlalchemy.types import Date, Integer
 except Exception:  # pragma: no cover - lightweight fallback used in tests
+    class _StubStatement:  # minimal stand-in when SQLAlchemy is absent
+        def __init__(self, sql: str):
+            self.sql = sql
+
+        def bindparams(self, *args, **kwargs):
+            return self
+
     def text(sql: str):  # type: ignore
-        return sql
+        return _StubStatement(sql)
+
+    def bindparam(key, type_=None):  # type: ignore
+        return {"key": key, "type": type_}
+
+    class Date:  # type: ignore
+        def __call__(self, *args, **kwargs):
+            return self
+
+    class Integer(Date):  # type: ignore
+        pass
 
 from core.settings import Settings
 
@@ -48,6 +66,7 @@ from .engine.explain import build_explain
 from .engine.fts import build_fts_where
 from .engine.table_profiles import CONTRACT_TABLE, fts_columns
 from .rating import rate_bp
+from .dates import coerce_oracle_date
 
 NAMESPACE = os.getenv("DW_NAMESPACE", "dw::common")
 
@@ -83,7 +102,23 @@ def _execute_oracle(sql: str, binds: Dict[str, Any]):
     if engine is None:
         return rows, cols, meta
     with engine.connect() as cx:  # type: ignore[union-attr]
-        rs = cx.execute(text(sql), binds)
+        coerced_binds = dict(binds or {})
+        if "date_start" in coerced_binds:
+            coerced_binds["date_start"] = coerce_oracle_date(coerced_binds.get("date_start"))
+        if "date_end" in coerced_binds:
+            coerced_binds["date_end"] = coerce_oracle_date(coerced_binds.get("date_end"))
+        if "top_n" in coerced_binds and coerced_binds["top_n"] is not None:
+            coerced_binds["top_n"] = int(coerced_binds["top_n"])
+
+        stmt = text(sql)
+        if ":date_start" in sql:
+            stmt = stmt.bindparams(bindparam("date_start", type_=Date()))
+        if ":date_end" in sql:
+            stmt = stmt.bindparams(bindparam("date_end", type_=Date()))
+        if ":top_n" in sql:
+            stmt = stmt.bindparams(bindparam("top_n", type_=Integer()))
+
+        rs = cx.execute(stmt, coerced_binds)
         cols = list(rs.keys()) if hasattr(rs, "keys") else []
         rows = [list(r) for r in rs.fetchall()]
     meta["rowcount"] = len(rows)
@@ -127,6 +162,58 @@ def _coerce_prefixes(raw) -> List[str]:
 def _tokenize_fts(text_value: str) -> List[str]:
     lowered = (text_value or "").lower()
     return [tok for tok in re.findall(r"[a-z0-9']+", lowered) if tok]
+
+
+def _format_window_val(val: Any) -> str:
+    if hasattr(val, "strftime"):
+        try:
+            return val.strftime("%Y-%m-%d")
+        except Exception:
+            return str(val)
+    return str(val)
+
+
+def _build_user_explain(intent: Any, binds: Dict[str, Any], sql: str) -> str:
+    parts: List[str] = []
+    _ = sql  # placeholder to document the SQL analyzed
+    binds = binds or {}
+    ds = binds.get("date_start")
+    de = binds.get("date_end")
+    if ds and de:
+        parts.append(
+            f"تم تفسير «الفترة» من {_format_window_val(ds)} إلى {_format_window_val(de)}."
+        )
+
+    dc = getattr(intent, "date_column", None)
+    if dc == "OVERLAP":
+        parts.append(
+            "اعتبرنا العقد «نشطًا» إذا تداخلت فترة العقد (START_DATE/END_DATE) مع هذه النافذة."
+        )
+    elif dc == "REQUEST_DATE":
+        parts.append("تم الاعتماد على REQUEST_DATE لأن الصياغة تشير إلى تاريخ الطلب.")
+    elif dc == "END_DATE":
+        parts.append("تم الاعتماد على END_DATE كما هو مذكور في السؤال.")
+
+    gb = getattr(intent, "group_by", None)
+    agg = getattr(intent, "agg", None)
+    if gb and agg:
+        parts.append(f"قمنا بتجميع النتائج حسب «{gb}» باستخدام {str(agg).upper()}.")
+    elif gb:
+        parts.append(f"قمنا بتجميع النتائج حسب «{gb}».")
+
+    sort_by = getattr(intent, "sort_by", None)
+    if sort_by:
+        desc = getattr(intent, "sort_desc", True)
+        order_word = "تنازليًا" if desc else "تصاعديًا"
+        parts.append(f"تم ترتيب النتائج {order_word} بالقيمة المطلوبة.")
+
+    if getattr(intent, "wants_all_columns", False):
+        parts.append("لم تُطلب أعمدة محددة، لذا عرضنا كل الأعمدة.")
+
+    if getattr(intent, "full_text_search", False):
+        parts.append("تم تفعيل البحث النصي عبر أعمدة FTS المعرفة في الإعدادات.")
+
+    return " ".join(parts) if parts else "تم استخدام الإعدادات الافتراضية لتفسير سؤالك."
 
 
 @dw_bp.post("/answer")
@@ -291,6 +378,9 @@ def answer():
         )
 
     payload: Dict[str, Any] = {"ok": True, "inquiry_id": inquiry_id, **result}
+    if "explain" in payload:
+        payload["llm_explain"] = payload["explain"]
+    payload["explain"] = _build_user_explain(intent, binds, sql)
     return jsonify(payload)
 
 
