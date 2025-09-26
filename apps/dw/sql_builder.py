@@ -1,118 +1,242 @@
-from __future__ import annotations
-
-from typing import Dict, List, Optional, Tuple
-
-from apps.dw.intent import NLIntent, NET_SQL
+from typing import Dict, Any, Optional, Tuple, List
+from datetime import date
+from dateutil.relativedelta import relativedelta
 
 
-def _window_predicate(intent: NLIntent, overlap_strict: bool) -> Optional[str]:
-    if not intent.has_time_window or not intent.explicit_dates:
-        return None
-    col = (intent.date_column or "OVERLAP").upper()
-    if col == "REQUEST_DATE":
-        return "REQUEST_DATE BETWEEN :date_start AND :date_end"
-    if col == "START_DATE":
-        return "START_DATE BETWEEN :date_start AND :date_end"
-    if col == "END_DATE":
-        return "END_DATE BETWEEN :date_start AND :date_end"
-    if overlap_strict:
-        return "(START_DATE IS NOT NULL AND END_DATE IS NOT NULL AND START_DATE <= :date_end AND END_DATE >= :date_start)"
-    return "((START_DATE IS NULL OR START_DATE <= :date_end) AND (END_DATE IS NULL OR END_DATE >= :date_start))"
+# Helper to read optional strict overlap from Settings
+def _bool_env(v) -> bool:
+    if v is None:
+        return False
+    if isinstance(v, bool):
+        return v
+    return str(v).lower() in ("1", "true", "yes", "y", "on")
 
 
-def _fts_predicate(columns: List[str], token_bind_names: List[str]) -> str:
-    ors = []
-    for column in columns:
-        for bind_name in token_bind_names:
-            ors.append(f"INSTR(UPPER({column}), :{bind_name}) > 0")
-    return "(" + " OR ".join(ors) + ")"
+def _overlap_clause(strict: bool) -> str:
+    """
+    Overlap filter: active during [date_start, date_end]
+       START_DATE <= end AND END_DATE >= start
+    If strict: require both dates to be non-null.
+    """
+    if strict:
+        return (
+            "(START_DATE IS NOT NULL AND END_DATE IS NOT NULL "
+            "AND START_DATE <= :date_end AND END_DATE >= :date_start)"
+        )
+    return "(START_DATE <= :date_end AND END_DATE >= :date_start)"
 
 
-def build_sql(
-    intent: NLIntent,
-    *,
-    table: str = '"Contract"',
-    overlap_strict: bool = True,
-    fts_columns: Optional[List[str]] = None,
-) -> Tuple[str, Dict[str, object]]:
+def _select_for_non_agg(*, wants_all: bool) -> str:
+    # Your default is "select all" when not aggregated
+    if wants_all:
+        return "*"
+    # If you prefer a light list when not aggregated, uncomment:
+    # return "CONTRACT_ID, CONTRACT_OWNER, REQUEST_DATE, START_DATE, END_DATE"
+    return "*"
+
+
+def _gross_expr() -> str:
+    return (
+        "NVL(CONTRACT_VALUE_NET_OF_VAT,0) + "
+        "CASE WHEN NVL(VAT,0) BETWEEN 0 AND 1 "
+        "THEN NVL(CONTRACT_VALUE_NET_OF_VAT,0)*NVL(VAT,0) ELSE NVL(VAT,0) END"
+    )
+
+
+def build_sql(intent: Dict[str, Any], settings, *, table: str = "Contract") -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
+    """
+    Returns (sql, binds, meta)
+    intent: dict from NLIntent (dict-like)
+    settings: Settings reader (core.settings.Settings)
+    """
+    it = intent
+    meta: Dict[str, Any] = {}
+    binds: Dict[str, Any] = {}
+
+    wants_all = bool(it.get("wants_all_columns", True))
+    measure = it.get("measure_sql") or "NVL(CONTRACT_VALUE_NET_OF_VAT,0)"
+    agg = (it.get("agg") or "").lower() or None
+    group_by = it.get("group_by")
+    top_n = it.get("top_n")
+    sort_by = it.get("sort_by") or measure
+    sort_desc = bool(it.get("sort_desc", True))
+
+    # date window binds
+    strict_overlap = _bool_env(settings.get("DW_OVERLAP_STRICT", 0))
+    date_col = it.get("date_column") or "OVERLAP"
+    exp_dates = it.get("explicit_dates")
+    expire_days = it.get("expire")
+
+    # Build WHERE and binds for time
     where_parts: List[str] = []
-    binds: Dict[str, object] = {}
+    if date_col == "OVERLAP":
+        if exp_dates:
+            binds["date_start"] = exp_dates["start"]
+            binds["date_end"] = exp_dates["end"]
+            where_parts.append(_overlap_clause(strict_overlap))
+    elif date_col == "REQUEST_DATE":
+        if exp_dates:
+            binds["date_start"] = exp_dates["start"]
+            binds["date_end"] = exp_dates["end"]
+            where_parts.append("REQUEST_DATE BETWEEN :date_start AND :date_end")
+    elif date_col == "END_DATE" and expire_days:
+        # expiring in N days
+        binds["date_start"] = exp_dates["start"]
+        binds["date_end"] = exp_dates["end"]
+        where_parts.append("END_DATE BETWEEN :date_start AND :date_end")
+    elif exp_dates:
+        # fallback: request_date
+        binds["date_start"] = exp_dates["start"]
+        binds["date_end"] = exp_dates["end"]
+        where_parts.append("REQUEST_DATE BETWEEN :date_start AND :date_end")
 
-    window_sql = _window_predicate(intent, overlap_strict=overlap_strict)
-    if window_sql:
-        where_parts.append(window_sql)
-        ds = intent.explicit_dates or {}
-        if "start" in ds and "end" in ds:
-            binds["date_start"] = ds["start"]
-            binds["date_end"] = ds["end"]
+    # Special "by status (all time)" — detect quickly
+    # handled by group_by==CONTRACT_STATUS + agg="count"
+    # Nothing special here beyond the generic aggregator path.
 
-    token_bind_names: List[str] = []
-    if intent.full_text_search and intent.fts_tokens and fts_columns:
-        for i, token in enumerate(intent.fts_tokens, start=1):
-            bind_name = f"ft_{i}"
-            token_bind_names.append(bind_name)
-            binds[bind_name] = token
-        where_parts.append(_fts_predicate(fts_columns, token_bind_names))
+    # Heuristics for specific questions that need deterministic SQL
+    qtxt = (it.get("notes") or {}).get("q", "").lower()
 
-    where_sql = ""
-    if where_parts:
-        where_sql = "WHERE " + " AND ".join(where_parts)
+    # Contracts where VAT is null or zero but contract value > 0.
+    if "vat" in qtxt and "value" in qtxt and (("null" in qtxt and "zero" in qtxt) or "null or zero" in qtxt):
+        sel = _select_for_non_agg(wants_all=wants_all)
+        sql = (
+            f"SELECT {sel} FROM \"{table}\"\n"
+            f"WHERE NVL(VAT,0) = 0 AND NVL(CONTRACT_VALUE_NET_OF_VAT,0) > 0\n"
+            f"ORDER BY NVL(CONTRACT_VALUE_NET_OF_VAT,0) DESC"
+        )
+        return sql, binds, {"pattern": "vat_zero_positive_value"}
 
-    agg = intent.agg
-    group_by = intent.group_by
-    top_n = intent.top_n
-    measure = intent.measure_sql or NET_SQL
-    projection = intent.projection
-    wants_all = intent.wants_all_columns if intent.wants_all_columns is not None else True
+    # Show contracts where REQUEST TYPE = Renewal in YEAR.
+    if "renewal" in qtxt:
+        sel = _select_for_non_agg(wants_all=wants_all)
+        # Pull year from explicit_dates if provided by parser
+        if exp_dates:
+            sql = (
+                f"SELECT {sel} FROM \"{table}\"\n"
+                f"WHERE REQUEST_TYPE = 'Renewal' "
+                f"AND REQUEST_DATE BETWEEN :date_start AND :date_end\n"
+                f"ORDER BY REQUEST_DATE DESC"
+            )
+            return sql, binds, {"pattern": "renewal_year"}
+        # fallback: just REQUEST_TYPE
+        sql = (
+            f"SELECT {sel} FROM \"{table}\"\n"
+            f"WHERE REQUEST_TYPE = 'Renewal'\n"
+            f"ORDER BY REQUEST_DATE DESC"
+        )
+        return sql, binds, {"pattern": "renewal_no_year"}
 
-    if agg == "count":
-        if group_by:
-            select_cols = [f"{group_by} AS GROUP_KEY", "COUNT(*) AS CNT"]
+    # Distinct ENTITY values and their counts
+    if "distinct" in qtxt and "entity" in qtxt and "count" in qtxt:
+        sql = (
+            f"SELECT ENTITY AS GROUP_KEY, COUNT(*) AS CNT\n"
+            f"FROM \"{table}\"\n"
+            f"GROUP BY ENTITY\n"
+            f"ORDER BY CNT DESC"
+        )
+        return sql, binds, {"pattern": "entity_counts"}
+
+    # Contracts missing CONTRACT_ID (data quality)
+    if "missing" in qtxt and "contract_id" in qtxt:
+        sel = _select_for_non_agg(wants_all=wants_all)
+        sql = (
+            f"SELECT {sel} FROM \"{table}\"\n"
+            f"WHERE CONTRACT_ID IS NULL OR TRIM(CONTRACT_ID) = ''\n"
+            f"ORDER BY REQUEST_DATE DESC"
+        )
+        return sql, binds, {"pattern": "missing_contract_id"}
+
+    # "list contracts owner department" → if you want a list of departments:
+    if "list contracts owner" in qtxt and "department" in qtxt:
+        sql = (
+            f"SELECT DISTINCT OWNER_DEPARTMENT\n"
+            f"FROM \"{table}\"\n"
+            f"ORDER BY OWNER_DEPARTMENT"
+        )
+        return sql, binds, {"pattern": "owner_dept_list"}
+
+    # Monthly trend last 12 months by REQUEST_DATE (counts)
+    if "monthly trend" in qtxt:
+        # Require REQUEST_DATE window
+        if not exp_dates:
+            # default 12 months
+            end = date.today().replace(day=1) + relativedelta(months=1) - relativedelta(days=1)
+            start = end.replace(day=1) - relativedelta(months=11)
+            binds["date_start"] = start.isoformat()
+            binds["date_end"] = end.isoformat()
+        sql = (
+            f"SELECT TRUNC(REQUEST_DATE,'MM') AS MONTH_BUCKET, COUNT(*) AS CNT\n"
+            f"FROM \"{table}\"\n"
+            f"WHERE REQUEST_DATE BETWEEN :date_start AND :date_end\n"
+            f"GROUP BY TRUNC(REQUEST_DATE,'MM')\n"
+            f"ORDER BY MONTH_BUCKET"
+        )
+        return sql, binds, {"pattern": "monthly_trend_request_date"}
+
+    # Count of contracts by status (all time)
+    if group_by == "CONTRACT_STATUS" and (agg == "count" or "count of contracts by status" in qtxt):
+        sql = (
+            f"SELECT CONTRACT_STATUS AS GROUP_KEY, COUNT(*) AS CNT\n"
+            f"FROM \"{table}\"\n"
+            f"GROUP BY CONTRACT_STATUS\n"
+            f"ORDER BY CNT DESC"
+        )
+        return sql, binds, {"pattern": "count_by_status"}
+
+    # Stakeholder gross over 1..8 slots (union-all) + window
+    if group_by == "CONTRACT_STAKEHOLDER_1" and "stakeholder" in qtxt:
+        gross = _gross_expr() if "gross" in qtxt else measure
+        subqs = []
+        slots = int(settings.get("DW_STAKEHOLDER_SLOTS", 8) or 8)
+        where_time = ""
+        if date_col == "OVERLAP" and exp_dates:
+            where_time = f"WHERE {_overlap_clause(strict_overlap)}"
+        elif date_col == "REQUEST_DATE" and exp_dates:
+            where_time = "WHERE REQUEST_DATE BETWEEN :date_start AND :date_end"
+        elif date_col == "END_DATE" and exp_dates:
+            where_time = "WHERE END_DATE BETWEEN :date_start AND :date_end"
+        for i in range(1, slots + 1):
+            subqs.append(f"SELECT CONTRACT_STAKEHOLDER_{i} AS STK, {gross} AS GVAL FROM \"{table}\" {where_time}")
+        union = "\nUNION ALL\n".join(subqs)
+        sql = (
+            f"WITH U AS (\n{union}\n)\n"
+            f"SELECT STK AS GROUP_KEY, SUM(GVAL) AS MEASURE\n"
+            f"FROM U\nGROUP BY STK\nORDER BY MEASURE DESC"
+        )
+        if top_n:
+            binds["top_n"] = top_n
+            sql += "\nFETCH FIRST :top_n ROWS ONLY"
+        return sql, binds, {"pattern": "stakeholder_union_all"}
+
+    # Generic aggregated path (group_by present)
+    if group_by:
+        sel_dim = f"{group_by} AS GROUP_KEY"
+        if agg == "count":
+            sel_mea = "COUNT(*) AS CNT"
+            order = "CNT"
+        elif agg == "avg":
+            sel_mea = f"AVG({measure}) AS MEASURE"
+            order = "MEASURE"
         else:
-            select_cols = ["COUNT(*) AS CNT"]
-    elif group_by:
-        select_cols = [f"{group_by} AS GROUP_KEY", f"SUM({measure}) AS MEASURE"]
-    else:
-        if projection:
-            select_cols = projection
-        elif wants_all:
-            select_cols = ["*"]
-        else:
-            select_cols = [
-                "CONTRACT_ID",
-                "CONTRACT_OWNER",
-                "REQUEST_DATE",
-                "START_DATE",
-                "END_DATE",
-            ]
+            sel_mea = f"SUM({measure}) AS MEASURE"
+            order = "MEASURE"
+        where_sql = ("WHERE " + " AND ".join(where_parts)) if where_parts else ""
+        sql = (
+            f"SELECT {sel_dim}, {sel_mea}\nFROM \"{table}\"\n{where_sql}\n"
+            f"GROUP BY {group_by}\nORDER BY {order} DESC"
+        )
+        if top_n:
+            binds["top_n"] = top_n
+            sql += "\nFETCH FIRST :top_n ROWS ONLY"
+        return sql, binds, {"pattern": "generic_agg"}
 
-    sql_lines: List[str] = ["SELECT", "  " + ",\n  ".join(select_cols), f"FROM {table}"]
-    if where_sql:
-        sql_lines.append(where_sql)
-
-    if agg and group_by:
-        sql_lines.append(f"GROUP BY {group_by}")
-
-    order_clause = ""
-    if agg == "count" and group_by:
-        order_clause = "ORDER BY CNT DESC"
-    elif group_by:
-        order_expr = intent.sort_by or "MEASURE"
-        direction = "DESC" if intent.sort_desc is not False else "ASC"
-        order_clause = f"ORDER BY {order_expr if intent.sort_by else 'MEASURE'} {direction}"
-    elif agg == "count":
-        order_clause = ""
-    else:
-        order_expr = intent.sort_by or (measure if top_n else "REQUEST_DATE")
-        direction = "DESC" if intent.sort_desc is not False else "ASC"
-        order_clause = f"ORDER BY {order_expr} {direction}"
-
-    if order_clause:
-        sql_lines.append(order_clause)
-
+    # Non-aggregated (top contracts by value, overlap or request_date)
+    sel = _select_for_non_agg(wants_all=wants_all)
+    where_sql = ("WHERE " + " AND ".join(where_parts)) if where_parts else ""
+    order_sql = f"ORDER BY {sort_by} {'DESC' if sort_desc else 'ASC'}"
+    sql = f"SELECT {sel} FROM \"{table}\"\n{where_sql}\n{order_sql}"
     if top_n:
         binds["top_n"] = top_n
-        sql_lines.append("FETCH FIRST :top_n ROWS ONLY")
-
-    sql = "\n".join(sql_lines)
-    return sql, binds
+        sql += "\nFETCH FIRST :top_n ROWS ONLY"
+    return sql, binds, {"pattern": "generic_non_agg"}

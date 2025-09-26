@@ -1,8 +1,6 @@
-from __future__ import annotations
-
 import json
 import os
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, List
 
 try:  # pragma: no cover - allow tests to import without Flask installed
     from flask import Blueprint, current_app, jsonify, request
@@ -34,6 +32,7 @@ except Exception:  # pragma: no cover - simple stub used in unit tests
     Blueprint = _StubBlueprint  # type: ignore[assignment]
     jsonify = _jsonify  # type: ignore[assignment]
     request = _StubRequest()  # type: ignore[assignment]
+
 try:  # pragma: no cover - optional dependency in tests
     from sqlalchemy import text
 except Exception:  # pragma: no cover - lightweight fallback used in tests
@@ -42,10 +41,9 @@ except Exception:  # pragma: no cover - lightweight fallback used in tests
 
 from core.settings import Settings
 
-from apps.dw.explain import build_explanation
-
-from .config import get_dw_fts_columns
-from .intent import NLIntent, parse_intent
+from apps.dw.explain import build_explanation, explain_interpretation
+from apps.dw.fts import build_predicate, load_columns, tokenize
+from .intent import parse_intent
 from .sql_builder import build_sql
 from .rating import rate_bp
 
@@ -58,8 +56,8 @@ dw_bp.register_blueprint(rate_bp, url_prefix="")
 
 def _execute_oracle(sql: str, binds: Dict[str, Any]):
     app = current_app
-    rows: list[list[Any]] = []
-    cols: list[str] = []
+    rows: List[List[Any]] = []
+    cols: List[str] = []
     meta: Dict[str, Any] = {
         "validation": {"ok": True, "errors": [], "binds": list(binds.keys())},
         "csv_path": None,
@@ -75,30 +73,30 @@ def _execute_oracle(sql: str, binds: Dict[str, Any]):
     return rows, cols, meta
 
 
-def _quote_table(name: str) -> str:
-    n = (name or "Contract").strip()
-    if n.startswith("\"") and n.endswith("\""):
-        return n
-    return f'"{n}"'
-
-
-def _intent_debug(intent: NLIntent) -> Dict[str, Any]:
-    return {
-        "agg": intent.agg,
-        "date_column": intent.date_column,
-        "expire": intent.expire,
-        "explicit_dates": intent.explicit_dates,
-        "full_text_search": intent.full_text_search,
-        "fts_tokens": intent.fts_tokens,
-        "group_by": intent.group_by,
-        "has_time_window": intent.has_time_window,
-        "measure_sql": intent.measure_sql,
-        "sort_by": intent.sort_by,
-        "sort_desc": intent.sort_desc,
-        "top_n": intent.top_n,
-        "user_requested_top_n": intent.user_requested_top_n,
-        "wants_all_columns": intent.wants_all_columns,
+def _intent_debug(intent) -> Dict[str, Any]:
+    if hasattr(intent, "model_dump"):
+        data = intent.model_dump()
+    elif isinstance(intent, dict):
+        data = dict(intent)
+    else:
+        data = {attr: getattr(intent, attr) for attr in dir(intent) if not attr.startswith("_")}
+    keep = {
+        "agg",
+        "date_column",
+        "expire",
+        "explicit_dates",
+        "full_text_search",
+        "fts_tokens",
+        "group_by",
+        "has_time_window",
+        "measure_sql",
+        "sort_by",
+        "sort_desc",
+        "top_n",
+        "user_requested_top_n",
+        "wants_all_columns",
     }
+    return {k: data.get(k) for k in keep}
 
 
 @dw_bp.post("/answer")
@@ -137,49 +135,56 @@ def answer():
     )
 
     contract_table = settings.get("DW_CONTRACT_TABLE", "Contract")
-    contract_table_sql = _quote_table(str(contract_table))
+    contract_table_name = str(contract_table)
 
-    prefer_overlap_default = True
-    require_window_flag = settings.get("DW_REQUIRE_WINDOW_FOR_EXPIRE", scope="namespace", default=1)
-    try:
-        require_window_for_expire = bool(int(str(require_window_flag)))
-    except Exception:
-        require_window_for_expire = bool(require_window_flag)
+    wants_all_default = settings.get_bool("DW_SELECT_ALL_DEFAULT", True)
+    intent = parse_intent(question, wants_all_columns_default=wants_all_default)
+    intent.full_text_search = full_text_search
 
-    overlap_flag = settings.get("DW_OVERLAP_STRICT", scope="namespace", default=1)
-    try:
-        overlap_strict = bool(int(str(overlap_flag)))
-    except Exception:
-        overlap_strict = bool(overlap_flag)
+    intent_dict = intent.model_dump()
 
-    intent = parse_intent(
-        question,
-        prefer_overlap_default=prefer_overlap_default,
-        require_window_for_expire=require_window_for_expire,
-        full_text_search=full_text_search,
-    )
+    # Full-text search setup
+    fts_meta = {"enabled": False, "tokens": None, "columns": None, "binds": None, "error": None}
+    fts_where = ""
+    fts_bind = {}
+    if full_text_search:
+        try:
+            tokens = tokenize(question)
+            cols = load_columns(settings, table=contract_table_name)
+            fts_meta.update({"enabled": True, "tokens": tokens, "columns": cols})
+            intent_dict["fts_tokens"] = tokens
+            if cols and tokens:
+                fts_where, fts_bind = build_predicate(cols, tokens)
+        except Exception as exc:  # pragma: no cover - defensive log only
+            fts_meta["error"] = str(exc)
 
-    fts_columns = get_dw_fts_columns(settings, contract_table)
-    sql, binds = build_sql(
-        intent,
-        table=contract_table_sql,
-        overlap_strict=overlap_strict,
-        fts_columns=fts_columns if full_text_search else None,
-    )
+    sql, binds, builder_meta = build_sql(intent_dict, settings, table=contract_table_name)
+
+    if fts_where:
+        upper_sql = sql.upper()
+        order_idx = upper_sql.find("ORDER BY")
+        if order_idx >= 0:
+            prefix = sql[:order_idx]
+            suffix = sql[order_idx:]
+        else:
+            prefix = sql
+            suffix = ""
+        if "WHERE" in prefix.upper():
+            prefix = prefix.rstrip() + f"\n  AND {fts_where}\n"
+        else:
+            prefix = prefix.rstrip() + f"\nWHERE {fts_where}\n"
+        sql = prefix + suffix
+        binds.update(fts_bind)
 
     rows, cols, exec_meta = _execute_oracle(sql, binds)
 
-    ft_bind_keys = [k for k in binds.keys() if k.startswith("ft_")]
-    fts_meta: Dict[str, Any] = {
-        "enabled": full_text_search and bool(intent.fts_tokens),
-        "tokens": intent.fts_tokens,
-        "columns": fts_columns if full_text_search else None,
-        "binds": ft_bind_keys or None,
-        "error": None,
-    }
+    ft_bind_keys = [k for k in binds.keys() if k.startswith("fts")]
+    fts_meta.update({"binds": ft_bind_keys or None})
+
+    explain = explain_interpretation(intent_dict, binds, table=contract_table_name)
 
     debug = {
-        "intent": _intent_debug(intent),
+        "intent": _intent_debug(intent_dict),
         "prompt": "",
         "validation": exec_meta.get("validation", {}),
         "fts": fts_meta,
@@ -192,34 +197,33 @@ def answer():
         "csv_path": exec_meta.get("csv_path"),
         "meta": {
             "binds": binds,
-            "wants_all_columns": intent.wants_all_columns,
+            "wants_all_columns": intent_dict.get("wants_all_columns"),
             "rowcount": len(rows),
             "attempt_no": 1,
             "strategy": "deterministic",
             "fts": fts_meta,
+            "builder": builder_meta,
         },
         "debug": debug,
         "ok": True,
+        "explain": explain,
     }
 
-    # ---------- Optional end-user explanation ----------
     include_explain_req = data.get("include_explain")
     include_explain_default = settings.get_bool("DW_INCLUDE_EXPLAIN", True)
     include_explain = include_explain_req if include_explain_req is not None else include_explain_default
 
-    if include_explain:
+    if include_explain and not result.get("explain"):
         meta_obj = result.get("meta")
         if not isinstance(meta_obj, dict):
             meta_obj = {}
-        columns_selected = meta_obj.get("projection_columns")
-        if not columns_selected:
-            columns_selected = cols
+        columns_selected = meta_obj.get("projection_columns") or cols
         try:
             result["explain"] = build_explanation(
-                intent=_intent_debug(intent),
+                intent=_intent_debug(intent_dict),
                 binds=meta_obj.get("binds", {}),
                 fts_meta=meta_obj.get("fts", {}),
-                table=str(contract_table),
+                table=str(contract_table_name),
                 cols_selected=columns_selected or [],
                 strategy=meta_obj.get("strategy", ""),
                 default_date_basis=settings.get("DW_DATE_COLUMN", "REQUEST_DATE"),
