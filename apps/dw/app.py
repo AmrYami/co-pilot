@@ -42,6 +42,8 @@ except Exception:  # pragma: no cover - lightweight fallback used in tests
 
 from core.settings import Settings
 
+from apps.dw.explain import build_explanation
+
 from .config import get_dw_fts_columns
 from .intent import NLIntent, parse_intent
 from .sql_builder import build_sql
@@ -199,6 +201,32 @@ def answer():
         "debug": debug,
         "ok": True,
     }
+
+    # ---------- Optional end-user explanation ----------
+    include_explain_req = data.get("include_explain")
+    include_explain_default = settings.get_bool("DW_INCLUDE_EXPLAIN", True)
+    include_explain = include_explain_req if include_explain_req is not None else include_explain_default
+
+    if include_explain:
+        meta_obj = result.get("meta")
+        if not isinstance(meta_obj, dict):
+            meta_obj = {}
+        columns_selected = meta_obj.get("projection_columns")
+        if not columns_selected:
+            columns_selected = cols
+        try:
+            result["explain"] = build_explanation(
+                intent=_intent_debug(intent),
+                binds=meta_obj.get("binds", {}),
+                fts_meta=meta_obj.get("fts", {}),
+                table=str(contract_table),
+                cols_selected=columns_selected or [],
+                strategy=meta_obj.get("strategy", ""),
+                default_date_basis=settings.get("DW_DATE_COLUMN", "REQUEST_DATE"),
+            )
+        except Exception as _e:  # pragma: no cover - defensive logging only
+            if isinstance(result.get("debug"), dict):
+                result["debug"]["explain_error"] = str(_e)
 
     with mem_engine.begin() as cx:
         cx.execute(
