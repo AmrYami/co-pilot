@@ -4,6 +4,7 @@ from typing import Dict, Tuple
 
 from .models import NLIntent
 from .table_profiles import CONTRACT_TABLE, STAKEHOLDER_COLS, gross_sql, net_sql
+from ..tables.contract import sql_total_gross_by_owner_department
 
 
 def _window_clause(intent: NLIntent, strict_overlap: bool = True) -> Tuple[str, Dict[str, str]]:
@@ -122,11 +123,23 @@ def build_sql(
         return sql, binds
 
     if intent.group_by == "OWNER_DEPARTMENT" and intent.agg in (None, "sum"):
-        where, win_binds = _window_clause(intent, strict_overlap=True)
+        wants_gross = "VAT" in (intent.measure_sql or "")
+        if wants_gross:
+            window = None
+            if intent.explicit_dates:
+                window = (":date_start", ":date_end")
+                binds["date_start"] = intent.explicit_dates["start"]
+                binds["date_end"] = intent.explicit_dates["end"]
+            sql = sql_total_gross_by_owner_department(
+                window=window,
+                strict_overlap=strict_overlap,
+            )
+            return sql, binds
+        where, win_binds = _window_clause(intent, strict_overlap=strict_overlap)
         clause = f"WHERE {where}" if where else ""
         sql = (
             "SELECT OWNER_DEPARTMENT AS GROUP_KEY, SUM("
-            f"{gross_sql()}) AS MEASURE "
+            f"{net_sql()}) AS MEASURE "
             f'FROM "{table}" {clause} '
             "GROUP BY OWNER_DEPARTMENT ORDER BY MEASURE DESC"
         )
@@ -155,7 +168,12 @@ def build_sql(
     where, win_binds = _window_clause(intent, strict_overlap=True)
     clause = f"WHERE {where}" if where else ""
     select_list = _select_star(intent)
-    order = intent.sort_by or intent.measure_sql or net_sql()
+    if intent.sort_by:
+        order = intent.sort_by
+    elif intent.date_column == "REQUEST_DATE":
+        order = "REQUEST_DATE"
+    else:
+        order = intent.measure_sql or net_sql()
     order_clause = f"ORDER BY {order} DESC" if intent.sort_desc else f"ORDER BY {order} ASC"
     fetch = _maybe_fetch_top(intent)
     sql = f'SELECT {select_list} FROM "{table}" {clause} {order_clause} {fetch}'.strip()
