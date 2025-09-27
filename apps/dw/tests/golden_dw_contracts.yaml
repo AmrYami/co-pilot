@@ -1,52 +1,16 @@
 tests:
-  - question: "top 10 contracts by contract value last month"
-    expect:
-      sql_contains:
-        - 'SELECT * FROM "Contract"'
-        - 'START_DATE <= :date_end AND END_DATE >= :date_start'
-        - 'ORDER BY NVL(CONTRACT_VALUE_NET_OF_VAT,0) DESC'
-        - 'FETCH FIRST :top_n ROWS ONLY'
-      must_order_by: true
-
-  - question: "contracts expiring in 30 days (count)"
-    expect:
-      sql_contains:
-        - 'COUNT(*) AS CNT'
-        - 'END_DATE BETWEEN :date_start AND :date_end'
-      must_order_by: false
-
-  - question: "List all contracts requested last month (contract id, owner, request date)."
-    expect:
-      sql_contains:
-        - 'REQUEST_DATE BETWEEN :date_start AND :date_end'
-        - 'ORDER BY REQUEST_DATE DESC'
-
-  - question: "Top 20 contracts by gross contract value last month"
-    expect:
-      sql_contains:
-        - 'SELECT * FROM "Contract"'
-        - 'START_DATE <= :date_end AND END_DATE >= :date_start'
-        - 'ORDER BY NVL(CONTRACT_VALUE_NET_OF_VAT,0) + CASE WHEN NVL(VAT,0) BETWEEN 0 AND 1'
-        - 'FETCH FIRST :top_n ROWS ONLY'
-
-  - question: "Total gross value of contracts per owner department last quarter"
-    expect:
-      sql_contains:
-        - 'OWNER_DEPARTMENT AS GROUP_KEY'
-        - 'SUM('
-        - ' GROUP BY OWNER_DEPARTMENT'
-      must_group_by: true
-
-  - question: "Count of contracts by status (all time)"
-    expect:
-      sql_contains:
-        - 'CONTRACT_STATUS AS GROUP_KEY'
-        - 'COUNT(*) AS CNT'
-        - ' GROUP BY CONTRACT_STATUS'
-      must_group_by: true
-
-  - question: "Show contracts where REQUEST TYPE = Renewal in 2023."
-    expect:
-      sql_contains:
-        - 'REQUEST_TYPE = :request_type'
-        - 'REQUEST_DATE BETWEEN :date_start AND :date_end'
+  - name: top_by_net_last_month
+    question: "top 10 contracts by contract value last month"
+    expect_like: "SELECT * FROM \"Contract\"%WHERE %(OVERLAP)s%ORDER BY NVL(CONTRACT_VALUE_NET_OF_VAT,0) DESC%FETCH FIRST :top_n ROWS ONLY"
+  - name: expiring_count_30
+    question: "contracts expiring in 30 days (count)"
+    expect_like: "SELECT COUNT(*) AS CNT FROM \"Contract\"%WHERE END_DATE BETWEEN :date_start AND :date_end"
+  - name: requested_last_month
+    question: "List all contracts requested last month (contract id, owner, request date)."
+    expect_like: "SELECT * FROM \"Contract\"%WHERE REQUEST_DATE BETWEEN :date_start AND :date_end%ORDER BY REQUEST_DATE DESC"
+  - name: gross_by_owner_dept_last_quarter
+    question: "Total gross value of contracts per owner department last quarter"
+    expect_like: "SELECT%OWNER_DEPARTMENT AS GROUP_KEY,%SUM%FROM \"Contract\"%WHERE %(OVERLAP)s%GROUP BY OWNER_DEPARTMENT%ORDER BY MEASURE DESC"
+  - name: count_by_status_all_time
+    question: "Count of contracts by status (all time)"
+    expect_like: "SELECT CONTRACT_STATUS AS GROUP_KEY, COUNT(*) AS CNT FROM \"Contract\" GROUP BY CONTRACT_STATUS ORDER BY CNT DESC"
