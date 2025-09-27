@@ -1,94 +1,297 @@
-cases:
-  - q: "list all contracts where CONTRACT_STATUS = expire"
-    intent:
-      direct_filter: {column: "CONTRACT_STATUS", op: "=", value: "expire"}
-      sort_desc: true
-    expect:
-      contains: ['WHERE UPPER(CONTRACT_STATUS) = UPPER(:df_val)']
+tests:
+  - name: "status_equals_expire"
+    question: "list all contracts where CONTRACT_STATUS = expire"
+    expect_contains:
+      - 'FROM "Contract"'
+      - 'WHERE'
+      - 'CONTRACT_STATUS'
+    notes: "Column-directed filter: use CONTRACT_STATUS equality, not overlap."
 
-  - q: "top 10 contracts by contract value last month"
-    intent:
-      date_column: "OVERLAP"
-      explicit_dates: {start: "2025-08-01", end: "2025-08-31"}
-      sort_by: "NVL(CONTRACT_VALUE_NET_OF_VAT,0)"
-      sort_desc: true
-      top_n: 10
-    expect:
-      contains: ['WHERE (START_DATE IS NOT NULL AND END_DATE IS NOT NULL AND START_DATE <= :date_end AND END_DATE >= :date_start)',
-                 'ORDER BY NVL(CONTRACT_VALUE_NET_OF_VAT,0) DESC',
-                 'FETCH FIRST :top_n ROWS ONLY']
+  - name: "top10_by_net_last_month"
+    question: "top 10 contracts by contract value last month"
+    expect_contains:
+      - 'FROM "Contract"'
+      - 'ORDER BY NVL(CONTRACT_VALUE_NET_OF_VAT,0) DESC'
+      - 'FETCH FIRST :top_n ROWS ONLY'
+      - 'START_DATE <= :date_end'
+      - 'END_DATE >= :date_start'
+    notes: "Overlap window; Top N by NET."
 
-  - q: "top 10 contracts by contract value last 8 months"
-    intent:
-      date_column: "OVERLAP"
-      explicit_dates: {start: "2025-02-01", end: "2025-09-30"}
-      sort_by: "NVL(CONTRACT_VALUE_NET_OF_VAT,0)"
-      sort_desc: true
-      top_n: 10
-    expect:
-      contains: ['START_DATE <= :date_end', 'END_DATE >= :date_start', 'FETCH FIRST :top_n ROWS ONLY']
+  - name: "top10_by_net_last_8_months"
+    question: "top 10 contracts by contract value last 8 months"
+    expect_contains:
+      - 'FROM "Contract"'
+      - 'ORDER BY NVL(CONTRACT_VALUE_NET_OF_VAT,0) DESC'
+      - 'FETCH FIRST :top_n ROWS ONLY'
+      - 'START_DATE <= :date_end'
+      - 'END_DATE >= :date_start'
+    notes: "Overlap window (8 months); Top N by NET."
 
-  - q: "contracts expiring in 30 days (count)"
-    intent:
-      agg: "count"
-      date_column: "END_DATE"
-      explicit_dates: {start: "2025-09-22", end: "2025-10-22"}
-    expect:
-      contains: ['SELECT COUNT(*) AS MEASURE', 'WHERE END_DATE BETWEEN :date_start AND :date_end']
+  - name: "expiring_30_days_count"
+    question: "contracts expiring in 30 days (count)"
+    expect_contains:
+      - 'SELECT COUNT(*) AS CNT'
+      - 'FROM "Contract"'
+      - 'END_DATE BETWEEN :date_start AND :date_end'
+    notes: "Expiry window uses END_DATE between."
 
-  - q: "List all contracts requested last month (contract id, owner, request date)."
-    intent:
-      date_column: "REQUEST_DATE"
-      explicit_dates: {start: "2025-08-01", end: "2025-08-31"}
-      sort_by: "REQUEST_DATE"
-      sort_desc: true
-    expect:
-      contains: ['WHERE REQUEST_DATE BETWEEN :date_start AND :date_end',
-                 'ORDER BY REQUEST_DATE DESC']
+  - name: "requested_last_month_subset_columns"
+    question: "List all contracts requested last month (contract id, owner, request date)."
+    expect_contains:
+      - 'SELECT'
+      - 'CONTRACT_ID'
+      - 'CONTRACT_OWNER'
+      - 'REQUEST_DATE'
+      - 'FROM "Contract"'
+      - 'REQUEST_DATE BETWEEN :date_start AND :date_end'
+    notes: "Projection is explicit; window on REQUEST_DATE."
 
-  - q: "Top 20 contracts by gross contract value last month"
-    intent:
-      date_column: "OVERLAP"
-      explicit_dates: {start: "2025-08-01", end: "2025-08-31"}
-      sort_by: "NVL(CONTRACT_VALUE_NET_OF_VAT,0) + CASE WHEN NVL(VAT,0) BETWEEN 0 AND 1 THEN NVL(CONTRACT_VALUE_NET_OF_VAT,0) * NVL(VAT,0) ELSE NVL(VAT,0) END"
-      sort_desc: true
-      top_n: 20
-    expect:
-      contains: ['ORDER BY NVL(CONTRACT_VALUE_NET_OF_VAT,0)', 'FETCH FIRST :top_n ROWS ONLY']
+  - name: "top20_by_gross_last_month"
+    question: "Top 20 contracts by gross contract value last month"
+    expect_contains:
+      - 'FROM "Contract"'
+      - 'ORDER BY NVL(CONTRACT_VALUE_NET_OF_VAT,0) + CASE'
+      - 'FETCH FIRST :top_n ROWS ONLY'
+      - 'START_DATE <= :date_end'
+      - 'END_DATE >= :date_start'
+    notes: "Overlap window; Top N by GROSS."
 
-  - q: "Total gross value of contracts per owner department last quarter"
-    intent:
-      date_column: "OVERLAP"
-      explicit_dates: {start: "2025-04-01", end: "2025-06-30"}
-      group_by: "OWNER_DEPARTMENT"
-      agg: "sum"
-      measure_sql: "NVL(CONTRACT_VALUE_NET_OF_VAT,0) + CASE WHEN NVL(VAT,0) BETWEEN 0 AND 1 THEN NVL(CONTRACT_VALUE_NET_OF_VAT,0) * NVL(VAT,0) ELSE NVL(VAT,0) END"
-      sort_desc: true
-    expect:
-      contains: ['GROUP BY OWNER_DEPARTMENT', 'SUM(']
+  - name: "gross_per_owner_dept_last_quarter"
+    question: "Total gross value of contracts per owner department last quarter"
+    expect_contains:
+      - 'FROM "Contract"'
+      - 'GROUP BY OWNER_DEPARTMENT'
+      - 'SUM(NVL(CONTRACT_VALUE_NET_OF_VAT,0) + CASE'
+      - 'START_DATE <= :date_end'
+      - 'END_DATE >= :date_start'
+    notes: "Grouped by OWNER_DEPARTMENT with overlap window."
 
-  - q: "Total gross value of contracts per owner department"
-    intent:
-      group_by: "OWNER_DEPARTMENT"
-      agg: "sum"
-      measure_sql: "NVL(CONTRACT_VALUE_NET_OF_VAT,0) + CASE WHEN NVL(VAT,0) BETWEEN 0 AND 1 THEN NVL(CONTRACT_VALUE_NET_OF_VAT,0) * NVL(VAT,0) ELSE NVL(VAT,0) END"
-      sort_desc: true
-    expect:
-      contains: ['GROUP BY OWNER_DEPARTMENT', 'SUM(']
+  - name: "gross_per_owner_dept_all_time"
+    question: "Total gross value of contracts per owner department"
+    expect_contains:
+      - 'FROM "Contract"'
+      - 'GROUP BY OWNER_DEPARTMENT'
+      - 'SUM(NVL(CONTRACT_VALUE_NET_OF_VAT,0) + CASE'
+    notes: "Grouped all-time; no required window."
 
-  - q: "Count of contracts by status (all time)"
-    intent:
-      group_by: "CONTRACT_STATUS"
-      agg: "count"
-      sort_desc: true
-    expect:
-      contains: ['SELECT CONTRACT_STATUS AS GROUP_KEY, COUNT(*) AS MEASURE', 'GROUP BY CONTRACT_STATUS']
+  - name: "count_by_status_all_time"
+    question: "Count of contracts by status (all time)"
+    expect_contains:
+      - 'FROM "Contract"'
+      - 'GROUP BY CONTRACT_STATUS'
+      - 'COUNT(*) AS CNT'
+    notes: "Grouped count by status."
 
-  - q: "Contracts with END_DATE in the next 90 days."
-    intent:
-      date_column: "END_DATE"
-      explicit_dates: {start: "2025-09-22", end: "2025-12-21"}
-      sort_by: "REQUEST_DATE"
-      sort_desc: true
-    expect:
-      contains: ['WHERE END_DATE BETWEEN :date_start AND :date_end']
+  - name: "end_date_next_90_days"
+    question: "Contracts with END_DATE in the next 90 days."
+    expect_contains:
+      - 'FROM "Contract"'
+      - 'WHERE END_DATE BETWEEN :date_start AND :date_end'
+    notes: "Explicit END_DATE window; simple listing."
+
+  - name: "vat_zero_or_null_value_positive"
+    question: "Contracts where VAT is null or zero but CONTRACT Value > 0."
+    expect_contains:
+      - 'FROM "Contract"'
+      - 'NVL(VAT, 0) = 0'
+      - 'NVL(CONTRACT_VALUE_NET_OF_VAT,0) > 0'
+    notes: "Data-quality style filter."
+
+  - name: "request_type_renewal_2023"
+    question: "Show contracts where REQUEST TYPE = Renewal in 2023."
+    expect_contains:
+      - 'FROM "Contract"'
+      - 'REQUEST_TYPE'
+      - 'REQUEST_DATE BETWEEN :date_start AND :date_end'
+    notes: "Column filter + REQUEST_DATE year window."
+
+  - name: "entity_distinct_counts"
+    question: "List distinct ENTITY values and their contract counts."
+    expect_contains:
+      - 'FROM "Contract"'
+      - 'GROUP BY ENTITY'
+      - 'COUNT(*) AS CNT'
+    notes: "Grouped by ENTITY."
+
+  - name: "owner_departments_list"
+    question: "list contracts owneres department."
+    expect_contains:
+      - 'FROM "Contract"'
+      - 'GROUP BY OWNER_DEPARTMENT'
+    notes: "Interpret as grouped by owner department (spelling tolerant)."
+
+  - name: "missing_contract_id"
+    question: "Contracts missing CONTRACT_ID (data quality check)."
+    expect_contains:
+      - 'FROM "Contract"'
+      - 'WHERE'
+      - 'CONTRACT_ID'
+    notes: "Check CONTRACT_ID IS NULL or blank."
+
+  - name: "gross_by_stakeholder_last_90_days_slots_1_8"
+    question: "For the last 90 days, total gross by stakeholder (across 1..8 slots)."
+    expect_contains:
+      - 'FROM "Contract"'
+      - 'CONTRACT_STAKEHOLDER_1'
+      - 'UNION ALL'
+      - 'GROUP BY'
+      - 'SUM(NVL(CONTRACT_VALUE_NET_OF_VAT,0) + CASE'
+    notes: "UNION ALL across stakeholder slots; group & sum gross."
+
+  - name: "top5_by_gross_ytd_2024"
+    question: "For 2024 YTD, top 5 contracts by gross."
+    expect_contains:
+      - 'FROM "Contract"'
+      - 'ORDER BY NVL(CONTRACT_VALUE_NET_OF_VAT,0) + CASE'
+      - 'FETCH FIRST :top_n ROWS ONLY'
+    notes: "YTD window; top by gross."
+
+  - name: "avg_gross_per_request_type_last_6_months"
+    question: "Average gross per REQUEST_TYPE in the last 6 months."
+    expect_contains:
+      - 'FROM "Contract"'
+      - 'GROUP BY REQUEST_TYPE'
+      - 'AVG('
+    notes: "AVG gross by request type; windowed."
+
+  - name: "monthly_trend_active_by_request_date_last_12_months"
+    question: "Monthly trend (last 12 months) of active contracts (by REQUEST_DATE)."
+    expect_contains:
+      - 'FROM "Contract"'
+      - "TRUNC(REQUEST_DATE, 'MM')"
+      - 'GROUP BY'
+    notes: "Monthly buckets by REQUEST_DATE."
+
+  - name: "entity_no_e123_total_and_count_by_status"
+    question: "For ENTITY_NO = 'E-123', total and count by CONTRACT_STATUS."
+    expect_contains:
+      - 'FROM "Contract"'
+      - 'WHERE'
+      - 'ENTITY_NO'
+      - 'GROUP BY CONTRACT_STATUS'
+    notes: "Filter ENTITY_NO then group by status."
+
+  - name: "expiring_30_60_90_three_counts"
+    question: "Contracts expiring in 30/60/90 days (three separate counts)."
+    expect_contains:
+      - 'FROM "Contract"'
+      - 'END_DATE BETWEEN'
+      - 'UNION ALL'
+    notes: "Three buckets via UNION ALL."
+
+  - name: "owner_dept_highest_avg_gross_last_quarter"
+    question: "Owner department with the highest average gross last quarter."
+    expect_contains:
+      - 'FROM "Contract"'
+      - 'GROUP BY OWNER_DEPARTMENT'
+      - 'AVG('
+      - 'FETCH FIRST 1 ROWS ONLY'
+    notes: "Top-1 by AVG gross last quarter."
+
+  - name: "stakeholders_more_than_n_in_2024"
+    question: "Stakeholders involved in more than N contracts in 2024."
+    expect_contains:
+      - 'GROUP BY'
+      - 'HAVING COUNT(*) >'
+    notes: "Threshold via HAVING; 2024 window."
+
+  - name: "missing_representative_email"
+    question: "Contracts where representative_email is missing."
+    expect_contains:
+      - 'FROM "Contract"'
+      - 'WHERE'
+      - 'REPRESENTATIVE_EMAIL'
+    notes: "Null/blank email filter."
+
+  - name: "requester_quarterly_totals"
+    question: "For REQUESTER = 'john@corp', total gross & count by quarter."
+    expect_contains:
+      - 'FROM "Contract"'
+      - 'WHERE'
+      - 'REQUESTER'
+      - "TRUNC(REQUEST_DATE, 'Q')"
+      - 'GROUP BY'
+    notes: "Group by quarter; filter requester."
+
+  - name: "stakeholder_departments_2024_with_totals"
+    question: "For each stakeholder, list distinct departments they touched in 2024, total gross, and contract count (one row per stakeholder)."
+    expect_contains:
+      - 'FROM "Contract"'
+      - 'LISTAGG'
+      - 'GROUP BY'
+    notes: "LISTAGG departments per stakeholder; 2024 window."
+
+  - name: "top10_contract_pairs_last_180_days"
+    question: "Top 10 contracts pairs by gross in the last 180 days."
+    expect_contains:
+      - 'FROM "Contract"'
+      - 'FETCH FIRST :top_n ROWS ONLY'
+    skip: true
+    notes: "Marked pending/skip — pairing definition ambiguous."
+
+  - name: "duplicate_contract_ids"
+    question: "Detect duplicate contract ids (same CONTRACT_ID across rows)."
+    expect_contains:
+      - 'FROM "Contract"'
+      - 'GROUP BY CONTRACT_ID'
+      - 'HAVING COUNT(*) > 1'
+    notes: "Duplicate check."
+
+  - name: "median_gross_per_owner_dept_this_year"
+    question: "Median gross value of contracts per owner department this year."
+    expect_contains:
+      - 'FROM "Contract"'
+      - 'PERCENTILE_CONT(0.5) WITHIN GROUP'
+      - 'GROUP BY OWNER_DEPARTMENT'
+    notes: "Median via PERCENTILE_CONT; year window."
+
+  - name: "end_date_lt_start_date_check"
+    question: "Contracts where END_DATE < START_DATE (integrity check)."
+    expect_contains:
+      - 'FROM "Contract"'
+      - 'WHERE END_DATE < START_DATE'
+    notes: "Simple integrity filter."
+
+  - name: "duration_mismatch_12_months"
+    question: "Contracts with DURATION like ""12 months"" but actual END_DATE–START_DATE != ~12 months."
+    expect_contains:
+      - 'FROM "Contract"'
+      - 'REGEXP_SUBSTR'
+      - 'ADD_MONTHS(START_DATE'
+    notes: "Duration text vs date delta; REGEXP + ADD_MONTHS."
+
+  - name: "yoy_gross_same_period"
+    question: "Year-over-year comparison of gross total for the same period (e.g., this Jan–Mar vs last Jan–Mar)."
+    expect_contains:
+      - 'FROM "Contract"'
+      - 'UNION ALL'
+      - 'SUM('
+      - 'REQUEST_DATE BETWEEN'
+    notes: "Two windows; compare with UNION ALL."
+
+  - name: "status_active_pending_gross_threshold"
+    question: "For CONTRACT_STATUS in ('Active','Pending'), list contracts whose total gross exceeds a threshold (e.g., > 1,000,000)."
+    expect_contains:
+      - 'FROM "Contract"'
+      - 'CONTRACT_STATUS'
+      - '>'
+      - 'NVL(CONTRACT_VALUE_NET_OF_VAT,0) + CASE'
+    notes: "Filter status IN; gross threshold."
+
+  - name: "entity_top3_contracts_last_365_days"
+    question: "For each ENTITY, top 3 contracts by gross in last 365 days."
+    expect_contains:
+      - 'FROM "Contract"'
+      - 'ROW_NUMBER() OVER (PARTITION BY ENTITY ORDER BY'
+      - 'WHERE rn <= 3'
+    notes: "Top-N per ENTITY via analytic row_number."
+
+  - name: "owner_dept_vs_oul_diff"
+    question: "OWNER_DEPARTMENT vs DEPARTMENT_OUL comparison (where OUL is the lead); list any cases."
+    expect_contains:
+      - 'FROM "Contract"'
+      - 'WHERE'
+      - 'DEPARTMENT_OUL'
+      - '<>'
+      - 'OWNER_DEPARTMENT'
+    notes: "Find mismatches between OUL and Owner department."
