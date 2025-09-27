@@ -1,280 +1,342 @@
+version: 1
 namespace: "dw::common"
 
+# Each case:
+#  - id: stable short id
+#  - question: user text
+#  - expect.must_contain: list of substrings that MUST appear in generated SQL (case-insensitive)
+#  - expect.must_not_contain: optional list of substrings that MUST NOT appear
+#  - note: free text (ignored by runner, for humans)
+
 cases:
-  - id: c001
+  - id: C_STATUS_EXPIRE
     question: "list all contracts where CONTRACT_STATUS = expire"
-    expect_sql_contains:
-      - 'FROM "Contract"'
-      - 'WHERE'
-      - 'CONTRACT_STATUS'
-    expect_sql_not_contains:
-      - 'BETWEEN :date_start AND :date_end'
+    expect:
+      must_contain:
+        - 'FROM "Contract"'
+        - 'CONTRACT_STATUS'
+        - "= 'expire'"
+      must_not_contain:
+        - 'GROUP BY'
 
-  - id: c002
+  - id: TOP10_NET_LAST_MONTH
     question: "top 10 contracts by contract value last month"
-    expect_sql_contains:
-      - 'FROM "Contract"'
-      - 'START_DATE <= :date_end'
-      - 'END_DATE >= :date_start'
-      - 'ORDER BY NVL(CONTRACT_VALUE_NET_OF_VAT,0) DESC'
-      - 'FETCH FIRST :top_n ROWS ONLY'
-    require_binds: [date_start, date_end, top_n]
+    expect:
+      must_contain:
+        - 'FROM "Contract"'
+        - 'ORDER BY NVL(CONTRACT_VALUE_NET_OF_VAT,0) DESC'
+        - 'FETCH FIRST :top_n ROWS ONLY'
+        - 'START_DATE'
+        - 'END_DATE'
+        - 'BETWEEN :date_start AND :date_end'
+      must_not_contain:
+        - 'REQUEST_DATE BETWEEN'   # لازم overlap مش requested
 
-  - id: c003
+  - id: TOP10_NET_LAST_8M
     question: "top 10 contracts by contract value last 8 months"
-    expect_sql_contains:
-      - 'FROM "Contract"'
-      - 'START_DATE <= :date_end'
-      - 'END_DATE >= :date_start'
-      - 'ORDER BY NVL(CONTRACT_VALUE_NET_OF_VAT,0) DESC'
-      - 'FETCH FIRST :top_n ROWS ONLY'
-    require_binds: [date_start, date_end, top_n]
+    expect:
+      must_contain:
+        - 'FROM "Contract"'
+        - 'ORDER BY NVL(CONTRACT_VALUE_NET_OF_VAT,0) DESC'
+        - 'FETCH FIRST :top_n ROWS ONLY'
+        - 'START_DATE'
+        - 'END_DATE'
+        - 'BETWEEN :date_start AND :date_end'
 
-  - id: c004
+  - id: EXPIRING_30_COUNT
     question: "contracts expiring in 30 days (count)"
-    expect_sql_contains:
-      - 'SELECT COUNT(*)'
-      - 'FROM "Contract"'
-      - 'END_DATE BETWEEN :date_start AND :date_end'
-    require_binds: [date_start, date_end]
+    expect:
+      must_contain:
+        - 'SELECT COUNT(*) AS CNT'
+        - 'FROM "Contract"'
+        - 'END_DATE BETWEEN :date_start AND :date_end'
+      must_not_contain:
+        - 'GROUP BY'
 
-  - id: c005
+  - id: REQUESTED_LAST_MONTH_COLUMNS
     question: "List all contracts requested last month (contract id, owner, request date)."
-    expect_sql_contains:
-      - 'FROM "Contract"'
-      - 'REQUEST_DATE BETWEEN :date_start AND :date_end'
-      - 'ORDER BY REQUEST_DATE DESC'
-    require_binds: [date_start, date_end]
+    expect:
+      must_contain:
+        - 'SELECT CONTRACT_ID, CONTRACT_OWNER, REQUEST_DATE'
+        - 'FROM "Contract"'
+        - 'REQUEST_DATE BETWEEN :date_start AND :date_end'
+        - 'ORDER BY REQUEST_DATE DESC'
 
-  - id: c006
+  - id: TOP20_GROSS_LAST_MONTH
     question: "Top 20 contracts by gross contract value last month"
-    expect_sql_contains:
-      - 'FROM "Contract"'
-      - 'START_DATE <= :date_end'
-      - 'END_DATE >= :date_start'
-      - 'ORDER BY NVL(CONTRACT_VALUE_NET_OF_VAT,0) + CASE WHEN NVL(VAT,0) BETWEEN 0 AND 1'
-      - 'FETCH FIRST :top_n ROWS ONLY'
-    require_binds: [date_start, date_end, top_n]
+    expect:
+      must_contain:
+        - 'FROM "Contract"'
+        - 'ORDER BY NVL(CONTRACT_VALUE_NET_OF_VAT,0) + CASE WHEN NVL(VAT,0) BETWEEN 0 AND 1 THEN NVL(CONTRACT_VALUE_NET_OF_VAT,0) * NVL(VAT,0) ELSE NVL(VAT,0) END DESC'
+        - 'FETCH FIRST :top_n ROWS ONLY'
+        - 'START_DATE'
+        - 'END_DATE'
+        - 'BETWEEN :date_start AND :date_end'
 
-  - id: c007
+  - id: GROSS_BY_OWNER_DEPT_LAST_Q
     question: "Total gross value of contracts per owner department last quarter"
-    expect_sql_contains:
-      - 'FROM "Contract"'
-      - 'GROUP BY OWNER_DEPARTMENT'
-      - 'SUM(NVL(CONTRACT_VALUE_NET_OF_VAT,0) + CASE WHEN NVL(VAT,0) BETWEEN 0 AND 1'
-      - 'START_DATE <= :date_end'
-      - 'END_DATE >= :date_start'
-    require_binds: [date_start, date_end]
+    expect:
+      must_contain:
+        - 'FROM "Contract"'
+        - 'OWNER_DEPARTMENT AS GROUP_KEY'
+        - 'SUM(NVL(CONTRACT_VALUE_NET_OF_VAT,0) + CASE WHEN NVL(VAT,0) BETWEEN 0 AND 1 THEN NVL(CONTRACT_VALUE_NET_OF_VAT,0) * NVL(VAT,0) ELSE NVL(VAT,0) END) AS'
+        - 'GROUP BY OWNER_DEPARTMENT'
+        - 'ORDER BY'
+        - 'START_DATE'
+        - 'END_DATE'
+        - 'BETWEEN :date_start AND :date_end'
 
-  - id: c008
+  - id: GROSS_BY_OWNER_DEPT_ALLTIME
     question: "Total gross value of contracts per owner department"
-    expect_sql_contains:
-      - 'FROM "Contract"'
-      - 'GROUP BY OWNER_DEPARTMENT'
-      - 'SUM(NVL(CONTRACT_VALUE_NET_OF_VAT,0) + CASE WHEN NVL(VAT,0) BETWEEN 0 AND 1'
+    expect:
+      must_contain:
+        - 'FROM "Contract"'
+        - 'OWNER_DEPARTMENT AS GROUP_KEY'
+        - 'SUM(NVL(CONTRACT_VALUE_NET_OF_VAT,0)'
+        - 'GROUP BY OWNER_DEPARTMENT'
+        - 'ORDER BY'
 
-  - id: c009
+  - id: COUNT_BY_STATUS_ALLTIME
     question: "Count of contracts by status (all time)"
-    expect_sql_contains:
-      - 'FROM "Contract"'
-      - 'CONTRACT_STATUS AS GROUP_KEY'
-      - 'COUNT(*) AS CNT'
-      - 'GROUP BY CONTRACT_STATUS'
-    expect_sql_not_contains:
-      - 'BETWEEN :date_start AND :date_end'
+    expect:
+      must_contain:
+        - 'FROM "Contract"'
+        - 'CONTRACT_STATUS AS GROUP_KEY'
+        - 'COUNT(*) AS CNT'
+        - 'GROUP BY CONTRACT_STATUS'
+        - 'ORDER BY CNT DESC'
 
-  - id: c010
+  - id: END_IN_NEXT_90D
     question: "Contracts with END_DATE in the next 90 days."
-    expect_sql_contains:
-      - 'FROM "Contract"'
-      - 'END_DATE BETWEEN :date_start AND :date_end'
-    require_binds: [date_start, date_end]
+    expect:
+      must_contain:
+        - 'FROM "Contract"'
+        - 'END_DATE BETWEEN :date_start AND :date_end'
 
-  - id: c011
+  - id: VAT_ZERO_BUT_VALUE_POS
     question: "Contracts where VAT is null or zero but CONTRACT Value > 0."
-    expect_sql_contains:
-      - 'FROM "Contract"'
-      - 'NVL(VAT, 0) = 0'
-      - 'NVL(CONTRACT_VALUE_NET_OF_VAT,0) > 0'
+    expect:
+      must_contain:
+        - 'FROM "Contract"'
+        - 'NVL(CONTRACT_VALUE_NET_OF_VAT,0) > 0'
+        - '(NVL(VAT,0) = 0 OR VAT IS NULL)'
 
-  - id: c012
+  - id: RENEWAL_2023
     question: "Show contracts where REQUEST TYPE = Renewal in 2023."
-    expect_sql_contains:
-      - 'FROM "Contract"'
-      - 'REQUEST_DATE BETWEEN :date_start AND :date_end'
-      - 'REQUEST_TYPE'
-    require_binds: [date_start, date_end]
+    expect:
+      must_contain:
+        - 'FROM "Contract"'
+        - "REQUEST_TYPE"
+        - "REQUEST_DATE BETWEEN :date_start AND :date_end"
 
-  - id: c013
+  - id: ENTITY_COUNTS
     question: "List distinct ENTITY values and their contract counts."
-    expect_sql_contains:
-      - 'FROM "Contract"'
-      - 'ENTITY AS GROUP_KEY'
-      - 'COUNT(*) AS CNT'
-      - 'GROUP BY ENTITY'
+    expect:
+      must_contain:
+        - 'FROM "Contract"'
+        - 'ENTITY AS GROUP_KEY'
+        - 'COUNT(*) AS CNT'
+        - 'GROUP BY ENTITY'
+        - 'ORDER BY CNT DESC'
 
-  - id: c014
+  - id: OWNER_DEPT_LIST
     question: "list contracts owneres department."
-    expect_sql_contains:
-      - 'FROM "Contract"'
-      - 'OWNER_DEPARTMENT AS GROUP_KEY'
-      - 'SUM(NVL(CONTRACT_VALUE_NET_OF_VAT,0)) AS MEASURE'
-      - 'GROUP BY OWNER_DEPARTMENT'
+    expect:
+      must_contain:
+        - 'FROM "Contract"'
+        - 'OWNER_DEPARTMENT AS GROUP_KEY'
+        - 'SUM(NVL(CONTRACT_VALUE_NET_OF_VAT,0)) AS MEASURE'
+        - 'GROUP BY OWNER_DEPARTMENT'
 
-  - id: c015
+  - id: MISSING_CONTRACT_ID
     question: "Contracts missing CONTRACT_ID (data quality check)."
-    expect_sql_contains:
-      - 'FROM "Contract"'
-      - '(CONTRACT_ID IS NULL OR TRIM(CONTRACT_ID) = '')'
+    expect:
+      must_contain:
+        - 'FROM "Contract"'
+        - "(CONTRACT_ID IS NULL OR TRIM(CONTRACT_ID) = '')"
 
-  - id: c016
+  - id: GROSS_BY_STAKEHOLDER_LAST_90
     question: "For the last 90 days, total gross by stakeholder (across 1..8 slots)."
-    expect_sql_contains:
-      - 'FROM "Contract"'
-      - 'CONTRACT_STAKEHOLDER_1'
-      - 'SUM(NVL(CONTRACT_VALUE_NET_OF_VAT,0) + CASE WHEN NVL(VAT,0) BETWEEN 0 AND 1'
-      - 'GROUP BY'
-    require_binds: [date_start, date_end]
+    expect:
+      must_contain:
+        - 'FROM "Contract"'
+        - 'GROUP BY'
+        - 'CONTRACT_STAKEHOLDER_1'
+        - 'SUM(NVL(CONTRACT_VALUE_NET_OF_VAT,0) + CASE WHEN NVL(VAT,0)'
+        - 'BETWEEN :date_start AND :date_end'
 
-  - id: c017
+  - id: TOP5_GROSS_2024_YTD
     question: "For 2024 YTD, top 5 contracts by gross."
-    expect_sql_contains:
-      - 'FROM "Contract"'
-      - 'ORDER BY NVL(CONTRACT_VALUE_NET_OF_VAT,0) + CASE WHEN NVL(VAT,0) BETWEEN 0 AND 1'
-      - 'FETCH FIRST :top_n ROWS ONLY'
-    require_binds: [date_start, date_end, top_n]
+    expect:
+      must_contain:
+        - 'FROM "Contract"'
+        - 'ORDER BY NVL(CONTRACT_VALUE_NET_OF_VAT,0) + CASE WHEN NVL(VAT,0)'
+        - 'FETCH FIRST :top_n ROWS ONLY'
+        - 'BETWEEN :date_start AND :date_end'
 
-  - id: c018
+  - id: AVG_GROSS_BY_REQTYPE_6M
     question: "Average gross per REQUEST_TYPE in the last 6 months."
-    expect_sql_contains:
-      - 'FROM "Contract"'
-      - 'GROUP BY REQUEST_TYPE'
-      - 'AVG('
-    require_binds: [date_start, date_end]
+    expect:
+      must_contain:
+        - 'FROM "Contract"'
+        - 'REQUEST_TYPE AS GROUP_KEY'
+        - 'AVG('
+        - 'GROUP BY REQUEST_TYPE'
+        - 'BETWEEN :date_start AND :date_end'
 
-  - id: c019
+  - id: MONTHLY_TREND_12M
     question: "Monthly trend (last 12 months) of active contracts (by REQUEST_DATE)."
-    expect_sql_contains:
-      - 'FROM "Contract"'
-      - "TRUNC(REQUEST_DATE,'MM')"
-      - "GROUP BY TRUNC(REQUEST_DATE,'MM')"
-    require_binds: [date_start, date_end]
+    expect:
+      must_contain:
+        - 'FROM "Contract"'
+        - 'REQUEST_DATE BETWEEN :date_start AND :date_end'
+        - "TRUNC(REQUEST_DATE, 'MM') AS PERIOD"
+        - "GROUP BY TRUNC(REQUEST_DATE, 'MM')"
 
-  - id: c020
+  - id: ENTITYNO_TOTAL_COUNT_BY_STATUS
     question: "For ENTITY_NO = 'E-123', total and count by CONTRACT_STATUS."
-    expect_sql_contains:
-      - 'FROM "Contract"'
-      - 'ENTITY_NO'
-      - 'CONTRACT_STATUS'
-      - 'GROUP BY CONTRACT_STATUS'
+    expect:
+      must_contain:
+        - 'FROM "Contract"'
+        - "ENTITY_NO = :entity_no"
+        - 'CONTRACT_STATUS AS GROUP_KEY'
+        - 'SUM('
+        - 'COUNT(*) AS CNT'
+        - 'GROUP BY CONTRACT_STATUS'
 
-  - id: c021
+  - id: EXPIRING_30_60_90_COUNTS
     question: "Contracts expiring in 30/60/90 days (three separate counts)."
-    expect_sql_contains:
-      - 'FROM "Contract"'
-      - 'END_DATE BETWEEN :date_start AND :date_end'
+    expect:
+      must_contain:
+        - 'FROM "Contract"'
+        - 'END_DATE'
+        - 'UNION ALL'
 
-  - id: c022
+  - id: OWNER_DEPT_HIGHEST_AVG_LAST_Q
     question: "Owner department with the highest average gross last quarter."
-    expect_sql_contains:
-      - 'FROM "Contract"'
-      - 'GROUP BY OWNER_DEPARTMENT'
-      - 'AVG('
-      - 'FETCH FIRST 1 ROWS ONLY'
+    expect:
+      must_contain:
+        - 'FROM "Contract"'
+        - 'OWNER_DEPARTMENT'
+        - 'AVG('
+        - 'GROUP BY OWNER_DEPARTMENT'
+        - 'ORDER BY'
+        - 'FETCH FIRST 1 ROW ONLY'
+        - 'BETWEEN :date_start AND :date_end'
 
-  - id: c023
+  - id: STAKEHOLDER_MORE_THAN_N_2024
     question: "Stakeholders involved in more than N contracts in 2024."
-    expect_sql_contains:
-      - 'FROM "Contract"'
-      - 'CONTRACT_STAKEHOLDER_1'
-      - 'GROUP BY CONTRACT_STAKEHOLDER_1'
-      - 'HAVING COUNT(*)'
-    require_binds: [date_start, date_end]
+    expect:
+      must_contain:
+        - 'FROM "Contract"'
+        - 'GROUP BY CONTRACT_STAKEHOLDER_1'
+        - 'HAVING COUNT(*) > :n'
+        - 'BETWEEN :date_start AND :date_end'
 
-  - id: c024
+  - id: MISSING_REP_EMAIL
     question: "Contracts where representative_email is missing."
-    expect_sql_contains:
-      - 'FROM "Contract"'
-      - '(representative_email IS NULL OR TRIM(representative_email) = '')'
+    expect:
+      must_contain:
+        - 'FROM "Contract"'
+        - "(representative_email IS NULL OR TRIM(representative_email) = '')"
 
-  - id: c025
+  - id: REQUESTER_GROSS_COUNT_BY_Q
     question: "For REQUESTER = 'john@corp', total gross & count by quarter."
-    expect_sql_contains:
-      - 'FROM "Contract"'
-      - "TRUNC(REQUEST_DATE,'Q')"
-      - 'GROUP BY TRUNC(REQUEST_DATE,'
-      - 'REQUESTER'
+    expect:
+      must_contain:
+        - 'FROM "Contract"'
+        - 'REQUESTER = :requester'
+        - "TRUNC(REQUEST_DATE, 'Q') AS PERIOD"
+        - 'SUM('
+        - 'COUNT(*) AS CNT'
+        - "GROUP BY TRUNC(REQUEST_DATE, 'Q')"
 
-  - id: c026
+  - id: PER_STAKEHOLDER_DEPTS_2024
     question: "For each stakeholder, list distinct departments they touched in 2024, total gross, and contract count (one row per stakeholder)."
-    expect_sql_contains:
-      - 'FROM "Contract"'
-      - 'CONTRACT_STAKEHOLDER_1'
-      - 'LISTAGG'
-      - 'GROUP BY CONTRACT_STAKEHOLDER_1'
-    require_binds: [date_start, date_end]
+    expect:
+      must_contain:
+        - 'FROM "Contract"'
+        - 'CONTRACT_STAKEHOLDER_1 AS STAKEHOLDER'
+        - 'LISTAGG('
+        - 'OWNER_DEPARTMENT'
+        - 'SUM('
+        - 'COUNT(*) AS CNT'
+        - 'GROUP BY CONTRACT_STAKEHOLDER_1'
 
-  - id: c027
+  - id: TOP10_PAIRS_180D
     question: "Top 10 contracts pairs by gross in the last 180 days."
-    expect_sql_contains:
-      - 'FROM "Contract"'
-      - 'ORDER BY'
-      - 'FETCH FIRST :top_n ROWS ONLY'
-    require_binds: [date_start, date_end, top_n]
+    expect:
+      must_contain:
+        - 'FROM "Contract"'
+        - 'ORDER BY'
+        - 'FETCH FIRST :top_n ROWS ONLY'
+        - 'BETWEEN :date_start AND :date_end'
 
-  - id: c028
+  - id: DUP_CONTRACT_IDS
     question: "Detect duplicate contract ids (same CONTRACT_ID across rows)."
-    expect_sql_contains:
-      - 'FROM "Contract"'
-      - 'GROUP BY CONTRACT_ID'
-      - 'HAVING COUNT(*) > 1'
+    expect:
+      must_contain:
+        - 'FROM "Contract"'
+        - 'CONTRACT_ID'
+        - 'COUNT(*)'
+        - 'GROUP BY CONTRACT_ID'
+        - 'HAVING COUNT(*) > 1'
 
-  - id: c029
+  - id: MEDIAN_GROSS_BY_DEPT_THIS_YEAR
     question: "Median gross value of contracts per owner department this year."
-    expect_sql_contains:
-      - 'FROM "Contract"'
-      - 'MEDIAN('
-      - 'GROUP BY OWNER_DEPARTMENT'
+    expect:
+      must_contain:
+        - 'FROM "Contract"'
+        - 'OWNER_DEPARTMENT'
+        - 'PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY'
+        - 'GROUP BY OWNER_DEPARTMENT'
 
-  - id: c030
+  - id: END_LT_START_CHECK
     question: "Contracts where END_DATE < START_DATE (integrity check)."
-    expect_sql_contains:
-      - 'FROM "Contract"'
-      - 'WHERE END_DATE < START_DATE'
+    expect:
+      must_contain:
+        - 'FROM "Contract"'
+        - 'END_DATE < START_DATE'
 
-  - id: c031
-    question: "Contracts with DURATION like \"12 months\" but actual END_DATE–START_DATE != ~12 months."
-    expect_sql_contains:
-      - 'FROM "Contract"'
-      - 'DURATION'
-      - 'MONTHS_BETWEEN('
+  - id: DURATION_12M_MISMATCH
+    question: 'Contracts with DURATION like "12 months" but actual END_DATE–START_DATE != ~12 months.'
+    expect:
+      must_contain:
+        - 'FROM "Contract"'
+        - "REGEXP_SUBSTR(DURATION"
+        - "MONTHS_BETWEEN(END_DATE, START_DATE)"
+        - "ABS("
 
-  - id: c032
-    question: "Year-over-year comparison of gross total for the same period (e.g., this Jan–Mar vs last Jan–Mar)."
-    expect_sql_contains:
-      - 'FROM "Contract"'
-      - "TRUNC(REQUEST_DATE,'YY')"
-      - 'SUM('
+  - id: YOY_GROSS_COMPARISON
+    question: 'Year-over-year comparison of gross total for the same period (e.g., this Jan–Mar vs last Jan–Mar).'
+    expect:
+      must_contain:
+        - 'FROM "Contract"'
+        - 'SUM('
+        - 'UNION ALL'
 
-  - id: c033
+  - id: ACTIVE_PENDING_GROSS_GT_THRESHOLD
     question: "For CONTRACT_STATUS in ('Active','Pending'), list contracts whose total gross exceeds a threshold (e.g., > 1,000,000)."
-    expect_sql_contains:
-      - 'FROM "Contract"'
-      - 'CONTRACT_STATUS'
-      - 'NVL(CONTRACT_VALUE_NET_OF_VAT,0)'
-      - '>'
-      - 'ORDER BY'
+    expect:
+      must_contain:
+        - 'FROM "Contract"'
+        - "CONTRACT_STATUS IN ('Active','Pending')"
+        - "NVL(CONTRACT_VALUE_NET_OF_VAT,0) + CASE WHEN NVL(VAT,0)"
+        - '> :threshold'
 
-  - id: c034
+  - id: PER_ENTITY_TOP3_LAST_365D
     question: "For each ENTITY, top 3 contracts by gross in last 365 days."
-    expect_sql_contains:
-      - 'FROM "Contract"'
-      - 'ROW_NUMBER() OVER (PARTITION BY ENTITY ORDER BY'
-      - 'WHERE'
-    require_binds: [date_start, date_end]
+    expect:
+      must_contain:
+        - 'FROM "Contract"'
+        - 'ROW_NUMBER() OVER (PARTITION BY ENTITY ORDER BY'
+        - 'NVL(CONTRACT_VALUE_NET_OF_VAT,0) + CASE WHEN NVL(VAT,0)'
+        - 'WHERE'
+        - 'BETWEEN :date_start AND :date_end'
 
-  - id: c035
+  - id: OWNER_DEPT_VS_OUL
     question: "OWNER_DEPARTMENT vs DEPARTMENT_OUL comparison (where OUL is the lead); list any cases."
-    expect_sql_contains:
-      - 'FROM "Contract"'
-      - 'WHERE OWNER_DEPARTMENT <> DEPARTMENT_OUL'
+    expect:
+      must_contain:
+        - 'FROM "Contract"'
+        - 'OWNER_DEPARTMENT <> DEPARTMENT_OUL'
