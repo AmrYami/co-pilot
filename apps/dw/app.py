@@ -53,7 +53,8 @@ except Exception:  # pragma: no cover - fallback for tests
 from core.inquiries import create_or_update_inquiry
 
 from .contract.plan import build_sql_for_question
-from .contracts.contract_common import coerce_oracle_binds
+from .contracts.contract_common import build_fts_clause, coerce_oracle_binds
+from .contracts.filters import parse_explicit_filters
 from .contracts.contract_planner import plan_contract_query
 from .rating import rate_bp
 
@@ -121,6 +122,53 @@ def _json_safe_binds(binds: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         else:
             safe[key] = value
     return safe
+
+
+DEFAULT_EXPLICIT_FILTER_COLUMNS: List[str] = [
+    "CONTRACT_STATUS",
+    "REQUEST_TYPE",
+    "ENTITY",
+    "ENTITY_NO",
+    "OWNER_DEPARTMENT",
+    "DEPARTMENT_OUL",
+    "CONTRACT_OWNER",
+    "CONTRACT_ID",
+]
+
+
+def _ensure_oracle_date(value: Optional[Any]) -> Optional[date]:
+    if value is None:
+        return None
+    if isinstance(value, date) and not isinstance(value, datetime):
+        return value
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, str):
+        try:
+            return datetime.strptime(value[:10], "%Y-%m-%d").date()
+        except ValueError:
+            return None
+    return None
+
+
+def _infer_window_column(question: str) -> str:
+    ql = (question or "").lower()
+    if any(word in ql for word in ("expire", "expired", "expiring", "termination", "ended")):
+        return "END_DATE"
+    if "start" in ql and "date" in ql:
+        return "START_DATE"
+    if "request" in ql:
+        return "REQUEST_DATE"
+    return "REQUEST_DATE"
+
+
+def _normalize_fts_clause(clause: str) -> str:
+    text = (clause or "").strip()
+    if not text:
+        return ""
+    if text.upper().startswith("AND "):
+        text = text[4:].strip()
+    return text
 
 
 _LAST_DAYS_RE = re.compile(r"last\s+(\d+)\s+day", re.IGNORECASE)
@@ -343,9 +391,35 @@ def answer():
         }
         return jsonify(response)
 
+    namespace = "dw::common"
+    settings = _get_settings()
+
+    table_name = "Contract"
+    getter = getattr(settings, "get", None) if settings is not None else None
+    if callable(getter):
+        try:
+            configured_table = getter("DW_CONTRACT_TABLE", scope="namespace", namespace=namespace)
+        except TypeError:
+            configured_table = getter("DW_CONTRACT_TABLE")
+        if configured_table:
+            table_name = str(configured_table)
+
     explicit_dates = _resolve_window(question)
 
-    fts_columns = _get_fts_columns(table="Contract", namespace="dw::common")
+    allowed_columns = DEFAULT_EXPLICIT_FILTER_COLUMNS
+    if callable(getter):
+        try:
+            raw_cols = getter("DW_EXPLICIT_FILTER_COLUMNS", scope="namespace", namespace=namespace)
+        except TypeError:
+            raw_cols = getter("DW_EXPLICIT_FILTER_COLUMNS")
+        if isinstance(raw_cols, (list, tuple, set)):
+            cols = [str(col).strip() for col in raw_cols if col is not None]
+            allowed_columns = [col for col in cols if col]
+        elif isinstance(raw_cols, str):
+            parsed = [part.strip() for part in raw_cols.split(",")]
+            allowed_columns = [col for col in parsed if col]
+
+    fts_columns = _get_fts_columns(table=table_name, namespace=namespace)
     fts_tokens = _extract_fts_tokens(question) if full_text_search else []
 
     top_n = payload.get("top_n")
@@ -353,6 +427,80 @@ def answer():
         top_n = _extract_top_n(question)
     elif isinstance(top_n, str) and top_n.isdigit():
         top_n = int(top_n)
+
+    explicit_snips, explicit_binds = parse_explicit_filters(question, allowed_columns)
+    if explicit_snips:
+        where_clauses = list(explicit_snips)
+        binds: Dict[str, Any] = dict(explicit_binds)
+        explain_bits = ["Applied explicit column filters from the question (took precedence over defaults)."]
+
+        if explicit_dates:
+            ds = _ensure_oracle_date(explicit_dates[0])
+            de = _ensure_oracle_date(explicit_dates[1])
+            if ds and de:
+                date_col = _infer_window_column(question)
+                binds["date_start"] = ds
+                binds["date_end"] = de
+                where_clauses.append(f"{date_col} BETWEEN :date_start AND :date_end")
+                explain_bits.append(f"Used date window {ds} .. {de} on {date_col}.")
+
+        if full_text_search and fts_columns and fts_tokens:
+            fts_clause, fts_binds = build_fts_clause(fts_columns, fts_tokens)
+            normalized = _normalize_fts_clause(fts_clause)
+            if normalized:
+                where_clauses.append(normalized)
+                explain_bits.append(f"Applied full-text search for tokens {fts_tokens}.")
+            binds.update(fts_binds)
+
+        sql = f'SELECT * FROM "{table_name}"'
+        if where_clauses:
+            sql += " WHERE " + " AND ".join(where_clauses)
+        order_by = "NVL(CONTRACT_VALUE_NET_OF_VAT,0)"
+        sql += f" ORDER BY {order_by} DESC"
+        if top_n:
+            binds["top_n"] = int(top_n)
+            sql += " FETCH FIRST :top_n ROWS ONLY"
+            explain_bits.append(f"Limited to top {int(top_n)} rows.")
+
+        LOGGER.info("[dw] explicit_filters_sql: %s", {"size": len(sql), "sql": sql})
+        rows, cols, exec_meta = _execute_oracle(sql, binds)
+
+        inquiry_id = _log_inquiry(
+            question,
+            auth_email,
+            status="answered",
+            rows=len(rows),
+            prefixes=prefixes,
+            payload=payload,
+        )
+
+        duration_ms = int((time.time() - t0) * 1000)
+        meta = {
+            "strategy": "explicit_filters",
+            "explicit_filters": True,
+            "binds": _json_safe_binds(binds),
+            **exec_meta,
+            "duration_ms": duration_ms,
+        }
+        response = {
+            "ok": True,
+            "inquiry_id": inquiry_id,
+            "rows": rows,
+            "columns": cols,
+            "sql": sql,
+            "meta": meta,
+            "explain": " ".join(explain_bits),
+            "debug": {
+                "explicit_filter_mode": True,
+                "intent": {
+                    "explicit_dates": _dates_to_iso(explicit_dates),
+                    "top_n": top_n,
+                    "full_text_search": full_text_search,
+                    "fts_tokens": fts_tokens,
+                },
+            },
+        }
+        return jsonify(response)
 
     sql, binds, meta, explain = plan_contract_query(
         question,
@@ -376,13 +524,16 @@ def answer():
     )
 
     duration_ms = int((time.time() - t0) * 1000)
+    meta_out: Dict[str, Any] = {**(meta or {}), **exec_meta, "duration_ms": duration_ms, "explicit_filters": False}
+    if "binds" not in meta_out:
+        meta_out["binds"] = _json_safe_binds(binds or {})
     response = {
         "ok": True,
         "inquiry_id": inquiry_id,
         "rows": rows,
         "columns": cols,
         "sql": sql,
-        "meta": {**(meta or {}), **exec_meta, "duration_ms": duration_ms},
+        "meta": meta_out,
         "explain": explain,
         "debug": {
             "intent": {
