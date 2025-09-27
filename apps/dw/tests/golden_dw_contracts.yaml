@@ -1,0 +1,19 @@
+# Simple golden tests for DW Contract intents (English-only inside code)
+cases:
+  - q: "top 10 contracts by contract value last month"
+    expect:
+      contains:
+        - "FROM \"Contract\""
+        - "ORDER BY NVL(CONTRACT_VALUE_NET_OF_VAT,0) DESC"
+        - "FETCH FIRST :top_n ROWS ONLY"
+  - q: "contracts expiring in 30 days (count)"
+    expect:
+      contains:
+        - "COUNT(*)"
+        - "END_DATE BETWEEN :date_start AND :date_end"
+  - q: "Total gross value of contracts per owner department last quarter"
+    expect:
+      contains:
+        - "OWNER_DEPARTMENT AS GROUP_KEY"
+        - "SUM("
+        - "GROUP BY OWNER_DEPARTMENT"
