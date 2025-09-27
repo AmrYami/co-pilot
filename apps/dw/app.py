@@ -57,14 +57,12 @@ from .contracts.contract_common import build_fts_clause, coerce_oracle_binds
 from .contracts.filters import parse_explicit_filters
 from .contracts.contract_planner import plan_contract_query
 from .rating import rate_bp
-from apps.dw.routes.golden import bp_golden as bp_golden_tests
 
 LOGGER = logging.getLogger("dw.app")
 
 
 dw_bp = Blueprint("dw", __name__)
 dw_bp.register_blueprint(rate_bp, url_prefix="")
-dw_bp.register_blueprint(bp_golden_tests, url_prefix="")
 
 
 def _ensure_engine():
@@ -124,6 +122,40 @@ def _json_safe_binds(binds: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         else:
             safe[key] = value
     return safe
+
+
+def derive_sql_for_test(question: str, namespace: str = "dw::common", test_binds: dict | None = None):
+    """Produce SQL (without execution) for a natural-language question.
+    Used by golden tests; merges deterministic planner binds with optional overrides."""
+    sql: str = ""
+    binds: Dict[str, Any] = {}
+    try:
+        sql, base_binds, _ = plan_sql(question, today=date.today())
+        binds.update(base_binds or {})
+    except Exception:  # pragma: no cover - defensive fallback for optional planner
+        sql = ""
+
+    if not sql:
+        explicit_dates = _resolve_window(question)
+        top_n = _extract_top_n(question)
+        fts_columns = _get_fts_columns(table="Contract", namespace=namespace)
+        sql, planner_binds, _, _ = plan_contract_query(
+            question,
+            explicit_dates=explicit_dates,
+            top_n=top_n,
+            full_text_search=False,
+            fts_columns=fts_columns,
+            fts_tokens=[],
+        )
+        binds.update(planner_binds or {})
+
+    if sql and ":top_n" in sql and "top_n" not in binds:
+        binds["top_n"] = 10
+
+    if test_binds:
+        binds.update(test_binds)
+
+    return sql, binds
 
 
 DEFAULT_EXPLICIT_FILTER_COLUMNS: List[str] = [
