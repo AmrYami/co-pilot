@@ -10,14 +10,13 @@ class Intent:
     kind: str
     reason: str
 
-# --- Patterns (EN + AR) ---
+# --- Patterns (EN) ---
 _GREETING = re.compile(
-    r'^\s*(hi|hello|hey|salam|salām|السلام\s*عليكم|مرحبا|أهلًا|اهلا|ازيك|صباح الخير|مساء الخير)\b',
+    r'^\s*(hi|hello|hey|salam|salām)\b',
     re.I | re.U
 )
 _HELP = re.compile(
-    r'\b(help|what\s+can\s+you\s+do|how\s+(?:do|can)\s+you\s+help|how\s+to\s+use|'
-    r'مساعدة|ممكن\s*تساعدني|تقدر\s*تعمل\s*ايه|ازاي\s*تستخدم)\b',
+    r'\b(help|what\s+can\s+you\s+do|how\s+(?:do|can)\s+you\s+help|how\s+to\s+use)\b',
     re.I | re.U
 )
 _ADMIN = re.compile(

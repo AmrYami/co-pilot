@@ -74,7 +74,7 @@ def parse_time_window(
     ref = _today(tz)
     inferred = False
 
-    match = re.search(r"\bbetween\b\s+(.+?)\s+\b(and|to|و)\b\s+(.+)", t)
+    match = re.search(r"\bbetween\b\s+(.+?)\s+\b(and|to)\b\s+(.+)", t)
     if match:
         a, _, b = match.groups()
         da = _parse_dateexpr(a)
@@ -88,18 +88,16 @@ def parse_time_window(
             )
 
     match = re.search(r"last\s+(\d+)\s+(day|days|week|weeks|month|months|year|years)", t)
-    if not match:
-        match = re.search(r"آخر\s+(\d+)\s+(يوم|أيام|أسبوع|أسابيع|شهر|أشهر|سنة|سنوات)", t)
     if match:
         n = int(match.group(1))
         unit = match.group(2)
-        if unit.startswith(("day", "يوم", "أيام")):
+        if unit.startswith("day"):
             start = ref - dt.timedelta(days=n)
             end = ref
-        elif unit.startswith(("week", "أسبوع")):
+        elif unit.startswith("week"):
             start = ref - dt.timedelta(days=7 * n)
             end = ref
-        elif unit.startswith(("month", "شهر", "أشهر")):
+        elif unit.startswith("month"):
             start = _add_months(ref, -n)
             end = ref
         else:
@@ -107,61 +105,61 @@ def parse_time_window(
             end = ref
         return ({"start": _fmt(start), "end": _fmt(end), "column": default_col}, True)
 
-    match = re.search(r"next\s+(\d+)\s+days", t) or re.search(r"القادمة\s+(\d+)\s+يوم", t)
+    match = re.search(r"next\s+(\d+)\s+days", t)
     if match:
         n = int(match.group(1))
         start = ref
         end = ref + dt.timedelta(days=n)
         return ({"start": _fmt(start), "end": _fmt(end), "column": default_col}, True)
 
-    if "last month" in t or "الشهر الماضي" in t:
+    if "last month" in t:
         first_this = ref.replace(day=1)
         end_last = first_this - dt.timedelta(days=1)
         start_last = end_last.replace(day=1)
         return ({"start": _fmt(start_last), "end": _fmt(end_last), "column": default_col}, True)
 
-    if "this month" in t or "هذا الشهر" in t:
+    if "this month" in t:
         start = ref.replace(day=1)
         end = _add_months(start, 1) - dt.timedelta(days=1)
         return ({"start": _fmt(start), "end": _fmt(end), "column": default_col}, True)
 
-    if "next month" in t or "الشهر القادم" in t:
+    if "next month" in t:
         start = _add_months(ref.replace(day=1), 1)
         end = _add_months(start, 1) - dt.timedelta(days=1)
         return ({"start": _fmt(start), "end": _fmt(end), "column": default_col}, True)
 
-    if "last quarter" in t or "الربع الماضي" in t:
+    if "last quarter" in t:
         start, end = last_quarter_bounds(ref)
         return ({"start": _fmt(start), "end": _fmt(end), "column": default_col}, True)
 
-    if "this quarter" in t or "الربع الحالي" in t:
+    if "this quarter" in t:
         start, end = quarter_bounds(ref)
         return ({"start": _fmt(start), "end": _fmt(end), "column": default_col}, True)
 
-    if "next quarter" in t or "الربع القادم" in t:
+    if "next quarter" in t:
         start_current, _ = quarter_bounds(ref)
         start_next = _add_months(start_current, 3)
         end_next = _add_months(start_next, 3) - dt.timedelta(days=1)
         return ({"start": _fmt(start_next), "end": _fmt(end_next), "column": default_col}, True)
 
-    match = re.search(r"in the next\s+(\d+)\s+days", t) or re.search(r"خلال\s+(\d+)\s+يوماً?", t)
+    match = re.search(r"in the next\s+(\d+)\s+days", t)
     if match:
         n = int(match.group(1))
         start = ref
         end = ref + dt.timedelta(days=n)
         return ({"start": _fmt(start), "end": _fmt(end), "column": default_col}, True)
 
-    if "last week" in t or "الأسبوع الماضي" in t:
+    if "last week" in t:
         start = ref - dt.timedelta(days=ref.weekday() + 7)
         end = start + dt.timedelta(days=6)
         return ({"start": _fmt(start), "end": _fmt(end), "column": default_col}, True)
 
-    if "this week" in t or "هذا الأسبوع" in t:
+    if "this week" in t:
         start = ref - dt.timedelta(days=ref.weekday())
         end = start + dt.timedelta(days=6)
         return ({"start": _fmt(start), "end": _fmt(end), "column": default_col}, True)
 
-    if "next week" in t or "الأسبوع القادم" in t:
+    if "next week" in t:
         start = ref + dt.timedelta(days=(7 - ref.weekday()))
         end = start + dt.timedelta(days=6)
         return ({"start": _fmt(start), "end": _fmt(end), "column": default_col}, True)

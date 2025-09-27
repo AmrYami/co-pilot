@@ -6,20 +6,17 @@ from core.dates import parse_time_window
 from core.nlu.schema import NLIntent, TimeWindow
 
 DIM_SYNONYMS = {
-    r"\bstakeholder(s)?\b|المساهم|صاحب المصلحة": "CONTRACT_STAKEHOLDER_1",
-    r"\b(owner\s+department|department)\b|القسم|الإدارة": "OWNER_DEPARTMENT",
-    r"\bowner\b|المالك": "CONTRACT_OWNER",
-    r"\bentity\b|الكيان": "ENTITY_NO",
+    r"\bstakeholder(s)?\b": "CONTRACT_STAKEHOLDER_1",
+    r"\b(owner\s+department|department)\b": "OWNER_DEPARTMENT",
+    r"\bowner\b": "CONTRACT_OWNER",
+    r"\bentity\b": "ENTITY_NO",
 }
 
-_RE_TOP = re.compile(
-    r"\btop\s+(\d+|[A-Za-z]+)\b|أعلى\s+(\d+|[^\s]+)",
-    re.I,
-)
+_RE_TOP = re.compile(r"\btop\s+(\d+|[A-Za-z]+)\b", re.I)
 _RE_COUNT = re.compile(r"\bcount\b|\(count\)", re.I)
-_RE_GROSS = re.compile(r"\bgross\b|إجمالي", re.I)
-_RE_NET = re.compile(r"\bnet\b|صافي", re.I)
-_RE_BY = re.compile(r"\bby\s+([a-z_ ]+)\b|\bper\s+([a-z_ ]+)\b|حسب\s+([^\s]+)", re.I)
+_RE_GROSS = re.compile(r"\bgross\b", re.I)
+_RE_NET = re.compile(r"\bnet\b", re.I)
+_RE_BY = re.compile(r"\bby\s+([a-z_ ]+)\b|\bper\s+([a-z_ ]+)\b", re.I)
 
 _TOP_WORDS = {
     "one": 1,
@@ -34,25 +31,7 @@ _TOP_WORDS = {
     "ten": 10,
     "eleven": 11,
     "twelve": 12,
-    "واحد": 1,
-    "اثنين": 2,
-    "اثنان": 2,
-    "ثلاث": 3,
-    "ثلاثة": 3,
-    "أربع": 4,
-    "أربعة": 4,
-    "خمسة": 5,
-    "ستة": 6,
-    "سبعة": 7,
-    "ثمانية": 8,
-    "تسعة": 9,
-    "عشرة": 10,
-    "إحدى": 11,
-    "إحدى عشر": 11,
-    "احدى عشر": 11,
-    "اثنا عشر": 12,
     "twenty": 20,
-    "عشرين": 20,
 }
 
 

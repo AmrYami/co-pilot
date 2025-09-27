@@ -57,11 +57,6 @@ _ALL_COL_HINTS = [
     "everything",
     "full details",
     "entire row",
-    "كل الأعمدة",
-    "كل الحقول",
-    "كل التفاصيل",
-    "الكل",
-    "كل السجلات",
 ]
 
 
@@ -308,11 +303,6 @@ def wants_all_columns_from_question(
         "distinct",
         "group by",
         "top ",
-        "أعلى",
-        "أكثر",
-        "مجموع",
-        "متوسط",
-        "عدد",
     ]
     if any(token in text for token in agg_tokens):
         return False

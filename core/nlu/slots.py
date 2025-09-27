@@ -15,7 +15,7 @@ _DIMENSION_MAP = {
 
 def extract_group_by(text: str) -> str | None:
     t = (text or "").lower()
-    match = re.search(r"\b(?:by|per)\s+([a-z_ ]+)\b", t) or re.search(r"\bحسب\s+([^\s]+)", t)
+    match = re.search(r"\b(?:by|per)\s+([a-z_ ]+)\b", t)
     if not match:
         return None
     key = match.group(1).strip()
@@ -27,9 +27,9 @@ def extract_group_by(text: str) -> str | None:
 
 def wants_gross(text: str) -> bool:
     t = (text or "").lower()
-    return "gross" in t or "الإجمالي" in t
+    return "gross" in t
 
 
 def wants_count(text: str) -> bool:
     t = (text or "").lower()
-    return " count" in t or "(count)" in t or "عدد" in t
+    return " count" in t or "(count)" in t
