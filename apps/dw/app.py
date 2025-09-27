@@ -52,17 +52,19 @@ except Exception:  # pragma: no cover - fallback for tests
 
 from core.inquiries import create_or_update_inquiry
 
-from .contract.plan import build_sql_for_question
+from apps.dw.tables.contracts import plan_sql
 from .contracts.contract_common import build_fts_clause, coerce_oracle_binds
 from .contracts.filters import parse_explicit_filters
 from .contracts.contract_planner import plan_contract_query
 from .rating import rate_bp
+from apps.dw.routes.golden import bp_golden as bp_golden_tests
 
 LOGGER = logging.getLogger("dw.app")
 
 
 dw_bp = Blueprint("dw", __name__)
 dw_bp.register_blueprint(rate_bp, url_prefix="")
+dw_bp.register_blueprint(bp_golden_tests, url_prefix="")
 
 
 def _ensure_engine():
@@ -359,9 +361,13 @@ def answer():
     auth_email = payload.get("auth_email") or None
     full_text_search = bool(payload.get("full_text_search") or False)
 
-    contract_sql, contract_binds, contract_explain = build_sql_for_question(question)
+    contract_sql, contract_binds, contract_meta = plan_sql(question, today=date.today())
     if contract_sql:
         binds = dict(contract_binds or {})
+        # ensure Oracle receives actual date objects
+        for key in ("date_start", "date_end"):
+            if key in binds and isinstance(binds[key], str):
+                binds[key] = datetime.fromisoformat(binds[key]).date()
         if ":top_n" in contract_sql and "top_n" not in binds:
             binds["top_n"] = 10
         rows, cols, exec_meta = _execute_oracle(contract_sql, binds)
@@ -383,10 +389,11 @@ def answer():
             "meta": {
                 "strategy": "contract_deterministic",
                 "binds": _json_safe_binds(binds),
+                **(contract_meta or {}),
                 **exec_meta,
                 "duration_ms": duration_ms,
             },
-            "explain": contract_explain,
+            "explain": (contract_meta or {}).get("explain"),
             "debug": {"contract_planner": True},
         }
         return jsonify(response)
