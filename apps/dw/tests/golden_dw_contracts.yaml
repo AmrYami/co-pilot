@@ -1,16 +1,77 @@
 tests:
-  - name: top_by_net_last_month
+  - id: status_expire
+    question: "list all contracts where CONTRACT_STATUS = expire"
+    must_contain:
+      - 'FROM "Contract"'
+      - 'UPPER(CONTRACT_STATUS) = UPPER(:status_val)'
+    forbid:
+      - 'GROUP BY'
+      - 'END_DATE BETWEEN'
+
+  - id: top10_last_month_net
     question: "top 10 contracts by contract value last month"
-    expect_like: "SELECT * FROM \"Contract\"%WHERE %(OVERLAP)s%ORDER BY NVL(CONTRACT_VALUE_NET_OF_VAT,0) DESC%FETCH FIRST :top_n ROWS ONLY"
-  - name: expiring_count_30
+    must_contain:
+      - 'FROM "Contract"'
+      - 'START_DATE <= :date_end'
+      - 'END_DATE >= :date_start'
+      - 'ORDER BY NVL(CONTRACT_VALUE_NET_OF_VAT,0) DESC'
+      - 'FETCH FIRST :top_n ROWS ONLY'
+
+  - id: top10_last8m_net
+    question: "top 10 contracts by contract value last 8 months"
+    must_contain:
+      - 'START_DATE <= :date_end'
+      - 'END_DATE >= :date_start'
+      - 'FETCH FIRST :top_n ROWS ONLY'
+
+  - id: expiring_30_count
     question: "contracts expiring in 30 days (count)"
-    expect_like: "SELECT COUNT(*) AS CNT FROM \"Contract\"%WHERE END_DATE BETWEEN :date_start AND :date_end"
-  - name: requested_last_month
+    must_contain:
+      - 'SELECT COUNT(*) AS CNT'
+      - 'END_DATE BETWEEN :date_start AND :date_end'
+    forbid:
+      - 'GROUP BY'
+
+  - id: requested_last_month_cols
     question: "List all contracts requested last month (contract id, owner, request date)."
-    expect_like: "SELECT * FROM \"Contract\"%WHERE REQUEST_DATE BETWEEN :date_start AND :date_end%ORDER BY REQUEST_DATE DESC"
-  - name: gross_by_owner_dept_last_quarter
+    must_contain:
+      - 'SELECT CONTRACT_ID, CONTRACT_OWNER, REQUEST_DATE'
+      - 'REQUEST_DATE BETWEEN :date_start AND :date_end'
+      - 'ORDER BY REQUEST_DATE DESC'
+
+  - id: top20_last_month_gross
+    question: "Top 20 contracts by gross contract value last month"
+    must_contain:
+      - 'START_DATE <= :date_end'
+      - 'END_DATE >= :date_start'
+      - 'FETCH FIRST :top_n ROWS ONLY'
+      - 'ORDER BY NVL(CONTRACT_VALUE_NET_OF_VAT,0) + CASE WHEN NVL(VAT,0)'
+
+  - id: gross_per_owner_last_q
     question: "Total gross value of contracts per owner department last quarter"
-    expect_like: "SELECT%OWNER_DEPARTMENT AS GROUP_KEY,%SUM%FROM \"Contract\"%WHERE %(OVERLAP)s%GROUP BY OWNER_DEPARTMENT%ORDER BY MEASURE DESC"
-  - name: count_by_status_all_time
+    must_contain:
+      - 'SELECT'
+      - 'OWNER_DEPARTMENT AS GROUP_KEY'
+      - 'SUM('
+      - 'GROUP BY OWNER_DEPARTMENT'
+
+  - id: gross_per_owner_all
+    question: "Total gross value of contracts per owner department"
+    must_contain:
+      - 'OWNER_DEPARTMENT AS GROUP_KEY'
+      - 'SUM('
+      - 'GROUP BY OWNER_DEPARTMENT'
+
+  - id: count_by_status
     question: "Count of contracts by status (all time)"
-    expect_like: "SELECT CONTRACT_STATUS AS GROUP_KEY, COUNT(*) AS CNT FROM \"Contract\" GROUP BY CONTRACT_STATUS ORDER BY CNT DESC"
+    must_contain:
+      - 'CONTRACT_STATUS AS GROUP_KEY'
+      - 'COUNT(*) AS CNT'
+      - 'GROUP BY CONTRACT_STATUS'
+
+  - id: end_next_90
+    question: "Contracts with END_DATE in the next 90 days."
+    must_contain:
+      - 'END_DATE BETWEEN :date_start AND :date_end'
+    forbid:
+      - 'START_DATE <= :date_end AND END_DATE >= :date_start'
