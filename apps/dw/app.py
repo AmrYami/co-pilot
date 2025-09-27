@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 import re
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 try:  # pragma: no cover - allow unit tests without Flask dependency
@@ -52,6 +52,7 @@ except Exception:  # pragma: no cover - fallback for tests
 
 from core.inquiries import create_or_update_inquiry
 
+from .contract.plan import build_sql_for_question
 from .contracts.contract_common import coerce_oracle_binds
 from .contracts.contract_planner import plan_contract_query
 from .rating import rate_bp
@@ -110,6 +111,16 @@ def _dates_to_iso(explicit: Optional[Tuple[date, date]]) -> Optional[Dict[str, s
         return None
     start, end = explicit
     return {"start": start.isoformat(), "end": end.isoformat()}
+
+
+def _json_safe_binds(binds: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    safe: Dict[str, Any] = {}
+    for key, value in (binds or {}).items():
+        if isinstance(value, (date, datetime)):
+            safe[key] = value.isoformat()
+        else:
+            safe[key] = value
+    return safe
 
 
 _LAST_DAYS_RE = re.compile(r"last\s+(\d+)\s+day", re.IGNORECASE)
@@ -299,6 +310,38 @@ def answer():
     prefixes = _coerce_prefixes(payload.get("prefixes"))
     auth_email = payload.get("auth_email") or None
     full_text_search = bool(payload.get("full_text_search") or False)
+
+    contract_sql, contract_binds, contract_explain = build_sql_for_question(question)
+    if contract_sql:
+        binds = dict(contract_binds or {})
+        if ":top_n" in contract_sql and "top_n" not in binds:
+            binds["top_n"] = 10
+        rows, cols, exec_meta = _execute_oracle(contract_sql, binds)
+        inquiry_id = _log_inquiry(
+            question,
+            auth_email,
+            status="answered",
+            rows=len(rows),
+            prefixes=prefixes,
+            payload=payload,
+        )
+        duration_ms = int((time.time() - t0) * 1000)
+        response = {
+            "ok": True,
+            "inquiry_id": inquiry_id,
+            "rows": rows,
+            "columns": cols,
+            "sql": contract_sql,
+            "meta": {
+                "strategy": "contract_deterministic",
+                "binds": _json_safe_binds(binds),
+                **exec_meta,
+                "duration_ms": duration_ms,
+            },
+            "explain": contract_explain,
+            "debug": {"contract_planner": True},
+        }
+        return jsonify(response)
 
     explicit_dates = _resolve_window(question)
 

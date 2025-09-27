@@ -10,21 +10,6 @@ try:  # pragma: no cover - optional dependency in test envs
 except Exception:  # pragma: no cover - graceful degradation
     w2n = None  # type: ignore
 
-_AR_NUM = {
-    "عشرة": 10,
-    "عشر": 10,
-    "خمسة": 5,
-    "خمس": 5,
-    "عشرين": 20,
-    "ثلاثين": 30,
-    "عشرون": 20,
-    "ثلاثون": 30,
-    "أربعون": 40,
-    "اربعون": 40,
-    "خمسون": 50,
-}
-
-
 def _word_to_num(token: str) -> Optional[int]:
     if not token:
         return None
@@ -45,7 +30,7 @@ def extract_top_n(text: str) -> int | None:
     if not t:
         return None
 
-    match = re.search(r"\btop\s+(\d+)\b", t) or re.search(r"\bأعلى\s+(\d+)\b", t)
+    match = re.search(r"\btop\s+(\d+)\b", t)
     if match:
         return int(match.group(1))
 
@@ -55,9 +40,5 @@ def extract_top_n(text: str) -> int | None:
             value = _word_to_num(rest[0])
             if value is not None:
                 return value
-
-    for word, val in _AR_NUM.items():
-        if f"أعلى {word}" in t or f"أفضل {word}" in t:
-            return val
 
     return None

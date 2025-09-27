@@ -7,8 +7,8 @@ from core.specs import QuestionSpec
 from core.model_loader import load_model, load_clarifier
 
 
-_SMALTALK = re.compile(r'^\s*(hi|hello|hey|السلام عليكم|مرحبا|أهلًا|اهلا|ازيك)\b', re.I)
-_HELP = re.compile(r'help|what can you do|how (?:do|can) you help|ممكن تساعد|تقدر تعمل ايه', re.I)
+_SMALTALK = re.compile(r'^\s*(hi|hello|hey)\b', re.I)
+_HELP = re.compile(r'help|what can you do|how (?:do|can) you help', re.I)
 
 SYS = (
     "You are a planning assistant. Output compact JSON only. "

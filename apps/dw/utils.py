@@ -55,7 +55,7 @@ def last_month(ref: datetime | None = None) -> tuple[str, str]:
     return first_prev.isoformat(), last_prev.isoformat()
 
 
-REQUEST_SYNONYMS = re.compile(r"\b(request|requested|request date|طلب)\b", re.I)
+REQUEST_SYNONYMS = re.compile(r"\b(request|requested|request date)\b", re.I)
 
 
 def mentions_requested(text: str) -> bool:

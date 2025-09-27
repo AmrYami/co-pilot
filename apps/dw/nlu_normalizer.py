@@ -26,15 +26,10 @@ DEFAULT_DATE_COL = "REQUEST_DATE"  # DW default
 DIMENSION_SYNONYMS = {
     # EN
     r"\bstakeholders?\b": "CONTRACT_STAKEHOLDER_1",
-    r"\bowner dept(?:artment)?\b": "OWNER_DEPARTMENT",
-    r"\bdepartment\b": "OWNER_DEPARTMENT",
-    r"\bentity\b": "ENTITY_NO",
-    r"\bowner\b": "CONTRACT_OWNER",
-    # AR (basic)
-    r"\bصاحب العقد\b": "CONTRACT_OWNER",
-    r"\bالقسم\b": "OWNER_DEPARTMENT",
-    r"\bجه(?:ة|ات)\b": "ENTITY_NO",
-    r"\bأصحاب المصلحة\b": "CONTRACT_STAKEHOLDER_1",
+    r"\bowner dept(?:artment)?s?\b": "OWNER_DEPARTMENT",
+    r"\bdepartments?\b": "OWNER_DEPARTMENT",
+    r"\bentities?\b": "ENTITY_NO",
+    r"\bowners?\b": "CONTRACT_OWNER",
 }
 
 GROSS_VALUE_EXPR = (
@@ -74,28 +69,11 @@ _NUM_WORDS = {
     "nineteen": 19,
     "twenty": 20,
 }
-_AR_NUM_WORDS = {
-    "واحد": 1,
-    "اثنين": 2,
-    "اتنين": 2,
-    "ثلاثة": 3,
-    "اربعة": 4,
-    "أربعة": 4,
-    "خمسة": 5,
-    "ستة": 6,
-    "سبعة": 7,
-    "ثمانية": 8,
-    "تسعة": 9,
-    "عشرة": 10,
-    "عشرون": 20,
-}
-
-
 def _to_int(tok: str) -> Optional[int]:
     t = tok.lower()
     if t.isdigit():
         return int(t)
-    return _NUM_WORDS.get(t) or _AR_NUM_WORDS.get(t)
+    return _NUM_WORDS.get(t)
 
 
 def _ensure_window(intent: NLIntent) -> TimeWindow:
@@ -172,37 +150,29 @@ def normalize(question: str, now: Optional[datetime] = None) -> NLIntent:
     intent = NLIntent(wants_all_columns=("select" not in q.lower()), notes={})
 
     # 1) Aggregation
-    if re.search(r"\bcount\b|\(count\)", q, re.I) or re.search(r"\bعدد\b", q):
+    if re.search(r"\bcount\b|\(count\)", q, re.I):
         intent.agg = "count"
-    elif re.search(r"\b(sum|total|اجمالي|إجمالي)\b", q, re.I):
+    elif re.search(r"\b(sum|total)\b", q, re.I):
         intent.agg = "sum"
-    elif re.search(r"\b(avg|average|متوسط)\b", q, re.I):
+    elif re.search(r"\b(avg|average)\b", q, re.I):
         intent.agg = "avg"
-    elif re.search(r"\bmin(imum)?\b|أقل", q, re.I):
+    elif re.search(r"\bmin(imum)?\b", q, re.I):
         intent.agg = "min"
-    elif re.search(r"\bmax(imum)?\b|أعلى|اكبر|أكبر", q, re.I):
+    elif re.search(r"\bmax(imum)?\b", q, re.I):
         intent.agg = "max"
 
     # 2) Measure: gross vs net
-    if re.search(r"\bgross\b|إجمالي شامل|شامل الضريبة", q, re.I):
+    if re.search(r"\bgross\b", q, re.I):
         intent.measure_sql = GROSS_VALUE_EXPR
-    elif re.search(r"\bnet\b|صافي", q, re.I):
+    elif re.search(r"\bnet\b", q, re.I):
         intent.measure_sql = NET_VALUE_EXPR
-    elif re.search(r"\b(contract value|value)\b|قيمة العقد", q, re.I):
+    elif re.search(r"\b(contract value|value)\b", q, re.I):
         intent.measure_sql = NET_VALUE_EXPR  # default for “contract value”
 
     # 3) Grouping (by/per <dimension>)
     m = re.search(r"\b(?:by|per)\s+([A-Za-z_ ]+)\b", q, re.I)
     if m:
         dim_txt = m.group(1).strip().lower()
-        for pat, col in DIMENSION_SYNONYMS.items():
-            if re.search(pat, dim_txt, re.I):
-                intent.group_by = col
-                break
-    # Arabic: "حسب <dimension>"
-    m = re.search(r"حسب\s+([^\s]+)", q)
-    if not intent.group_by and m:
-        dim_txt = m.group(1).strip()
         for pat, col in DIMENSION_SYNONYMS.items():
             if re.search(pat, dim_txt, re.I):
                 intent.group_by = col
@@ -214,16 +184,14 @@ def normalize(question: str, now: Optional[datetime] = None) -> NLIntent:
                 break
 
     # 4) Top/Bottom N
-    tb = re.search(
-        r"\b(top|highest|best|الأعلى|افضل|أفضل|أكبر|الأكثر)\s+(\w+)\b", q, re.I
-    )
+    tb = re.search(r"\b(top|highest|best|largest|most)\s+(\w+)\b", q, re.I)
     if tb:
         n = _to_int(tb.group(2))
         if n:
             intent.top_n = n
             intent.user_requested_top_n = True
             intent.sort_desc = True
-    bb = re.search(r"\b(bottom|lowest|least|الأقل|أصغر|الاقل)\s+(\w+)\b", q, re.I)
+    bb = re.search(r"\b(bottom|lowest|least|smallest)\s+(\w+)\b", q, re.I)
     if bb:
         n = _to_int(bb.group(2))
         if n:
@@ -235,24 +203,24 @@ def normalize(question: str, now: Optional[datetime] = None) -> NLIntent:
     ql = q.lower()
     tz = now.tzinfo or DEFAULT_TZ
     # Explicit phrases
-    if "last month" in ql or "الشهر الماضي" in ql:
+    if "last month" in ql:
         start, end = _month_range(now.replace(day=1) - timedelta(days=1))
         _set_window(intent, start=start.date().isoformat(), end=end.date().isoformat())
-    elif "next month" in ql or "الشهر القادم" in ql:
+    elif "next month" in ql:
         probe = now.replace(day=28) + timedelta(days=4)
         start, end = _month_range(probe)
         _set_window(intent, start=start.date().isoformat(), end=end.date().isoformat())
-    elif "this month" in ql or "هذا الشهر" in ql:
+    elif "this month" in ql:
         start, end = _month_range(now)
         _set_window(intent, start=start.date().isoformat(), end=end.date().isoformat())
-    elif "last quarter" in ql or "الربع الماضي" in ql:
+    elif "last quarter" in ql:
         start, end = _last_quarter_range(now)
         _set_window(intent, start=start.date().isoformat(), end=end.date().isoformat())
-    elif "this quarter" in ql or "الربع الحالي" in ql:
+    elif "this quarter" in ql:
         current_q = (now.month - 1) // 3 + 1
         start, end = _quarter_range(now.year, current_q, tz)
         _set_window(intent, start=start.date().isoformat(), end=end.date().isoformat())
-    elif "next quarter" in ql or "الربع القادم" in ql:
+    elif "next quarter" in ql:
         current_q = (now.month - 1) // 3 + 1
         next_q = current_q + 1
         year = now.year
@@ -261,13 +229,13 @@ def normalize(question: str, now: Optional[datetime] = None) -> NLIntent:
             year += 1
         start, end = _quarter_range(year, next_q, tz)
         _set_window(intent, start=start.date().isoformat(), end=end.date().isoformat())
-    elif "last year" in ql or "السنة الماضية" in ql or "العام الماضي" in ql:
+    elif "last year" in ql:
         start, end = _year_range(now.year - 1, tz)
         _set_window(intent, start=start.date().isoformat(), end=end.date().isoformat())
-    elif "this year" in ql or "هذه السنة" in ql or "هذا العام" in ql or "العام الحالي" in ql:
+    elif "this year" in ql:
         start, end = _year_range(now.year, tz)
         _set_window(intent, start=start.date().isoformat(), end=end.date().isoformat())
-    elif "next year" in ql or "السنة القادمة" in ql or "العام القادم" in ql:
+    elif "next year" in ql:
         start, end = _year_range(now.year + 1, tz)
         _set_window(intent, start=start.date().isoformat(), end=end.date().isoformat())
     else:
@@ -279,8 +247,8 @@ def normalize(question: str, now: Optional[datetime] = None) -> NLIntent:
             _set_window(intent, start=start.date().isoformat(), end=end.date().isoformat())
         else:
             n_window = re.search(
-                r"\b(last|next|within|in|القادم|الماضي|السابقة)\s+(\d+|\w+)\s+"
-                r"(day|days|week|weeks|month|months|year|years|يوم|أيام|اسبوع|أسابيع|شهر|شهور|سنة|سنوات)\b",
+                r"\b(last|next|within|in)\s+(\d+|\w+)\s+"
+                r"(day|days|week|weeks|month|months|year|years)\b",
                 q,
                 re.I,
             )
@@ -288,8 +256,8 @@ def normalize(question: str, now: Optional[datetime] = None) -> NLIntent:
                 dir_word, num_tok, unit = n_window.groups()
                 n = _to_int(num_tok) or 0
                 if n > 0:
-                    direction = "last" if re.search(r"last|الماضي|السابقة", dir_word, re.I) else "next"
-                    if re.search(r"month|شهر|شهور", unit, re.I):
+                    direction = "last" if re.search(r"last", dir_word, re.I) else "next"
+                    if re.search(r"month", unit, re.I):
                         if direction == "last":
                             start_probe = _shift_month(now, -n)
                             start = start_probe.replace(hour=0, minute=0, second=0, microsecond=0, day=1)
@@ -300,9 +268,9 @@ def normalize(question: str, now: Optional[datetime] = None) -> NLIntent:
                             _set_window(intent, start=now.date().isoformat(), end=end.date().isoformat())
                     else:
                         scale = 1
-                        if re.search(r"week|اسبوع|أسابيع", unit, re.I):
+                        if re.search(r"week", unit, re.I):
                             scale = 7
-                        if re.search(r"year|سنة|سنوات", unit, re.I):
+                        if re.search(r"year", unit, re.I):
                             scale = 365
                         delta = timedelta(days=scale * n)
                         if direction == "last":
@@ -328,9 +296,9 @@ def normalize(question: str, now: Optional[datetime] = None) -> NLIntent:
                         _set_window(intent, start=ds.date().isoformat(), end=de.date().isoformat())
 
     # Choose date column if user mentions END_DATE/START_DATE explicitly or via keywords
-    if re.search(r"\bEND_DATE\b", q, re.I) or "تاريخ الانتهاء" in q or re.search(r"expir", q, re.I):
+    if re.search(r"\bEND_DATE\b", q, re.I) or re.search(r"expir", q, re.I):
         intent.date_column = "END_DATE"
-    elif re.search(r"\bSTART_DATE\b", q, re.I) or "تاريخ البداية" in q:
+    elif re.search(r"\bSTART_DATE\b", q, re.I):
         intent.date_column = "START_DATE"
     else:
         intent.date_column = DEFAULT_DATE_COL

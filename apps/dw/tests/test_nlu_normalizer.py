@@ -42,9 +42,9 @@ def test_normalize_expiring_next_two_weeks():
     assert intent.explicit_dates.end == "2023-01-24"
 
 
-def test_normalize_arabic_top_entities_this_year():
+def test_normalize_top_entities_this_year():
     now = datetime(2023, 7, 1, tzinfo=DEFAULT_TZ)
-    intent = normalize("أفضل 3 جهات حسب قيمة العقد هذا العام", now=now)
+    intent = normalize("top three entities by contract value this year", now=now)
     assert intent.top_n == 3
     assert intent.group_by == "ENTITY_NO"
     assert intent.measure_sql == NET_VALUE_EXPR
