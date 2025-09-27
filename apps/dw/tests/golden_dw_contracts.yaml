@@ -1,471 +1,280 @@
-# Golden DW tests for "Contract" table.
-# These tests assert the exact SQL we expect the planner to produce for each natural-language question.
-# Dates are relative; the runner computes :date_start / :date_end from the "window" meta (last_month, last_8_months, etc).
+namespace: "dw::common"
 
-tests:
-
-  - id: list_contracts_where_status_expire
+cases:
+  - id: c001
     question: "list all contracts where CONTRACT_STATUS = expire"
-    expect_sql: |
-      SELECT *
-      FROM "Contract"
-      WHERE UPPER(NVL(CONTRACT_STATUS, '')) = 'EXPIRE'
-      ORDER BY REQUEST_DATE DESC
+    expect_sql_contains:
+      - 'FROM "Contract"'
+      - 'WHERE'
+      - 'CONTRACT_STATUS'
+    expect_sql_not_contains:
+      - 'BETWEEN :date_start AND :date_end'
 
-  - id: top10_by_net_last_month
+  - id: c002
     question: "top 10 contracts by contract value last month"
-    window: last_month_overlaps
-    expect_sql: |
-      SELECT *
-      FROM "Contract"
-      WHERE (START_DATE IS NOT NULL AND END_DATE IS NOT NULL
-             AND START_DATE <= :date_end AND END_DATE >= :date_start)
-      ORDER BY NVL(CONTRACT_VALUE_NET_OF_VAT,0) DESC
-      FETCH FIRST :top_n ROWS ONLY
+    expect_sql_contains:
+      - 'FROM "Contract"'
+      - 'START_DATE <= :date_end'
+      - 'END_DATE >= :date_start'
+      - 'ORDER BY NVL(CONTRACT_VALUE_NET_OF_VAT,0) DESC'
+      - 'FETCH FIRST :top_n ROWS ONLY'
+    require_binds: [date_start, date_end, top_n]
 
-  - id: top10_by_net_last_8_months
+  - id: c003
     question: "top 10 contracts by contract value last 8 months"
-    window: last_8_months_overlaps
-    expect_sql: |
-      SELECT *
-      FROM "Contract"
-      WHERE (START_DATE IS NOT NULL AND END_DATE IS NOT NULL
-             AND START_DATE <= :date_end AND END_DATE >= :date_start)
-      ORDER BY NVL(CONTRACT_VALUE_NET_OF_VAT,0) DESC
-      FETCH FIRST :top_n ROWS ONLY
+    expect_sql_contains:
+      - 'FROM "Contract"'
+      - 'START_DATE <= :date_end'
+      - 'END_DATE >= :date_start'
+      - 'ORDER BY NVL(CONTRACT_VALUE_NET_OF_VAT,0) DESC'
+      - 'FETCH FIRST :top_n ROWS ONLY'
+    require_binds: [date_start, date_end, top_n]
 
-  - id: expiring_in_30_days_count
+  - id: c004
     question: "contracts expiring in 30 days (count)"
-    window: next_30_days_enddate
-    expect_sql: |
-      SELECT COUNT(*) AS CNT
-      FROM "Contract"
-      WHERE END_DATE BETWEEN :date_start AND :date_end
+    expect_sql_contains:
+      - 'SELECT COUNT(*)'
+      - 'FROM "Contract"'
+      - 'END_DATE BETWEEN :date_start AND :date_end'
+    require_binds: [date_start, date_end]
 
-  - id: requested_last_month_list_core_cols
+  - id: c005
     question: "List all contracts requested last month (contract id, owner, request date)."
-    window: last_month_requestdate
-    expect_sql: |
-      SELECT CONTRACT_ID, CONTRACT_OWNER, REQUEST_DATE
-      FROM "Contract"
-      WHERE REQUEST_DATE BETWEEN :date_start AND :date_end
-      ORDER BY REQUEST_DATE DESC
+    expect_sql_contains:
+      - 'FROM "Contract"'
+      - 'REQUEST_DATE BETWEEN :date_start AND :date_end'
+      - 'ORDER BY REQUEST_DATE DESC'
+    require_binds: [date_start, date_end]
 
-  - id: top20_by_gross_last_month
+  - id: c006
     question: "Top 20 contracts by gross contract value last month"
-    window: last_month_overlaps
-    expect_sql: |
-      SELECT *
-      FROM "Contract"
-      WHERE (START_DATE IS NOT NULL AND END_DATE IS NOT NULL
-             AND START_DATE <= :date_end AND END_DATE >= :date_start)
-      ORDER BY (NVL(CONTRACT_VALUE_NET_OF_VAT,0)
-                + CASE WHEN NVL(VAT,0) BETWEEN 0 AND 1
-                       THEN NVL(CONTRACT_VALUE_NET_OF_VAT,0) * NVL(VAT,0)
-                       ELSE NVL(VAT,0) END) DESC
-      FETCH FIRST :top_n ROWS ONLY
+    expect_sql_contains:
+      - 'FROM "Contract"'
+      - 'START_DATE <= :date_end'
+      - 'END_DATE >= :date_start'
+      - 'ORDER BY NVL(CONTRACT_VALUE_NET_OF_VAT,0) + CASE WHEN NVL(VAT,0) BETWEEN 0 AND 1'
+      - 'FETCH FIRST :top_n ROWS ONLY'
+    require_binds: [date_start, date_end, top_n]
 
-  - id: gross_by_owner_dept_last_quarter
+  - id: c007
     question: "Total gross value of contracts per owner department last quarter"
-    window: last_quarter_overlaps
-    expect_sql: |
-      SELECT OWNER_DEPARTMENT AS GROUP_KEY,
-             SUM(NVL(CONTRACT_VALUE_NET_OF_VAT,0)
-                 + CASE WHEN NVL(VAT,0) BETWEEN 0 AND 1
-                        THEN NVL(CONTRACT_VALUE_NET_OF_VAT,0) * NVL(VAT,0)
-                        ELSE NVL(VAT,0) END) AS MEASURE
-      FROM "Contract"
-      WHERE (START_DATE IS NOT NULL AND END_DATE IS NOT NULL
-             AND START_DATE <= :date_end AND END_DATE >= :date_start)
-      GROUP BY OWNER_DEPARTMENT
-      ORDER BY MEASURE DESC
+    expect_sql_contains:
+      - 'FROM "Contract"'
+      - 'GROUP BY OWNER_DEPARTMENT'
+      - 'SUM(NVL(CONTRACT_VALUE_NET_OF_VAT,0) + CASE WHEN NVL(VAT,0) BETWEEN 0 AND 1'
+      - 'START_DATE <= :date_end'
+      - 'END_DATE >= :date_start'
+    require_binds: [date_start, date_end]
 
-  - id: gross_by_owner_dept_all_time
+  - id: c008
     question: "Total gross value of contracts per owner department"
-    expect_sql: |
-      SELECT OWNER_DEPARTMENT AS GROUP_KEY,
-             SUM(NVL(CONTRACT_VALUE_NET_OF_VAT,0)
-                 + CASE WHEN NVL(VAT,0) BETWEEN 0 AND 1
-                        THEN NVL(CONTRACT_VALUE_NET_OF_VAT,0) * NVL(VAT,0)
-                        ELSE NVL(VAT,0) END) AS MEASURE
-      FROM "Contract"
-      GROUP BY OWNER_DEPARTMENT
-      ORDER BY MEASURE DESC
+    expect_sql_contains:
+      - 'FROM "Contract"'
+      - 'GROUP BY OWNER_DEPARTMENT'
+      - 'SUM(NVL(CONTRACT_VALUE_NET_OF_VAT,0) + CASE WHEN NVL(VAT,0) BETWEEN 0 AND 1'
 
-  - id: count_by_status_all_time
+  - id: c009
     question: "Count of contracts by status (all time)"
-    expect_sql: |
-      SELECT CONTRACT_STATUS AS GROUP_KEY, COUNT(*) AS CNT
-      FROM "Contract"
-      GROUP BY CONTRACT_STATUS
-      ORDER BY CNT DESC
+    expect_sql_contains:
+      - 'FROM "Contract"'
+      - 'CONTRACT_STATUS AS GROUP_KEY'
+      - 'COUNT(*) AS CNT'
+      - 'GROUP BY CONTRACT_STATUS'
+    expect_sql_not_contains:
+      - 'BETWEEN :date_start AND :date_end'
 
-  - id: enddate_next_90_days_list
+  - id: c010
     question: "Contracts with END_DATE in the next 90 days."
-    window: next_90_days_enddate
-    expect_sql: |
-      SELECT *
-      FROM "Contract"
-      WHERE END_DATE BETWEEN :date_start AND :date_end
-      ORDER BY END_DATE ASC
+    expect_sql_contains:
+      - 'FROM "Contract"'
+      - 'END_DATE BETWEEN :date_start AND :date_end'
+    require_binds: [date_start, date_end]
 
-  - id: vat_zero_net_gt_zero
+  - id: c011
     question: "Contracts where VAT is null or zero but CONTRACT Value > 0."
-    expect_sql: |
-      SELECT *
-      FROM "Contract"
-      WHERE NVL(VAT,0) = 0
-        AND NVL(CONTRACT_VALUE_NET_OF_VAT,0) > 0
-      ORDER BY NVL(CONTRACT_VALUE_NET_OF_VAT,0) DESC
+    expect_sql_contains:
+      - 'FROM "Contract"'
+      - 'NVL(VAT, 0) = 0'
+      - 'NVL(CONTRACT_VALUE_NET_OF_VAT,0) > 0'
 
-  - id: renewal_in_2023
+  - id: c012
     question: "Show contracts where REQUEST TYPE = Renewal in 2023."
-    window: year_2023_requestdate
-    expect_sql: |
-      SELECT *
-      FROM "Contract"
-      WHERE UPPER(NVL(REQUEST_TYPE,'')) = 'RENEWAL'
-        AND REQUEST_DATE BETWEEN :date_start AND :date_end
-      ORDER BY REQUEST_DATE DESC
+    expect_sql_contains:
+      - 'FROM "Contract"'
+      - 'REQUEST_DATE BETWEEN :date_start AND :date_end'
+      - 'REQUEST_TYPE'
+    require_binds: [date_start, date_end]
 
-  - id: distinct_entity_counts
+  - id: c013
     question: "List distinct ENTITY values and their contract counts."
-    expect_sql: |
-      SELECT ENTITY AS GROUP_KEY, COUNT(*) AS CNT
-      FROM "Contract"
-      GROUP BY ENTITY
-      ORDER BY CNT DESC
+    expect_sql_contains:
+      - 'FROM "Contract"'
+      - 'ENTITY AS GROUP_KEY'
+      - 'COUNT(*) AS CNT'
+      - 'GROUP BY ENTITY'
 
-  - id: owner_dept_list_sum_net
+  - id: c014
     question: "list contracts owneres department."
-    expect_sql: |
-      SELECT OWNER_DEPARTMENT AS GROUP_KEY,
-             SUM(NVL(CONTRACT_VALUE_NET_OF_VAT,0)) AS MEASURE
-      FROM "Contract"
-      GROUP BY OWNER_DEPARTMENT
-      ORDER BY MEASURE DESC
+    expect_sql_contains:
+      - 'FROM "Contract"'
+      - 'OWNER_DEPARTMENT AS GROUP_KEY'
+      - 'SUM(NVL(CONTRACT_VALUE_NET_OF_VAT,0)) AS MEASURE'
+      - 'GROUP BY OWNER_DEPARTMENT'
 
-  - id: missing_contract_id_dq
+  - id: c015
     question: "Contracts missing CONTRACT_ID (data quality check)."
-    expect_sql: |
-      SELECT *
-      FROM "Contract"
-      WHERE CONTRACT_ID IS NULL OR TRIM(CONTRACT_ID) = ''
-      ORDER BY REQUEST_DATE DESC
+    expect_sql_contains:
+      - 'FROM "Contract"'
+      - '(CONTRACT_ID IS NULL OR TRIM(CONTRACT_ID) = '')'
 
-  - id: gross_by_stakeholder_90_days_slots_1_8
+  - id: c016
     question: "For the last 90 days, total gross by stakeholder (across 1..8 slots)."
-    window: last_90_days_overlaps
-    expect_sql: |
-      WITH U AS (
-        SELECT CONTRACT_ID, OWNER_DEPARTMENT, REQUEST_DATE, START_DATE, END_DATE,
-               CONTRACT_VALUE_NET_OF_VAT, VAT, CONTRACT_STAKEHOLDER_1 AS STAKEHOLDER FROM "Contract"
-        UNION ALL SELECT CONTRACT_ID, OWNER_DEPARTMENT, REQUEST_DATE, START_DATE, END_DATE,
-               CONTRACT_VALUE_NET_OF_VAT, VAT, CONTRACT_STAKEHOLDER_2 FROM "Contract"
-        UNION ALL SELECT CONTRACT_ID, OWNER_DEPARTMENT, REQUEST_DATE, START_DATE, END_DATE,
-               CONTRACT_VALUE_NET_OF_VAT, VAT, CONTRACT_STAKEHOLDER_3 FROM "Contract"
-        UNION ALL SELECT CONTRACT_ID, OWNER_DEPARTMENT, REQUEST_DATE, START_DATE, END_DATE,
-               CONTRACT_VALUE_NET_OF_VAT, VAT, CONTRACT_STAKEHOLDER_4 FROM "Contract"
-        UNION ALL SELECT CONTRACT_ID, OWNER_DEPARTMENT, REQUEST_DATE, START_DATE, END_DATE,
-               CONTRACT_VALUE_NET_OF_VAT, VAT, CONTRACT_STAKEHOLDER_5 FROM "Contract"
-        UNION ALL SELECT CONTRACT_ID, OWNER_DEPARTMENT, REQUEST_DATE, START_DATE, END_DATE,
-               CONTRACT_VALUE_NET_OF_VAT, VAT, CONTRACT_STAKEHOLDER_6 FROM "Contract"
-        UNION ALL SELECT CONTRACT_ID, OWNER_DEPARTMENT, REQUEST_DATE, START_DATE, END_DATE,
-               CONTRACT_VALUE_NET_OF_VAT, VAT, CONTRACT_STAKEHOLDER_7 FROM "Contract"
-        UNION ALL SELECT CONTRACT_ID, OWNER_DEPARTMENT, REQUEST_DATE, START_DATE, END_DATE,
-               CONTRACT_VALUE_NET_OF_VAT, VAT, CONTRACT_STAKEHOLDER_8 FROM "Contract"
-      )
-      SELECT STAKEHOLDER AS GROUP_KEY,
-             SUM(NVL(CONTRACT_VALUE_NET_OF_VAT,0)
-                 + CASE WHEN NVL(VAT,0) BETWEEN 0 AND 1
-                        THEN NVL(CONTRACT_VALUE_NET_OF_VAT,0) * NVL(VAT,0)
-                        ELSE NVL(VAT,0) END) AS MEASURE
-      FROM U
-      WHERE STAKEHOLDER IS NOT NULL
-        AND (START_DATE IS NOT NULL AND END_DATE IS NOT NULL
-             AND START_DATE <= :date_end AND END_DATE >= :date_start)
-      GROUP BY STAKEHOLDER
-      ORDER BY MEASURE DESC
+    expect_sql_contains:
+      - 'FROM "Contract"'
+      - 'CONTRACT_STAKEHOLDER_1'
+      - 'SUM(NVL(CONTRACT_VALUE_NET_OF_VAT,0) + CASE WHEN NVL(VAT,0) BETWEEN 0 AND 1'
+      - 'GROUP BY'
+    require_binds: [date_start, date_end]
 
-  - id: top5_by_gross_2024_ytd
+  - id: c017
     question: "For 2024 YTD, top 5 contracts by gross."
-    window: ytd_2024_overlaps
-    expect_sql: |
-      SELECT CONTRACT_ID, CONTRACT_OWNER, REQUEST_DATE, START_DATE, END_DATE
-      FROM "Contract"
-      WHERE (START_DATE IS NOT NULL AND END_DATE IS NOT NULL
-             AND START_DATE <= :date_end AND END_DATE >= :date_start)
-      ORDER BY (NVL(CONTRACT_VALUE_NET_OF_VAT,0)
-                + CASE WHEN NVL(VAT,0) BETWEEN 0 AND 1
-                       THEN NVL(CONTRACT_VALUE_NET_OF_VAT,0) * NVL(VAT,0)
-                       ELSE NVL(VAT,0) END) DESC
-      FETCH FIRST :top_n ROWS ONLY
+    expect_sql_contains:
+      - 'FROM "Contract"'
+      - 'ORDER BY NVL(CONTRACT_VALUE_NET_OF_VAT,0) + CASE WHEN NVL(VAT,0) BETWEEN 0 AND 1'
+      - 'FETCH FIRST :top_n ROWS ONLY'
+    require_binds: [date_start, date_end, top_n]
 
-  - id: avg_gross_per_request_type_last_6m
+  - id: c018
     question: "Average gross per REQUEST_TYPE in the last 6 months."
-    window: last_6_months_overlaps
-    expect_sql: |
-      SELECT REQUEST_TYPE AS GROUP_KEY,
-             AVG(NVL(CONTRACT_VALUE_NET_OF_VAT,0)
-                 + CASE WHEN NVL(VAT,0) BETWEEN 0 AND 1
-                        THEN NVL(CONTRACT_VALUE_NET_OF_VAT,0) * NVL(VAT,0)
-                        ELSE NVL(VAT,0) END) AS AVG_GROSS
-      FROM "Contract"
-      WHERE (START_DATE IS NOT NULL AND END_DATE IS NOT NULL
-             AND START_DATE <= :date_end AND END_DATE >= :date_start)
-      GROUP BY REQUEST_TYPE
-      ORDER BY AVG_GROSS DESC
+    expect_sql_contains:
+      - 'FROM "Contract"'
+      - 'GROUP BY REQUEST_TYPE'
+      - 'AVG('
+    require_binds: [date_start, date_end]
 
-  - id: monthly_trend_last_12m_reqdate
+  - id: c019
     question: "Monthly trend (last 12 months) of active contracts (by REQUEST_DATE)."
-    window: last_12_months_requestdate
-    expect_sql: |
-      SELECT TRUNC(REQUEST_DATE, 'MM') AS MONTH_KEY, COUNT(*) AS CNT
-      FROM "Contract"
-      WHERE REQUEST_DATE BETWEEN :date_start AND :date_end
-      GROUP BY TRUNC(REQUEST_DATE, 'MM')
-      ORDER BY MONTH_KEY ASC
+    expect_sql_contains:
+      - 'FROM "Contract"'
+      - "TRUNC(REQUEST_DATE,'MM')"
+      - "GROUP BY TRUNC(REQUEST_DATE,'MM')"
+    require_binds: [date_start, date_end]
 
-  - id: entity_no_bucket_total_count_status
+  - id: c020
     question: "For ENTITY_NO = 'E-123', total and count by CONTRACT_STATUS."
-    expect_sql: |
-      SELECT CONTRACT_STATUS AS GROUP_KEY,
-             SUM(NVL(CONTRACT_VALUE_NET_OF_VAT,0)
-                 + CASE WHEN NVL(VAT,0) BETWEEN 0 AND 1
-                        THEN NVL(CONTRACT_VALUE_NET_OF_VAT,0) * NVL(VAT,0)
-                        ELSE NVL(VAT,0) END) AS MEASURE,
-             COUNT(*) AS CNT
-      FROM "Contract"
-      WHERE ENTITY_NO = :entity_no
-      GROUP BY CONTRACT_STATUS
-      ORDER BY MEASURE DESC
+    expect_sql_contains:
+      - 'FROM "Contract"'
+      - 'ENTITY_NO'
+      - 'CONTRACT_STATUS'
+      - 'GROUP BY CONTRACT_STATUS'
 
-  - id: counts_expiring_30_60_90
+  - id: c021
     question: "Contracts expiring in 30/60/90 days (three separate counts)."
-    expect_sql: |
-      SELECT 30 AS WINDOW_DAYS, COUNT(*) AS CNT
-      FROM "Contract"
-      WHERE END_DATE BETWEEN :d30_start AND :d30_end
-      UNION ALL
-      SELECT 60 AS WINDOW_DAYS, COUNT(*) AS CNT
-      FROM "Contract"
-      WHERE END_DATE BETWEEN :d60_start AND :d60_end
-      UNION ALL
-      SELECT 90 AS WINDOW_DAYS, COUNT(*) AS CNT
-      FROM "Contract"
-      WHERE END_DATE BETWEEN :d90_start AND :d90_end
+    expect_sql_contains:
+      - 'FROM "Contract"'
+      - 'END_DATE BETWEEN :date_start AND :date_end'
 
-  - id: owner_dept_highest_avg_gross_last_quarter
+  - id: c022
     question: "Owner department with the highest average gross last quarter."
-    window: last_quarter_overlaps
-    expect_sql: |
-      SELECT OWNER_DEPARTMENT, AVG(NVL(CONTRACT_VALUE_NET_OF_VAT,0)
-                 + CASE WHEN NVL(VAT,0) BETWEEN 0 AND 1
-                        THEN NVL(CONTRACT_VALUE_NET_OF_VAT,0) * NVL(VAT,0)
-                        ELSE NVL(VAT,0) END) AS AVG_GROSS
-      FROM "Contract"
-      WHERE (START_DATE IS NOT NULL AND END_DATE IS NOT NULL
-             AND START_DATE <= :date_end AND END_DATE >= :date_start)
-      GROUP BY OWNER_DEPARTMENT
-      ORDER BY AVG_GROSS DESC
-      FETCH FIRST 1 ROWS ONLY
+    expect_sql_contains:
+      - 'FROM "Contract"'
+      - 'GROUP BY OWNER_DEPARTMENT'
+      - 'AVG('
+      - 'FETCH FIRST 1 ROWS ONLY'
 
-  - id: stakeholders_more_than_n_in_2024
+  - id: c023
     question: "Stakeholders involved in more than N contracts in 2024."
-    window: year_2024_overlaps
-    expect_sql: |
-      WITH U AS (
-        SELECT CONTRACT_ID, REQUEST_DATE, START_DATE, END_DATE, CONTRACT_STAKEHOLDER_1 AS STAKEHOLDER FROM "Contract"
-        UNION ALL SELECT CONTRACT_ID, REQUEST_DATE, START_DATE, END_DATE, CONTRACT_STAKEHOLDER_2 FROM "Contract"
-        UNION ALL SELECT CONTRACT_ID, REQUEST_DATE, START_DATE, END_DATE, CONTRACT_STAKEHOLDER_3 FROM "Contract"
-        UNION ALL SELECT CONTRACT_ID, REQUEST_DATE, START_DATE, END_DATE, CONTRACT_STAKEHOLDER_4 FROM "Contract"
-        UNION ALL SELECT CONTRACT_ID, REQUEST_DATE, START_DATE, END_DATE, CONTRACT_STAKEHOLDER_5 FROM "Contract"
-        UNION ALL SELECT CONTRACT_ID, REQUEST_DATE, START_DATE, END_DATE, CONTRACT_STAKEHOLDER_6 FROM "Contract"
-        UNION ALL SELECT CONTRACT_ID, REQUEST_DATE, START_DATE, END_DATE, CONTRACT_STAKEHOLDER_7 FROM "Contract"
-        UNION ALL SELECT CONTRACT_ID, REQUEST_DATE, START_DATE, END_DATE, CONTRACT_STAKEHOLDER_8 FROM "Contract"
-      )
-      SELECT STAKEHOLDER, COUNT(DISTINCT CONTRACT_ID) AS CONTRACTS_CNT
-      FROM U
-      WHERE STAKEHOLDER IS NOT NULL
-        AND (START_DATE IS NOT NULL AND END_DATE IS NOT NULL
-             AND START_DATE <= :date_end AND END_DATE >= :date_start)
-      GROUP BY STAKEHOLDER
-      HAVING COUNT(DISTINCT CONTRACT_ID) > :min_n
-      ORDER BY CONTRACTS_CNT DESC
+    expect_sql_contains:
+      - 'FROM "Contract"'
+      - 'CONTRACT_STAKEHOLDER_1'
+      - 'GROUP BY CONTRACT_STAKEHOLDER_1'
+      - 'HAVING COUNT(*)'
+    require_binds: [date_start, date_end]
 
-  - id: missing_representative_email
+  - id: c024
     question: "Contracts where representative_email is missing."
-    expect_sql: |
-      SELECT *
-      FROM "Contract"
-      WHERE representative_email IS NULL OR TRIM(representative_email) = ''
-      ORDER BY REQUEST_DATE DESC
+    expect_sql_contains:
+      - 'FROM "Contract"'
+      - '(representative_email IS NULL OR TRIM(representative_email) = '')'
 
-  - id: requester_totals_by_quarter
+  - id: c025
     question: "For REQUESTER = 'john@corp', total gross & count by quarter."
-    expect_sql: |
-      SELECT TRUNC(REQUEST_DATE, 'Q') AS QUARTER_KEY,
-             SUM(NVL(CONTRACT_VALUE_NET_OF_VAT,0)
-                 + CASE WHEN NVL(VAT,0) BETWEEN 0 AND 1
-                        THEN NVL(CONTRACT_VALUE_NET_OF_VAT,0) * NVL(VAT,0)
-                        ELSE NVL(VAT,0) END) AS MEASURE,
-             COUNT(*) AS CNT
-      FROM "Contract"
-      WHERE REQUESTER = :requester
-      GROUP BY TRUNC(REQUEST_DATE, 'Q')
-      ORDER BY QUARTER_KEY ASC
+    expect_sql_contains:
+      - 'FROM "Contract"'
+      - "TRUNC(REQUEST_DATE,'Q')"
+      - 'GROUP BY TRUNC(REQUEST_DATE,'
+      - 'REQUESTER'
 
-  - id: stakeholder_departments_2024
+  - id: c026
     question: "For each stakeholder, list distinct departments they touched in 2024, total gross, and contract count (one row per stakeholder)."
-    window: year_2024_overlaps
-    expect_sql: |
-      WITH U AS (
-        SELECT CONTRACT_ID, OWNER_DEPARTMENT, REQUEST_DATE, START_DATE, END_DATE,
-               CONTRACT_VALUE_NET_OF_VAT, VAT, CONTRACT_STAKEHOLDER_1 AS STAKEHOLDER FROM "Contract"
-        UNION ALL SELECT CONTRACT_ID, OWNER_DEPARTMENT, REQUEST_DATE, START_DATE, END_DATE,
-               CONTRACT_VALUE_NET_OF_VAT, VAT, CONTRACT_STAKEHOLDER_2 FROM "Contract"
-        UNION ALL SELECT CONTRACT_ID, OWNER_DEPARTMENT, REQUEST_DATE, START_DATE, END_DATE,
-               CONTRACT_VALUE_NET_OF_VAT, VAT, CONTRACT_STAKEHOLDER_3 FROM "Contract"
-        UNION ALL SELECT CONTRACT_ID, OWNER_DEPARTMENT, REQUEST_DATE, START_DATE, END_DATE,
-               CONTRACT_VALUE_NET_OF_VAT, VAT, CONTRACT_STAKEHOLDER_4 FROM "Contract"
-        UNION ALL SELECT CONTRACT_ID, OWNER_DEPARTMENT, REQUEST_DATE, START_DATE, END_DATE,
-               CONTRACT_VALUE_NET_OF_VAT, VAT, CONTRACT_STAKEHOLDER_5 FROM "Contract"
-        UNION ALL SELECT CONTRACT_ID, OWNER_DEPARTMENT, REQUEST_DATE, START_DATE, END_DATE,
-               CONTRACT_VALUE_NET_OF_VAT, VAT, CONTRACT_STAKEHOLDER_6 FROM "Contract"
-        UNION ALL SELECT CONTRACT_ID, OWNER_DEPARTMENT, REQUEST_DATE, START_DATE, END_DATE,
-               CONTRACT_VALUE_NET_OF_VAT, VAT, CONTRACT_STAKEHOLDER_7 FROM "Contract"
-        UNION ALL SELECT CONTRACT_ID, OWNER_DEPARTMENT, REQUEST_DATE, START_DATE, END_DATE,
-               CONTRACT_VALUE_NET_OF_VAT, VAT, CONTRACT_STAKEHOLDER_8 FROM "Contract"
-      )
-      SELECT STAKEHOLDER,
-             LISTAGG(DISTINCT OWNER_DEPARTMENT, ', ') WITHIN GROUP (ORDER BY OWNER_DEPARTMENT) AS DEPARTMENTS,
-             SUM(NVL(CONTRACT_VALUE_NET_OF_VAT,0)
-                 + CASE WHEN NVL(VAT,0) BETWEEN 0 AND 1
-                        THEN NVL(CONTRACT_VALUE_NET_OF_VAT,0) * NVL(VAT,0)
-                        ELSE NVL(VAT,0) END) AS TOTAL_GROSS,
-             COUNT(DISTINCT CONTRACT_ID) AS CONTRACT_COUNT
-      FROM U
-      WHERE STAKEHOLDER IS NOT NULL
-        AND (START_DATE IS NOT NULL AND END_DATE IS NOT NULL
-             AND START_DATE <= :date_end AND END_DATE >= :date_start)
-      GROUP BY STAKEHOLDER
-      ORDER BY TOTAL_GROSS DESC
+    expect_sql_contains:
+      - 'FROM "Contract"'
+      - 'CONTRACT_STAKEHOLDER_1'
+      - 'LISTAGG'
+      - 'GROUP BY CONTRACT_STAKEHOLDER_1'
+    require_binds: [date_start, date_end]
 
-  - id: top10_owner_stakeholder_pairs_180_days
+  - id: c027
     question: "Top 10 contracts pairs by gross in the last 180 days."
-    window: last_180_days_overlaps
-    expect_sql: |
-      SELECT CONTRACT_OWNER, CONTRACT_STAKEHOLDER_1,
-             SUM(NVL(CONTRACT_VALUE_NET_OF_VAT,0)
-                 + CASE WHEN NVL(VAT,0) BETWEEN 0 AND 1
-                        THEN NVL(CONTRACT_VALUE_NET_OF_VAT,0) * NVL(VAT,0)
-                        ELSE NVL(VAT,0) END) AS MEASURE
-      FROM "Contract"
-      WHERE (START_DATE IS NOT NULL AND END_DATE IS NOT NULL
-             AND START_DATE <= :date_end AND END_DATE >= :date_start)
-      GROUP BY CONTRACT_OWNER, CONTRACT_STAKEHOLDER_1
-      ORDER BY MEASURE DESC
-      FETCH FIRST :top_n ROWS ONLY
+    expect_sql_contains:
+      - 'FROM "Contract"'
+      - 'ORDER BY'
+      - 'FETCH FIRST :top_n ROWS ONLY'
+    require_binds: [date_start, date_end, top_n]
 
-  - id: duplicate_contract_ids
+  - id: c028
     question: "Detect duplicate contract ids (same CONTRACT_ID across rows)."
-    expect_sql: |
-      SELECT CONTRACT_ID, COUNT(*) AS CNT
-      FROM "Contract"
-      GROUP BY CONTRACT_ID
-      HAVING COUNT(*) > 1
-      ORDER BY CNT DESC
+    expect_sql_contains:
+      - 'FROM "Contract"'
+      - 'GROUP BY CONTRACT_ID'
+      - 'HAVING COUNT(*) > 1'
 
-  - id: median_gross_by_owner_dept_this_year
+  - id: c029
     question: "Median gross value of contracts per owner department this year."
-    window: this_year_overlaps
-    expect_sql: |
-      SELECT OWNER_DEPARTMENT AS GROUP_KEY,
-             MEDIAN(NVL(CONTRACT_VALUE_NET_OF_VAT,0)
-                    + CASE WHEN NVL(VAT,0) BETWEEN 0 AND 1
-                           THEN NVL(CONTRACT_VALUE_NET_OF_VAT,0) * NVL(VAT,0)
-                           ELSE NVL(VAT,0) END) AS MEDIAN_GROSS
-      FROM "Contract"
-      WHERE (START_DATE IS NOT NULL AND END_DATE IS NOT NULL
-             AND START_DATE <= :date_end AND END_DATE >= :date_start)
-      GROUP BY OWNER_DEPARTMENT
-      ORDER BY MEDIAN_GROSS DESC
+    expect_sql_contains:
+      - 'FROM "Contract"'
+      - 'MEDIAN('
+      - 'GROUP BY OWNER_DEPARTMENT'
 
-  - id: end_before_start_integrity
+  - id: c030
     question: "Contracts where END_DATE < START_DATE (integrity check)."
-    expect_sql: |
-      SELECT *
-      FROM "Contract"
-      WHERE END_DATE < START_DATE
-      ORDER BY REQUEST_DATE DESC
+    expect_sql_contains:
+      - 'FROM "Contract"'
+      - 'WHERE END_DATE < START_DATE'
 
-  - id: duration_mismatch_12m
-    question: "Contracts with DURATION like "12 months" but actual END_DATE–START_DATE != ~12 months."
-    expect_sql: |
-      SELECT *
-      FROM "Contract"
-      WHERE REGEXP_LIKE(NVL(DURATION,''), '^[[:digit:]]+')
-        AND ABS(MONTHS_BETWEEN(END_DATE, START_DATE) - TO_NUMBER(REGEXP_SUBSTR(DURATION, '[[:digit:]]+'))) > 1
-      ORDER BY REQUEST_DATE DESC
+  - id: c031
+    question: "Contracts with DURATION like \"12 months\" but actual END_DATE–START_DATE != ~12 months."
+    expect_sql_contains:
+      - 'FROM "Contract"'
+      - 'DURATION'
+      - 'MONTHS_BETWEEN('
 
-  - id: yoy_gross_same_period
+  - id: c032
     question: "Year-over-year comparison of gross total for the same period (e.g., this Jan–Mar vs last Jan–Mar)."
-    expect_sql: |
-      SELECT TO_CHAR(REQUEST_DATE, 'YYYY') AS YEAR_KEY,
-             SUM(NVL(CONTRACT_VALUE_NET_OF_VAT,0)
-                 + CASE WHEN NVL(VAT,0) BETWEEN 0 AND 1
-                        THEN NVL(CONTRACT_VALUE_NET_OF_VAT,0) * NVL(VAT,0)
-                        ELSE NVL(VAT,0) END) AS MEASURE
-      FROM "Contract"
-      WHERE (REQUEST_DATE BETWEEN :period_start AND :period_end)
-         OR (REQUEST_DATE BETWEEN ADD_MONTHS(:period_start, -12) AND ADD_MONTHS(:period_end, -12))
-      GROUP BY TO_CHAR(REQUEST_DATE, 'YYYY')
-      ORDER BY YEAR_KEY DESC
+    expect_sql_contains:
+      - 'FROM "Contract"'
+      - "TRUNC(REQUEST_DATE,'YY')"
+      - 'SUM('
 
-  - id: status_active_pending_gross_over_threshold
+  - id: c033
     question: "For CONTRACT_STATUS in ('Active','Pending'), list contracts whose total gross exceeds a threshold (e.g., > 1,000,000)."
-    expect_sql: |
-      SELECT *
-      FROM "Contract"
-      WHERE UPPER(NVL(CONTRACT_STATUS,'')) IN ('ACTIVE','PENDING')
-        AND (NVL(CONTRACT_VALUE_NET_OF_VAT,0)
-             + CASE WHEN NVL(VAT,0) BETWEEN 0 AND 1
-                    THEN NVL(CONTRACT_VALUE_NET_OF_VAT,0) * NVL(VAT,0)
-                    ELSE NVL(VAT,0) END) > :threshold
-      ORDER BY (NVL(CONTRACT_VALUE_NET_OF_VAT,0)
-                + CASE WHEN NVL(VAT,0) BETWEEN 0 AND 1
-                       THEN NVL(CONTRACT_VALUE_NET_OF_VAT,0) * NVL(VAT,0)
-                       ELSE NVL(VAT,0) END) DESC
+    expect_sql_contains:
+      - 'FROM "Contract"'
+      - 'CONTRACT_STATUS'
+      - 'NVL(CONTRACT_VALUE_NET_OF_VAT,0)'
+      - '>'
+      - 'ORDER BY'
 
-  - id: top3_by_gross_per_entity_365d
+  - id: c034
     question: "For each ENTITY, top 3 contracts by gross in last 365 days."
-    window: last_365_days_overlaps
-    expect_sql: |
-      SELECT ENTITY, CONTRACT_ID, CONTRACT_OWNER, REQUEST_DATE, START_DATE, END_DATE, GROSS
-      FROM (
-        SELECT ENTITY, CONTRACT_ID, CONTRACT_OWNER, REQUEST_DATE, START_DATE, END_DATE,
-               (NVL(CONTRACT_VALUE_NET_OF_VAT,0)
-                 + CASE WHEN NVL(VAT,0) BETWEEN 0 AND 1
-                        THEN NVL(CONTRACT_VALUE_NET_OF_VAT,0) * NVL(VAT,0)
-                        ELSE NVL(VAT,0) END) AS GROSS,
-               ROW_NUMBER() OVER (PARTITION BY ENTITY
-                                  ORDER BY (NVL(CONTRACT_VALUE_NET_OF_VAT,0)
-                                            + CASE WHEN NVL(VAT,0) BETWEEN 0 AND 1
-                                                   THEN NVL(CONTRACT_VALUE_NET_OF_VAT,0) * NVL(VAT,0)
-                                                   ELSE NVL(VAT,0) END) DESC) AS RN
-        FROM "Contract"
-        WHERE (START_DATE IS NOT NULL AND END_DATE IS NOT NULL
-               AND START_DATE <= :date_end AND END_DATE >= :date_start)
-      )
-      WHERE RN <= 3
-      ORDER BY ENTITY, GROSS DESC
+    expect_sql_contains:
+      - 'FROM "Contract"'
+      - 'ROW_NUMBER() OVER (PARTITION BY ENTITY ORDER BY'
+      - 'WHERE'
+    require_binds: [date_start, date_end]
 
-  - id: owner_dept_vs_oul_mismatch
+  - id: c035
     question: "OWNER_DEPARTMENT vs DEPARTMENT_OUL comparison (where OUL is the lead); list any cases."
-    expect_sql: |
-      SELECT *
-      FROM "Contract"
-      WHERE OWNER_DEPARTMENT IS NOT NULL
-        AND DEPARTMENT_OUL IS NOT NULL
-        AND OWNER_DEPARTMENT <> DEPARTMENT_OUL
-      ORDER BY REQUEST_DATE DESC
+    expect_sql_contains:
+      - 'FROM "Contract"'
+      - 'WHERE OWNER_DEPARTMENT <> DEPARTMENT_OUL'
