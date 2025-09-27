@@ -44,7 +44,7 @@ def create_app():
     dw_bp = create_dw_blueprint(settings=settings, pipeline=pipeline)
 
     app.register_blueprint(dw_bp, url_prefix="/dw")
-    app.register_blueprint(golden_bp, url_prefix="/admin")
+    app.register_blueprint(golden_bp)
     app.register_blueprint(core_admin_bp, url_prefix="/admin")
     app.register_blueprint(admin_common_bp)
 
