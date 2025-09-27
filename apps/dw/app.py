@@ -87,11 +87,23 @@ def _ensure_engine():
         return getattr(pipeline, "app_engine", None)
 
 
+def _normalize_date_binds(binds: Dict[str, Any]) -> Dict[str, Any]:
+    fixed: Dict[str, Any] = {}
+    for key, value in (binds or {}).items():
+        if key.startswith("date_"):
+            coerced = _ensure_oracle_date(value)
+            fixed[key] = coerced if coerced is not None else value
+        else:
+            fixed[key] = value
+    return fixed
+
+
 def _execute_oracle(sql: str, binds: Dict[str, Any]):
     engine = _ensure_engine()
     if engine is None:
         return [], [], {"rows": 0}
     safe_binds = coerce_oracle_binds(binds or {})
+    safe_binds = _normalize_date_binds(safe_binds)
     with engine.connect() as cx:  # type: ignore[union-attr]
         rs = cx.execute(text(sql), safe_binds)
         cols = list(rs.keys()) if hasattr(rs, "keys") else []
