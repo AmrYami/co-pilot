@@ -181,39 +181,39 @@ def _build_user_explain(intent: Any, binds: Dict[str, Any], sql: str) -> str:
     de = binds.get("date_end")
     if ds and de:
         parts.append(
-            f"تم تفسير «الفترة» من {_format_window_val(ds)} إلى {_format_window_val(de)}."
+            f"Interpreted the requested window from {_format_window_val(ds)} to {_format_window_val(de)}."
         )
 
     dc = getattr(intent, "date_column", None)
     if dc == "OVERLAP":
         parts.append(
-            "اعتبرنا العقد «نشطًا» إذا تداخلت فترة العقد (START_DATE/END_DATE) مع هذه النافذة."
+            "Treated a contract as active when the START_DATE/END_DATE overlap the requested window."
         )
     elif dc == "REQUEST_DATE":
-        parts.append("تم الاعتماد على REQUEST_DATE لأن الصياغة تشير إلى تاريخ الطلب.")
+        parts.append("Used REQUEST_DATE because the question refers to request timing.")
     elif dc == "END_DATE":
-        parts.append("تم الاعتماد على END_DATE كما هو مذكور في السؤال.")
+        parts.append("Used END_DATE as specified in the question.")
 
     gb = getattr(intent, "group_by", None)
     agg = getattr(intent, "agg", None)
     if gb and agg:
-        parts.append(f"قمنا بتجميع النتائج حسب «{gb}» باستخدام {str(agg).upper()}.")
+        parts.append(f"Grouped results by {gb} using {str(agg).upper()}.")
     elif gb:
-        parts.append(f"قمنا بتجميع النتائج حسب «{gb}».")
+        parts.append(f"Grouped results by {gb}.")
 
     sort_by = getattr(intent, "sort_by", None)
     if sort_by:
         desc = getattr(intent, "sort_desc", True)
-        order_word = "تنازليًا" if desc else "تصاعديًا"
-        parts.append(f"تم ترتيب النتائج {order_word} بالقيمة المطلوبة.")
+        order_word = "descending" if desc else "ascending"
+        parts.append(f"Sorted the results in {order_word} order by the requested measure.")
 
     if getattr(intent, "wants_all_columns", False):
-        parts.append("لم تُطلب أعمدة محددة، لذا عرضنا كل الأعمدة.")
+        parts.append("All columns were returned because none were specifically requested.")
 
     if getattr(intent, "full_text_search", False):
-        parts.append("تم تفعيل البحث النصي عبر أعمدة FTS المعرفة في الإعدادات.")
+        parts.append("Full-text search was enabled across the configured FTS columns.")
 
-    return " ".join(parts) if parts else "تم استخدام الإعدادات الافتراضية لتفسير سؤالك."
+    return " ".join(parts) if parts else "Used default interpretation settings for your question."
 
 
 @dw_bp.post("/answer")
