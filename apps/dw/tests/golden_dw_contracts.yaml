@@ -124,8 +124,8 @@ tests:
     question: "Contracts missing CONTRACT_ID (data quality check)."
     expect_contains:
       - 'FROM "Contract"'
-      - 'WHERE'
-      - 'CONTRACT_ID'
+      - "WHERE CONTRACT_ID IS NULL OR TRIM(CONTRACT_ID) = ''"
+      - 'ORDER BY REQUEST_DATE DESC'
     notes: "Check CONTRACT_ID IS NULL or blank."
 
   - name: "gross_by_stakeholder_last_90_days_slots_1_8"
@@ -134,8 +134,9 @@ tests:
       - 'FROM "Contract"'
       - 'CONTRACT_STAKEHOLDER_1'
       - 'UNION ALL'
-      - 'GROUP BY'
-      - 'SUM(NVL(CONTRACT_VALUE_NET_OF_VAT,0) + CASE'
+      - 'WITH STAKEHOLDER_UNION'
+      - 'SUM(GVAL) AS TOTAL_GROSS'
+      - 'WHERE STK IS NOT NULL'
     notes: "UNION ALL across stakeholder slots; group & sum gross."
 
   - name: "top5_by_gross_ytd_2024"
@@ -144,6 +145,7 @@ tests:
       - 'FROM "Contract"'
       - 'ORDER BY NVL(CONTRACT_VALUE_NET_OF_VAT,0) + CASE'
       - 'FETCH FIRST :top_n ROWS ONLY'
+      - 'REQUEST_DATE BETWEEN :date_start AND :date_end'
     notes: "YTD window; top by gross."
 
   - name: "avg_gross_per_request_type_last_6_months"
@@ -152,6 +154,7 @@ tests:
       - 'FROM "Contract"'
       - 'GROUP BY REQUEST_TYPE'
       - 'AVG('
+      - 'REQUEST_DATE BETWEEN :date_start AND :date_end'
     notes: "AVG gross by request type; windowed."
 
   - name: "monthly_trend_active_by_request_date_last_12_months"
@@ -160,6 +163,7 @@ tests:
       - 'FROM "Contract"'
       - "TRUNC(REQUEST_DATE, 'MM')"
       - 'GROUP BY'
+      - 'ORDER BY MONTH_BUCKET'
     notes: "Monthly buckets by REQUEST_DATE."
 
   - name: "entity_no_e123_total_and_count_by_status"
@@ -169,6 +173,7 @@ tests:
       - 'WHERE'
       - 'ENTITY_NO'
       - 'GROUP BY CONTRACT_STATUS'
+      - 'COUNT(*) AS CONTRACT_COUNT'
     notes: "Filter ENTITY_NO then group by status."
 
   - name: "expiring_30_60_90_three_counts"
@@ -177,6 +182,7 @@ tests:
       - 'FROM "Contract"'
       - 'END_DATE BETWEEN'
       - 'UNION ALL'
+      - 'AS BUCKET'
     notes: "Three buckets via UNION ALL."
 
   - name: "owner_dept_highest_avg_gross_last_quarter"
@@ -186,21 +192,23 @@ tests:
       - 'GROUP BY OWNER_DEPARTMENT'
       - 'AVG('
       - 'FETCH FIRST 1 ROWS ONLY'
+      - 'REQUEST_DATE BETWEEN :date_start AND :date_end'
     notes: "Top-1 by AVG gross last quarter."
 
   - name: "stakeholders_more_than_n_in_2024"
     question: "Stakeholders involved in more than N contracts in 2024."
     expect_contains:
-      - 'GROUP BY'
-      - 'HAVING COUNT(*) >'
+      - 'WITH STAKEHOLDER_HITS'
+      - 'HAVING COUNT(*) > :min_count'
+      - 'REQUEST_DATE BETWEEN :date_start AND :date_end'
     notes: "Threshold via HAVING; 2024 window."
 
   - name: "missing_representative_email"
     question: "Contracts where representative_email is missing."
     expect_contains:
       - 'FROM "Contract"'
-      - 'WHERE'
-      - 'REPRESENTATIVE_EMAIL'
+      - 'WHERE REPRESENTATIVE_EMAIL IS NULL'
+      - "TRIM(UPPER(REPRESENTATIVE_EMAIL)) IN ('', 'NA', 'N/A')"
     notes: "Null/blank email filter."
 
   - name: "requester_quarterly_totals"
@@ -211,20 +219,23 @@ tests:
       - 'REQUESTER'
       - "TRUNC(REQUEST_DATE, 'Q')"
       - 'GROUP BY'
+      - 'COUNT(*) AS CONTRACT_COUNT'
     notes: "Group by quarter; filter requester."
 
   - name: "stakeholder_departments_2024_with_totals"
     question: "For each stakeholder, list distinct departments they touched in 2024, total gross, and contract count (one row per stakeholder)."
     expect_contains:
       - 'FROM "Contract"'
-      - 'LISTAGG'
-      - 'GROUP BY'
+      - 'WITH STAKEHOLDER_DEPTS'
+      - 'LISTAGG(DISTINCT OWNER_DEPT'
+      - 'SUM(GVAL) AS TOTAL_GROSS'
     notes: "LISTAGG departments per stakeholder; 2024 window."
 
   - name: "top10_contract_pairs_last_180_days"
     question: "Top 10 contracts pairs by gross in the last 180 days."
     expect_contains:
       - 'FROM "Contract"'
+      - 'WITH PAIRS AS'
       - 'FETCH FIRST :top_n ROWS ONLY'
     skip: true
     notes: "Marked pending/skip — pairing definition ambiguous."
@@ -235,6 +246,7 @@ tests:
       - 'FROM "Contract"'
       - 'GROUP BY CONTRACT_ID'
       - 'HAVING COUNT(*) > 1'
+      - 'ORDER BY DUP_COUNT DESC'
     notes: "Duplicate check."
 
   - name: "median_gross_per_owner_dept_this_year"
@@ -243,6 +255,7 @@ tests:
       - 'FROM "Contract"'
       - 'PERCENTILE_CONT(0.5) WITHIN GROUP'
       - 'GROUP BY OWNER_DEPARTMENT'
+      - 'REQUEST_DATE BETWEEN :date_start AND :date_end'
     notes: "Median via PERCENTILE_CONT; year window."
 
   - name: "end_date_lt_start_date_check"
@@ -250,6 +263,7 @@ tests:
     expect_contains:
       - 'FROM "Contract"'
       - 'WHERE END_DATE < START_DATE'
+      - 'ORDER BY REQUEST_DATE DESC'
     notes: "Simple integrity filter."
 
   - name: "duration_mismatch_12_months"
@@ -258,6 +272,7 @@ tests:
       - 'FROM "Contract"'
       - 'REGEXP_SUBSTR'
       - 'ADD_MONTHS(START_DATE'
+      - "TRIM(UPPER(DURATION))"
     notes: "Duration text vs date delta; REGEXP + ADD_MONTHS."
 
   - name: "yoy_gross_same_period"
@@ -267,6 +282,7 @@ tests:
       - 'UNION ALL'
       - 'SUM('
       - 'REQUEST_DATE BETWEEN'
+      - 'ADD_MONTHS(:date_start, -12)'
     notes: "Two windows; compare with UNION ALL."
 
   - name: "status_active_pending_gross_threshold"
@@ -276,6 +292,7 @@ tests:
       - 'CONTRACT_STATUS'
       - '>'
       - 'NVL(CONTRACT_VALUE_NET_OF_VAT,0) + CASE'
+      - ':gross_min'
     notes: "Filter status IN; gross threshold."
 
   - name: "entity_top3_contracts_last_365_days"
@@ -284,14 +301,12 @@ tests:
       - 'FROM "Contract"'
       - 'ROW_NUMBER() OVER (PARTITION BY ENTITY ORDER BY'
       - 'WHERE rn <= 3'
+      - 'REQUEST_DATE BETWEEN :date_start AND :date_end'
     notes: "Top-N per ENTITY via analytic row_number."
 
   - name: "owner_dept_vs_oul_diff"
     question: "OWNER_DEPARTMENT vs DEPARTMENT_OUL comparison (where OUL is the lead); list any cases."
     expect_contains:
       - 'FROM "Contract"'
-      - 'WHERE'
-      - 'DEPARTMENT_OUL'
-      - '<>'
-      - 'OWNER_DEPARTMENT'
+      - "NVL(TRIM(OWNER_DEPARTMENT), '(NULL)') <> NVL(TRIM(DEPARTMENT_OUL), '(NULL)')"
     notes: "Find mismatches between OUL and Owner department."
