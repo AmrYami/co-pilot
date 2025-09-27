@@ -1,4 +1,6 @@
+import os
 import re
+import datetime as dt
 from typing import Any, Dict, List
 
 try:  # pragma: no cover - allow tests to import without Flask installed
@@ -39,9 +41,10 @@ except Exception:  # pragma: no cover - lightweight fallback used in tests
         return sql
 
 
-from .contracts import build_sql_for_intent, parse_contract_intent
+import yaml
+
+from .contracts import parse_intent_contract, build_sql_contract, explain_interpretation
 from .rating import rate_bp
-from .util import compose_explain, ensure_oracle_date_binds, get_fts_columns
 
 
 dw_bp = Blueprint("dw", __name__)
@@ -73,11 +76,27 @@ def _execute_oracle(sql: str, binds: Dict[str, Any]):
     if engine is None:
         return rows, cols, {"ms": 0}
     with engine.connect() as cx:  # type: ignore[union-attr]
-        safe_binds = ensure_oracle_date_binds(binds)
+        safe_binds = _coerce_date_binds(binds)
         rs = cx.execute(text(sql), safe_binds)
         cols = list(rs.keys()) if hasattr(rs, "keys") else []
         rows = [list(r) for r in rs.fetchall()]
     return rows, cols, {"ms": 0}
+
+
+def _coerce_date_binds(binds: Dict[str, Any]) -> Dict[str, Any]:
+    """Ensure Oracle date binds stay datetime.date objects."""
+    out: Dict[str, Any] = {}
+    for key, value in (binds or {}).items():
+        if key in {"date_start", "date_end"}:
+            if isinstance(value, dt.date):
+                out[key] = value
+            elif isinstance(value, str):
+                out[key] = dt.date.fromisoformat(value)
+            else:
+                out[key] = value
+        else:
+            out[key] = value
+    return out
 
 
 @dw_bp.post("/answer")
@@ -91,65 +110,92 @@ def answer():
     _ = auth_email  # pragma: no cover - reserved for future auditing
     full_text_search = bool(payload.get("full_text_search", False))
 
-    pipeline = current_app.config.get("PIPELINE") or current_app.config.get("pipeline")
+    table_name = "Contract"
+    app_obj = current_app
+    config = getattr(app_obj, "config", None)
+    pipeline = None
+    if config is not None:
+        config_get = getattr(config, "get", None)
+        if callable(config_get):
+            pipeline = config_get("PIPELINE") or config_get("pipeline")
+        elif isinstance(config, dict):
+            pipeline = config.get("PIPELINE") or config.get("pipeline")
     settings = getattr(pipeline, "settings", {}) if pipeline else {}
-    settings_get = getattr(settings, "get", None)
-    if callable(settings_get):
-        table = settings_get("DW_CONTRACT_TABLE", "Contract")
+    getter = getattr(settings, "get", None)
+    if callable(getter):
+        table_name = getter("DW_CONTRACT_TABLE", table_name)
     elif isinstance(settings, dict):
-        table = settings.get("DW_CONTRACT_TABLE", "Contract")
-    else:
-        table = "Contract"
+        table_name = settings.get("DW_CONTRACT_TABLE", table_name)
 
-    # 1) Parse intent (Contract domain)
-    intent = parse_contract_intent(question)
-    intent.full_text_search = full_text_search
+    intent = parse_intent_contract(question, full_text_search=full_text_search)
+    intent.table = table_name
     if full_text_search:
         tokens = [tok for tok in re.split(r"\W+", question) if len(tok) >= 3]
         intent.fts_tokens = tokens
 
-    # 2) Default top_n if user requested Top without number → 10
     if intent.user_requested_top_n and not intent.top_n:
         intent.top_n = 10
 
-    # 3) Prepare binds (dates/limits)
-    binds: Dict[str, Any] = {}
-    if intent.explicit_dates:
-        binds["date_start"] = intent.explicit_dates.get("start")
-        binds["date_end"] = intent.explicit_dates.get("end")
-    if intent.top_n:
-        binds["top_n"] = intent.top_n
+    select_all_default = bool(int(os.getenv("DW_SELECT_ALL_DEFAULT", "1")))
+    sql, binds = build_sql_contract(intent, select_all_default=select_all_default)
+    binds = _coerce_date_binds(binds)
 
-    # 4) FTS columns from settings
-    settings_for_fts = settings if hasattr(settings, "get") else {}
-    fts_cols = get_fts_columns(settings_for_fts, table) if full_text_search else []
-
-    # 5) Build SQL
-    sql, extra_binds = build_sql_for_intent(intent, table_name=table, fts_cols=fts_cols)
-    binds.update(extra_binds)
-
-    # 6) Execute
     rows, cols, meta = _execute_oracle(sql, binds)
 
-    # 7) Explain text
-    explain = compose_explain(intent, binds)
-
-    out_meta = {
-        "binds": {k: str(v) for k, v in binds.items()},
-        "rowcount": len(rows),
-    }
-    out_meta.update(meta or {})
-
-    response = {
+    resp: Dict[str, Any] = {
         "ok": True,
-        "inquiry_id": None,
         "sql": sql,
         "rows": rows,
         "columns": cols,
-        "meta": out_meta,
-        "explain": explain,
+        "meta": {**(meta or {}), "clarifier_intent": intent.__dict__},
+        "debug": {
+            "intent": intent.__dict__,
+        },
     }
-    return jsonify(response)
+    if os.getenv("DW_EXPLAIN", "1") == "1":
+        resp["explain"] = explain_interpretation(intent)
+    return jsonify(resp)
+
+
+@dw_bp.post("/admin/run_golden")
+def run_golden():
+    """Execute deterministic golden test suite for contract intents."""
+    body = request.get_json(force=True) or {}
+    path = body.get("path") or "apps/dw/tests/golden_dw_contracts.yaml"
+    with open(path, "r", encoding="utf-8") as handle:
+        suite = yaml.safe_load(handle) or {}
+
+    results: List[Dict[str, Any]] = []
+    passed = 0
+    total = 0
+    for case in suite.get("tests", []):
+        total += 1
+        q = case.get("question", "")
+        intent = parse_intent_contract(q, full_text_search=bool(case.get("full_text_search")))
+        sql, binds = build_sql_contract(intent, select_all_default=True)
+        ok = True
+        why: List[str] = []
+        expect = case.get("expect", {})
+        for token in expect.get("sql_contains", []):
+            if token not in sql:
+                ok = False
+                why.append(f"missing token: {token}")
+        if expect.get("must_group_by") and " GROUP BY " not in sql:
+            ok = False
+            why.append("GROUP BY expected")
+        if expect.get("must_order_by") and " ORDER BY " not in sql:
+            ok = False
+            why.append("ORDER BY expected")
+        results.append({
+            "question": q,
+            "ok": ok,
+            "sql": sql,
+            "why": why,
+            "binds": binds,
+        })
+        if ok:
+            passed += 1
+    return jsonify({"ok": True, "passed": passed, "total": total, "results": results})
 
 
 def create_dw_blueprint(*args, **kwargs):
