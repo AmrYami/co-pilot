@@ -130,6 +130,11 @@ def parse_intent(q: str, today: date | None = None) -> Intent:
                     explicit_columns=None, where_clauses=[], where_binds={},
                     explain_parts=[])
 
+    def _note_ordering(desc: bool) -> None:
+        intent.explain_parts.append(
+            "Ordering: descending (top/highest)." if desc else "Ordering: ascending (lowest/bottom)."
+        )
+
     # ---- Specific direct where on explicit column (e.g., CONTRACT_STATUS) ----
     m_status = re.search(r"contract_status\s*=\s*([A-Za-z\-]+)", qi)
     if m_status:
@@ -174,6 +179,7 @@ def parse_intent(q: str, today: date | None = None) -> Intent:
         intent.order_by = "REQUEST_DATE"
         intent.order_desc = True
         intent.explain_parts.append("Using REQUEST_DATE window for 'requested last month'.")
+        _note_ordering(True)
         return intent
 
     # ---- top N by gross / net last X months/month ----------------------------
@@ -189,6 +195,7 @@ def parse_intent(q: str, today: date | None = None) -> Intent:
         intent.order_by = GROSS_SQL
         intent.order_desc = True
         intent.explain_parts.append(f"Top {n} by GROSS over last {months} months, using OVERLAP window.")
+        _note_ordering(True)
         return intent
 
     m_top_gross_lm = re.search(r"top\s+(\d+)\s+.*gross.*last\s+month", qi)
@@ -202,6 +209,7 @@ def parse_intent(q: str, today: date | None = None) -> Intent:
         intent.order_by = GROSS_SQL
         intent.order_desc = True
         intent.explain_parts.append(f"Top {n} by GROSS in last month, using OVERLAP window.")
+        _note_ordering(True)
         return intent
 
     m_top_net_lm = re.search(r"top\s+(\d+)\s+contracts.*contract value.*last\s+month", qi)
@@ -215,6 +223,7 @@ def parse_intent(q: str, today: date | None = None) -> Intent:
         intent.order_by = "NVL(CONTRACT_VALUE_NET_OF_VAT,0)"
         intent.order_desc = True
         intent.explain_parts.append(f"Top {n} by NET in last month, using OVERLAP window.")
+        _note_ordering(True)
         return intent
 
     m_top_net_lmN = re.search(r"top\s+(\d+)\s+contracts.*contract value.*last\s+(\d+)\s+months", qi)
@@ -228,6 +237,22 @@ def parse_intent(q: str, today: date | None = None) -> Intent:
         intent.order_by = "NVL(CONTRACT_VALUE_NET_OF_VAT,0)"
         intent.order_desc = True
         intent.explain_parts.append(f"Top {n} by NET over last {months} months, using OVERLAP window.")
+        _note_ordering(True)
+        return intent
+
+    # ---- bottom N by net last month -----------------------------------------
+    m_bottom_net_lm = re.search(r"bottom\s+(\d+)\s+contracts.*contract value.*last\s+month", qi)
+    if m_bottom_net_lm:
+        n = int(m_bottom_net_lm.group(1))
+        ds, de = _last_month(t)
+        intent.top_n = n
+        intent.gross = False
+        intent.window_kind = "OVERLAP"
+        intent.window_start, intent.window_end = ds, de
+        intent.order_by = "NVL(CONTRACT_VALUE_NET_OF_VAT,0)"
+        intent.order_desc = False
+        intent.explain_parts.append(f"Bottom {n} by NET in last month, using OVERLAP window.")
+        _note_ordering(False)
         return intent
 
     # ---- totals per owner department last quarter ----------------------------
@@ -241,6 +266,7 @@ def parse_intent(q: str, today: date | None = None) -> Intent:
         intent.order_by = "MEASURE"
         intent.order_desc = True
         intent.explain_parts.append("Gross SUM per OWNER_DEPARTMENT over last quarter (OVERLAP).")
+        _note_ordering(True)
         return intent
 
     # total gross per owner department (no window)
@@ -251,6 +277,35 @@ def parse_intent(q: str, today: date | None = None) -> Intent:
         intent.order_by = "MEASURE"
         intent.order_desc = True
         intent.explain_parts.append("Gross SUM per OWNER_DEPARTMENT (all time).")
+        _note_ordering(True)
+        return intent
+
+    # lowest owner department by gross last quarter
+    if "lowest owner department" in qi and "gross" in qi and "last quarter" in qi:
+        ds, de = _last_quarter(t)
+        intent.group_by = "OWNER_DEPARTMENT"
+        intent.agg = "sum"
+        intent.gross = True
+        intent.window_kind = "OVERLAP"
+        intent.window_start, intent.window_end = ds, de
+        intent.order_by = "MEASURE"
+        intent.order_desc = False
+        intent.explain_parts.append("Gross SUM per OWNER_DEPARTMENT over last quarter (OVERLAP).")
+        _note_ordering(False)
+        return intent
+
+    # total gross per DEPARTMENT_OUL last quarter
+    if "total gross value per department_oul last quarter" in qi or "total gross value per department oul last quarter" in qi:
+        ds, de = _last_quarter(t)
+        intent.group_by = "DEPARTMENT_OUL"
+        intent.agg = "sum"
+        intent.gross = True
+        intent.window_kind = "OVERLAP"
+        intent.window_start, intent.window_end = ds, de
+        intent.order_by = "MEASURE"
+        intent.order_desc = True
+        intent.explain_parts.append("Gross SUM per DEPARTMENT_OUL over last quarter (OVERLAP).")
+        _note_ordering(True)
         return intent
 
     # count by status all time
@@ -260,6 +315,16 @@ def parse_intent(q: str, today: date | None = None) -> Intent:
         intent.order_by = "CNT"
         intent.order_desc = True
         intent.explain_parts.append("COUNT(*) per CONTRACT_STATUS (all time).")
+        _note_ordering(True)
+        return intent
+
+    if "count of contracts per entity_no" in qi or "count of contracts per entity no" in qi:
+        intent.group_by = "ENTITY_NO"
+        intent.agg = "count"
+        intent.order_by = "CNT"
+        intent.order_desc = True
+        intent.explain_parts.append("COUNT(*) per ENTITY_NO (all time).")
+        _note_ordering(True)
         return intent
 
     # VAT zero but net > 0
@@ -311,6 +376,7 @@ def parse_intent(q: str, today: date | None = None) -> Intent:
         intent.order_by = "END_DATE"
         intent.order_desc = False
         intent.explain_parts.append("END_DATE between today and +90 days.")
+        _note_ordering(False)
         return intent
 
     # ---- Missing CONTRACT_ID -------------------------------------------------
