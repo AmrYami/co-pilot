@@ -6,6 +6,13 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from dateutil.relativedelta import relativedelta
 
+_YTD_YEAR_RE = re.compile(
+    r"(?:\b(?:ytd|year\s*to\s*date)\s*(\d{4})\b)|(?:\b(\d{4})\s*(?:ytd|year\s*to\s*date)\b)",
+    re.IGNORECASE,
+)
+
+_LOWEST_RE = re.compile(r"\b(lowest|bottom|least|smallest)\b", re.IGNORECASE)
+
 # ---- Gross and helpers -------------------------------------------------------
 GROSS_SQL = (
     "NVL(CONTRACT_VALUE_NET_OF_VAT,0) + "
@@ -124,11 +131,16 @@ def parse_intent(q: str, today: date | None = None) -> Intent:
     qn = (q or "").strip()
     qi = qn.lower()
 
+    lowest_hint = bool(_LOWEST_RE.search(qn))
+
     intent = Intent(question=qn, top_n=None, order_by=None, order_desc=True,
                     group_by=None, agg=None, gross=False,
                     window_kind=None, window_start=None, window_end=None,
                     explicit_columns=None, where_clauses=[], where_binds={},
                     explain_parts=[])
+
+    if lowest_hint:
+        intent.order_desc = False
 
     def _note_ordering(desc: bool) -> None:
         intent.explain_parts.append(
@@ -402,15 +414,16 @@ def parse_intent(q: str, today: date | None = None) -> Intent:
         return intent
 
     # ---- YTD top gross -------------------------------------------------------
-    m_ytd = re.search(r"top\s+(\d+).*gross.*(20\d{2})\s*ytd", qi)
-    if m_ytd:
-        top_n = int(m_ytd.group(1))
-        year = int(m_ytd.group(2))
+    if ("ytd" in qi or "year to date" in qi) and "gross" in qi and "top" in qi:
+        m_top = re.search(r"top\s+(\d+)", qi)
+        m_year = _YTD_YEAR_RE.search(qn)
+        if m_year:
+            year = int(m_year.group(1) or m_year.group(2))
+        else:
+            year = t.year
+        top_n = int(m_top.group(1)) if m_top else 5
         start = date(year, 1, 1)
-        year_end = date(year, 12, 31)
-        end = t if t.year == year else year_end
-        if end > year_end:
-            end = year_end
+        end = date(year, 12, 31)
         intent.top_n = top_n
         intent.gross = True
         intent.window_kind = "OVERLAP"
@@ -418,6 +431,7 @@ def parse_intent(q: str, today: date | None = None) -> Intent:
         intent.order_by = GROSS_SQL
         intent.order_desc = True
         intent.explain_parts.append(f"Top {top_n} by GROSS for {year} YTD (OVERLAP window).")
+        _note_ordering(True)
         return intent
 
     # ---- Average gross per REQUEST_TYPE last N months -----------------------
@@ -556,15 +570,21 @@ def parse_intent(q: str, today: date | None = None) -> Intent:
         return intent
 
     # ---- Owner vs OUL mismatch ---------------------------------------------
-    if "owner_department" in qi and "department_oul" in qi and "mismatch" in qi:
+    owner_dept_hint = "owner_department" in qi or "owner department" in qi or "owner dept" in qi
+    oul_hint = "department_oul" in qi or "department oul" in qi or "oul" in qi
+    compare_hint = "mismatch" in qi or " vs " in qi or "compare" in qi or "versus" in qi
+    if owner_dept_hint and oul_hint and compare_hint:
         intent.special = "owner_vs_oul_mismatch"
         intent.explain_parts.append("Comparing OWNER_DEPARTMENT vs DEPARTMENT_OUL.")
         return intent
 
     # Fallback: list all ordered by REQUEST_DATE desc
     intent.order_by = "REQUEST_DATE"
-    intent.order_desc = True
-    intent.explain_parts.append("Fallback listing ordered by REQUEST_DATE DESC.")
+    intent.order_desc = not lowest_hint
+    if lowest_hint:
+        intent.explain_parts.append("Fallback listing ordered by REQUEST_DATE ASC due to lowest/bottom phrasing.")
+    else:
+        intent.explain_parts.append("Fallback listing ordered by REQUEST_DATE DESC.")
     return intent
 
 
@@ -947,11 +967,12 @@ def _build_special(intent: Intent) -> tuple[str, dict, dict]:
 
     if special == "owner_vs_oul_mismatch":
         sql = (
-            "SELECT * FROM \"Contract\"\n"
+            "SELECT OWNER_DEPARTMENT, DEPARTMENT_OUL, COUNT(*) AS CNT\n"
+            'FROM "Contract"\n'
             "WHERE DEPARTMENT_OUL IS NOT NULL\n"
-            "  AND OWNER_DEPARTMENT IS NOT NULL\n"
-            "  AND UPPER(DEPARTMENT_OUL) <> UPPER(OWNER_DEPARTMENT)\n"
-            "ORDER BY REQUEST_DATE DESC"
+            "  AND NVL(TRIM(OWNER_DEPARTMENT),'(None)') <> NVL(TRIM(DEPARTMENT_OUL),'(None)')\n"
+            "GROUP BY OWNER_DEPARTMENT, DEPARTMENT_OUL\n"
+            "ORDER BY CNT DESC"
         )
         return sql, {}, _build_meta(intent, explain=explain_meta, strategy="contract_deterministic")
 
