@@ -26,6 +26,22 @@ def overlap_pred() -> str:
     return _overlap_pred()
 
 
+GROUPABLE_DIMENSIONS = {
+    "owner department": "OWNER_DEPARTMENT",
+    "owner_department": "OWNER_DEPARTMENT",
+    "owner dept": "OWNER_DEPARTMENT",
+    "department_oul": "DEPARTMENT_OUL",
+    "department oul": "DEPARTMENT_OUL",
+    "entity": "ENTITY",
+    "entity_no": "ENTITY_NO",
+    "entity no": "ENTITY_NO",
+    "status": "CONTRACT_STATUS",
+    "contract_status": "CONTRACT_STATUS",
+    "request_type": "REQUEST_TYPE",
+    "request type": "REQUEST_TYPE",
+}
+
+
 # --- Case (15): missing CONTRACT_ID ---
 def sql_missing_contract_id() -> str:
     return (
@@ -246,6 +262,26 @@ def build_contracts_sql(
 
     # 4) SELECT list and GROUP BY / measure
     group_by = intent.get("group_by")
+    group_by_token = intent.get("group_by_token")
+
+    def _map_group(candidate: Optional[str]) -> Optional[str]:
+        if not isinstance(candidate, str):
+            return None
+        key = candidate.strip().lower()
+        if not key:
+            return None
+        mapped = GROUPABLE_DIMENSIONS.get(key)
+        if mapped:
+            return mapped
+        return candidate.strip()
+
+    mapped = _map_group(group_by_token)
+    if mapped:
+        group_by = mapped
+    else:
+        mapped = _map_group(group_by)
+        if mapped:
+            group_by = mapped
     agg = intent.get("agg")
     measure_sql = (intent.get("measure_sql") or _NET)
 

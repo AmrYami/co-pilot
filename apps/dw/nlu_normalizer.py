@@ -191,7 +191,7 @@ def normalize(question: str, now: Optional[datetime] = None) -> NLIntent:
             intent.top_n = n
             intent.user_requested_top_n = True
             intent.sort_desc = True
-    bb = re.search(r"\b(bottom|lowest|least|smallest)\s+(\w+)\b", q, re.I)
+    bb = re.search(r"\b(bottom|lowest|least|smallest|cheapest|min)\s+(\w+)\b", q, re.I)
     if bb:
         n = _to_int(bb.group(2))
         if n:

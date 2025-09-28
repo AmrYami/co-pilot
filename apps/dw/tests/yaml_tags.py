@@ -38,15 +38,33 @@ def _first_day_of_quarter(d: date) -> date:
     return d.replace(month=first_month, day=1)
 
 
-def _start_of_month(offset: Union[int, str, None]) -> date:
+def _maybe_date(value: Any) -> date | None:
+    if value is None:
+        return None
+    if isinstance(value, date) and not isinstance(value, datetime):
+        return value
+    try:
+        return _iso_date(value)
+    except Exception:
+        return None
+
+
+def _start_of_month(value: Union[int, str, date, datetime, None]) -> date:
     base = _today().replace(day=1)
-    if offset is None:
+    if value is None:
         return base
-    return base + relativedelta(months=_parse_int(offset, 0))
+    candidate = _maybe_date(value)
+    if candidate:
+        return candidate.replace(day=1)
+    try:
+        offset = _parse_int(value, 0)
+    except Exception:
+        offset = 0
+    return base + relativedelta(months=offset)
 
 
-def _end_of_month(offset: Union[int, str, None]) -> date:
-    start = _start_of_month(offset)
+def _end_of_month(value: Union[int, str, date, datetime, None]) -> date:
+    start = _start_of_month(value)
     next_month = start + relativedelta(months=1)
     return next_month - timedelta(days=1)
 
@@ -58,34 +76,44 @@ def _start_of_last_month() -> date:
 def _end_of_last_month() -> date:
     return _end_of_month(-1)
 
-def _start_of_year(offset_or_year: Union[int, str, None]) -> date:
+def _start_of_year(offset_or_year: Union[int, str, date, datetime, None]) -> date:
     t = _today()
     if offset_or_year is None:
         y = t.year
     else:
-        # If explicit year like "2023", use as absolute. Otherwise treat as offset.
-        try:
-            val = int(str(offset_or_year).strip())
-        except Exception:
-            val = 0
-        if val >= 1900:
-            y = val
+        date_candidate = _maybe_date(offset_or_year)
+        if date_candidate:
+            y = date_candidate.year
         else:
-            y = (t + relativedelta(years=val)).year
+            try:
+                val = int(str(offset_or_year).strip())
+            except Exception:
+                val = 0
+            if val >= 1900:
+                y = val
+            else:
+                y = (t + relativedelta(years=val)).year
     return date(y, 1, 1)
 
 def _end_of_year(offset_or_year: Union[int, str, None]) -> date:
     s = _start_of_year(offset_or_year)
     return s.replace(month=12, day=31)
 
-def _start_of_quarter(offset: Union[int, str, None]) -> date:
-    t = _today()
-    base = _first_day_of_quarter(t)
-    k = 0 if offset is None else _parse_int(offset, 0)
+def _start_of_quarter(value: Union[int, str, date, datetime, None]) -> date:
+    base = _first_day_of_quarter(_today())
+    if value is None:
+        return base
+    candidate = _maybe_date(value)
+    if candidate:
+        return _first_day_of_quarter(candidate)
+    try:
+        k = _parse_int(value, 0)
+    except Exception:
+        k = 0
     return base + relativedelta(months=3 * k)
 
-def _end_of_quarter(offset: Union[int, str, None]) -> date:
-    s = _start_of_quarter(offset)
+def _end_of_quarter(value: Union[int, str, date, datetime, None]) -> date:
+    s = _start_of_quarter(value)
     # end = start_of_next_quarter - 1 day
     nxt = s + relativedelta(months=3)
     return nxt - timedelta(days=1)
@@ -218,49 +246,56 @@ def construct_iso(loader: GoldenLoader, node: yaml.Node) -> date:
 
 
 def _multi_start_dispatch(suffix: str, payload: Any) -> date:
-    s = (suffix or "").strip().lower()
-    if s in ("month", ""):
+    s = (suffix or "").strip().lower().replace("-", "_")
+    if s in ("", "month", "months", "this_month"):
         return _start_of_month(payload)
-    if s == "last_month":
+    if s in ("last_month", "previous_month"):
         return _start_of_last_month()
-    if s == "year":
+    if s in ("year", "years"):
         return _start_of_year(payload)
-    if s == "last_year":
+    if s in ("last_year", "previous_year"):
         return _start_of_year(-1)
-    if s == "quarter":
+    if s in ("quarter", "quarters"):
         return _start_of_quarter(payload)
-    if s == "last_quarter":
+    if s in ("last_quarter", "previous_quarter"):
         return _start_of_quarter(-1)
-    if s in ("prev_months", "months_ago", "month_ago"):
+    if s in ("prev_months", "previous_months", "months_ago", "month_ago"):
         return _start_of_month(-_parse_optional_int(payload, 1))
-    if s in ("prev_years", "years_ago", "year_ago"):
+    if s in ("prev_years", "previous_years", "years_ago", "year_ago"):
         return _start_of_year(-_parse_optional_int(payload, 1))
-    if s in ("prev_quarters", "quarters_ago", "quarter_ago"):
+    if s in ("prev_quarters", "previous_quarters", "quarters_ago", "quarter_ago"):
         return _start_of_quarter(-_parse_optional_int(payload, 1))
-    return _start_of_month(-_parse_optional_int(payload, 1))
+    # Fallback: interpret payload as explicit base date or default to current month start.
+    try:
+        return _start_of_month(payload)
+    except Exception:
+        return _start_of_month(None)
 
 
 def _multi_end_dispatch(suffix: str, payload: Any) -> date:
-    s = (suffix or "").strip().lower()
-    if s in ("month", ""):
+    s = (suffix or "").strip().lower().replace("-", "_")
+    if s in ("", "month", "months", "this_month"):
         return _end_of_month(payload)
-    if s == "last_month":
+    if s in ("last_month", "previous_month"):
         return _end_of_last_month()
-    if s == "year":
+    if s in ("year", "years"):
         return _end_of_year(payload)
-    if s == "last_year":
+    if s in ("last_year", "previous_year"):
         return _end_of_year(-1)
-    if s == "quarter":
+    if s in ("quarter", "quarters"):
         return _end_of_quarter(payload)
-    if s == "last_quarter":
+    if s in ("last_quarter", "previous_quarter"):
         return _end_of_quarter(-1)
-    if s in ("prev_months", "months_ago", "month_ago"):
+    if s in ("prev_months", "previous_months", "months_ago", "month_ago"):
         return _end_of_month(-_parse_optional_int(payload, 1))
-    if s in ("prev_years", "years_ago", "year_ago"):
+    if s in ("prev_years", "previous_years", "years_ago", "year_ago"):
         return _end_of_year(-_parse_optional_int(payload, 1))
-    if s in ("prev_quarters", "quarters_ago", "quarter_ago"):
+    if s in ("prev_quarters", "previous_quarters", "quarters_ago", "quarter_ago"):
         return _end_of_quarter(-_parse_optional_int(payload, 1))
-    return _end_of_month(-_parse_optional_int(payload, 1))
+    try:
+        return _end_of_month(payload)
+    except Exception:
+        return _end_of_month(None)
 
 
 def construct_start_multi(loader: GoldenLoader, tag_suffix: str, node: yaml.Node) -> date:
