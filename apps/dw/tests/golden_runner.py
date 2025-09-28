@@ -63,12 +63,14 @@ def _load_yaml(path: Path) -> Dict[str, Any]:
         return {}
 
 
+def _dense(s: str) -> str:
+    """Lowercase + strip all whitespace for flexible substring checks."""
+    return re.sub(r"\s+", "", (s or "")).lower()
+
+
 def _flatten(s: str) -> str:
     """Normalize SQL to be whitespace- and punctuation-agnostic for substring checks."""
-    s = s or ""
-    s = re.sub(r"\s+", "", s)
-    s = s.replace("`", "").lower()
-    return s
+    return _dense(s).replace("`", "")
 
 
 def _contains_all(sql: str, fragments: List[str]) -> List[str]:
@@ -203,8 +205,9 @@ def _check_expectations(case: GoldenCase, resp: Dict[str, Any]) -> Tuple[bool, L
         ok = False
         reasons.extend([f"SQL does not contain expected fragment: {frag}" for frag in missing_fragments])
 
+    sql_dense = _dense(sql)
     for frag in case.expect_sql_not_contains:
-        if frag in sql:
+        if _dense(frag) in sql_dense:
             ok = False
             reasons.append(f"SQL unexpectedly contained fragment: {frag}")
 

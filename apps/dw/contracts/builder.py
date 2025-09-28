@@ -3,6 +3,8 @@ import re
 from datetime import date, datetime
 from typing import Dict, Tuple, Optional, List
 
+from .rules_extra import try_build_special_cases
+
 # NOTE: Keep this module strictly table-specific (Contract).
 #       Cross-table / DocuWare-generic helpers should live elsewhere.
 
@@ -98,6 +100,7 @@ def build_contracts_sql(
     """
     Build Oracle SQL for the Contract table based on a normalized intent dict.
     Returns (sql, binds).
+    Accuracy-first: attempt known high-value shortcuts before generic rules.
     Expected intent fields (subset):
       - explicit_dates: {start, end} or None
       - date_column: 'REQUEST_DATE' | 'END_DATE' | 'OVERLAP' | None
@@ -115,6 +118,10 @@ def build_contracts_sql(
         or intent.get("q")
         or ""
     )
+
+    sc_sql, sc_binds, _ = try_build_special_cases(q_text)
+    if sc_sql:
+        return sc_sql, (sc_binds or {})
     q_norm = str(intent.get("raw_question_norm") or q_text).strip().lower()
 
     # Special deterministic cases mapped by the parser or fallback keyword match.
