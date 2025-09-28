@@ -229,7 +229,7 @@ def parse_dw_intent(q: str, *, default_date_col: str = "REQUEST_DATE") -> NLInte
         if not intent.group_by and "stakeholder" in dim_raw:
             intent.group_by = "CONTRACT_STAKEHOLDER_1"
 
-    match = re.search(r"\b(top|highest|bottom|lowest)\s+([a-zA-Z0-9\-]+)", lowered)
+    match = re.search(r"\b(top|highest|bottom|lowest|least|smallest|cheapest|min)\s+([a-zA-Z0-9\-]+)", lowered)
     if match:
         number = _num_from_text(match.group(2))
         if number:
@@ -238,7 +238,7 @@ def parse_dw_intent(q: str, *, default_date_col: str = "REQUEST_DATE") -> NLInte
             keyword = match.group(1)
             if keyword in {"top", "highest"}:
                 intent.sort_desc = True
-            elif keyword in {"bottom", "lowest"}:
+            elif keyword in {"bottom", "lowest", "least", "smallest", "cheapest", "min"}:
                 intent.sort_desc = False
 
     match = re.search(r"\b(expir(?:e|ing)s?|due|ending)\s+in\s+([a-zA-Z0-9\-]+)\s+day", lowered)

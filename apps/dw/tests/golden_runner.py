@@ -73,6 +73,24 @@ def _flatten(s: str) -> str:
     return _dense(s).replace("`", "")
 
 
+def _must_contain(sql: str, frag: str, reasons: List[str]) -> None:
+    if not frag:
+        return
+    if _flatten(frag) not in _flatten(sql):
+        reasons.append(f"SQL does not contain expected fragment: {frag}")
+
+
+def assert_overlap_present(case: GoldenCase | None, sql: str, reasons: List[str]) -> None:
+    _must_contain(sql, "START_DATE <= :date_end", reasons)
+    _must_contain(sql, "END_DATE >= :date_start", reasons)
+
+
+def assert_order_direction(sql: str, expect_desc: bool, reasons: List[str]) -> None:
+    dir_kw = "DESC" if expect_desc else "ASC"
+    if "ORDER BY" in sql.upper() and dir_kw not in sql.upper():
+        reasons.append(f"ORDER BY direction not {dir_kw}")
+
+
 def _contains_all(sql: str, fragments: List[str]) -> List[str]:
     """Return list of missing fragments after normalization; empty list means all found."""
     sql_n = _flatten(sql)
@@ -86,55 +104,56 @@ def _contains_all(sql: str, fragments: List[str]) -> List[str]:
 
 def _assert_overlap(sql: str) -> List[str]:
     """Expect overlap window predicates to be present."""
-    return _contains_all(sql, [
-        "START_DATE <= :date_end",
-        "END_DATE >= :date_start",
-    ])
+    reasons: List[str] = []
+    assert_overlap_present(None, sql, reasons)
+    return reasons
 
 
 def _assert_end_only(sql: str) -> List[str]:
     """Expect END_DATE window predicates to be present."""
-    return _contains_all(sql, [
-        "END_DATE BETWEEN :date_start AND :date_end",
-    ])
+    reasons: List[str] = []
+    _must_contain(sql, "END_DATE BETWEEN :date_start AND :date_end", reasons)
+    return reasons
 
 
 def _assert_request_window(sql: str) -> List[str]:
-    return _contains_all(sql, [
-        "REQUEST_DATE BETWEEN :date_start AND :date_end",
-    ])
+    reasons: List[str] = []
+    _must_contain(sql, "REQUEST_DATE BETWEEN :date_start AND :date_end", reasons)
+    return reasons
 
 
 def _assert_order(sql: str, metric: str, direction: str) -> List[str]:
     """metric in {'gross','net','measure'}; direction in {'asc','desc'}."""
-    order_fragments: List[str] = []
+    reasons: List[str] = []
     metric_key = (metric or "measure").lower()
-    dir_key = (direction or "desc").upper()
+    dir_key = (direction or "desc").lower()
     if metric_key == "gross":
-        order_fragments.append(f"ORDER BY {GROSS_EXPR} {dir_key}")
+        _must_contain(sql, f"ORDER BY {GROSS_EXPR} {dir_key.upper()}", reasons)
     elif metric_key == "net":
-        order_fragments.append(f"ORDER BY {NET_EXPR} {dir_key}")
+        _must_contain(sql, f"ORDER BY {NET_EXPR} {dir_key.upper()}", reasons)
     elif metric_key == "measure":
-        order_fragments.append(f"ORDER BY MEASURE {dir_key}")
+        _must_contain(sql, f"ORDER BY MEASURE {dir_key.upper()}", reasons)
     else:
-        order_fragments.append("ORDER BY")
-        order_fragments.append(dir_key)
-    return _contains_all(sql, order_fragments)
+        _must_contain(sql, "ORDER BY", reasons)
+        assert_order_direction(sql, dir_key == "desc", reasons)
+    return reasons
 
 
 def _assert_group_by(sql: str, cols: List[str]) -> List[str]:
     columns = [c.strip() for c in cols if c and c.strip()]
     if not columns:
         return []
-    return _contains_all(sql, ["GROUP BY " + ", ".join(columns)])
+    reasons: List[str] = []
+    _must_contain(sql, "GROUP BY " + ", ".join(columns), reasons)
+    return reasons
 
 
 def _assert_owner_vs_oul_mismatch(sql: str) -> List[str]:
-    return _contains_all(sql, [
-        "DEPARTMENT_OUL IS NOT NULL",
-        "NVL(TRIM(OWNER_DEPARTMENT),'(None)') <> NVL(TRIM(DEPARTMENT_OUL),'(None)')",
-        "ORDER BY CNT DESC",
-    ])
+    reasons: List[str] = []
+    _must_contain(sql, "DEPARTMENT_OUL IS NOT NULL", reasons)
+    _must_contain(sql, "NVL(TRIM(OWNER_DEPARTMENT),'(None)') <> NVL(TRIM(DEPARTMENT_OUL),'(None)')", reasons)
+    _must_contain(sql, "ORDER BY CNT DESC", reasons)
+    return reasons
 
 
 def _ensure_date(v: Any) -> Any:
@@ -230,26 +249,26 @@ def _check_expectations(case: GoldenCase, resp: Dict[str, Any]) -> Tuple[bool, L
             reasons.append(f"Expected ORDER BY on: {case.expect_order_by}")
 
     # 3b) structured assertions
-    structured_missing: List[str] = []
+    structured_reasons: List[str] = []
     assertions = case.assertions or {}
     if assertions.get("overlap"):
-        structured_missing.extend(_assert_overlap(sql))
+        structured_reasons.extend(_assert_overlap(sql))
     if assertions.get("end_only"):
-        structured_missing.extend(_assert_end_only(sql))
+        structured_reasons.extend(_assert_end_only(sql))
     if assertions.get("request_window"):
-        structured_missing.extend(_assert_request_window(sql))
+        structured_reasons.extend(_assert_request_window(sql))
     if "order" in assertions:
         order_cfg = assertions.get("order") or {}
-        structured_missing.extend(
+        structured_reasons.extend(
             _assert_order(sql, order_cfg.get("metric", "measure"), order_cfg.get("dir", "desc"))
         )
     if "group_by" in assertions:
-        structured_missing.extend(_assert_group_by(sql, assertions.get("group_by") or []))
+        structured_reasons.extend(_assert_group_by(sql, assertions.get("group_by") or []))
     if assertions.get("owner_vs_oul_mismatch"):
-        structured_missing.extend(_assert_owner_vs_oul_mismatch(sql))
-    if structured_missing:
+        structured_reasons.extend(_assert_owner_vs_oul_mismatch(sql))
+    if structured_reasons:
         ok = False
-        reasons.extend([f"SQL does not contain expected fragment: {frag}" for frag in structured_missing])
+        reasons.extend(structured_reasons)
 
     # 4) date column intent
     if case.expect_date_col:

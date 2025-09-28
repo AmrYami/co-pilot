@@ -11,7 +11,7 @@ _YTD_YEAR_RE = re.compile(
     re.IGNORECASE,
 )
 
-_LOWEST_RE = re.compile(r"\b(lowest|bottom|least|smallest)\b", re.IGNORECASE)
+_LOWEST_RE = re.compile(r"\b(lowest|bottom|least|smallest|cheapest|min)\b", re.IGNORECASE)
 
 # ---- Gross and helpers -------------------------------------------------------
 GROSS_SQL = (

@@ -87,12 +87,26 @@ def _ensure_engine():
         return getattr(pipeline, "app_engine", None)
 
 
-def _normalize_date_binds(binds: Dict[str, Any]) -> Dict[str, Any]:
+def _coerce_date(val: Any) -> Any:
+    if isinstance(val, date) and not isinstance(val, datetime):
+        return val
+    if isinstance(val, datetime):
+        return val.date()
+    if isinstance(val, str):
+        text = val.strip()
+        if len(text) == 10:
+            try:
+                return datetime.strptime(text, "%Y-%m-%d").date()
+            except ValueError:
+                return val
+    return val
+
+
+def _coerce_bind_dates(binds: Dict[str, Any]) -> Dict[str, Any]:
     fixed: Dict[str, Any] = {}
     for key, value in (binds or {}).items():
-        if key.startswith("date_"):
-            coerced = _ensure_oracle_date(value)
-            fixed[key] = coerced if coerced is not None else value
+        if isinstance(key, str) and key.startswith(("date_", "d30", "d60", "d90")):
+            fixed[key] = _coerce_date(value)
         else:
             fixed[key] = value
     return fixed
@@ -102,8 +116,7 @@ def _execute_oracle(sql: str, binds: Dict[str, Any]):
     engine = _ensure_engine()
     if engine is None:
         return [], [], {"rows": 0}
-    safe_binds = coerce_oracle_binds(binds or {})
-    safe_binds = _normalize_date_binds(safe_binds)
+    safe_binds = _coerce_bind_dates(coerce_oracle_binds(binds or {}))
     with engine.connect() as cx:  # type: ignore[union-attr]
         rs = cx.execute(text(sql), safe_binds)
         cols = list(rs.keys()) if hasattr(rs, "keys") else []
@@ -167,7 +180,7 @@ def derive_sql_for_test(question: str, namespace: str = "dw::common", test_binds
     if test_binds:
         binds.update(test_binds)
 
-    return sql, binds
+    return sql, _coerce_bind_dates(binds)
 
 
 DEFAULT_EXPLICIT_FILTER_COLUMNS: List[str] = [
@@ -183,17 +196,9 @@ DEFAULT_EXPLICIT_FILTER_COLUMNS: List[str] = [
 
 
 def _ensure_oracle_date(value: Optional[Any]) -> Optional[date]:
-    if value is None:
-        return None
-    if isinstance(value, date) and not isinstance(value, datetime):
-        return value
-    if isinstance(value, datetime):
-        return value.date()
-    if isinstance(value, str):
-        try:
-            return datetime.strptime(value[:10], "%Y-%m-%d").date()
-        except ValueError:
-            return None
+    coerced = _coerce_date(value)
+    if isinstance(coerced, date) and not isinstance(coerced, datetime):
+        return coerced
     return None
 
 
@@ -316,9 +321,24 @@ def _get_fts_columns(*, table: str, namespace: str) -> List[str]:
     getter = getattr(settings, "get_fts_columns", None)
     if callable(getter):
         return getter(table)  # type: ignore[return-value]
-    mapping = settings.get("DW_FTS_COLUMNS", scope="namespace", namespace=namespace) if hasattr(settings, "get") else {}
-    if isinstance(mapping, dict):
-        return mapping.get(table, mapping.get("*", [])) or []
+    fts_map: Dict[str, Any] = {}
+    json_getter = getattr(settings, "get_json", None)
+    if callable(json_getter):
+        try:
+            fts_map = json_getter("DW_FTS_COLUMNS", scope="namespace", namespace=namespace) or {}
+        except TypeError:
+            fts_map = json_getter("DW_FTS_COLUMNS") or {}
+    elif hasattr(settings, "get"):
+        try:
+            fts_map = settings.get("DW_FTS_COLUMNS", scope="namespace", namespace=namespace) or {}
+        except TypeError:
+            fts_map = settings.get("DW_FTS_COLUMNS") or {}
+    if isinstance(fts_map, dict):
+        columns = fts_map.get(table) or fts_map.get("*") or []
+        if isinstance(columns, list):
+            return [str(col) for col in columns]
+        if isinstance(columns, str):
+            return [part.strip() for part in columns.split(",") if part.strip()]
     return []
 
 
@@ -407,11 +427,7 @@ def answer():
 
     contract_sql, contract_binds, contract_meta = plan_sql(question, today=date.today())
     if contract_sql:
-        binds = dict(contract_binds or {})
-        # ensure Oracle receives actual date objects
-        for key in ("date_start", "date_end"):
-            if key in binds and isinstance(binds[key], str):
-                binds[key] = datetime.fromisoformat(binds[key]).date()
+        binds = _coerce_bind_dates(dict(contract_binds or {}))
         if ":top_n" in contract_sql and "top_n" not in binds:
             binds["top_n"] = 10
         rows, cols, exec_meta = _execute_oracle(contract_sql, binds)
@@ -514,6 +530,7 @@ def answer():
             explain_bits.append(f"Limited to top {int(top_n)} rows.")
 
         LOGGER.info("[dw] explicit_filters_sql: %s", {"size": len(sql), "sql": sql})
+        binds = _coerce_bind_dates(binds)
         rows, cols, exec_meta = _execute_oracle(sql, binds)
 
         inquiry_id = _log_inquiry(
@@ -563,7 +580,8 @@ def answer():
     )
 
     LOGGER.info("[dw] final_sql: %s", {"size": len(sql), "sql": sql})
-    rows, cols, exec_meta = _execute_oracle(sql, binds or {})
+    binds = _coerce_bind_dates(binds or {})
+    rows, cols, exec_meta = _execute_oracle(sql, binds)
 
     inquiry_id = _log_inquiry(
         question,

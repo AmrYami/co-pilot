@@ -28,7 +28,7 @@ def _extract_top_n(q: str, default: int = 5) -> int:
 
 def _is_bottom_request(q: str) -> bool:
     """Detect bottom/lowest requests to flip sort order."""
-    return bool(re.search(r"\b(lowest|bottom|least|smallest)\b", q, re.IGNORECASE))
+    return bool(re.search(r"\b(lowest|bottom|least|smallest|cheapest|min)\b", q, re.IGNORECASE))
 
 
 def _extract_year(q: str) -> Optional[int]:
