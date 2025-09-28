@@ -11,11 +11,11 @@ from .rules_extra import try_build_special_cases
 _NET = "NVL(CONTRACT_VALUE_NET_OF_VAT,0)"
 
 
-def gross_expr() -> str:
-    return (
-        "NVL(CONTRACT_VALUE_NET_OF_VAT,0) + CASE WHEN NVL(VAT,0) BETWEEN 0 AND 1 "
-        "THEN NVL(CONTRACT_VALUE_NET_OF_VAT,0) * NVL(VAT,0) ELSE NVL(VAT,0) END"
-    )
+def gross_expr(alias: str | None = None) -> str:
+    base = "NVL(CONTRACT_VALUE_NET_OF_VAT,0)"
+    vat = "NVL(VAT,0)"
+    expr = f"{base} + CASE WHEN {vat} BETWEEN 0 AND 1 THEN {base} * {vat} ELSE {vat} END"
+    return f"{expr} AS {alias}" if alias else expr
 
 
 # --- Helpers: measures / overlap predicate ---
@@ -24,6 +24,90 @@ GROSS_EXPR = gross_expr()
 
 def overlap_pred() -> str:
     return _overlap_pred()
+
+
+def build_top_gross_ytd(q: str, binds: Dict[str, object] | None, top_n: int) -> Tuple[str, Dict[str, object]]:
+    """Top-N contracts by gross for a YTD window inferred from question/binds."""
+    text = q or ""
+    lowered = text.lower()
+    out_binds = dict(binds or {})
+    today_hint = out_binds.pop("today", None)
+    today_val = today_hint or date.today()
+    if not isinstance(today_val, date):
+        today_val = _as_date(today_val)
+
+    # Prefer a year mentioned near YTD; otherwise fall back to current year-to-date.
+    year = None
+    near_year = re.search(r"\b(20\d{2})\b[^0-9a-z]{0,10}\bYTD\b", text, re.IGNORECASE)
+    if near_year:
+        year = int(near_year.group(1))
+    else:
+        near_year = re.search(r"\bYTD\b[^0-9a-z]{0,10}\b(20\d{2})\b", text, re.IGNORECASE)
+        if near_year:
+            year = int(near_year.group(1))
+    if year is None and "ytd" in lowered:
+        generic_year = re.search(r"\b(20\d{2})\b", text, re.IGNORECASE)
+        if generic_year:
+            year = int(generic_year.group(1))
+
+    if year is not None:
+        ds = date(year, 1, 1)
+        de = date(year, 12, 31)
+    else:
+        ds = date(today_val.year, 1, 1)
+        de = today_val
+
+    try:
+        top_n_int = int(top_n)
+    except (TypeError, ValueError):
+        top_n_int = 5
+    if top_n_int <= 0:
+        top_n_int = 5
+
+    out_binds.update({
+        "date_start": ds,
+        "date_end": de,
+        "top_n": top_n_int,
+    })
+    _ensure_date_binds(out_binds, "date_start", "date_end")
+
+    sql = (
+        'SELECT * FROM "Contract"\n'
+        f"WHERE {_overlap_pred()}\n"
+        f"ORDER BY {gross_expr()} DESC\n"
+        "FETCH FIRST :top_n ROWS ONLY"
+    )
+    return sql, out_binds
+
+
+def build_yoy_gross_overlap(binds: Dict[str, object] | None) -> Tuple[str, Dict[str, object]]:
+    """YoY gross totals using overlap windows for current and previous periods."""
+    out = dict(binds or {})
+    _ensure_date_binds(out, "ds", "de", "p_ds", "p_de")
+    sql = (
+        "SELECT 'CURRENT' AS PERIOD, SUM(" + gross_expr() + ") AS TOTAL_GROSS\n"
+        'FROM "Contract"\n'
+        f"WHERE {_overlap_pred(':ds', ':de')}\n"
+        "UNION ALL\n"
+        "SELECT 'PREVIOUS' AS PERIOD, SUM(" + gross_expr() + ") AS TOTAL_GROSS\n"
+        'FROM "Contract"\n'
+        f"WHERE {_overlap_pred(':p_ds', ':p_de')}"
+    )
+    return sql, out
+
+
+def build_owner_vs_oul_mismatch(binds: Dict[str, object] | None = None) -> Tuple[str, Dict[str, object]]:
+    sql = (
+        "SELECT NVL(TRIM(OWNER_DEPARTMENT), '(None)') AS OWNER_DEPARTMENT,\n"
+        "       NVL(TRIM(DEPARTMENT_OUL), '(None)')   AS DEPARTMENT_OUL,\n"
+        "       COUNT(*) AS CNT\n"
+        'FROM "Contract"\n'
+        "WHERE DEPARTMENT_OUL IS NOT NULL\n"
+        "  AND NVL(TRIM(OWNER_DEPARTMENT), '(None)') <> NVL(TRIM(DEPARTMENT_OUL), '(None)')\n"
+        "GROUP BY NVL(TRIM(OWNER_DEPARTMENT), '(None)'), NVL(TRIM(DEPARTMENT_OUL), '(None)')\n"
+        "ORDER BY CNT DESC"
+    )
+    return sql, dict(binds or {})
 
 
 GROUPABLE_DIMENSIONS = {
@@ -50,42 +134,6 @@ def sql_missing_contract_id() -> str:
         "ORDER BY REQUEST_DATE DESC"
     )
 
-
-# --- Case (17): YTD top N by gross ---
-def sql_ytd_top_gross() -> str:
-    return (
-        'SELECT * FROM "Contract"\n'
-        f"WHERE {overlap_pred()}\n"
-        f"ORDER BY {gross_expr()} DESC\n"
-        "FETCH FIRST :top_n ROWS ONLY"
-    )
-
-
-# --- Case (32): YoY gross using overlap, two blocks ---
-def sql_yoy_same_period_overlap() -> str:
-    return (
-        "SELECT 'CURRENT' AS PERIOD, SUM(" + GROSS_EXPR + ") AS TOTAL_GROSS\n"
-        'FROM "Contract"\n'
-        "WHERE (START_DATE IS NOT NULL AND END_DATE IS NOT NULL "
-        "AND START_DATE <= :de AND END_DATE >= :ds)\n"
-        "UNION ALL\n"
-        "SELECT 'PREVIOUS' AS PERIOD, SUM(" + GROSS_EXPR + ") AS TOTAL_GROSS\n"
-        'FROM "Contract"\n'
-        "WHERE (START_DATE IS NOT NULL AND END_DATE IS NOT NULL "
-        "AND START_DATE <= :p_de AND END_DATE >= :p_ds)"
-    )
-
-
-# --- Case (35): mismatches OWNER_DEPARTMENT vs DEPARTMENT_OUL ---
-def sql_owner_vs_oul_mismatch() -> str:
-    return (
-        'SELECT OWNER_DEPARTMENT, DEPARTMENT_OUL, COUNT(*) AS CNT\n'
-        'FROM "Contract"\n'
-        "WHERE DEPARTMENT_OUL IS NOT NULL\n"
-        "  AND NVL(TRIM(OWNER_DEPARTMENT),'(None)') <> NVL(TRIM(DEPARTMENT_OUL),'(None)')\n"
-        "GROUP BY OWNER_DEPARTMENT, DEPARTMENT_OUL\n"
-        "ORDER BY CNT DESC"
-    )
 
 def _as_date(obj: object) -> date:
     if isinstance(obj, datetime):
@@ -144,34 +192,25 @@ def build_contracts_sql(
     if "missing contract_id" in q_norm or "data quality" in q_norm:
         return sql_missing_contract_id(), {}
 
-    ytd_match = re.search(r"\b(20\d{2})\b.*?\bYTD\b", q_text, re.IGNORECASE)
-    if ytd_match and "gross" in q_norm and ("top" in q_norm or intent.get("top_n")):
-        today_obj = intent.get("today") or notes.get("today") or date.today()
-        today_date = _as_date(today_obj)
-        year = int(ytd_match.group(1))
-        date_start = date(year, 1, 1)
-        if year == today_date.year:
-            date_end = today_date
-        else:
-            date_end = date(year, 12, 31)
+    if (
+        "ytd" in q_norm
+        and ("gross" in q_norm or "contract value" in q_norm)
+        and ("top" in q_norm or "highest" in q_norm or intent.get("top_n"))
+    ):
         top_hint = re.search(r"top\s+(\d+)", q_text, re.IGNORECASE)
-        default_top = 5
+        top_candidate: Optional[int] = None
         if top_hint:
-            default_top = int(top_hint.group(1))
-        else:
+            top_candidate = int(top_hint.group(1))
+        elif intent.get("top_n") is not None:
             try:
-                default_top = int(intent.get("top_n")) if intent.get("top_n") is not None else 5
+                top_candidate = int(intent.get("top_n"))
             except (TypeError, ValueError):
-                default_top = 5
-        try:
-            top_n = int(intent.get("top_n") or default_top)
-        except (TypeError, ValueError):
-            top_n = default_top
-        if top_n <= 0:
-            top_n = default_top if default_top > 0 else 5
-        binds = {"date_start": date_start, "date_end": date_end, "top_n": top_n}
-        _ensure_date_binds(binds, "date_start", "date_end")
-        return sql_ytd_top_gross(), binds
+                top_candidate = None
+        top_candidate = top_candidate if top_candidate and top_candidate > 0 else 5
+        today_hint = intent.get("today") or notes.get("today")
+        binds_hint = {"today": today_hint} if today_hint else {}
+        sql, binds_out = build_top_gross_ytd(q_text, binds_hint, top_candidate)
+        return sql, binds_out
 
     if re.search(r"\byear-?over-?year\b|\bYoY\b", q_text, re.IGNORECASE):
         today_obj = intent.get("today") or notes.get("today") or date.today()
@@ -188,8 +227,8 @@ def build_contracts_sql(
             p_ds = p_ds or date(this_year - 1, 1, 1)
             p_de = p_de or date(this_year - 1, 3, 31)
         binds = {"ds": ds, "de": de, "p_ds": p_ds, "p_de": p_de}
-        _ensure_date_binds(binds, "ds", "de", "p_ds", "p_de")
-        return sql_yoy_same_period_overlap(), binds
+        sql, out_binds = build_yoy_gross_overlap(binds)
+        return sql, out_binds
 
     if (
         re.search(
@@ -209,7 +248,8 @@ def build_contracts_sql(
             re.IGNORECASE,
         )
     ):
-        return sql_owner_vs_oul_mismatch(), {}
+        sql, binds_out = build_owner_vs_oul_mismatch()
+        return sql, binds_out
 
     q_parts: List[str] = []
     binds: Dict[str, object] = {}
