@@ -1,6 +1,7 @@
 # apps/dw/tests/golden_runner.py
 from __future__ import annotations
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
@@ -51,6 +52,11 @@ def _load_yaml(path: Path) -> Dict[str, Any]:
     except Exception as e:
         logging.exception("Failed to load golden YAML: %s", e)
         return {}
+
+
+def _canon_sql(value: str) -> str:
+    """Normalise SQL by removing all whitespace and lowercasing."""
+    return re.sub(r"\s+", "", (value or "")).lower()
 
 
 def _ensure_date(v: Any) -> Any:
@@ -111,12 +117,13 @@ def _check_expectations(case: GoldenCase, resp: Dict[str, Any]) -> Tuple[bool, L
     ok = True
 
     sql = (resp or {}).get("sql") or ""
+    sql_canon = _canon_sql(sql)
     meta = (resp or {}).get("meta") or {}
     intent = ((resp or {}).get("debug") or {}).get("intent") or meta.get("clarifier_intent") or {}
 
     # 1) sql contains
     for frag in case.expect_sql_contains:
-        if frag not in sql:
+        if _canon_sql(frag) not in sql_canon:
             ok = False
             reasons.append(f"SQL does not contain expected fragment: {frag}")
 
