@@ -153,9 +153,9 @@ cases:
     question: "Contracts missing CONTRACT_ID (data quality check)."
     expect:
       sql_like:
-        - 'FROM "Contract"'
-        - 'WHERE'
-        - 'CONTRACT_ID'
+        - 'CONTRACT_ID IS NULL'
+        - "TRIM(CONTRACT_ID) = ''"
+        - 'ORDER BY REQUEST_DATE DESC'
       must_not: []
       notes: "Should test CONTRACT_ID IS NULL or TRIM(CONTRACT_ID) = ''."
 
@@ -163,9 +163,11 @@ cases:
     question: "For the last 90 days, total gross by stakeholder (across 1..8 slots)."
     expect:
       sql_like:
-        - 'FROM "Contract"'
-        - 'SUM('
-        - 'GROUP BY'
+        - 'WITH S AS ('
+        - 'CONTRACT_STAKEHOLDER_1 AS STAKEHOLDER'
+        - 'UNION ALL'
+        - 'GROUP BY STAKEHOLDER'
+        - 'ORDER BY MEASURE DESC'
       must_not: []
       notes: "Ok if current version groups by CONTRACT_STAKEHOLDER_1; advanced version may UNPIVOT 1..8."
 
@@ -187,14 +189,16 @@ cases:
         - 'FROM "Contract"'
         - 'AVG('
         - 'GROUP BY REQUEST_TYPE'
+        - 'REQUEST_DATE BETWEEN'
       must_not: []
 
   - id: monthly_trend_last_12_by_request_date
     question: "Monthly trend (last 12 months) of active contracts (by REQUEST_DATE)."
     expect:
       sql_like:
-        - 'FROM "Contract"'
-        - 'REQUEST_DATE BETWEEN'
+        - "TRUNC(REQUEST_DATE, 'MM') AS MONTH"
+        - "GROUP BY TRUNC(REQUEST_DATE, 'MM')"
+        - 'ORDER BY MONTH ASC'
       must_not: []
       notes: "A pure SELECT with REQUEST_DATE window is acceptable; a grouped month bucket is nicer but optional."
 
@@ -206,14 +210,17 @@ cases:
         - 'WHERE'
         - 'ENTITY_NO'
         - 'GROUP BY CONTRACT_STATUS'
+        - 'SUM('
+        - 'COUNT(*) AS CNT'
       must_not: []
 
   - id: expiring_30_60_90_counts
     question: "Contracts expiring in 30/60/90 days (three separate counts)."
     expect:
       sql_like:
-        - 'FROM "Contract"'
-        - 'END_DATE'
+        - 'SELECT 30 AS BUCKET_DAYS'
+        - 'UNION ALL'
+        - 'SELECT 90 AS BUCKET_DAYS'
       must_not: []
       notes: "Accept union of three counts or three separate queries; runner only checks fragments."
 
@@ -224,6 +231,7 @@ cases:
         - 'FROM "Contract"'
         - 'AVG('
         - 'GROUP BY OWNER_DEPARTMENT'
+        - 'FETCH FIRST'
       must_not: []
       notes: "May also FETCH FIRST 1 ROW ONLY."
 
@@ -231,35 +239,36 @@ cases:
     question: "Stakeholders involved in more than N contracts in 2024."
     expect:
       sql_like:
-        - 'FROM "Contract"'
-        - 'GROUP BY'
-        - 'HAVING'
+        - 'WITH S AS ('
+        - 'GROUP BY STAKEHOLDER'
+        - 'HAVING COUNT(*) > :min_n'
       must_not: []
 
   - id: missing_representative_email
     question: "Contracts where representative_email is missing."
     expect:
       sql_like:
-        - 'FROM "Contract"'
-        - 'WHERE'
-        - 'REPRESENTATIVE_EMAIL'
+        - 'representative_email IS NULL'
+        - "TRIM(representative_email) = ''"
+        - 'ORDER BY REQUEST_DATE DESC'
       must_not: []
 
   - id: requester_quarter_totals
     question: "For REQUESTER = 'john@corp', total gross & count by quarter."
     expect:
       sql_like:
-        - 'FROM "Contract"'
-        - 'WHERE'
-        - 'REQUESTER'
+        - "TRUNC(REQUEST_DATE,'Q') AS QUARTER"
+        - 'SUM('
+        - 'COUNT(*) AS CNT'
+        - 'UPPER(REQUESTER)=UPPER(:requester)'
       must_not: []
 
   - id: stakeholder_depts_2024
     question: "For each stakeholder, list distinct departments they touched in 2024, total gross, and contract count (one row per stakeholder)."
     expect:
       sql_like:
-        - 'FROM "Contract"'
-        - 'GROUP BY'
+        - 'LISTAGG(DISTINCT OWNER_DEPARTMENT'
+        - 'GROUP BY STAKEHOLDER'
       must_not: []
       notes: "Advanced: LISTAGG DISTINCT(OWNER_DEPARTMENT) by stakeholder acceptable but not enforced."
 
@@ -267,9 +276,9 @@ cases:
     question: "Top 10 contracts pairs by gross in the last 180 days."
     expect:
       sql_like:
-        - 'FROM "Contract"'
-        - 'ORDER BY'
-        - 'FETCH FIRST'
+        - 'WITH P AS ('
+        - 'GROUP BY OWNER_DEPARTMENT, STAKEHOLDER'
+        - 'FETCH FIRST 10 ROWS ONLY'
       must_not: []
       notes: "This is advanced (self-join); we only check basic fragments."
 
@@ -280,6 +289,7 @@ cases:
         - 'FROM "Contract"'
         - 'GROUP BY CONTRACT_ID'
         - 'HAVING'
+        - 'ORDER BY CNT DESC'
       must_not: []
 
   - id: median_gross_by_owner_dept_this_year
@@ -289,6 +299,7 @@ cases:
         - 'FROM "Contract"'
         - 'MEDIAN('
         - 'GROUP BY OWNER_DEPARTMENT'
+        - 'ORDER BY MEASURE DESC'
       must_not: []
 
   - id: end_before_start_check
@@ -305,6 +316,7 @@ cases:
     expect:
       sql_like:
         - 'FROM "Contract"'
+        - 'REGEXP_LIKE'
         - 'MONTHS_BETWEEN'
       must_not: []
 
@@ -312,7 +324,8 @@ cases:
     question: "Year-over-year comparison of gross total for the same period (e.g., this Jan–Mar vs last Jan–Mar)."
     expect:
       sql_like:
-        - 'FROM "Contract"'
+        - "SELECT 'CURRENT' AS PERIOD"
+        - "SELECT 'PREVIOUS' AS PERIOD"
         - 'SUM('
       must_not: []
       notes: "Implementation styles vary; fragments only."
@@ -321,9 +334,9 @@ cases:
     question: "For CONTRACT_STATUS in ('Active','Pending'), list contracts whose total gross exceeds a threshold (e.g., > 1,000,000)."
     expect:
       sql_like:
-        - 'FROM "Contract"'
-        - 'WHERE'
-        - 'CONTRACT_STATUS'
+        - 'CONTRACT_STATUS IN'
+        - 'NVL(CONTRACT_VALUE_NET_OF_VAT,0)'
+        - 'ORDER BY'
       must_not: []
 
   - id: top3_by_entity_last_365
@@ -331,15 +344,16 @@ cases:
     expect:
       sql_like:
         - 'FROM "Contract"'
-        - 'ROW_NUMBER() OVER'
-        - 'PARTITION BY ENTITY'
+        - 'ROW_NUMBER() OVER (PARTITION BY ENTITY ORDER BY'
+        - 'WHERE rn <= 3'
       must_not: []
 
   - id: owner_dept_vs_oul_mismatch
     question: "OWNER_DEPARTMENT vs DEPARTMENT_OUL comparison (where OUL is the lead); list any cases."
     expect:
       sql_like:
-        - 'FROM "Contract"'
-        - 'WHERE'
-        - 'DEPARTMENT_OUL'
+        - 'DEPARTMENT_OUL IS NOT NULL'
+        - 'OWNER_DEPARTMENT IS NOT NULL'
+        - 'UPPER(DEPARTMENT_OUL) <> UPPER(OWNER_DEPARTMENT)'
+        - 'ORDER BY REQUEST_DATE DESC'
       must_not: []

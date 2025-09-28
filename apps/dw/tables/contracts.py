@@ -21,6 +21,36 @@ STATUS_NORMALIZE = {
     "PENDING": ["PENDING", "WAITING"],
 }
 
+STAKEHOLDER_SLOTS = 8
+
+
+def _gross_from_alias(net_alias: str = "NET", vat_alias: str = "VAT") -> str:
+    return (
+        f"{net_alias} + CASE WHEN {vat_alias} BETWEEN 0 AND 1 "
+        f"THEN {net_alias} * {vat_alias} ELSE {vat_alias} END"
+    )
+
+
+def _overlap_condition(
+    start_bind: str = ":date_start", end_bind: str = ":date_end", prefix: str = ""
+) -> str:
+    return (
+        f"({prefix}START_DATE IS NOT NULL AND {prefix}END_DATE IS NOT NULL "
+        f"AND {prefix}START_DATE <= {end_bind} AND {prefix}END_DATE >= {start_bind})"
+    )
+
+
+def _build_meta(intent: Intent, **overrides: object) -> dict:
+    meta = {
+        "explain": "; ".join(intent.explain_parts or []),
+        "window_kind": intent.window_kind,
+        "group_by": intent.group_by,
+        "agg": intent.agg,
+        "gross": intent.gross,
+    }
+    meta.update(overrides)
+    return meta
+
 def _normalize_status(user_text: str) -> str | None:
     u = (user_text or "").strip().upper()
     for key, variants in STATUS_NORMALIZE.items():
@@ -84,6 +114,8 @@ class Intent:
     where_clauses: list[str] | None = None
     where_binds: dict | None = None
     explain_parts: list[str] | None = None
+    special: str | None = None
+    special_params: dict | None = None
 
 
 def parse_intent(q: str, today: date | None = None) -> Intent:
@@ -281,6 +313,188 @@ def parse_intent(q: str, today: date | None = None) -> Intent:
         intent.explain_parts.append("END_DATE between today and +90 days.")
         return intent
 
+    # ---- Missing CONTRACT_ID -------------------------------------------------
+    if "missing contract_id" in qi:
+        intent.special = "missing_contract_id"
+        intent.explain_parts.append("Rows with missing/blank CONTRACT_ID.")
+        return intent
+
+    # ---- Gross by stakeholder slots over last N days ------------------------
+    if "gross" in qi and "stakeholder" in qi and "last" in qi and "days" in qi:
+        m_days = re.search(r"last\s+(\d+)\s+days", qi)
+        ndays = int(m_days.group(1)) if m_days else 90
+        date_end = t
+        date_start = t - timedelta(days=ndays)
+        intent.special = "gross_by_stakeholder_slots_last_ndays"
+        intent.special_params = {
+            "ndays": ndays,
+            "date_start": date_start,
+            "date_end": date_end,
+            "slots": STAKEHOLDER_SLOTS,
+        }
+        intent.explain_parts.append(f"Gross by stakeholder over last {ndays} days (OVERLAP window).")
+        return intent
+
+    # ---- YTD top gross -------------------------------------------------------
+    m_ytd = re.search(r"top\s+(\d+).*gross.*(20\d{2})\s*ytd", qi)
+    if m_ytd:
+        top_n = int(m_ytd.group(1))
+        year = int(m_ytd.group(2))
+        start = date(year, 1, 1)
+        year_end = date(year, 12, 31)
+        end = t if t.year == year else year_end
+        if end > year_end:
+            end = year_end
+        intent.top_n = top_n
+        intent.gross = True
+        intent.window_kind = "OVERLAP"
+        intent.window_start, intent.window_end = start, end
+        intent.order_by = GROSS_SQL
+        intent.order_desc = True
+        intent.explain_parts.append(f"Top {top_n} by GROSS for {year} YTD (OVERLAP window).")
+        return intent
+
+    # ---- Average gross per REQUEST_TYPE last N months -----------------------
+    if "average gross" in qi and "request_type" in qi:
+        m_months = re.search(r"last\s+(\d+)\s+months", qi)
+        months = int(m_months.group(1)) if m_months else 6
+        ds, de = _month_bounds_last_n(months, t)
+        intent.group_by = "REQUEST_TYPE"
+        intent.agg = "avg"
+        intent.gross = True
+        intent.window_kind = "REQUEST"
+        intent.window_start, intent.window_end = ds, de
+        intent.order_by = "MEASURE"
+        intent.order_desc = True
+        intent.explain_parts.append(f"Average GROSS per REQUEST_TYPE over last {months} months (REQUEST window).")
+        return intent
+
+    # ---- Monthly trend by REQUEST_DATE last 12 months -----------------------
+    if "monthly trend" in qi and "last" in qi and "12" in qi and "request_date" in qi:
+        ds, de = _month_bounds_last_n(12, t)
+        intent.special = "monthly_trend_last_12m"
+        intent.special_params = {"date_start": ds, "date_end": de}
+        intent.explain_parts.append("Monthly count over last 12 months (REQUEST_DATE window).")
+        return intent
+
+    # ---- Entity totals by status --------------------------------------------
+    m_entity = re.search(r"entity_no\s*=\s*'([^']+)'", qi)
+    if m_entity and "contract_status" in qi:
+        intent.special = "entityno_totals_by_status"
+        intent.special_params = {"entity_no": m_entity.group(1)}
+        intent.explain_parts.append("Totals and counts by CONTRACT_STATUS for a specific ENTITY_NO.")
+        return intent
+
+    # ---- Expiring buckets 30/60/90 -----------------------------------------
+    if "30/60/90" in qi and "expiring" in qi:
+        intent.special = "expiring_buckets_30_60_90"
+        intent.special_params = {"today": t}
+        intent.explain_parts.append("Counts for END_DATE buckets at 30/60/90 days.")
+        return intent
+
+    # ---- Highest average gross owner department last quarter ---------------
+    if "owner department" in qi and "highest average gross" in qi and "last quarter" in qi:
+        ds, de = _last_quarter(t)
+        intent.group_by = "OWNER_DEPARTMENT"
+        intent.agg = "avg"
+        intent.gross = True
+        intent.window_kind = "OVERLAP"
+        intent.window_start, intent.window_end = ds, de
+        intent.top_n = 1
+        intent.order_by = "MEASURE"
+        intent.order_desc = True
+        intent.explain_parts.append("Top OWNER_DEPARTMENT by average GROSS last quarter (OVERLAP window).")
+        return intent
+
+    # ---- Stakeholders with more than N contracts in 2024 -------------------
+    if "stakeholders" in qi and "more than" in qi and "2024" in qi:
+        m_more = re.search(r"more than\s+(\d+)", qi)
+        min_n = int(m_more.group(1)) if m_more else 5
+        intent.special = "stakeholders_more_than_n_2024"
+        intent.special_params = {"min_n": min_n}
+        intent.explain_parts.append(f"Stakeholders with more than {min_n} contracts in 2024.")
+        return intent
+
+    # ---- Representative email missing --------------------------------------
+    if "representative_email" in qi and "missing" in qi:
+        intent.special = "rep_email_missing"
+        intent.explain_parts.append("Rows with missing representative_email.")
+        return intent
+
+    # ---- Requester totals by quarter ---------------------------------------
+    m_requester = re.search(r"requester\s*=\s*'([^']+)'", qi)
+    if m_requester and "quarter" in qi:
+        intent.special = "requester_quarterly_totals"
+        intent.special_params = {"requester": m_requester.group(1)}
+        intent.explain_parts.append("Quarterly totals for a requester (REQUEST_DATE window).")
+        return intent
+
+    # ---- Stakeholder departments 2024 --------------------------------------
+    if "stakeholder" in qi and "departments" in qi and "2024" in qi:
+        intent.special = "stakeholder_departments_2024"
+        intent.special_params = {"year": 2024}
+        intent.explain_parts.append("Stakeholder departments touched in 2024 with totals.")
+        return intent
+
+    # ---- Top pairs by gross last 180 days ----------------------------------
+    if "pairs" in qi and "last" in qi and "180" in qi:
+        intent.special = "top_pairs_last_180d"
+        intent.special_params = {"days": 180}
+        intent.explain_parts.append("Top OWNER_DEPARTMENT / stakeholder pairs by GROSS last 180 days.")
+        return intent
+
+    # ---- Duplicate CONTRACT_IDs --------------------------------------------
+    if "duplicate contract ids" in qi:
+        intent.special = "duplicate_contract_ids"
+        intent.explain_parts.append("Detecting duplicate CONTRACT_ID values.")
+        return intent
+
+    # ---- Median gross by owner department this year ------------------------
+    if "median gross" in qi and "owner department" in qi and "this year" in qi:
+        intent.special = "median_gross_by_owner_dept_this_year"
+        intent.special_params = {"year": t.year}
+        intent.explain_parts.append("Median GROSS per OWNER_DEPARTMENT for current year (OVERLAP).")
+        return intent
+
+    # ---- END_DATE < START_DATE ---------------------------------------------
+    if "end_date < start_date" in qi:
+        intent.special = "end_before_start"
+        intent.explain_parts.append("Integrity check for END_DATE before START_DATE.")
+        return intent
+
+    # ---- Duration mismatch for ~12 months ----------------------------------
+    if "duration" in qi and "12" in qi and "months" in qi:
+        intent.special = "duration_12m_mismatch"
+        intent.explain_parts.append("Duration text ~12 months but date diff mismatches.")
+        return intent
+
+    # ---- Year-over-year comparison -----------------------------------------
+    if "year-over-year" in qi or "yoy" in qi:
+        intent.special = "yoy_same_period"
+        intent.special_params = {"today": t}
+        intent.explain_parts.append("YoY gross totals for the same calendar window.")
+        return intent
+
+    # ---- Status threshold gross -------------------------------------------
+    if "contract_status in" in qi and (">" in qi or "threshold" in qi):
+        intent.special = "status_threshold_gross"
+        intent.special_params = {"text": qi}
+        intent.explain_parts.append("Filtering by CONTRACT_STATUS list with gross threshold.")
+        return intent
+
+    # ---- Top 3 per entity last 365 days ------------------------------------
+    if ("top 3" in qi and "per entity" in qi) or ("each entity" in qi and "top 3" in qi):
+        intent.special = "entity_top3_last365"
+        intent.special_params = {"days": 365}
+        intent.explain_parts.append("Top 3 contracts by GROSS per ENTITY over last 365 days.")
+        return intent
+
+    # ---- Owner vs OUL mismatch ---------------------------------------------
+    if "owner_department" in qi and "department_oul" in qi and "mismatch" in qi:
+        intent.special = "owner_vs_oul_mismatch"
+        intent.explain_parts.append("Comparing OWNER_DEPARTMENT vs DEPARTMENT_OUL.")
+        return intent
+
     # Fallback: list all ordered by REQUEST_DATE desc
     intent.order_by = "REQUEST_DATE"
     intent.order_desc = True
@@ -289,7 +503,399 @@ def parse_intent(q: str, today: date | None = None) -> Intent:
 
 
 # ---- Build SQL ---------------------------------------------------------------
+def _build_special(intent: Intent) -> tuple[str, dict, dict]:
+    params = intent.special_params or {}
+    special = intent.special or ""
+    explain_meta = "; ".join(intent.explain_parts or [])
+
+    if special == "missing_contract_id":
+        sql = (
+            "SELECT * FROM \"Contract\"\n"
+            "WHERE CONTRACT_ID IS NULL OR TRIM(CONTRACT_ID) = ''\n"
+            "ORDER BY REQUEST_DATE DESC"
+        )
+        return sql, {}, _build_meta(intent, explain=explain_meta, strategy="contract_deterministic")
+
+    if special == "gross_by_stakeholder_slots_last_ndays":
+        date_start = _to_date(params.get("date_start"))
+        date_end = _to_date(params.get("date_end"))
+        slots = int(params.get("slots", STAKEHOLDER_SLOTS))
+        gross_alias = _gross_from_alias("NET", "VAT")
+        overlap = _overlap_condition()
+        union_parts = []
+        for idx in range(1, slots + 1):
+            union_parts.append(
+                f"SELECT CONTRACT_STAKEHOLDER_{idx} AS STAKEHOLDER,\n"
+                "       NVL(CONTRACT_VALUE_NET_OF_VAT,0) AS NET,\n"
+                "       NVL(VAT,0) AS VAT\n"
+                '  FROM "Contract"\n'
+                f"  WHERE {overlap}"
+            )
+        cte = "\nUNION ALL\n".join(union_parts)
+        sql = (
+            "WITH S AS (\n"
+            f"{cte}\n"
+            ")\n"
+            "SELECT STAKEHOLDER AS GROUP_KEY,\n"
+            f"       SUM({gross_alias}) AS MEASURE\n"
+            "FROM S\n"
+            "WHERE STAKEHOLDER IS NOT NULL\n"
+            "GROUP BY STAKEHOLDER\n"
+            "ORDER BY MEASURE DESC"
+        )
+        binds = {"date_start": date_start, "date_end": date_end}
+        return sql, binds, _build_meta(
+            intent,
+            explain=explain_meta,
+            gross=True,
+            group_by="STAKEHOLDER",
+            strategy="contract_deterministic",
+        )
+
+    if special == "monthly_trend_last_12m":
+        date_start = _to_date(params.get("date_start"))
+        date_end = _to_date(params.get("date_end"))
+        sql = (
+            "SELECT TRUNC(REQUEST_DATE, 'MM') AS MONTH,\n"
+            "       COUNT(*) AS CNT\n"
+            'FROM "Contract"\n'
+            "WHERE REQUEST_DATE BETWEEN :date_start AND :date_end\n"
+            "GROUP BY TRUNC(REQUEST_DATE, 'MM')\n"
+            "ORDER BY MONTH ASC"
+        )
+        binds = {"date_start": date_start, "date_end": date_end}
+        return sql, binds, _build_meta(
+            intent,
+            explain=explain_meta,
+            agg="count",
+            group_by="MONTH",
+            strategy="contract_deterministic",
+        )
+
+    if special == "entityno_totals_by_status":
+        entity_no = params.get("entity_no")
+        sql = (
+            "SELECT CONTRACT_STATUS AS GROUP_KEY,\n"
+            f"       SUM({GROSS_SQL}) AS TOTAL_GROSS,\n"
+            "       COUNT(*) AS CNT\n"
+            'FROM "Contract"\n'
+            "WHERE ENTITY_NO = :entity_no\n"
+            "GROUP BY CONTRACT_STATUS\n"
+            "ORDER BY TOTAL_GROSS DESC"
+        )
+        binds = {"entity_no": entity_no}
+        return sql, binds, _build_meta(
+            intent,
+            explain=explain_meta,
+            gross=True,
+            group_by="CONTRACT_STATUS",
+            strategy="contract_deterministic",
+        )
+
+    if special == "expiring_buckets_30_60_90":
+        base = params.get("today") or date.today()
+        d30s = _to_date(base)
+        d30e = _to_date(base + timedelta(days=30))
+        d60s = _to_date(base)
+        d60e = _to_date(base + timedelta(days=60))
+        d90s = _to_date(base)
+        d90e = _to_date(base + timedelta(days=90))
+        sql = (
+            "SELECT 30 AS BUCKET_DAYS, COUNT(*) AS CNT FROM \"Contract\" WHERE END_DATE BETWEEN :d30s AND :d30e\n"
+            "UNION ALL\n"
+            "SELECT 60 AS BUCKET_DAYS, COUNT(*) AS CNT FROM \"Contract\" WHERE END_DATE BETWEEN :d60s AND :d60e\n"
+            "UNION ALL\n"
+            "SELECT 90 AS BUCKET_DAYS, COUNT(*) AS CNT FROM \"Contract\" WHERE END_DATE BETWEEN :d90s AND :d90e\n"
+            "ORDER BY BUCKET_DAYS"
+        )
+        binds = {
+            "d30s": d30s,
+            "d30e": d30e,
+            "d60s": d60s,
+            "d60e": d60e,
+            "d90s": d90s,
+            "d90e": d90e,
+        }
+        return sql, binds, _build_meta(
+            intent,
+            explain=explain_meta,
+            strategy="contract_deterministic",
+            agg="count",
+        )
+
+    if special == "stakeholders_more_than_n_2024":
+        min_n = int(params.get("min_n", 5))
+        ds = _to_date(date(2024, 1, 1))
+        de = _to_date(date(2024, 12, 31))
+        union_parts = []
+        for idx in range(1, STAKEHOLDER_SLOTS + 1):
+            union_parts.append(
+                f"SELECT CONTRACT_STAKEHOLDER_{idx} AS STAKEHOLDER\n"
+                '  FROM "Contract"\n'
+                "  WHERE REQUEST_DATE BETWEEN :date_start AND :date_end"
+            )
+        cte = "\nUNION ALL\n".join(union_parts)
+        sql = (
+            "WITH S AS (\n"
+            f"{cte}\n"
+            ")\n"
+            "SELECT STAKEHOLDER AS GROUP_KEY, COUNT(*) AS CNT\n"
+            "FROM S\n"
+            "WHERE STAKEHOLDER IS NOT NULL\n"
+            "GROUP BY STAKEHOLDER\n"
+            "HAVING COUNT(*) > :min_n\n"
+            "ORDER BY CNT DESC"
+        )
+        binds = {"date_start": ds, "date_end": de, "min_n": min_n}
+        return sql, binds, _build_meta(
+            intent,
+            explain=explain_meta,
+            strategy="contract_deterministic",
+            group_by="STAKEHOLDER",
+            agg="count",
+        )
+
+    if special == "rep_email_missing":
+        sql = (
+            "SELECT * FROM \"Contract\"\n"
+            "WHERE representative_email IS NULL OR TRIM(representative_email) = ''\n"
+            "ORDER BY REQUEST_DATE DESC"
+        )
+        return sql, {}, _build_meta(intent, explain=explain_meta, strategy="contract_deterministic")
+
+    if special == "requester_quarterly_totals":
+        requester = params.get("requester")
+        sql = (
+            "SELECT TRUNC(REQUEST_DATE,'Q') AS QUARTER,\n"
+            f"       SUM({GROSS_SQL}) AS TOTAL_GROSS,\n"
+            "       COUNT(*) AS CNT\n"
+            'FROM "Contract"\n'
+            "WHERE UPPER(REQUESTER)=UPPER(:requester)\n"
+            "GROUP BY TRUNC(REQUEST_DATE,'Q')\n"
+            "ORDER BY QUARTER ASC"
+        )
+        binds = {"requester": requester}
+        return sql, binds, _build_meta(
+            intent,
+            explain=explain_meta,
+            gross=True,
+            strategy="contract_deterministic",
+            group_by="QUARTER",
+        )
+
+    if special == "stakeholder_departments_2024":
+        year = int(params.get("year", 2024))
+        ds = _to_date(date(year, 1, 1))
+        de = _to_date(date(year, 12, 31))
+        overlap = _overlap_condition()
+        union_parts = []
+        for idx in range(1, STAKEHOLDER_SLOTS + 1):
+            union_parts.append(
+                f"SELECT CONTRACT_STAKEHOLDER_{idx} AS STAKEHOLDER,\n"
+                "       OWNER_DEPARTMENT,\n"
+                "       NVL(CONTRACT_VALUE_NET_OF_VAT,0) AS NET,\n"
+                "       NVL(VAT,0) AS VAT\n"
+                '  FROM "Contract"\n'
+                f"  WHERE {overlap}"
+            )
+        cte = "\nUNION ALL\n".join(union_parts)
+        gross_alias = _gross_from_alias("NET", "VAT")
+        sql = (
+            "WITH S AS (\n"
+            f"{cte}\n"
+            ")\n"
+            "SELECT STAKEHOLDER AS GROUP_KEY,\n"
+            "       LISTAGG(DISTINCT OWNER_DEPARTMENT, ', ') WITHIN GROUP (ORDER BY OWNER_DEPARTMENT) AS DEPARTMENTS,\n"
+            f"       SUM({gross_alias}) AS TOTAL_GROSS,\n"
+            "       COUNT(*) AS CNT\n"
+            "FROM S\n"
+            "WHERE STAKEHOLDER IS NOT NULL\n"
+            "GROUP BY STAKEHOLDER\n"
+            "ORDER BY TOTAL_GROSS DESC"
+        )
+        binds = {"date_start": ds, "date_end": de}
+        return sql, binds, _build_meta(
+            intent,
+            explain=explain_meta,
+            gross=True,
+            strategy="contract_deterministic",
+            group_by="STAKEHOLDER",
+        )
+
+    if special == "top_pairs_last_180d":
+        days = int(params.get("days", 180))
+        end_date = params.get("today") or date.today()
+        ds = _to_date(end_date - timedelta(days=days))
+        de = _to_date(end_date)
+        overlap = _overlap_condition()
+        union_parts = []
+        for idx in range(1, STAKEHOLDER_SLOTS + 1):
+            union_parts.append(
+                f"SELECT OWNER_DEPARTMENT, CONTRACT_STAKEHOLDER_{idx} AS STAKEHOLDER,\n"
+                "       NVL(CONTRACT_VALUE_NET_OF_VAT,0) AS NET,\n"
+                "       NVL(VAT,0) AS VAT\n"
+                '  FROM "Contract"\n'
+                f"  WHERE {overlap}"
+            )
+        cte = "\nUNION ALL\n".join(union_parts)
+        gross_alias = _gross_from_alias("NET", "VAT")
+        sql = (
+            "WITH P AS (\n"
+            f"{cte}\n"
+            ")\n"
+            "SELECT OWNER_DEPARTMENT, STAKEHOLDER,\n"
+            f"       SUM({gross_alias}) AS MEASURE\n"
+            "FROM P\n"
+            "WHERE STAKEHOLDER IS NOT NULL\n"
+            "GROUP BY OWNER_DEPARTMENT, STAKEHOLDER\n"
+            "ORDER BY MEASURE DESC\n"
+            "FETCH FIRST 10 ROWS ONLY"
+        )
+        binds = {"date_start": ds, "date_end": de}
+        return sql, binds, _build_meta(
+            intent,
+            explain=explain_meta,
+            gross=True,
+            strategy="contract_deterministic",
+            group_by="OWNER_DEPARTMENT,STAKEHOLDER",
+        )
+
+    if special == "duplicate_contract_ids":
+        sql = (
+            "SELECT CONTRACT_ID, COUNT(*) AS CNT\n"
+            'FROM "Contract"\n'
+            "GROUP BY CONTRACT_ID\n"
+            "HAVING COUNT(*) > 1\n"
+            "ORDER BY CNT DESC"
+        )
+        return sql, {}, _build_meta(
+            intent,
+            explain=explain_meta,
+            strategy="contract_deterministic",
+            group_by="CONTRACT_ID",
+            agg="count",
+        )
+
+    if special == "median_gross_by_owner_dept_this_year":
+        year = int(params.get("year", date.today().year))
+        ds = _to_date(date(year, 1, 1))
+        de = _to_date(date(year, 12, 31))
+        condition = _overlap_condition()
+        sql = (
+            "SELECT OWNER_DEPARTMENT AS GROUP_KEY, MEDIAN("
+            f"{GROSS_SQL}"
+            ") AS MEASURE\n"
+            'FROM "Contract"\n'
+            f"WHERE {condition}\n"
+            "GROUP BY OWNER_DEPARTMENT\n"
+            "ORDER BY MEASURE DESC"
+        )
+        binds = {"date_start": ds, "date_end": de}
+        return sql, binds, _build_meta(intent, explain=explain_meta, gross=True, strategy="contract_deterministic")
+
+    if special == "end_before_start":
+        sql = (
+            "SELECT * FROM \"Contract\"\n"
+            "WHERE END_DATE < START_DATE\n"
+            "ORDER BY REQUEST_DATE DESC"
+        )
+        return sql, {}, _build_meta(intent, explain=explain_meta, strategy="contract_deterministic")
+
+    if special == "duration_12m_mismatch":
+        sql = (
+            "SELECT * FROM \"Contract\"\n"
+            "WHERE REGEXP_LIKE(NVL(DURATION,''), '12')\n"
+            "  AND (START_DATE IS NOT NULL AND END_DATE IS NOT NULL)\n"
+            "  AND ABS(MONTHS_BETWEEN(END_DATE, START_DATE) - 12) > 1\n"
+            "ORDER BY REQUEST_DATE DESC"
+        )
+        return sql, {}, _build_meta(intent, explain=explain_meta, strategy="contract_deterministic")
+
+    if special == "yoy_same_period":
+        today_val = params.get("today") or date.today()
+        current_start = date(today_val.year, 1, 1)
+        current_end = date(today_val.year, 3, 31)
+        prev_start = date(today_val.year - 1, 1, 1)
+        prev_end = date(today_val.year - 1, 3, 31)
+        binds = {
+            "ds": _to_date(current_start),
+            "de": _to_date(min(current_end, today_val)),
+            "p_ds": _to_date(prev_start),
+            "p_de": _to_date(prev_end),
+        }
+        sql = (
+            "SELECT 'CURRENT' AS PERIOD, SUM("
+            f"{GROSS_SQL}"
+            ") AS TOTAL_GROSS\n"
+            'FROM "Contract"\n'
+            "WHERE REQUEST_DATE BETWEEN :ds AND :de\n"
+            "UNION ALL\n"
+            "SELECT 'PREVIOUS' AS PERIOD, SUM("
+            f"{GROSS_SQL}"
+            ") AS TOTAL_GROSS\n"
+            'FROM "Contract"\n'
+            "WHERE REQUEST_DATE BETWEEN :p_ds AND :p_de"
+        )
+        return sql, binds, _build_meta(intent, explain=explain_meta, gross=True, strategy="contract_deterministic")
+
+    if special == "status_threshold_gross":
+        raw = params.get("text", "")
+        m_status = re.search(r"contract_status\s+in\s*\(([^)]+)\)", raw)
+        statuses = []
+        if m_status:
+            statuses = [s.strip().strip("'\"") for s in m_status.group(1).split(",") if s.strip()]
+        if not statuses:
+            statuses = ["Active", "Pending"]
+        m_thr = re.search(r">\s*([0-9][0-9,]*)", raw)
+        threshold = int(m_thr.group(1).replace(",", "")) if m_thr else 1_000_000
+        placeholders = ", ".join(f":s{i}" for i in range(len(statuses)))
+        sql = (
+            "SELECT * FROM \"Contract\"\n"
+            f"WHERE CONTRACT_STATUS IN ({placeholders})\n"
+            f"  AND ({GROSS_SQL}) > :thr\n"
+            f"ORDER BY {GROSS_SQL} DESC"
+        )
+        binds = {f"s{i}": status for i, status in enumerate(statuses)}
+        binds["thr"] = threshold
+        return sql, binds, _build_meta(intent, explain=explain_meta, gross=True, strategy="contract_deterministic")
+
+    if special == "entity_top3_last365":
+        days = int(params.get("days", 365))
+        end_date = params.get("today") or date.today()
+        ds = _to_date(end_date - timedelta(days=days))
+        de = _to_date(end_date)
+        overlap = _overlap_condition(prefix="c.")
+        sql = (
+            "SELECT * FROM (\n"
+            "  SELECT c.*, ROW_NUMBER() OVER (PARTITION BY ENTITY ORDER BY "
+            f"{GROSS_SQL}"
+            " DESC) AS rn\n"
+            '  FROM "Contract" c\n'
+            f"  WHERE {overlap}\n"
+            ")\n"
+            "WHERE rn <= 3\n"
+            "ORDER BY ENTITY, rn"
+        )
+        binds = {"date_start": ds, "date_end": de}
+        return sql, binds, _build_meta(intent, explain=explain_meta, gross=True, strategy="contract_deterministic")
+
+    if special == "owner_vs_oul_mismatch":
+        sql = (
+            "SELECT * FROM \"Contract\"\n"
+            "WHERE DEPARTMENT_OUL IS NOT NULL\n"
+            "  AND OWNER_DEPARTMENT IS NOT NULL\n"
+            "  AND UPPER(DEPARTMENT_OUL) <> UPPER(OWNER_DEPARTMENT)\n"
+            "ORDER BY REQUEST_DATE DESC"
+        )
+        return sql, {}, _build_meta(intent, explain=explain_meta, strategy="contract_deterministic")
+
+    return "", {}, _build_meta(intent, explain=explain_meta)
+
+
 def build_sql(intent: Intent) -> tuple[str, dict, dict]:
+    if intent.special:
+        return _build_special(intent)
+
     binds = {}
     parts = []
     explain = []
@@ -345,6 +951,15 @@ def build_sql(intent: Intent) -> tuple[str, dict, dict]:
                 f"GROUP BY {intent.group_by}"
             )
             order_col = intent.order_by or "CNT"
+        elif intent.agg == "avg":
+            measure = gross_expr if intent.gross else "NVL(CONTRACT_VALUE_NET_OF_VAT,0)"
+            sql = (
+                f"SELECT\n  {intent.group_by} AS GROUP_KEY,\n"
+                f"  AVG({measure}) AS MEASURE\n"
+                f'FROM "Contract"{where_sql}\n'
+                f"GROUP BY {intent.group_by}"
+            )
+            order_col = intent.order_by or "MEASURE"
         else:
             # default: count
             sql = (
