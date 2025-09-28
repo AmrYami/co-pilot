@@ -108,46 +108,51 @@ def build_contracts_sql(
       - sort_by, sort_desc, top_n
       - full_text_search: bool, fts_tokens: [str]
     """
-    q_norm = str(
-        intent.get("raw_question_norm")
+    notes = intent.get("notes") or {}
+    q_text = str(
+        notes.get("q")
         or intent.get("raw_question")
-        or (intent.get("notes") or {}).get("q")
+        or intent.get("question")
+        or intent.get("q")
         or ""
-    ).strip().lower()
+    )
+    q_norm = str(intent.get("raw_question_norm") or q_text).strip().lower()
 
     # Special deterministic cases mapped by the parser or fallback keyword match.
     if "missing contract_id" in q_norm or "data quality" in q_norm:
         return sql_missing_contract_id(), {}
 
-    if "ytd" in q_norm and "gross" in q_norm and "top" in q_norm:
-        today_obj = (
-            intent.get("today")
-            or (intent.get("notes") or {}).get("today")
-            or date.today()
-        )
+    ytd_match = re.search(r"\b(20\d{2})\b.*?\bYTD\b", q_text, re.IGNORECASE)
+    if ytd_match and "gross" in q_norm and ("top" in q_norm or intent.get("top_n")):
+        today_obj = intent.get("today") or notes.get("today") or date.today()
         today_date = _as_date(today_obj)
-        year_match = re.search(r"\b(20\d{2})\b", q_norm)
-        year = int(year_match.group(1)) if year_match else today_date.year
-        top_hint = re.search(r"top\s+(\d+)", q_norm)
-        default_top = int(top_hint.group(1)) if top_hint else 5
+        year = int(ytd_match.group(1))
+        date_start = date(year, 1, 1)
+        if year == today_date.year:
+            date_end = today_date
+        else:
+            date_end = date(year, 12, 31)
+        top_hint = re.search(r"top\s+(\d+)", q_text, re.IGNORECASE)
+        default_top = 5
+        if top_hint:
+            default_top = int(top_hint.group(1))
+        else:
+            try:
+                default_top = int(intent.get("top_n")) if intent.get("top_n") is not None else 5
+            except (TypeError, ValueError):
+                default_top = 5
         try:
-            top_n = int(intent.get("top_n", default_top))
+            top_n = int(intent.get("top_n") or default_top)
         except (TypeError, ValueError):
             top_n = default_top
-        binds = {
-            "date_start": date(year, 1, 1),
-            "date_end": today_date,
-            "top_n": top_n,
-        }
+        if top_n <= 0:
+            top_n = default_top if default_top > 0 else 5
+        binds = {"date_start": date_start, "date_end": date_end, "top_n": top_n}
         _ensure_date_binds(binds, "date_start", "date_end")
         return sql_ytd_top_gross(), binds
 
-    if "year-over-year" in q_norm or "yoy" in q_norm:
-        today_obj = (
-            intent.get("today")
-            or (intent.get("notes") or {}).get("today")
-            or date.today()
-        )
+    if re.search(r"\byear-?over-?year\b|\bYoY\b", q_text, re.IGNORECASE):
+        today_obj = intent.get("today") or notes.get("today") or date.today()
         today_date = _as_date(today_obj)
         explicit = intent.get("explicit_dates") or {}
         ds = explicit.get("ds") or explicit.get("start") or intent.get("ds")
@@ -164,8 +169,10 @@ def build_contracts_sql(
         _ensure_date_binds(binds, "ds", "de", "p_ds", "p_de")
         return sql_yoy_same_period_overlap(), binds
 
-    if "owner_department vs department_oul" in q_norm or (
-        "department_oul" in q_norm and "owner" in q_norm
+    if re.search(
+        r"\bowner[_\s]?department\b.*\bdepartment[_\s]?oul\b.*(compare|comparison|mismatch|lead)",
+        q_text,
+        re.IGNORECASE,
     ):
         return sql_owner_vs_oul_mismatch(), {}
 

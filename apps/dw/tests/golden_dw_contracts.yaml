@@ -20,6 +20,9 @@ cases:
         - 'FETCH FIRST'
       must_not: []
       notes: "Should use active-overlap window (START_DATE..END_DATE) for last month and return all columns."
+    assertions:
+      overlap: true
+      order: { metric: net, dir: desc }
 
   - id: top10_value_last_8_months
     question: "top 10 contracts by contract value last 8 months"
@@ -30,6 +33,9 @@ cases:
         - 'FETCH FIRST'
       must_not: []
       notes: "Active-overlap window for last 8 months."
+    assertions:
+      overlap: true
+      order: { metric: net, dir: desc }
 
   - id: expiring_30_days_count
     question: "contracts expiring in 30 days (count)"
@@ -66,6 +72,9 @@ cases:
         - 'FETCH FIRST'
       must_not: []
       notes: "Gross = NET + VAT (VAT may be percent or absolute)."
+    assertions:
+      overlap: true
+      order: { metric: gross, dir: desc }
 
   - id: gross_by_owner_dept_last_quarter
     question: "Total gross value of contracts per owner department last quarter"
@@ -77,6 +86,10 @@ cases:
         - 'ORDER BY'
       must_not: []
       notes: "Should use overlap window for last quarter."
+    assertions:
+      overlap: true
+      order: { metric: measure, dir: desc }
+      group_by: ["OWNER_DEPARTMENT"]
 
   - id: gross_by_owner_dept_all_time
     question: "Total gross value of contracts per owner department"
@@ -88,6 +101,9 @@ cases:
         - 'ORDER BY'
       must_not: []
       notes: "No time filter."
+    assertions:
+      order: { metric: measure, dir: desc }
+      group_by: ["OWNER_DEPARTMENT"]
 
   - id: count_by_status_all_time
     question: "Count of contracts by status (all time)"
@@ -107,6 +123,8 @@ cases:
         - 'WHERE'
         - 'END_DATE BETWEEN'
       must_not: []
+    assertions:
+      end_only: true
 
   - id: vat_zero_value_gt_zero
     question: "Contracts where VAT is null or zero but CONTRACT Value > 0."
@@ -127,6 +145,9 @@ cases:
         - 'REQUEST_TYPE'
         - 'REQUEST_DATE BETWEEN'
       must_not: []
+    assertions:
+      request_window: true
+      order: { metric: measure, dir: desc }
 
   - id: distinct_entity_counts
     question: "List distinct ENTITY values and their contract counts."
@@ -175,6 +196,10 @@ cases:
         - 'ORDER BY MEASURE DESC'
       must_not: []
       notes: "Ok if current version groups by CONTRACT_STAKEHOLDER_1; advanced version may UNPIVOT 1..8."
+    assertions:
+      overlap: true
+      order: { metric: measure, dir: desc }
+      group_by: ["STAKEHOLDER"]
 
   - id: top5_gross_2024_ytd
     question: "For 2024 YTD, top 5 contracts by gross."
@@ -223,6 +248,9 @@ cases:
         - 'ORDER BY MONTH ASC'
       must_not: []
       notes: "A pure SELECT with REQUEST_DATE window is acceptable; a grouped month bucket is nicer but optional."
+    assertions:
+      request_window: true
+      group_by: ["TRUNC(REQUEST_DATE, 'MM')"]
 
   - id: entity_no_total_count_by_status
     question: "For ENTITY_NO = 'E-123', total and count by CONTRACT_STATUS."
@@ -235,6 +263,9 @@ cases:
         - 'SUM('
         - 'COUNT(*) AS CNT'
       must_not: []
+    assertions:
+      order: { metric: measure, dir: desc }
+      group_by: ["CONTRACT_STATUS"]
 
   - id: expiring_30_60_90_counts
     question: "Contracts expiring in 30/60/90 days (three separate counts)."
@@ -245,6 +276,7 @@ cases:
         - 'SELECT 90 AS BUCKET_DAYS'
       must_not: []
       notes: "Accept union of three counts or three separate queries; runner only checks fragments."
+    assertions: {}
 
   - id: highest_avg_gross_last_quarter
     question: "Owner department with the highest average gross last quarter."
@@ -256,6 +288,10 @@ cases:
         - 'FETCH FIRST'
       must_not: []
       notes: "May also FETCH FIRST 1 ROW ONLY."
+    assertions:
+      overlap: true
+      order: { metric: measure, dir: desc }
+      group_by: ["OWNER_DEPARTMENT"]
 
   - id: stakeholders_more_than_n_in_2024
     question: "Stakeholders involved in more than N contracts in 2024."
@@ -265,6 +301,10 @@ cases:
         - 'GROUP BY STAKEHOLDER'
         - 'HAVING COUNT(*) > :min_n'
       must_not: []
+    assertions:
+      request_window: true
+      order: { metric: measure, dir: desc }
+      group_by: ["STAKEHOLDER"]
 
   - id: missing_representative_email
     question: "Contracts where representative_email is missing."
@@ -274,6 +314,7 @@ cases:
         - "TRIM(representative_email) = ''"
         - 'ORDER BY REQUEST_DATE DESC'
       must_not: []
+    assertions: {}
 
   - id: requester_quarter_totals
     question: "For REQUESTER = 'john@corp', total gross & count by quarter."
@@ -284,6 +325,8 @@ cases:
         - 'COUNT(*) AS CNT'
         - 'UPPER(REQUESTER)=UPPER(:requester)'
       must_not: []
+    assertions:
+      group_by: ["TRUNC(REQUEST_DATE,'Q')"]
 
   - id: stakeholder_depts_2024
     question: "For each stakeholder, list distinct departments they touched in 2024, total gross, and contract count (one row per stakeholder)."
@@ -293,6 +336,10 @@ cases:
         - 'GROUP BY STAKEHOLDER'
       must_not: []
       notes: "Advanced: LISTAGG DISTINCT(OWNER_DEPARTMENT) by stakeholder acceptable but not enforced."
+    assertions:
+      overlap: true
+      order: { metric: measure, dir: desc }
+      group_by: ["STAKEHOLDER"]
 
   - id: top10_pairs_last_180
     question: "Top 10 contracts pairs by gross in the last 180 days."
@@ -303,6 +350,10 @@ cases:
         - 'FETCH FIRST 10 ROWS ONLY'
       must_not: []
       notes: "This is advanced (self-join); we only check basic fragments."
+    assertions:
+      overlap: true
+      order: { metric: measure, dir: desc }
+      group_by: ["OWNER_DEPARTMENT", "STAKEHOLDER"]
 
   - id: duplicate_contract_ids
     question: "Detect duplicate contract ids (same CONTRACT_ID across rows)."
@@ -323,6 +374,10 @@ cases:
         - 'GROUP BY OWNER_DEPARTMENT'
         - 'ORDER BY MEASURE DESC'
       must_not: []
+    assertions:
+      overlap: true
+      order: { metric: measure, dir: desc }
+      group_by: ["OWNER_DEPARTMENT"]
 
   - id: end_before_start_check
     question: "Contracts where END_DATE < START_DATE (integrity check)."
@@ -332,6 +387,7 @@ cases:
         - 'WHERE'
         - 'END_DATE < START_DATE'
       must_not: []
+    assertions: {}
 
   - id: duration_12m_mismatch
     question: "Contracts with DURATION like \"12 months\" but actual END_DATE–START_DATE != ~12 months."
@@ -341,6 +397,7 @@ cases:
         - 'REGEXP_LIKE'
         - 'MONTHS_BETWEEN'
       must_not: []
+    assertions: {}
 
   - id: yoy_gross_same_period
     question: "Year-over-year comparison of gross total for the same period (e.g., this Jan–Mar vs last Jan–Mar)."
@@ -374,6 +431,9 @@ cases:
         - 'WHERE REQUEST_DATE BETWEEN :p_ds AND :p_de'
       must_not: []
       notes: "Implementation styles vary; fragments only."
+    assertions:
+      request_window: true
+      order: { metric: measure, dir: desc }
 
   - id: status_active_pending_over_threshold
     question: "For CONTRACT_STATUS in ('Active','Pending'), list contracts whose total gross exceeds a threshold (e.g., > 1,000,000)."
@@ -383,6 +443,8 @@ cases:
         - 'NVL(CONTRACT_VALUE_NET_OF_VAT,0)'
         - 'ORDER BY'
       must_not: []
+    assertions:
+      order: { metric: gross, dir: desc }
 
   - id: top3_by_entity_last_365
     question: "For each ENTITY, top 3 contracts by gross in last 365 days."
@@ -392,6 +454,9 @@ cases:
         - 'ROW_NUMBER() OVER (PARTITION BY ENTITY ORDER BY'
         - 'WHERE rn <= 3'
       must_not: []
+    assertions:
+      overlap: true
+      order: { metric: gross, dir: desc }
 
   - id: owner_dept_vs_oul_mismatch
     question: "OWNER_DEPARTMENT vs DEPARTMENT_OUL comparison (where OUL is the lead); list any cases."
@@ -409,6 +474,8 @@ cases:
         - "NVL(TRIM(OWNER_DEPARTMENT),'(None)') <> NVL(TRIM(DEPARTMENT_OUL),'(None)')"
         - 'ORDER BY CNT DESC'
       must_not: []
+    assertions:
+      owner_vs_oul_mismatch: true
 
   - question: "bottom 5 contracts by contract value last month"
     expect_sql:
