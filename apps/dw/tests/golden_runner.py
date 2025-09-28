@@ -7,6 +7,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+
+def _normalize_sql(s: str) -> str:
+    """Uppercase and normalize whitespace/punctuation for tolerant comparisons."""
+    s = (s or "").replace("`", "")
+    s = re.sub(r"\s+", " ", s)
+    s = re.sub(r"\(\s+", "(", s)
+    s = re.sub(r",\s+", ",", s)
+    return s.strip().upper()
+
 import yaml
 from flask import Flask
 
@@ -93,10 +102,10 @@ def assert_order_direction(sql: str, expect_desc: bool, reasons: List[str]) -> N
 
 def _contains_all(sql: str, fragments: List[str]) -> List[str]:
     """Return list of missing fragments after normalization; empty list means all found."""
-    sql_n = _flatten(sql)
+    sql_n = _normalize_sql(sql)
     missing: List[str] = []
     for frag in fragments:
-        frag_n = _flatten(frag)
+        frag_n = _normalize_sql(frag)
         if frag_n and frag_n not in sql_n:
             missing.append(frag)
     return missing
