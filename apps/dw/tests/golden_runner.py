@@ -2,75 +2,18 @@
 from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
-from datetime import date, timedelta
+from datetime import date
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from dateutil.relativedelta import relativedelta
 import yaml
 from flask import Flask
+
+from .yaml_tags import GoldenLoader, register_yaml_tags
 
 # Stable, package-relative path to the golden YAML file
 GOLDEN_PATH = Path(__file__).with_name("golden_dw_contracts.yaml")
 DEFAULT_NS = "dw::common"
-
-
-# ----------------------------
-# YAML loader with custom tags
-# ----------------------------
-class CustomLoader(yaml.SafeLoader):
-    """YAML loader that supports relative-date tags for golden tests."""
-
-
-def _today(loader, node):
-    return date.today()
-
-
-def _days_ago(loader, node):
-    n = int(loader.construct_scalar(node))
-    return date.today() - timedelta(days=n)
-
-
-def _months_ago(loader, node):
-    n = int(loader.construct_scalar(node))
-    return date.today() - relativedelta(months=n)
-
-
-def _start_of_last_month(loader, node):
-    t = date.today()
-    first_this = date(t.year, t.month, 1)
-    prev_first = first_this - relativedelta(months=1)
-    return date(prev_first.year, prev_first.month, 1)
-
-
-def _end_of_last_month(loader, node):
-    t = date.today()
-    first_this = date(t.year, t.month, 1)
-    return first_this - timedelta(days=1)
-
-
-def _start_of_quarter(loader, node):
-    t = date.today()
-    start_month = ((t.month - 1) // 3) * 3 + 1
-    return date(t.year, start_month, 1)
-
-
-def _end_of_quarter(loader, node):
-    t = date.today()
-    start_month = ((t.month - 1) // 3) * 3 + 1
-    start_q = date(t.year, start_month, 1)
-    next_q = start_q + relativedelta(months=3)
-    return next_q - timedelta(days=1)
-
-
-# Register constructors
-CustomLoader.add_constructor("!today", _today)
-CustomLoader.add_constructor("!days_ago", _days_ago)
-CustomLoader.add_constructor("!months_ago", _months_ago)
-CustomLoader.add_constructor("!start_of_last_month", _start_of_last_month)
-CustomLoader.add_constructor("!end_of_last_month", _end_of_last_month)
-CustomLoader.add_constructor("!start_of_quarter", _start_of_quarter)
-CustomLoader.add_constructor("!end_of_quarter", _end_of_quarter)
 
 
 @dataclass
@@ -93,7 +36,9 @@ class GoldenCase:
 def _load_yaml(path: Path) -> Dict[str, Any]:
     try:
         with path.open("r", encoding="utf-8") as f:
-            data = yaml.load(f, Loader=CustomLoader) or {}
+            # Register custom tags then load with our loader:
+            register_yaml_tags()
+            data = yaml.load(f, Loader=GoldenLoader) or {}
         if not isinstance(data, dict):
             raise ValueError(f"Golden YAML root must be a mapping, got: {type(data).__name__}")
         if "cases" not in data or not isinstance(data["cases"], list):
