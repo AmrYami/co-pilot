@@ -1,17 +1,77 @@
 # apps/dw/tests/golden_runner.py
 from __future__ import annotations
-import json
 import logging
 from dataclasses import dataclass, field
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from dateutil.relativedelta import relativedelta
 import yaml
 from flask import Flask
 
 # Stable, package-relative path to the golden YAML file
 GOLDEN_PATH = Path(__file__).with_name("golden_dw_contracts.yaml")
 DEFAULT_NS = "dw::common"
+
+
+# ----------------------------
+# YAML loader with custom tags
+# ----------------------------
+class CustomLoader(yaml.SafeLoader):
+    """YAML loader that supports relative-date tags for golden tests."""
+
+
+def _today(loader, node):
+    return date.today()
+
+
+def _days_ago(loader, node):
+    n = int(loader.construct_scalar(node))
+    return date.today() - timedelta(days=n)
+
+
+def _months_ago(loader, node):
+    n = int(loader.construct_scalar(node))
+    return date.today() - relativedelta(months=n)
+
+
+def _start_of_last_month(loader, node):
+    t = date.today()
+    first_this = date(t.year, t.month, 1)
+    prev_first = first_this - relativedelta(months=1)
+    return date(prev_first.year, prev_first.month, 1)
+
+
+def _end_of_last_month(loader, node):
+    t = date.today()
+    first_this = date(t.year, t.month, 1)
+    return first_this - timedelta(days=1)
+
+
+def _start_of_quarter(loader, node):
+    t = date.today()
+    start_month = ((t.month - 1) // 3) * 3 + 1
+    return date(t.year, start_month, 1)
+
+
+def _end_of_quarter(loader, node):
+    t = date.today()
+    start_month = ((t.month - 1) // 3) * 3 + 1
+    start_q = date(t.year, start_month, 1)
+    next_q = start_q + relativedelta(months=3)
+    return next_q - timedelta(days=1)
+
+
+# Register constructors
+CustomLoader.add_constructor("!today", _today)
+CustomLoader.add_constructor("!days_ago", _days_ago)
+CustomLoader.add_constructor("!months_ago", _months_ago)
+CustomLoader.add_constructor("!start_of_last_month", _start_of_last_month)
+CustomLoader.add_constructor("!end_of_last_month", _end_of_last_month)
+CustomLoader.add_constructor("!start_of_quarter", _start_of_quarter)
+CustomLoader.add_constructor("!end_of_quarter", _end_of_quarter)
+
 
 @dataclass
 class GoldenCase:
@@ -20,8 +80,10 @@ class GoldenCase:
     prefixes: List[str] = field(default_factory=list)
     auth_email: str = "golden@local"
     full_text_search: bool = False
+    binds: Dict[str, Any] = field(default_factory=dict)
     # Expectations (all optional)
     expect_sql_contains: List[str] = field(default_factory=list)
+    expect_sql_not_contains: List[str] = field(default_factory=list)
     expect_group_by: List[str] = field(default_factory=list)
     expect_order_by: Optional[str] = None
     expect_date_col: Optional[str] = None  # e.g. "REQUEST_DATE", "OVERLAP", "END_DATE"
@@ -31,30 +93,68 @@ class GoldenCase:
 def _load_yaml(path: Path) -> Dict[str, Any]:
     try:
         with path.open("r", encoding="utf-8") as f:
-            data = yaml.safe_load(f) or {}
+            data = yaml.load(f, Loader=CustomLoader) or {}
         if not isinstance(data, dict):
-            logging.warning("Golden YAML is not a dict; got: %s", type(data).__name__)
-            return {"cases": []}
+            raise ValueError(f"Golden YAML root must be a mapping, got: {type(data).__name__}")
         if "cases" not in data or not isinstance(data["cases"], list):
-            logging.warning("Golden YAML missing a 'cases' list.")
-            return {"cases": []}
+            raise ValueError("Golden YAML missing a 'cases' list.")
+        data.setdefault("namespace", DEFAULT_NS)
         return data
     except FileNotFoundError:
         logging.error("Golden YAML not found at %s", path)
-        return {"cases": []}
+        return {}
     except Exception as e:
         logging.exception("Failed to load golden YAML: %s", e)
-        return {"cases": []}
+        return {}
+
+
+def _ensure_date(v: Any) -> Any:
+    if isinstance(v, date):
+        return v
+    if isinstance(v, str):
+        try:
+            return date.fromisoformat(v)
+        except ValueError:
+            return v
+    return v
+
+
+def _normalize_binds(raw_binds: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not raw_binds:
+        return {}
+    return {k: _ensure_date(v) for k, v in raw_binds.items()}
+
+
+def _serialize_binds_for_json(binds: Dict[str, Any]) -> Dict[str, Any]:
+    serialised: Dict[str, Any] = {}
+    for key, value in binds.items():
+        if isinstance(value, date):
+            serialised[key] = value.isoformat()
+        else:
+            serialised[key] = value
+    return serialised
+
+
+def _ensure_str_list(value: Any) -> List[str]:
+    if not value:
+        return []
+    if isinstance(value, str):
+        return [value]
+    return [str(v) for v in value]
+
 
 def _hydrate_case(raw: Dict[str, Any]) -> GoldenCase:
+    expect = raw.get("expect") or {}
     return GoldenCase(
         question = raw.get("question", "").strip(),
-        namespace = raw.get("namespace", DEFAULT_NS),
+        namespace = (raw.get("namespace") or DEFAULT_NS).strip(),
         prefixes = raw.get("prefixes", []) or [],
         auth_email = raw.get("auth_email", "golden@local"),
         full_text_search = bool(raw.get("full_text_search", False)),
-        expect_sql_contains = raw.get("expect_sql_contains", []) or [],
-        expect_group_by = raw.get("expect_group_by", []) or [],
+        binds = _normalize_binds(raw.get("binds")),
+        expect_sql_contains = _ensure_str_list(raw.get("expect_sql_contains") or expect.get("sql_like")),
+        expect_sql_not_contains = _ensure_str_list(expect.get("must_not")),
+        expect_group_by = _ensure_str_list(raw.get("expect_group_by")),
         expect_order_by = raw.get("expect_order_by"),
         expect_date_col = raw.get("expect_date_col"),
         expect_agg = raw.get("expect_agg"),
@@ -74,6 +174,11 @@ def _check_expectations(case: GoldenCase, resp: Dict[str, Any]) -> Tuple[bool, L
         if frag not in sql:
             ok = False
             reasons.append(f"SQL does not contain expected fragment: {frag}")
+
+    for frag in case.expect_sql_not_contains:
+        if frag in sql:
+            ok = False
+            reasons.append(f"SQL unexpectedly contained fragment: {frag}")
 
     # 2) group by
     if case.expect_group_by:
@@ -122,14 +227,31 @@ def run_golden_tests(
     namespace: Optional[str] = None,
     limit: Optional[int] = None,
 ) -> Dict[str, Any]:
+    ns_clean = namespace.strip() if isinstance(namespace, str) else None
+
     data = _load_yaml(GOLDEN_PATH)
+    if not data:
+        return {
+            "ok": False,
+            "total": 0,
+            "passed": 0,
+            "results": [],
+            "error": "Golden YAML failed to load.",
+            "namespace": ns_clean or DEFAULT_NS,
+        }
+
     raw_cases: List[Dict[str, Any]] = data.get("cases", [])
+    default_namespace = data.get("namespace", DEFAULT_NS)
 
     # Namespace filter with fallback to all cases if none matched
-    if namespace:
-        cases = [c for c in raw_cases if c.get("namespace", DEFAULT_NS) == namespace]
+    if ns_clean:
+        cases = [c for c in raw_cases if (c.get("namespace") or default_namespace) == ns_clean]
         if not cases:
-            logging.info("No golden cases matched namespace '%s'. Running all cases (%d).", namespace, len(raw_cases))
+            logging.info(
+                "No golden cases matched namespace '%s'. Running all cases (%d).",
+                ns_clean,
+                len(raw_cases),
+            )
             cases = raw_cases
     else:
         cases = raw_cases
@@ -140,7 +262,13 @@ def run_golden_tests(
 
     # If we do not have an app to call, just report the count
     if not flask_app:
-        return {"ok": True, "total": len(cases), "passed": 0, "results": []}
+        return {
+            "ok": True,
+            "total": len(cases),
+            "passed": 0,
+            "results": [],
+            "namespace": ns_clean or default_namespace,
+        }
 
     results: List[Dict[str, Any]] = []
     passed_count = 0
@@ -154,6 +282,10 @@ def run_golden_tests(
                 "auth_email": case.auth_email,
                 "full_text_search": case.full_text_search,
             }
+            if case.namespace:
+                payload["namespace"] = case.namespace
+            if case.binds:
+                payload["binds"] = _serialize_binds_for_json(case.binds)
             try:
                 rv = client.post("/dw/answer", json=payload)
                 data = rv.get_json(silent=True) or {}
@@ -170,8 +302,15 @@ def run_golden_tests(
                 "question": case.question,
                 "passed": ok,
                 "reasons": reasons,
+                "binds": _serialize_binds_for_json(case.binds),
                 "sql": data.get("sql"),
                 "meta": data.get("meta"),
             })
 
-    return {"ok": True, "total": len(results), "passed": passed_count, "results": results}
+    return {
+        "ok": True,
+        "total": len(results),
+        "passed": passed_count,
+        "results": results,
+        "namespace": ns_clean or default_namespace,
+    }

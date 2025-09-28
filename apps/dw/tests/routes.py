@@ -12,4 +12,8 @@ def run_golden():
     limit = req.get("limit")
 
     report = run_golden_tests(flask_app=current_app, namespace=ns, limit=limit)
+    if not report.get("ok", True):
+        report.setdefault("error", "Golden YAML failed to load or contained no matching cases.")
+        report.setdefault("namespace", ns)
+        return jsonify(report), 400
     return jsonify(report), 200
