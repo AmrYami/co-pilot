@@ -1,9 +1,9 @@
 # apps/dw/tests/golden_runner.py
 from __future__ import annotations
+import datetime as _dt
 import logging
 import re
 from dataclasses import dataclass, field
-from datetime import date
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -15,6 +15,14 @@ from .yaml_tags import GoldenLoader, register_yaml_tags
 # Stable, package-relative path to the golden YAML file
 GOLDEN_PATH = Path(__file__).with_name("golden_dw_contracts.yaml")
 DEFAULT_NS = "dw::common"
+
+# NOTE: keep comments in English inside code.
+
+GROSS_EXPR = (
+    "NVL(CONTRACT_VALUE_NET_OF_VAT,0) + CASE WHEN NVL(VAT,0) BETWEEN 0 AND 1 "
+    "THEN NVL(CONTRACT_VALUE_NET_OF_VAT,0) * NVL(VAT,0) ELSE NVL(VAT,0) END"
+)
+NET_EXPR = "NVL(CONTRACT_VALUE_NET_OF_VAT,0)"
 
 
 @dataclass
@@ -33,6 +41,7 @@ class GoldenCase:
     expect_date_col: Optional[str] = None  # e.g. "REQUEST_DATE", "OVERLAP", "END_DATE"
     expect_agg: Optional[str] = None       # e.g. "count", "sum"
     expect_top_n: Optional[int] = None
+    assertions: Dict[str, Any] = field(default_factory=dict)
 
 def _load_yaml(path: Path) -> Dict[str, Any]:
     try:
@@ -54,17 +63,84 @@ def _load_yaml(path: Path) -> Dict[str, Any]:
         return {}
 
 
-def _canon_sql(value: str) -> str:
-    """Normalise SQL by removing all whitespace and lowercasing."""
-    return re.sub(r"\s+", "", (value or "")).lower()
+def _flatten(s: str) -> str:
+    """Normalize SQL to be whitespace- and punctuation-agnostic for substring checks."""
+    s = s or ""
+    s = re.sub(r"\s+", "", s)
+    s = s.replace("`", "").lower()
+    return s
+
+
+def _contains_all(sql: str, fragments: List[str]) -> List[str]:
+    """Return list of missing fragments after normalization; empty list means all found."""
+    sql_n = _flatten(sql)
+    missing: List[str] = []
+    for frag in fragments:
+        frag_n = _flatten(frag)
+        if frag_n and frag_n not in sql_n:
+            missing.append(frag)
+    return missing
+
+
+def _assert_overlap(sql: str) -> List[str]:
+    """Expect overlap window predicates to be present."""
+    return _contains_all(sql, [
+        "START_DATE <= :date_end",
+        "END_DATE >= :date_start",
+    ])
+
+
+def _assert_end_only(sql: str) -> List[str]:
+    """Expect END_DATE window predicates to be present."""
+    return _contains_all(sql, [
+        "END_DATE BETWEEN :date_start AND :date_end",
+    ])
+
+
+def _assert_request_window(sql: str) -> List[str]:
+    return _contains_all(sql, [
+        "REQUEST_DATE BETWEEN :date_start AND :date_end",
+    ])
+
+
+def _assert_order(sql: str, metric: str, direction: str) -> List[str]:
+    """metric in {'gross','net','measure'}; direction in {'asc','desc'}."""
+    order_fragments: List[str] = []
+    metric_key = (metric or "measure").lower()
+    dir_key = (direction or "desc").upper()
+    if metric_key == "gross":
+        order_fragments.append(f"ORDER BY {GROSS_EXPR} {dir_key}")
+    elif metric_key == "net":
+        order_fragments.append(f"ORDER BY {NET_EXPR} {dir_key}")
+    elif metric_key == "measure":
+        order_fragments.append(f"ORDER BY MEASURE {dir_key}")
+    else:
+        order_fragments.append("ORDER BY")
+        order_fragments.append(dir_key)
+    return _contains_all(sql, order_fragments)
+
+
+def _assert_group_by(sql: str, cols: List[str]) -> List[str]:
+    columns = [c.strip() for c in cols if c and c.strip()]
+    if not columns:
+        return []
+    return _contains_all(sql, ["GROUP BY " + ", ".join(columns)])
+
+
+def _assert_owner_vs_oul_mismatch(sql: str) -> List[str]:
+    return _contains_all(sql, [
+        "DEPARTMENT_OUL IS NOT NULL",
+        "NVL(TRIM(OWNER_DEPARTMENT),'(None)') <> NVL(TRIM(DEPARTMENT_OUL),'(None)')",
+        "ORDER BY CNT DESC",
+    ])
 
 
 def _ensure_date(v: Any) -> Any:
-    if isinstance(v, date):
+    if isinstance(v, _dt.date):
         return v
     if isinstance(v, str):
         try:
-            return date.fromisoformat(v)
+            return _dt.date.fromisoformat(v)
         except ValueError:
             return v
     return v
@@ -79,7 +155,7 @@ def _normalize_binds(raw_binds: Optional[Dict[str, Any]]) -> Dict[str, Any]:
 def _serialize_binds_for_json(binds: Dict[str, Any]) -> Dict[str, Any]:
     serialised: Dict[str, Any] = {}
     for key, value in binds.items():
-        if isinstance(value, date):
+        if isinstance(value, _dt.date):
             serialised[key] = value.isoformat()
         else:
             serialised[key] = value
@@ -110,6 +186,7 @@ def _hydrate_case(raw: Dict[str, Any]) -> GoldenCase:
         expect_date_col = raw.get("expect_date_col"),
         expect_agg = raw.get("expect_agg"),
         expect_top_n = raw.get("expect_top_n"),
+        assertions = raw.get("assertions") or {},
     )
 
 def _check_expectations(case: GoldenCase, resp: Dict[str, Any]) -> Tuple[bool, List[str]]:
@@ -117,15 +194,14 @@ def _check_expectations(case: GoldenCase, resp: Dict[str, Any]) -> Tuple[bool, L
     ok = True
 
     sql = (resp or {}).get("sql") or ""
-    sql_canon = _canon_sql(sql)
     meta = (resp or {}).get("meta") or {}
     intent = ((resp or {}).get("debug") or {}).get("intent") or meta.get("clarifier_intent") or {}
 
     # 1) sql contains
-    for frag in case.expect_sql_contains:
-        if _canon_sql(frag) not in sql_canon:
-            ok = False
-            reasons.append(f"SQL does not contain expected fragment: {frag}")
+    missing_fragments = _contains_all(sql, case.expect_sql_contains)
+    if missing_fragments:
+        ok = False
+        reasons.extend([f"SQL does not contain expected fragment: {frag}" for frag in missing_fragments])
 
     for frag in case.expect_sql_not_contains:
         if frag in sql:
@@ -149,6 +225,28 @@ def _check_expectations(case: GoldenCase, resp: Dict[str, Any]) -> Tuple[bool, L
         if case.expect_order_by.upper() not in sql.upper():
             ok = False
             reasons.append(f"Expected ORDER BY on: {case.expect_order_by}")
+
+    # 3b) structured assertions
+    structured_missing: List[str] = []
+    assertions = case.assertions or {}
+    if assertions.get("overlap"):
+        structured_missing.extend(_assert_overlap(sql))
+    if assertions.get("end_only"):
+        structured_missing.extend(_assert_end_only(sql))
+    if assertions.get("request_window"):
+        structured_missing.extend(_assert_request_window(sql))
+    if "order" in assertions:
+        order_cfg = assertions.get("order") or {}
+        structured_missing.extend(
+            _assert_order(sql, order_cfg.get("metric", "measure"), order_cfg.get("dir", "desc"))
+        )
+    if "group_by" in assertions:
+        structured_missing.extend(_assert_group_by(sql, assertions.get("group_by") or []))
+    if assertions.get("owner_vs_oul_mismatch"):
+        structured_missing.extend(_assert_owner_vs_oul_mismatch(sql))
+    if structured_missing:
+        ok = False
+        reasons.extend([f"SQL does not contain expected fragment: {frag}" for frag in structured_missing])
 
     # 4) date column intent
     if case.expect_date_col:
