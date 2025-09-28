@@ -121,6 +121,15 @@ def _iso_date(value: Union[str, date]) -> date:
         return datetime.fromisoformat(s).date()
 
 
+def _parse_optional_int(value: Any, default: int = 1) -> int:
+    if value is None:
+        return default
+    try:
+        return _parse_int(value, default)
+    except Exception:
+        return default
+
+
 # --- YAML constructors ---
 class GoldenLoader(yaml.SafeLoader):
     """Custom loader to support temporal tags for golden tests."""
@@ -208,6 +217,62 @@ def construct_iso(loader: GoldenLoader, node: yaml.Node) -> date:
     return _iso_date(val)
 
 
+def _multi_start_dispatch(suffix: str, payload: Any) -> date:
+    s = (suffix or "").strip().lower()
+    if s in ("month", ""):
+        return _start_of_month(payload)
+    if s == "last_month":
+        return _start_of_last_month()
+    if s == "year":
+        return _start_of_year(payload)
+    if s == "last_year":
+        return _start_of_year(-1)
+    if s == "quarter":
+        return _start_of_quarter(payload)
+    if s == "last_quarter":
+        return _start_of_quarter(-1)
+    if s in ("prev_months", "months_ago", "month_ago"):
+        return _start_of_month(-_parse_optional_int(payload, 1))
+    if s in ("prev_years", "years_ago", "year_ago"):
+        return _start_of_year(-_parse_optional_int(payload, 1))
+    if s in ("prev_quarters", "quarters_ago", "quarter_ago"):
+        return _start_of_quarter(-_parse_optional_int(payload, 1))
+    return _start_of_month(-_parse_optional_int(payload, 1))
+
+
+def _multi_end_dispatch(suffix: str, payload: Any) -> date:
+    s = (suffix or "").strip().lower()
+    if s in ("month", ""):
+        return _end_of_month(payload)
+    if s == "last_month":
+        return _end_of_last_month()
+    if s == "year":
+        return _end_of_year(payload)
+    if s == "last_year":
+        return _end_of_year(-1)
+    if s == "quarter":
+        return _end_of_quarter(payload)
+    if s == "last_quarter":
+        return _end_of_quarter(-1)
+    if s in ("prev_months", "months_ago", "month_ago"):
+        return _end_of_month(-_parse_optional_int(payload, 1))
+    if s in ("prev_years", "years_ago", "year_ago"):
+        return _end_of_year(-_parse_optional_int(payload, 1))
+    if s in ("prev_quarters", "quarters_ago", "quarter_ago"):
+        return _end_of_quarter(-_parse_optional_int(payload, 1))
+    return _end_of_month(-_parse_optional_int(payload, 1))
+
+
+def construct_start_multi(loader: GoldenLoader, tag_suffix: str, node: yaml.Node) -> date:
+    payload = _normalise_optional(_construct_scalar(loader, node))
+    return _multi_start_dispatch(tag_suffix, payload)
+
+
+def construct_end_multi(loader: GoldenLoader, tag_suffix: str, node: yaml.Node) -> date:
+    payload = _normalise_optional(_construct_scalar(loader, node))
+    return _multi_end_dispatch(tag_suffix, payload)
+
+
 def register_yaml_tags() -> None:
     """Register all custom YAML tags on the GoldenLoader."""
     yaml.add_constructor("!today",               construct_today,              Loader=GoldenLoader)
@@ -225,3 +290,5 @@ def register_yaml_tags() -> None:
     yaml.add_constructor("!end_of_quarter",      construct_end_of_quarter,      Loader=GoldenLoader)
     yaml.add_constructor("!quarter_ago",         construct_quarter_ago,         Loader=GoldenLoader)
     yaml.add_constructor("!iso",                 construct_iso,                 Loader=GoldenLoader)
+    yaml.add_multi_constructor("!start_of_",      construct_start_multi,         Loader=GoldenLoader)
+    yaml.add_multi_constructor("!end_of_",        construct_end_multi,           Loader=GoldenLoader)

@@ -114,7 +114,7 @@ cases:
       sql_like:
         - 'FROM "Contract"'
         - 'WHERE'
-        - 'NVL(VAT, 0) = 0'
+        - 'NVL(VAT,0) = 0'
         - 'NVL(CONTRACT_VALUE_NET_OF_VAT,0) > 0'
       must_not: []
 
@@ -369,8 +369,9 @@ cases:
         - "SELECT 'CURRENT' AS PERIOD"
         - "SELECT 'PREVIOUS' AS PERIOD"
         - 'SUM('
-        - 'START_DATE <= :de'
-        - 'END_DATE   >= :ds'
+        # Template uses REQUEST_DATE ranges in both halves of the UNION.
+        - 'WHERE REQUEST_DATE BETWEEN :ds AND :de'
+        - 'WHERE REQUEST_DATE BETWEEN :p_ds AND :p_de'
       must_not: []
       notes: "Implementation styles vary; fragments only."
 

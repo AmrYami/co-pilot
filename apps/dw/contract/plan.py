@@ -18,7 +18,17 @@ def _window_from_intent(ci: ContractIntent) -> Dict[str, Any]:
     explain_parts = []
     binds: Dict[str, Any] = {}
 
-    if ci.last_month:
+    if ci.ytd:
+        year = ci.ytd_year or today.year
+        start = date(year, 1, 1)
+        end = today if year == today.year else date(year, 12, 31)
+        binds["date_start"] = start
+        binds["date_end"] = end
+        label = "year-to-date" if year == today.year else f"year-to-date {year}"
+        explain_parts.append(
+            f"Window: {label} ({start.isoformat()}..{end.isoformat()})."
+        )
+    elif ci.last_month:
         first_day_this_month = today.replace(day=1)
         end_last_month = first_day_this_month - timedelta(days=1)
         start_last_month = end_last_month.replace(day=1)
@@ -76,6 +86,9 @@ def build_sql_for_question(q: str) -> Tuple[str, Dict[str, Any], str]:
         return sqlgen.top_contracts_by_net(True), binds, " ".join(explain_parts)
 
     if ci.action == "top_gross":
+        if "top_n" not in binds and ci.ytd:
+            binds["top_n"] = 5
+            explain_parts.append("Top 5 default for YTD request.")
         explain_parts.append("Sorting by GROSS contract value.")
         return sqlgen.top_contracts_by_gross(True), binds, " ".join(explain_parts)
 
@@ -123,6 +136,10 @@ def build_sql_for_question(q: str) -> Tuple[str, Dict[str, Any], str]:
     if ci.action == "owner_dept_counts":
         explain_parts.append("Counting contracts per OWNER_DEPARTMENT; all-time.")
         return sqlgen.owner_department_counts(), binds, " ".join(explain_parts)
+
+    if ci.action == "owner_vs_oul_mismatch":
+        explain_parts.append("Comparing OWNER_DEPARTMENT against DEPARTMENT_OUL mismatches.")
+        return sqlgen.owner_vs_oul_mismatch(), binds, " ".join(explain_parts)
 
     return "", {}, ""
 

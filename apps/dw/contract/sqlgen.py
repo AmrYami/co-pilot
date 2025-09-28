@@ -148,3 +148,14 @@ def owner_department_counts() -> str:
         'ORDER BY CNT DESC'
     )
 
+
+def owner_vs_oul_mismatch() -> str:
+    return (
+        'SELECT OWNER_DEPARTMENT, DEPARTMENT_OUL, COUNT(*) AS CNT\n'
+        'FROM "Contract"\n'
+        'WHERE DEPARTMENT_OUL IS NOT NULL\n'
+        "  AND NVL(TRIM(OWNER_DEPARTMENT),'(None)') <> NVL(TRIM(DEPARTMENT_OUL),'(None)')\n"
+        'GROUP BY OWNER_DEPARTMENT, DEPARTMENT_OUL\n'
+        'ORDER BY CNT DESC'
+    )
+
