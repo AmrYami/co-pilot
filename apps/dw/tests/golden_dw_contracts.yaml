@@ -408,3 +408,40 @@ cases:
         - "NVL(TRIM(OWNER_DEPARTMENT),'(None)') <> NVL(TRIM(DEPARTMENT_OUL),'(None)')"
         - 'ORDER BY CNT DESC'
       must_not: []
+
+  - question: "bottom 5 contracts by contract value last month"
+    expect_sql:
+      contains:
+        - 'ORDER BY NVL(CONTRACT_VALUE_NET_OF_VAT,0) ASC'
+        - 'FETCH FIRST 5 ROWS ONLY'
+        - 'START_DATE <= :date_end'
+        - 'END_DATE >= :date_start'
+    binds:
+      date_start: !start_of_last_month
+      date_end: !end_of_last_month
+      top_n: 5
+
+  - question: "lowest owner department by gross last quarter"
+    expect_sql:
+      contains:
+        - 'OWNER_DEPARTMENT AS GROUP_KEY'
+        - 'SUM(NVL(CONTRACT_VALUE_NET_OF_VAT,0)'
+        - 'ORDER BY MEASURE ASC'
+    binds:
+      date_start: !start_of_last_quarter
+      date_end: !end_of_last_quarter
+
+  - question: "Total gross value per DEPARTMENT_OUL last quarter"
+    expect_sql:
+      contains:
+        - 'DEPARTMENT_OUL AS GROUP_KEY'
+        - 'SUM(NVL(CONTRACT_VALUE_NET_OF_VAT,0)'
+        - 'START_DATE <= :date_end'
+        - 'END_DATE >= :date_start'
+
+  - question: "Count of contracts per ENTITY_NO"
+    expect_sql:
+      contains:
+        - 'ENTITY_NO AS GROUP_KEY'
+        - 'COUNT(*) AS CNT'
+        - 'GROUP BY ENTITY_NO'
