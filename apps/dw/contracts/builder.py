@@ -64,7 +64,6 @@ def sql_owner_vs_oul_mismatch() -> str:
         'SELECT OWNER_DEPARTMENT, DEPARTMENT_OUL, COUNT(*) AS CNT\n'
         'FROM "Contract"\n'
         "WHERE DEPARTMENT_OUL IS NOT NULL\n"
-        "  AND TRIM(DEPARTMENT_OUL) <> ''\n"
         "  AND NVL(TRIM(OWNER_DEPARTMENT),'(None)') <> NVL(TRIM(DEPARTMENT_OUL),'(None)')\n"
         "GROUP BY OWNER_DEPARTMENT, DEPARTMENT_OUL\n"
         "ORDER BY CNT DESC"
@@ -169,10 +168,23 @@ def build_contracts_sql(
         _ensure_date_binds(binds, "ds", "de", "p_ds", "p_de")
         return sql_yoy_same_period_overlap(), binds
 
-    if re.search(
-        r"\bowner[_\s]?department\b.*\bdepartment[_\s]?oul\b.*(compare|comparison|mismatch|lead)",
-        q_text,
-        re.IGNORECASE,
+    if (
+        re.search(
+            r"\b(owner[_\s]?department)\b.*\b(vs|compare|comparison)\b.*\b(department[_\s]?oul)\b",
+            q_text,
+            re.IGNORECASE,
+        )
+        or re.search(
+            r"\b(department[_\s]?oul)\b.*\b(vs|compare|comparison)\b.*\b(owner[_\s]?department)\b",
+            q_text,
+            re.IGNORECASE,
+        )
+        or re.search(r"\bOUL\b.*\blead\b", q_text, re.IGNORECASE)
+        or re.search(
+            r"\bowner[_\s]?department\b.*\bdepartment[_\s]?oul\b.*(compare|comparison|mismatch|lead)",
+            q_text,
+            re.IGNORECASE,
+        )
     ):
         return sql_owner_vs_oul_mismatch(), {}
 
