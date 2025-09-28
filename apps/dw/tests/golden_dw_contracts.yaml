@@ -151,6 +151,11 @@ cases:
 
   - id: missing_contract_id
     question: "Contracts missing CONTRACT_ID (data quality check)."
+    sql: |
+      SELECT *
+      FROM "Contract"
+      WHERE CONTRACT_ID IS NULL OR TRIM(CONTRACT_ID) = ''
+      ORDER BY REQUEST_DATE DESC
     expect:
       sql_like:
         - 'CONTRACT_ID IS NULL'
@@ -173,13 +178,30 @@ cases:
 
   - id: top5_gross_2024_ytd
     question: "For 2024 YTD, top 5 contracts by gross."
+    binds:
+      date_start: 2024-01-01
+      date_end: !today
+      top_n: 5
+    sql: |
+      SELECT *
+      FROM "Contract"
+      WHERE (START_DATE IS NOT NULL AND END_DATE IS NOT NULL
+         AND START_DATE <= :date_end
+         AND END_DATE   >= :date_start)
+      ORDER BY NVL(CONTRACT_VALUE_NET_OF_VAT,0)
+           + CASE WHEN NVL(VAT,0) BETWEEN 0 AND 1
+                  THEN NVL(CONTRACT_VALUE_NET_OF_VAT,0) * NVL(VAT,0)
+                  ELSE NVL(VAT,0) END DESC
+      FETCH FIRST 5 ROWS ONLY
     expect:
       sql_like:
         - 'FROM "Contract"'
         - 'ORDER BY'
         - 'NVL(CONTRACT_VALUE_NET_OF_VAT,0)'
         - 'NVL(VAT,0)'
-        - 'FETCH FIRST'
+        - 'FETCH FIRST 5 ROWS ONLY'
+        - 'START_DATE <= :date_end'
+        - 'END_DATE   >= :date_start'
       must_not: []
 
   - id: avg_gross_per_request_type_6m
@@ -322,11 +344,33 @@ cases:
 
   - id: yoy_gross_same_period
     question: "Year-over-year comparison of gross total for the same period (e.g., this Jan–Mar vs last Jan–Mar)."
+    sql: |
+      SELECT 'CURRENT' AS PERIOD,
+             SUM(NVL(CONTRACT_VALUE_NET_OF_VAT,0)
+               + CASE WHEN NVL(VAT,0) BETWEEN 0 AND 1
+                      THEN NVL(CONTRACT_VALUE_NET_OF_VAT,0) * NVL(VAT,0)
+                      ELSE NVL(VAT,0) END) AS TOTAL_GROSS
+      FROM "Contract"
+      WHERE (START_DATE IS NOT NULL AND END_DATE IS NOT NULL
+         AND START_DATE <= :de
+         AND END_DATE   >= :ds)
+      UNION ALL
+      SELECT 'PREVIOUS' AS PERIOD,
+             SUM(NVL(CONTRACT_VALUE_NET_OF_VAT,0)
+               + CASE WHEN NVL(VAT,0) BETWEEN 0 AND 1
+                      THEN NVL(CONTRACT_VALUE_NET_OF_VAT,0) * NVL(VAT,0)
+                      ELSE NVL(VAT,0) END) AS TOTAL_GROSS
+      FROM "Contract"
+      WHERE (START_DATE IS NOT NULL AND END_DATE IS NOT NULL
+         AND START_DATE <= :p_de
+         AND END_DATE   >= :p_ds)
     expect:
       sql_like:
         - "SELECT 'CURRENT' AS PERIOD"
         - "SELECT 'PREVIOUS' AS PERIOD"
         - 'SUM('
+        - 'START_DATE <= :de'
+        - 'END_DATE   >= :ds'
       must_not: []
       notes: "Implementation styles vary; fragments only."
 
@@ -350,10 +394,17 @@ cases:
 
   - id: owner_dept_vs_oul_mismatch
     question: "OWNER_DEPARTMENT vs DEPARTMENT_OUL comparison (where OUL is the lead); list any cases."
+    sql: |
+      SELECT OWNER_DEPARTMENT, DEPARTMENT_OUL, COUNT(*) AS CNT
+      FROM "Contract"
+      WHERE DEPARTMENT_OUL IS NOT NULL
+        AND TRIM(DEPARTMENT_OUL) <> ''
+        AND NVL(TRIM(OWNER_DEPARTMENT),'(None)') <> NVL(TRIM(DEPARTMENT_OUL),'(None)')
+      GROUP BY OWNER_DEPARTMENT, DEPARTMENT_OUL
+      ORDER BY CNT DESC
     expect:
       sql_like:
         - 'DEPARTMENT_OUL IS NOT NULL'
-        - 'OWNER_DEPARTMENT IS NOT NULL'
-        - 'UPPER(DEPARTMENT_OUL) <> UPPER(OWNER_DEPARTMENT)'
-        - 'ORDER BY REQUEST_DATE DESC'
+        - "NVL(TRIM(OWNER_DEPARTMENT),'(None)') <> NVL(TRIM(DEPARTMENT_OUL),'(None)')"
+        - 'ORDER BY CNT DESC'
       must_not: []

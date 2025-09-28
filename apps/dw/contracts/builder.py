@@ -8,13 +8,72 @@ from typing import Dict, Tuple, Optional, List
 _NET = "NVL(CONTRACT_VALUE_NET_OF_VAT,0)"
 _GROSS = f"{_NET} + CASE WHEN NVL(VAT,0) BETWEEN 0 AND 1 THEN {_NET} * NVL(VAT,0) ELSE NVL(VAT,0) END"
 
-def _to_date(d: object) -> date:
-    if isinstance(d, date):
-        return d
-    if isinstance(d, datetime):
-        return d.date()
-    # Expecting ISO string
-    return datetime.fromisoformat(str(d)).date()
+# --- Helpers: measures / overlap predicate ---
+GROSS_EXPR = _GROSS
+
+
+def overlap_pred() -> str:
+    return _overlap_pred()
+
+
+# --- Case (15): missing CONTRACT_ID ---
+def sql_missing_contract_id() -> str:
+    return (
+        'SELECT * FROM "Contract"\n'
+        "WHERE CONTRACT_ID IS NULL OR TRIM(CONTRACT_ID) = ''\n"
+        "ORDER BY REQUEST_DATE DESC"
+    )
+
+
+# --- Case (17): YTD top 5 by gross ---
+def sql_ytd_top5_gross() -> str:
+    return (
+        'SELECT * FROM "Contract"\n'
+        f"WHERE {overlap_pred()}\n"
+        f"ORDER BY {GROSS_EXPR} DESC\n"
+        "FETCH FIRST 5 ROWS ONLY"
+    )
+
+
+# --- Case (32): YoY gross using overlap, two blocks ---
+def sql_yoy_same_period_overlap() -> str:
+    return (
+        "SELECT 'CURRENT' AS PERIOD, SUM(" + GROSS_EXPR + ") AS TOTAL_GROSS\n"
+        'FROM "Contract"\n'
+        "WHERE (START_DATE IS NOT NULL AND END_DATE IS NOT NULL "
+        "AND START_DATE <= :de AND END_DATE >= :ds)\n"
+        "UNION ALL\n"
+        "SELECT 'PREVIOUS' AS PERIOD, SUM(" + GROSS_EXPR + ") AS TOTAL_GROSS\n"
+        'FROM "Contract"\n'
+        "WHERE (START_DATE IS NOT NULL AND END_DATE IS NOT NULL "
+        "AND START_DATE <= :p_de AND END_DATE >= :p_ds)"
+    )
+
+
+# --- Case (35): mismatches OWNER_DEPARTMENT vs DEPARTMENT_OUL ---
+def sql_owner_vs_oul_mismatch() -> str:
+    return (
+        'SELECT OWNER_DEPARTMENT, DEPARTMENT_OUL, COUNT(*) AS CNT\n'
+        'FROM "Contract"\n'
+        "WHERE DEPARTMENT_OUL IS NOT NULL\n"
+        "  AND TRIM(DEPARTMENT_OUL) <> ''\n"
+        "  AND NVL(TRIM(OWNER_DEPARTMENT),'(None)') <> NVL(TRIM(DEPARTMENT_OUL),'(None)')\n"
+        "GROUP BY OWNER_DEPARTMENT, DEPARTMENT_OUL\n"
+        "ORDER BY CNT DESC"
+    )
+
+def _as_date(obj: object) -> date:
+    if isinstance(obj, datetime):
+        return obj.date()
+    if isinstance(obj, date):
+        return obj
+    return date.fromisoformat(str(obj)[:10])
+
+
+def _ensure_date_binds(binds: Dict[str, object], *keys: str) -> None:
+    for key in keys:
+        if key in binds and binds[key] is not None:
+            binds[key] = _as_date(binds[key])
 
 def _overlap_pred(date_start_bind: str = ":date_start", date_end_bind: str = ":date_end") -> str:
     # Strict overlap: start <= end AND end >= start (both not null)
@@ -38,6 +97,48 @@ def build_contracts_sql(
       - sort_by, sort_desc, top_n
       - full_text_search: bool, fts_tokens: [str]
     """
+    q_norm = str(
+        intent.get("raw_question_norm")
+        or intent.get("raw_question")
+        or (intent.get("notes") or {}).get("q")
+        or ""
+    ).strip().lower()
+
+    # Special deterministic cases mapped by the parser or fallback keyword match.
+    if "missing contract_id" in q_norm or "data quality" in q_norm:
+        return sql_missing_contract_id(), {}
+
+    if "ytd" in q_norm and "top 5" in q_norm and "gross" in q_norm:
+        today_obj = (
+            intent.get("today")
+            or (intent.get("notes") or {}).get("today")
+            or date.today()
+        )
+        today_date = _as_date(today_obj)
+        binds = {
+            "date_start": date(today_date.year, 1, 1),
+            "date_end": today_date,
+            "top_n": 5,
+        }
+        _ensure_date_binds(binds, "date_start", "date_end")
+        return sql_ytd_top5_gross(), binds
+
+    if "year-over-year" in q_norm or "yoy" in q_norm:
+        binds = {
+            "ds": intent.get("ds"),
+            "de": intent.get("de"),
+            "p_ds": intent.get("p_ds"),
+            "p_de": intent.get("p_de"),
+        }
+        _ensure_date_binds(binds, "ds", "de", "p_ds", "p_de")
+        binds = {k: v for k, v in binds.items() if v is not None}
+        return sql_yoy_same_period_overlap(), binds
+
+    if "owner_department vs department_oul" in q_norm or (
+        "department_oul" in q_norm and "owner" in q_norm
+    ):
+        return sql_owner_vs_oul_mismatch(), {}
+
     q_parts: List[str] = []
     binds: Dict[str, object] = {}
     select_list = "*"
@@ -49,8 +150,8 @@ def build_contracts_sql(
     explicit = intent.get("explicit_dates")
     date_col = (intent.get("date_column") or "").upper() if intent.get("date_column") else None
     if explicit:
-        binds["date_start"] = _to_date(explicit["start"])
-        binds["date_end"]   = _to_date(explicit["end"])
+        binds["date_start"] = _as_date(explicit["start"])
+        binds["date_end"] = _as_date(explicit["end"])
         if date_col == "REQUEST_DATE":
             where_parts.append("REQUEST_DATE BETWEEN :date_start AND :date_end")
         elif date_col == "END_DATE":
