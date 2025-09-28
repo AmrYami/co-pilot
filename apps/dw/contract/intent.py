@@ -16,6 +16,8 @@ class ContractIntent:
     last_n_months: Optional[int] = None
     next_n_days: Optional[int] = None
     year_literal: Optional[int] = None
+    ytd: bool = False
+    ytd_year: Optional[int] = None
     notes: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -24,6 +26,8 @@ _re_last_n_months = re.compile(r"\blast\s+(\d+)\s+months?\b", re.I)
 _re_last_month = re.compile(r"\blast\s+month\b", re.I)
 _re_next_n_days = re.compile(r"\bnext\s+(\d+)\s+days?\b", re.I)
 _re_year = re.compile(r"\b(20\d{2})\b")
+_re_year_ytd = re.compile(r"\b(20\d{2})\s*ytd\b", re.I)
+_re_ytd_year_post = re.compile(r"\bytd\s+(20\d{2})\b", re.I)
 
 
 def parse_contract_intent(q: str) -> Optional[ContractIntent]:
@@ -59,6 +63,18 @@ def parse_contract_intent(q: str) -> Optional[ContractIntent]:
         ci.wants_all_columns = False
         return ci
 
+    if "owner_department" in lowered and "department_oul" in lowered and (
+        "mismatch" in lowered
+        or "vs" in lowered
+        or "versus" in lowered
+        or "different" in lowered
+        or "diff" in lowered
+        or "compare" in lowered
+    ):
+        ci.action = "owner_vs_oul_mismatch"
+        ci.wants_all_columns = False
+        return ci
+
     if "vat" in lowered and ("null" in lowered or "zero" in lowered) and (
         "contract value" in lowered or "value > 0" in lowered
     ):
@@ -90,6 +106,20 @@ def parse_contract_intent(q: str) -> Optional[ContractIntent]:
         else:
             ci.action = "group_gross_owner_dept_all_time"
         return ci
+
+    if "ytd" in lowered:
+        ci.ytd = True
+        year_match = _re_year_ytd.search(text)
+        if year_match:
+            ci.ytd_year = int(year_match.group(1))
+        else:
+            post_match = _re_ytd_year_post.search(text)
+            if post_match:
+                ci.ytd_year = int(post_match.group(1))
+            else:
+                year = _re_year.search(text)
+                if year:
+                    ci.ytd_year = int(year.group(1))
 
     if "top" in lowered and "contracts" in lowered and "contract value" in lowered:
         if "gross" in lowered:
