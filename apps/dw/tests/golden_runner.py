@@ -5,7 +5,14 @@ import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+# NOTE: Test runner helpers should be resilient to harmless SQL shape differences
+# (aliases, bind names, spacing). We keep comments here in English by request.
+
+MEASURE_ALIASES = ("MEASURE", "TOTAL_GROSS", "GROSS_VALUE", "NET_VALUE", "CNT", "TOTAL", "VALUE")
+DATE_START_SYNS = (":date_start", ":ds")
+DATE_END_SYNS = (":date_end", ":de")
 
 
 def _normalize_sql(s: str) -> str:
@@ -14,7 +21,12 @@ def _normalize_sql(s: str) -> str:
     s = re.sub(r"\s+", " ", s)
     s = re.sub(r"\(\s+", "(", s)
     s = re.sub(r",\s+", ",", s)
-    return s.strip().upper()
+    s = s.strip()
+    return s.upper()
+
+
+def _contains_any(sql: str, patterns: Iterable[str]) -> bool:
+    return any(re.search(p, sql, flags=re.I) for p in patterns)
 
 import yaml
 from flask import Flask
@@ -106,7 +118,41 @@ def _contains_all(sql: str, fragments: List[str]) -> List[str]:
     missing: List[str] = []
     for frag in fragments:
         frag_n = _normalize_sql(frag)
-        if frag_n and frag_n not in sql_n:
+        if not frag_n:
+            continue
+        if frag_n == "ORDER BY MEASURE DESC":
+            pattern = r"ORDER\s+BY\s+(%s)\s+DESC" % "|".join(MEASURE_ALIASES)
+            if not re.search(pattern, sql_n, flags=re.I):
+                missing.append(frag)
+            continue
+        match = re.match(r"FETCH\s+FIRST\s+(\d+)\s+ROWS\s+ONLY", frag_n, flags=re.I)
+        if match:
+            n = match.group(1)
+            candidates = [
+                rf"FETCH\s+FIRST\s+{n}\s+ROWS\s+ONLY",
+                r"FETCH\s+FIRST\s+:TOP_N\s+ROWS\s+ONLY",
+            ]
+            if not _contains_any(sql_n, candidates):
+                missing.append(f"FETCH FIRST {n} ROWS ONLY")
+            continue
+        if "REQUEST_DATE BETWEEN :DATE_START AND :DATE_END" in frag_n:
+            patterns = [
+                rf"REQUEST_DATE\s+BETWEEN\s+{ds}\s+AND\s+{de}" for ds in DATE_START_SYNS for de in DATE_END_SYNS
+            ]
+            if not _contains_any(sql_n, patterns):
+                missing.append(frag)
+            continue
+        if "START_DATE <= :DATE_END" in frag_n:
+            patterns = [rf"START_DATE\s*<=\s*{de}" for de in DATE_END_SYNS]
+            if not _contains_any(sql_n, patterns):
+                missing.append(frag)
+            continue
+        if "END_DATE >= :DATE_START" in frag_n:
+            patterns = [rf"END_DATE\s*>=\s*{ds}" for ds in DATE_START_SYNS]
+            if not _contains_any(sql_n, patterns):
+                missing.append(frag)
+            continue
+        if frag_n not in sql_n:
             missing.append(frag)
     return missing
 

@@ -144,6 +144,7 @@ cases:
         - 'WHERE'
         - 'REQUEST_TYPE'
         - 'REQUEST_DATE BETWEEN'
+        - 'ORDER BY REQUEST_DATE DESC'
       must_not: []
     assertions:
       request_window: true
@@ -224,7 +225,7 @@ cases:
         - 'ORDER BY'
         - 'NVL(CONTRACT_VALUE_NET_OF_VAT,0)'
         - 'NVL(VAT,0)'
-        - 'FETCH FIRST 5 ROWS ONLY'
+        - 'FETCH FIRST :top_n ROWS ONLY'
         - 'START_DATE <= :date_end'
         - 'END_DATE   >= :date_start'
       must_not: []
@@ -262,6 +263,7 @@ cases:
         - 'GROUP BY CONTRACT_STATUS'
         - 'SUM('
         - 'COUNT(*) AS CNT'
+        - 'ORDER BY TOTAL_GROSS DESC'
       must_not: []
     assertions:
       order: { metric: measure, dir: desc }
@@ -300,6 +302,7 @@ cases:
         - 'WITH S AS ('
         - 'GROUP BY STAKEHOLDER'
         - 'HAVING COUNT(*) > :min_n'
+        - 'ORDER BY CNT DESC'
       must_not: []
     assertions:
       request_window: true
@@ -334,6 +337,7 @@ cases:
       sql_like:
         - 'LISTAGG(DISTINCT OWNER_DEPARTMENT'
         - 'GROUP BY STAKEHOLDER'
+        - 'ORDER BY TOTAL_GROSS DESC'
       must_not: []
       notes: "Advanced: LISTAGG DISTINCT(OWNER_DEPARTMENT) by stakeholder acceptable but not enforced."
     assertions:
@@ -372,7 +376,7 @@ cases:
         - 'FROM "Contract"'
         - 'MEDIAN('
         - 'GROUP BY OWNER_DEPARTMENT'
-        - 'ORDER BY MEASURE DESC'
+        - 'ORDER BY TOTAL_GROSS DESC'
       must_not: []
     assertions:
       overlap: true
@@ -426,9 +430,11 @@ cases:
         - "SELECT 'CURRENT' AS PERIOD"
         - "SELECT 'PREVIOUS' AS PERIOD"
         - 'SUM('
-        # Template uses REQUEST_DATE ranges in both halves of the UNION.
-        - 'WHERE REQUEST_DATE BETWEEN :ds AND :de'
-        - 'WHERE REQUEST_DATE BETWEEN :p_ds AND :p_de'
+        - 'REQUEST_DATE BETWEEN :ds AND :de'
+        - 'REQUEST_DATE BETWEEN :p_ds AND :p_de'
+        - 'UNION ALL'
+        - "'CURRENT'"
+        - "'PREVIOUS'"
       must_not: []
       notes: "Implementation styles vary; fragments only."
     assertions:
