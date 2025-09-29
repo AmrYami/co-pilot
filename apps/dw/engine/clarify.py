@@ -26,6 +26,7 @@ _RE_COUNT = re.compile(r"\bcount\b|\(count\)", re.I)
 _RE_BY = re.compile(r"\bby\s+([a-zA-Z_ ]+)\b", re.I)
 _RE_YEAR = re.compile(r"\b(20\d{2})\b")
 _RE_YTD = re.compile(r"\bYTD\b", re.I)
+_RE_YTD_EXPLICIT = re.compile(r"\b(20\d{2})\s*(?:ytd|year\s*to\s*date)\b", re.I)
 _RE_LAST_12 = re.compile(r"\blast\s+12\s+months?\b", re.I)
 _RE_LAST_90D = re.compile(r"\blast\s+90\s+days?\b", re.I)
 
@@ -168,12 +169,26 @@ def parse_intent(question: str) -> NLIntent:
             intent.has_time_window = True
             intent.explicit_dates = {"start": start.isoformat(), "end": end.isoformat()}
 
-    if _RE_YTD.search(text):
+    m_ytd = _RE_YTD_EXPLICIT.search(text)
+    if m_ytd:
+        year = int(m_ytd.group(1))
+        today = datetime.utcnow().date()
+        start = f"{year}-01-01"
+        end = today.isoformat() if year == today.year else f"{year}-12-31"
+        intent.has_time_window = True
+        intent.explicit_dates = {"start": start, "end": end}
+        if not intent.date_column or intent.date_column == "OVERLAP":
+            intent.date_column = "OVERLAP"
+        intent.notes["window"] = "ytd"
+    elif _RE_YTD.search(text):
         year = datetime.utcnow().year
         start = f"{year}-01-01"
         end = datetime.utcnow().date().isoformat()
         intent.has_time_window = True
         intent.explicit_dates = {"start": start, "end": end}
+        if not intent.date_column or intent.date_column == "OVERLAP":
+            intent.date_column = "OVERLAP"
+        intent.notes["window"] = "ytd"
 
     m = _RE_YEAR.search(text)
     if m and "requested" in lowered:

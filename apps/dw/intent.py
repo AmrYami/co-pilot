@@ -43,6 +43,7 @@ _RE_LAST_6_MONTHS = re.compile(r'\blast\s+6\s+months?\b', re.I)
 _RE_90_DAYS       = re.compile(r'\b(last|next)\s+90\s+days?\b', re.I)
 _RE_NEXT_N_DAYS   = re.compile(r'\bexpir(?:y|ing)\s+in\s+([0-9]+)\s+days?\b', re.I)
 _RE_YEAR_YYYY     = re.compile(r'\b(20\d{2})\b')
+_RE_YTD_EXPLICIT  = re.compile(r'\b(20\d{2})\s*(?:ytd|year\s*to\s*date)\b', re.I)
 _RE_RENEWAL       = re.compile(r'\brenewal\b', re.I)
 _RE_GROSS         = re.compile(r'\bgross\b', re.I)
 _RE_NET           = re.compile(r'\bnet\b', re.I)
@@ -135,11 +136,23 @@ def parse_intent_legacy(
         yy = int(year_match.group(1))
         it.has_time_window = True
         it.explicit_dates = {"start": date(yy, 1, 1).isoformat(), "end": date(yy, 12, 31).isoformat()}
-    if "ytd" in q.lower():
+    m_ytd = _RE_YTD_EXPLICIT.search(q)
+    if m_ytd:
+        yy = int(m_ytd.group(1))
+        s, e = _ytd_bounds(yy, today)
+        it.has_time_window = True
+        it.explicit_dates = {"start": s.isoformat(), "end": e.isoformat()}
+        if not it.date_column or it.date_column == "OVERLAP":
+            it.date_column = "OVERLAP"
+        it.notes["window"] = "ytd"
+    elif "ytd" in q.lower():
         yy = today.year
         s, e = _ytd_bounds(yy, today)
         it.has_time_window = True
         it.explicit_dates = {"start": s.isoformat(), "end": e.isoformat()}
+        if not it.date_column or it.date_column == "OVERLAP":
+            it.date_column = "OVERLAP"
+        it.notes["window"] = "ytd"
 
     # 3) date column decision:
     # Default to OVERLAP unless user explicitly talks about "requested".

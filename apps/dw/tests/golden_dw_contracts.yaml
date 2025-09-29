@@ -213,12 +213,12 @@ cases:
       FROM "Contract"
       WHERE (START_DATE IS NOT NULL AND END_DATE IS NOT NULL
          AND START_DATE <= :date_end
-         AND END_DATE   >= :date_start)
+         AND END_DATE >= :date_start)
       ORDER BY NVL(CONTRACT_VALUE_NET_OF_VAT,0)
            + CASE WHEN NVL(VAT,0) BETWEEN 0 AND 1
                   THEN NVL(CONTRACT_VALUE_NET_OF_VAT,0) * NVL(VAT,0)
                   ELSE NVL(VAT,0) END DESC
-      FETCH FIRST 5 ROWS ONLY
+      FETCH FIRST :top_n ROWS ONLY
     expect:
       sql_like:
         - 'FROM "Contract"'
@@ -227,7 +227,7 @@ cases:
         - 'NVL(VAT,0)'
         - 'FETCH FIRST :top_n ROWS ONLY'
         - 'START_DATE <= :date_end'
-        - 'END_DATE   >= :date_start'
+        - 'END_DATE >= :date_start'
       must_not: []
 
   - id: avg_gross_per_request_type_6m
@@ -414,7 +414,7 @@ cases:
       FROM "Contract"
       WHERE (START_DATE IS NOT NULL AND END_DATE IS NOT NULL
          AND START_DATE <= :de
-         AND END_DATE   >= :ds)
+         AND END_DATE >= :ds)
       UNION ALL
       SELECT 'PREVIOUS' AS PERIOD,
              SUM(NVL(CONTRACT_VALUE_NET_OF_VAT,0)
@@ -424,17 +424,17 @@ cases:
       FROM "Contract"
       WHERE (START_DATE IS NOT NULL AND END_DATE IS NOT NULL
          AND START_DATE <= :p_de
-         AND END_DATE   >= :p_ds)
+         AND END_DATE >= :p_ds)
     expect:
-      sql_like:
-        - "SELECT 'CURRENT' AS PERIOD"
-        - "SELECT 'PREVIOUS' AS PERIOD"
-        - 'SUM('
-        - 'REQUEST_DATE BETWEEN :ds AND :de'
-        - 'REQUEST_DATE BETWEEN :p_ds AND :p_de'
-        - 'UNION ALL'
-        - "'CURRENT'"
-        - "'PREVIOUS'"
+        sql_like:
+          - "SELECT 'CURRENT' AS PERIOD"
+          - "SELECT 'PREVIOUS' AS PERIOD"
+          - 'SUM('
+          - 'START_DATE <= :de'
+          - 'END_DATE >= :ds'
+          - 'START_DATE <= :p_de'
+          - 'END_DATE >= :p_ds'
+          - 'UNION ALL'
       must_not: []
       notes: "Implementation styles vary; fragments only."
     assertions:

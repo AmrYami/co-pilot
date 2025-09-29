@@ -174,7 +174,12 @@ def build_contracts_sql(
       - sort_by, sort_desc, top_n
       - full_text_search: bool, fts_tokens: [str]
     """
-    notes = intent.get("notes") or {}
+    notes = intent.get("notes")
+    if not isinstance(notes, dict):
+        notes = {}
+        intent["notes"] = notes
+    else:
+        intent["notes"] = notes
     q_text = str(
         notes.get("q")
         or intent.get("raw_question")
@@ -228,6 +233,7 @@ def build_contracts_sql(
             p_de = p_de or date(this_year - 1, 3, 31)
         binds = {"ds": ds, "de": de, "p_ds": p_ds, "p_de": p_de}
         sql, out_binds = build_yoy_gross_overlap(binds)
+        notes["yoy"] = "overlap"
         return sql, out_binds
 
     if (
