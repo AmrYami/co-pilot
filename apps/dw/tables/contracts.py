@@ -909,18 +909,21 @@ def _build_special(intent: Intent) -> tuple[str, dict, dict]:
             "p_ds": _to_date(prev_start),
             "p_de": _to_date(prev_end),
         }
+        # Overlap-based YoY: treat "contracts" as active when the contract window overlaps each period.
+        current_overlap = _overlap_condition(":ds", ":de")
+        previous_overlap = _overlap_condition(":p_ds", ":p_de")
         sql = (
             "SELECT 'CURRENT' AS PERIOD, SUM("
             f"{GROSS_SQL}"
             ") AS TOTAL_GROSS\n"
             'FROM "Contract"\n'
-            "WHERE REQUEST_DATE BETWEEN :ds AND :de\n"
+            f"WHERE {current_overlap}\n"
             "UNION ALL\n"
             "SELECT 'PREVIOUS' AS PERIOD, SUM("
             f"{GROSS_SQL}"
             ") AS TOTAL_GROSS\n"
             'FROM "Contract"\n'
-            "WHERE REQUEST_DATE BETWEEN :p_ds AND :p_de"
+            f"WHERE {previous_overlap}"
         )
         return sql, binds, _build_meta(intent, explain=explain_meta, gross=True, strategy="contract_deterministic")
 

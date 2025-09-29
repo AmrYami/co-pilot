@@ -357,6 +357,11 @@ def _normalize_sql(s: str) -> str:
 def _contains_any(sql: str, patterns: Iterable[str]) -> bool:
     return any(re.search(p, sql, flags=re.I) for p in patterns)
 
+
+def _canon_ws(s: str) -> str:
+    """Normalize all whitespace to a single space for robust 'contains' checks."""
+    return re.sub(r"\s+", " ", s or "").strip()
+
 # Stable, package-relative path to the golden YAML file
 GOLDEN_PATH = Path(__file__).with_name("golden_dw_contracts.yaml")
 DEFAULT_NS = "dw::common"
@@ -437,9 +442,11 @@ def assert_order_direction(sql: str, expect_desc: bool, reasons: List[str]) -> N
 def _contains_all(sql: str, fragments: List[str]) -> List[str]:
     """Return list of missing fragments after normalization; empty list means all found."""
     sql_norm = _normalize_sql(sql)
+    sql_ws = _canon_ws(sql).lower()
     missing: List[str] = []
     for frag in fragments:
         frag_norm = _normalize_sql(frag)
+        frag_ws = _canon_ws(frag).lower()
         if not frag_norm:
             continue
         if frag_norm == "order by measure desc":
@@ -475,7 +482,7 @@ def _contains_all(sql: str, fragments: List[str]) -> List[str]:
             if not _contains_any(sql, patterns):
                 missing.append(frag)
             continue
-        if frag_norm not in sql_norm:
+        if frag_norm not in sql_norm and frag_ws not in sql_ws:
             missing.append(frag)
     return missing
 
@@ -510,7 +517,11 @@ def _assert_order(sql: str, metric: str, direction: str) -> List[str]:
     elif metric_key == "net":
         _must_contain(sql, f"ORDER BY {NET_EXPR} {dir_key.upper()}", reasons)
     elif metric_key == "measure":
-        _must_contain(sql, f"ORDER BY MEASURE {dir_key.upper()}", reasons)
+        alias_pattern = "|".join(alias.lower() for alias in MEASURE_ALIASES)
+        sql_ws = _canon_ws(sql)
+        pattern = rf"order\s+by\s+({alias_pattern})\s+{dir_key}"
+        if not re.search(pattern, sql_ws, flags=re.I):
+            reasons.append(f"ORDER BY measure alias missing ({dir_key.upper()})")
     else:
         _must_contain(sql, "ORDER BY", reasons)
         assert_order_direction(sql, dir_key == "desc", reasons)
@@ -578,7 +589,11 @@ def _hydrate_case(raw: Dict[str, Any]) -> GoldenCase:
         auth_email = raw.get("auth_email", "golden@local"),
         full_text_search = bool(raw.get("full_text_search", False)),
         binds = _normalize_binds(raw.get("binds")),
-        expect_sql_contains = _ensure_str_list(raw.get("expect_sql_contains") or expect.get("sql_like")),
+        expect_sql_contains = _ensure_str_list(
+            raw.get("expect_sql_contains")
+            or raw.get("expect_contains")
+            or expect.get("sql_like")
+        ),
         expect_sql_not_contains = _ensure_str_list(expect.get("must_not")),
         expect_group_by = _ensure_str_list(raw.get("expect_group_by")),
         expect_order_by = raw.get("expect_order_by"),
