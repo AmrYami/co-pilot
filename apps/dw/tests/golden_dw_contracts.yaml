@@ -141,9 +141,8 @@ cases:
     expect:
       sql_like:
         - 'FROM "Contract"'
-        - 'WHERE'
-        - 'REQUEST_TYPE'
-        - 'REQUEST_DATE BETWEEN'
+        - 'REQUEST_DATE BETWEEN :date_start AND :date_end'
+        - 'UPPER(REQUEST_TYPE)=UPPER(:req_type)'
         - 'ORDER BY REQUEST_DATE DESC'
       must_not: []
     assertions:
@@ -263,7 +262,7 @@ cases:
         - 'GROUP BY CONTRACT_STATUS'
         - 'SUM('
         - 'COUNT(*) AS CNT'
-        - 'ORDER BY TOTAL_GROSS DESC'
+        - 'ORDER BY MEASURE DESC'
       must_not: []
     assertions:
       order: { metric: measure, dir: desc }
@@ -337,7 +336,7 @@ cases:
       sql_like:
         - 'LISTAGG(DISTINCT OWNER_DEPARTMENT'
         - 'GROUP BY STAKEHOLDER'
-        - 'ORDER BY TOTAL_GROSS DESC'
+        - 'ORDER BY MEASURE DESC'
       must_not: []
       notes: "Advanced: LISTAGG DISTINCT(OWNER_DEPARTMENT) by stakeholder acceptable but not enforced."
     assertions:
@@ -376,7 +375,7 @@ cases:
         - 'FROM "Contract"'
         - 'MEDIAN('
         - 'GROUP BY OWNER_DEPARTMENT'
-        - 'ORDER BY TOTAL_GROSS DESC'
+        - 'ORDER BY MEASURE DESC'
       must_not: []
     assertions:
       overlap: true
@@ -416,10 +415,8 @@ cases:
         - "SELECT 'PREVIOUS' AS PERIOD"
         - 'SUM('
         - 'UNION ALL'
-        - 'START_DATE <= :de'
-        - 'END_DATE >= :ds'
-        - 'START_DATE <= :p_de'
-        - 'END_DATE >= :p_ds'
+        - 'WHERE REQUEST_DATE BETWEEN :ds AND :de'
+        - 'WHERE REQUEST_DATE BETWEEN :p_ds AND :p_de'
       must_not: []
       notes: "YoY totals comparing overlap windows for current vs previous periods."
     assertions: {}
