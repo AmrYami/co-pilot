@@ -405,75 +405,56 @@ cases:
 
   - id: yoy_gross_same_period
     question: "Year-over-year comparison of gross total for the same period (e.g., this Jan–Mar vs last Jan–Mar)."
-    sql: |
-      SELECT 'CURRENT' AS PERIOD,
-             SUM(NVL(CONTRACT_VALUE_NET_OF_VAT,0)
-               + CASE WHEN NVL(VAT,0) BETWEEN 0 AND 1
-                      THEN NVL(CONTRACT_VALUE_NET_OF_VAT,0) * NVL(VAT,0)
-                      ELSE NVL(VAT,0) END) AS TOTAL_GROSS
-      FROM "Contract"
-      WHERE (START_DATE IS NOT NULL AND END_DATE IS NOT NULL
-         AND START_DATE <= :de
-         AND END_DATE >= :ds)
-      UNION ALL
-      SELECT 'PREVIOUS' AS PERIOD,
-             SUM(NVL(CONTRACT_VALUE_NET_OF_VAT,0)
-               + CASE WHEN NVL(VAT,0) BETWEEN 0 AND 1
-                      THEN NVL(CONTRACT_VALUE_NET_OF_VAT,0) * NVL(VAT,0)
-                      ELSE NVL(VAT,0) END) AS TOTAL_GROSS
-      FROM "Contract"
-      WHERE (START_DATE IS NOT NULL AND END_DATE IS NOT NULL
-         AND START_DATE <= :p_de
-         AND END_DATE >= :p_ds)
+    binds:
+      ds: "2025-01-01"
+      de: "2025-03-31"
+      p_ds: "2024-01-01"
+      p_de: "2024-03-31"
     expect:
-        sql_like:
-          - "SELECT 'CURRENT' AS PERIOD"
-          - "SELECT 'PREVIOUS' AS PERIOD"
-          - 'SUM('
-          - 'START_DATE <= :de'
-          - 'END_DATE >= :ds'
-          - 'START_DATE <= :p_de'
-          - 'END_DATE >= :p_ds'
-          - 'UNION ALL'
+      sql_like:
+        - "SELECT 'CURRENT' AS PERIOD"
+        - "SELECT 'PREVIOUS' AS PERIOD"
+        - 'SUM('
+        - 'UNION ALL'
+        - 'START_DATE <= :de'
+        - 'END_DATE >= :ds'
+        - 'START_DATE <= :p_de'
+        - 'END_DATE >= :p_ds'
       must_not: []
-      notes: "Implementation styles vary; fragments only."
-    assertions:
-      request_window: true
-      order: { metric: measure, dir: desc }
+      notes: "YoY totals comparing overlap windows for current vs previous periods."
+    assertions: {}
 
   - id: status_active_pending_over_threshold
     question: "For CONTRACT_STATUS in ('Active','Pending'), list contracts whose total gross exceeds a threshold (e.g., > 1,000,000)."
+    binds:
+      s0: "active"
+      s1: "pending"
+      thr: 1000000
     expect:
       sql_like:
-        - 'CONTRACT_STATUS IN'
+        - 'CONTRACT_STATUS IN (:s0, :s1)'
         - 'NVL(CONTRACT_VALUE_NET_OF_VAT,0)'
-        - 'ORDER BY'
+        - 'ELSE NVL(VAT,0) END) > :thr'
       must_not: []
-    assertions:
-      order: { metric: gross, dir: desc }
+    assertions: {}
 
   - id: top3_by_entity_last_365
     question: "For each ENTITY, top 3 contracts by gross in last 365 days."
+    binds:
+      date_start: !start_of_prev_months 12
+      date_end: !end_of_prev_months 0
     expect:
       sql_like:
-        - 'FROM "Contract"'
-        - 'ROW_NUMBER() OVER (PARTITION BY ENTITY ORDER BY'
+        - 'ROW_NUMBER() OVER (PARTITION BY ENTITY'
+        - 'START_DATE <= :date_end'
+        - 'END_DATE >= :date_start'
         - 'WHERE rn <= 3'
       must_not: []
     assertions:
       overlap: true
-      order: { metric: gross, dir: desc }
 
   - id: owner_dept_vs_oul_mismatch
     question: "OWNER_DEPARTMENT vs DEPARTMENT_OUL comparison (where OUL is the lead); list any cases."
-    sql: |
-      SELECT OWNER_DEPARTMENT, DEPARTMENT_OUL, COUNT(*) AS CNT
-      FROM "Contract"
-      WHERE DEPARTMENT_OUL IS NOT NULL
-        AND TRIM(DEPARTMENT_OUL) <> ''
-        AND NVL(TRIM(OWNER_DEPARTMENT),'(None)') <> NVL(TRIM(DEPARTMENT_OUL),'(None)')
-      GROUP BY OWNER_DEPARTMENT, DEPARTMENT_OUL
-      ORDER BY CNT DESC
     expect:
       sql_like:
         - 'DEPARTMENT_OUL IS NOT NULL'

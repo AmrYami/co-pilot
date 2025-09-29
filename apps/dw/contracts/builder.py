@@ -10,6 +10,8 @@ from .rules_extra import try_build_special_cases
 
 _NET = "NVL(CONTRACT_VALUE_NET_OF_VAT,0)"
 
+_BOTTOM_RE = re.compile(r"\b(bottom|lowest|least|أقل)\b", re.IGNORECASE)
+_REQUEST_RE = re.compile(r"\brequest(?:ed|s)?\b", re.IGNORECASE)
 
 def gross_expr(alias: str | None = None) -> str:
     base = "NVL(CONTRACT_VALUE_NET_OF_VAT,0)"
@@ -26,7 +28,7 @@ def overlap_pred() -> str:
     return _overlap_pred()
 
 
-def build_top_gross_ytd(q: str, binds: Dict[str, object] | None, top_n: int) -> Tuple[str, Dict[str, object]]:
+def build_top_gross_ytd(q: str, binds: Dict[str, object] | None, top_n: int, ascending: bool = False) -> Tuple[str, Dict[str, object]]:
     """Top-N contracts by gross for a YTD window inferred from question/binds."""
     text = q or ""
     lowered = text.lower()
@@ -71,10 +73,11 @@ def build_top_gross_ytd(q: str, binds: Dict[str, object] | None, top_n: int) -> 
     })
     _ensure_date_binds(out_binds, "date_start", "date_end")
 
+    order_dir = "ASC" if ascending else "DESC"
     sql = (
         'SELECT * FROM "Contract"\n'
         f"WHERE {_overlap_pred()}\n"
-        f"ORDER BY {gross_expr()} DESC\n"
+        f"ORDER BY {gross_expr()} {order_dir}\n"
         "FETCH FIRST :top_n ROWS ONLY"
     )
     return sql, out_binds
@@ -92,6 +95,22 @@ def build_yoy_gross_overlap(binds: Dict[str, object] | None) -> Tuple[str, Dict[
         "SELECT 'PREVIOUS' AS PERIOD, SUM(" + gross_expr() + ") AS TOTAL_GROSS\n"
         'FROM "Contract"\n'
         f"WHERE {_overlap_pred(':p_ds', ':p_de')}"
+    )
+    return sql, out
+
+
+def build_yoy_gross_requested(binds: Dict[str, object] | None) -> Tuple[str, Dict[str, object]]:
+    """YoY gross totals using REQUEST_DATE windows for current and previous periods."""
+    out = dict(binds or {})
+    _ensure_date_binds(out, "ds", "de", "p_ds", "p_de")
+    sql = (
+        "SELECT 'CURRENT' AS PERIOD, SUM(" + gross_expr() + ") AS TOTAL_GROSS\n"
+        'FROM "Contract"\n'
+        "WHERE REQUEST_DATE BETWEEN :ds AND :de\n"
+        "UNION ALL\n"
+        "SELECT 'PREVIOUS' AS PERIOD, SUM(" + gross_expr() + ") AS TOTAL_GROSS\n"
+        'FROM "Contract"\n'
+        "WHERE REQUEST_DATE BETWEEN :p_ds AND :p_de"
     )
     return sql, out
 
@@ -192,6 +211,22 @@ def build_contracts_sql(
     if sc_sql:
         return sc_sql, (sc_binds or {})
     q_norm = str(intent.get("raw_question_norm") or q_text).strip().lower()
+    wants_bottom = bool(_BOTTOM_RE.search(q_text))
+    top_n_value = intent.get("top_n")
+    if top_n_value is not None and not isinstance(top_n_value, int):
+        try:
+            top_n_value = int(top_n_value)
+        except (TypeError, ValueError):
+            top_n_value = None
+    if top_n_value is None:
+        match_top = re.search(r"\b(?:top|highest|bottom|lowest|least)\s+(\d+)\b", q_text, re.IGNORECASE)
+        if match_top:
+            try:
+                top_n_value = int(match_top.group(1))
+            except ValueError:
+                top_n_value = None
+    if top_n_value is not None and top_n_value <= 0:
+        top_n_value = None
 
     # Special deterministic cases mapped by the parser or fallback keyword match.
     if "missing contract_id" in q_norm or "data quality" in q_norm:
@@ -200,21 +235,12 @@ def build_contracts_sql(
     if (
         "ytd" in q_norm
         and ("gross" in q_norm or "contract value" in q_norm)
-        and ("top" in q_norm or "highest" in q_norm or intent.get("top_n"))
+        and ("top" in q_norm or "highest" in q_norm or wants_bottom or top_n_value)
     ):
-        top_hint = re.search(r"top\s+(\d+)", q_text, re.IGNORECASE)
-        top_candidate: Optional[int] = None
-        if top_hint:
-            top_candidate = int(top_hint.group(1))
-        elif intent.get("top_n") is not None:
-            try:
-                top_candidate = int(intent.get("top_n"))
-            except (TypeError, ValueError):
-                top_candidate = None
-        top_candidate = top_candidate if top_candidate and top_candidate > 0 else 5
+        top_candidate = top_n_value if top_n_value is not None else 5
         today_hint = intent.get("today") or notes.get("today")
         binds_hint = {"today": today_hint} if today_hint else {}
-        sql, binds_out = build_top_gross_ytd(q_text, binds_hint, top_candidate)
+        sql, binds_out = build_top_gross_ytd(q_text, binds_hint, top_candidate, ascending=wants_bottom)
         return sql, binds_out
 
     if re.search(r"\byear-?over-?year\b|\bYoY\b", q_text, re.IGNORECASE):
@@ -232,8 +258,13 @@ def build_contracts_sql(
             p_ds = p_ds or date(this_year - 1, 1, 1)
             p_de = p_de or date(this_year - 1, 3, 31)
         binds = {"ds": ds, "de": de, "p_ds": p_ds, "p_de": p_de}
-        sql, out_binds = build_yoy_gross_overlap(binds)
-        notes["yoy"] = "overlap"
+        overlap = not _REQUEST_RE.search(q_text)
+        if overlap:
+            sql, out_binds = build_yoy_gross_overlap(binds)
+            notes["yoy"] = "overlap"
+        else:
+            sql, out_binds = build_yoy_gross_requested(binds)
+            notes["yoy"] = "request_date"
         return sql, out_binds
 
     if (
@@ -329,10 +360,19 @@ def build_contracts_sql(
         if mapped:
             group_by = mapped
     agg = intent.get("agg")
-    measure_sql = (intent.get("measure_sql") or _NET)
+    base_measure = intent.get("measure_sql")
+    if not base_measure and "gross" in q_norm:
+        base_measure = GROSS_EXPR
+    measure_sql = base_measure or _NET
 
     order_by: Optional[str] = None
-    desc = bool(intent.get("sort_desc"))
+    sort_desc_flag = intent.get("sort_desc")
+    if sort_desc_flag is None:
+        desc = bool(top_n_value) and not wants_bottom
+    else:
+        desc = bool(sort_desc_flag)
+    if wants_bottom:
+        desc = False
 
     if group_by:
         # GROUPED output
@@ -361,9 +401,9 @@ def build_contracts_sql(
         q_parts.append(f"ORDER BY {order_by} {'DESC' if desc else 'ASC'}")
 
     # 6) Top-N
-    if intent.get("top_n"):
+    if top_n_value:
         q_parts.append("FETCH FIRST :top_n ROWS ONLY")
-        binds["top_n"] = int(intent["top_n"])
+        binds["top_n"] = int(top_n_value)
 
     sql = "\n".join(q_parts)
     return sql, binds
