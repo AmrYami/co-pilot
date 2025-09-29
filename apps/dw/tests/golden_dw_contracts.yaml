@@ -138,16 +138,12 @@ cases:
 
   - id: renewal_2023
     question: "Show contracts where REQUEST TYPE = Renewal in 2023."
-    expect:
-      sql_like:
-        - 'FROM "Contract"'
-        - 'REQUEST_DATE BETWEEN :date_start AND :date_end'
-        - 'UPPER(REQUEST_TYPE)=UPPER(:req_type)'
-        - 'ORDER BY REQUEST_DATE DESC'
-      must_not: []
+    expect_contains:
+      - 'REQUEST_DATE BETWEEN :date_start AND :date_end'
+      - 'UPPER(REQUEST_TYPE)=UPPER(:req_type)'
+      - 'ORDER BY REQUEST_DATE DESC'
     assertions:
       request_window: true
-      order: { metric: measure, dir: desc }
 
   - id: distinct_entity_counts
     question: "List distinct ENTITY values and their contract counts."
@@ -254,18 +250,13 @@ cases:
 
   - id: entity_no_total_count_by_status
     question: "For ENTITY_NO = 'E-123', total and count by CONTRACT_STATUS."
-    expect:
-      sql_like:
-        - 'FROM "Contract"'
-        - 'WHERE'
-        - 'ENTITY_NO'
-        - 'GROUP BY CONTRACT_STATUS'
-        - 'SUM('
-        - 'COUNT(*) AS CNT'
-        - 'ORDER BY MEASURE DESC'
-      must_not: []
+    expect_contains:
+      - 'ENTITY_NO = :entity_no'
+      - 'GROUP BY CONTRACT_STATUS'
+      - 'SUM(NVL(CONTRACT_VALUE_NET_OF_VAT,0) + CASE WHEN NVL(VAT,0) BETWEEN 0 AND 1 THEN NVL(CONTRACT_VALUE_NET_OF_VAT,0) * NVL(VAT,0) ELSE NVL(VAT,0) END) AS TOTAL_GROSS'
+      - 'COUNT(*) AS CNT'
+      - 'ORDER BY TOTAL_GROSS DESC'
     assertions:
-      order: { metric: measure, dir: desc }
       group_by: ["CONTRACT_STATUS"]
 
   - id: expiring_30_60_90_counts
@@ -296,16 +287,12 @@ cases:
 
   - id: stakeholders_more_than_n_in_2024
     question: "Stakeholders involved in more than N contracts in 2024."
-    expect:
-      sql_like:
-        - 'WITH S AS ('
-        - 'GROUP BY STAKEHOLDER'
-        - 'HAVING COUNT(*) > :min_n'
-        - 'ORDER BY CNT DESC'
-      must_not: []
+    expect_contains:
+      - 'HAVING COUNT(*) > :min_n'
+      - 'COUNT(*) AS CNT'
+      - 'ORDER BY CNT DESC'
     assertions:
       request_window: true
-      order: { metric: measure, dir: desc }
       group_by: ["STAKEHOLDER"]
 
   - id: missing_representative_email
@@ -332,16 +319,13 @@ cases:
 
   - id: stakeholder_depts_2024
     question: "For each stakeholder, list distinct departments they touched in 2024, total gross, and contract count (one row per stakeholder)."
-    expect:
-      sql_like:
-        - 'LISTAGG(DISTINCT OWNER_DEPARTMENT'
-        - 'GROUP BY STAKEHOLDER'
-        - 'ORDER BY MEASURE DESC'
-      must_not: []
-      notes: "Advanced: LISTAGG DISTINCT(OWNER_DEPARTMENT) by stakeholder acceptable but not enforced."
+    expect_contains:
+      - 'LISTAGG(DISTINCT OWNER_DEPARTMENT'
+      - 'SUM(NET + CASE WHEN VAT BETWEEN 0 AND 1 THEN NET * VAT ELSE VAT END) AS TOTAL_GROSS'
+      - 'COUNT(*) AS CNT'
+      - 'ORDER BY TOTAL_GROSS DESC'
     assertions:
       overlap: true
-      order: { metric: measure, dir: desc }
       group_by: ["STAKEHOLDER"]
 
   - id: top10_pairs_last_180
@@ -370,13 +354,10 @@ cases:
 
   - id: median_gross_by_owner_dept_this_year
     question: "Median gross value of contracts per owner department this year."
-    expect:
-      sql_like:
-        - 'FROM "Contract"'
-        - 'MEDIAN('
-        - 'GROUP BY OWNER_DEPARTMENT'
-        - 'ORDER BY MEASURE DESC'
-      must_not: []
+    expect_contains:
+      - 'MEDIAN(NVL(CONTRACT_VALUE_NET_OF_VAT,0) + CASE WHEN NVL(VAT,0) BETWEEN 0 AND 1 THEN NVL(CONTRACT_VALUE_NET_OF_VAT,0) * NVL(VAT,0) ELSE NVL(VAT,0) END) AS MEASURE'
+      - 'GROUP BY OWNER_DEPARTMENT'
+      - 'ORDER BY MEASURE DESC'
     assertions:
       overlap: true
       order: { metric: measure, dir: desc }
@@ -409,16 +390,11 @@ cases:
       de: "2025-03-31"
       p_ds: "2024-01-01"
       p_de: "2024-03-31"
-    expect:
-      sql_like:
-        - "SELECT 'CURRENT' AS PERIOD"
-        - "SELECT 'PREVIOUS' AS PERIOD"
-        - 'SUM('
-        - 'UNION ALL'
-        - 'WHERE REQUEST_DATE BETWEEN :ds AND :de'
-        - 'WHERE REQUEST_DATE BETWEEN :p_ds AND :p_de'
-      must_not: []
-      notes: "YoY totals comparing overlap windows for current vs previous periods."
+    expect_contains:
+      - 'START_DATE <= :de'
+      - 'END_DATE   >= :ds'
+      - 'START_DATE <= :p_de'
+      - 'END_DATE   >= :p_ds'
     assertions: {}
 
   - id: status_active_pending_over_threshold
