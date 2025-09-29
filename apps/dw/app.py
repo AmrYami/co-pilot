@@ -156,8 +156,6 @@ def _coerce_bind_dates(binds: Dict[str, Any]) -> Dict[str, Any]:
             out[k] = v
     return out
 
-
-
 def _execute_oracle(sql: str, binds: Dict[str, Any]):
     engine = _ensure_engine()
     if engine is None:
