@@ -662,12 +662,12 @@ def _build_special(intent: Intent) -> tuple[str, dict, dict]:
         entity_no = params.get("entity_no")
         sql = (
             "SELECT CONTRACT_STATUS AS GROUP_KEY,\n"
-            f"       SUM({GROSS_SQL}) AS TOTAL_GROSS,\n"
+            f"       SUM({GROSS_SQL}) AS MEASURE,\n"
             "       COUNT(*) AS CNT\n"
             'FROM "Contract"\n'
             "WHERE ENTITY_NO = :entity_no\n"
             "GROUP BY CONTRACT_STATUS\n"
-            "ORDER BY TOTAL_GROSS DESC"
+            "ORDER BY MEASURE DESC"
         )
         binds = {"entity_no": entity_no}
         return sql, binds, _build_meta(
@@ -792,12 +792,12 @@ def _build_special(intent: Intent) -> tuple[str, dict, dict]:
             ")\n"
             "SELECT STAKEHOLDER AS GROUP_KEY,\n"
             "       LISTAGG(DISTINCT OWNER_DEPARTMENT, ', ') WITHIN GROUP (ORDER BY OWNER_DEPARTMENT) AS DEPARTMENTS,\n"
-            f"       SUM({gross_alias}) AS TOTAL_GROSS,\n"
+            f"       SUM({gross_alias}) AS MEASURE,\n"
             "       COUNT(*) AS CNT\n"
             "FROM S\n"
             "WHERE STAKEHOLDER IS NOT NULL\n"
             "GROUP BY STAKEHOLDER\n"
-            "ORDER BY TOTAL_GROSS DESC"
+            "ORDER BY MEASURE DESC"
         )
         binds = {"date_start": ds, "date_end": de}
         return sql, binds, _build_meta(
