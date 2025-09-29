@@ -88,18 +88,22 @@ def _ensure_engine():
 
 
 def _ensure_date(val: Any) -> Any:
+    """Return a datetime.date if the input looks like an ISO date; otherwise return as-is."""
     if isinstance(val, date) and not isinstance(val, datetime):
         return val
     if isinstance(val, datetime):
         return val.date()
     if isinstance(val, str):
         text = val.strip()
-        if len(text) == 10:
+        # Quick ISO-8601 check: 'YYYY-MM-DD'
+        if len(text) == 10 and text[4] == '-' and text[7] == '-':
             try:
                 return datetime.strptime(text, "%Y-%m-%d").date()
-        except ValueError:
-            return val
+            except ValueError:
+                # Not parseable as ISO date
+                return val
     return val
+
 
 
 def _coerce_oracle_binds(binds: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -141,15 +145,17 @@ def _coerce_oracle_binds(binds: Optional[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def _coerce_bind_dates(binds: Dict[str, Any]) -> Dict[str, Any]:
-    fixed: Dict[str, Any] = {}
-    for key, value in (binds or {}).items():
-        if isinstance(key, str):
-            lower = key.lower()
-            if lower.startswith(("date", "ds", "de", "p_ds", "p_de", "d30", "d60", "d90")):
-                fixed[key] = _ensure_date(value)
-                continue
-        fixed[key] = value
-    return fixed
+    """Coerce date-like bind values to datetime.date objects."""
+    out: Dict[str, Any] = {}
+    for k, v in (binds or {}).items():
+        if isinstance(v, (date, datetime)):
+            out[k] = v.date() if isinstance(v, datetime) else v
+        elif isinstance(v, str):
+            out[k] = _ensure_date(v)
+        else:
+            out[k] = v
+    return out
+
 
 
 def _execute_oracle(sql: str, binds: Dict[str, Any]):
