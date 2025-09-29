@@ -2,10 +2,287 @@
 from __future__ import annotations
 import datetime as _dt
 import logging
+import os
 import re
+from calendar import monthrange
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+import yaml
+from dateutil.relativedelta import relativedelta
+from flask import Flask
+
+
+class GoldenLoader(yaml.SafeLoader):
+    """Custom YAML loader supporting temporal tags for golden tests."""
+
+
+def _today() -> _dt.date:
+    env_v = os.getenv("GOLDEN_TODAY")
+    if env_v:
+        try:
+            return _dt.date.fromisoformat(env_v)
+        except ValueError:
+            pass
+    return _dt.date.today()
+
+
+def _iso(d: _dt.date) -> str:
+    return d.isoformat()
+
+
+def _scalar(loader: yaml.Loader, node: yaml.Node) -> Any:
+    if isinstance(node, yaml.ScalarNode):
+        return loader.construct_scalar(node)
+    return loader.construct_object(node)
+
+
+def _maybe_date(value: Any) -> Optional[_dt.date]:
+    if isinstance(value, _dt.date):
+        return value
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return None
+        try:
+            return _dt.date.fromisoformat(s)
+        except ValueError:
+            return None
+    return None
+
+
+def _parse_int(value: Any, default: int = 0) -> int:
+    if value is None:
+        return default
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return default
+        try:
+            return int(s)
+        except ValueError:
+            return default
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def _start_of_month(loader: Any, node: yaml.Node) -> str:
+    raw = _scalar(loader, node)
+    base = _maybe_date(raw)
+    if base:
+        target = base.replace(day=1)
+    else:
+        offset = _parse_int(raw, 0)
+        target = _today().replace(day=1) + relativedelta(months=offset)
+    return _iso(target)
+
+
+def _end_of_month(loader: Any, node: yaml.Node) -> str:
+    raw = _scalar(loader, node)
+    base = _maybe_date(raw)
+    if base:
+        target = base.replace(day=1)
+    else:
+        offset = _parse_int(raw, 0)
+        target = _today().replace(day=1) + relativedelta(months=offset)
+    last = monthrange(target.year, target.month)[1]
+    return _iso(target.replace(day=last))
+
+
+def _start_of_last_month(loader: Any, node: yaml.Node) -> str:
+    _scalar(loader, node)
+    target = _today().replace(day=1) - relativedelta(months=1)
+    return _iso(target)
+
+
+def _end_of_last_month(loader: Any, node: yaml.Node) -> str:
+    _scalar(loader, node)
+    base = _today().replace(day=1) - relativedelta(months=1)
+    last = monthrange(base.year, base.month)[1]
+    return _iso(base.replace(day=last))
+
+
+def _start_of_prev_months(loader: Any, node: yaml.Node) -> str:
+    raw = _scalar(loader, node)
+    n = _parse_int(raw, 0)
+    target = _today().replace(day=1) - relativedelta(months=n)
+    return _iso(target)
+
+
+def _end_of_prev_months(loader: Any, node: yaml.Node) -> str:
+    raw = _scalar(loader, node)
+    n = _parse_int(raw, 0)
+    base = _today().replace(day=1) - relativedelta(months=n)
+    last = monthrange(base.year, base.month)[1]
+    return _iso(base.replace(day=last))
+
+
+def _year_from_value(value: Any) -> int:
+    base = _today()
+    candidate = _maybe_date(value)
+    if candidate:
+        return candidate.year
+    try:
+        if value is None:
+            return base.year
+        if isinstance(value, int):
+            num = value
+        else:
+            num = int(str(value).strip())
+    except Exception:
+        return base.year
+    if num >= 1000:
+        return num
+    return (base + relativedelta(years=num)).year
+
+
+def _start_of_year(loader: Any, node: yaml.Node) -> str:
+    raw = _scalar(loader, node)
+    year = _year_from_value(raw)
+    return _iso(_dt.date(year, 1, 1))
+
+
+def _end_of_year(loader: Any, node: yaml.Node) -> str:
+    raw = _scalar(loader, node)
+    year = _year_from_value(raw)
+    return _iso(_dt.date(year, 12, 31))
+
+
+def _start_of_prev_years(loader: Any, node: yaml.Node) -> str:
+    raw = _scalar(loader, node)
+    n = _parse_int(raw, 1)
+    year = _today().year - n
+    return _iso(_dt.date(year, 1, 1))
+
+
+def _end_of_prev_years(loader: Any, node: yaml.Node) -> str:
+    raw = _scalar(loader, node)
+    n = _parse_int(raw, 1)
+    year = _today().year - n
+    return _iso(_dt.date(year, 12, 31))
+
+
+def _quarter_start(d: _dt.date) -> _dt.date:
+    quarter = (d.month - 1) // 3
+    month = quarter * 3 + 1
+    return _dt.date(d.year, month, 1)
+
+
+def _start_of_quarter(loader: Any, node: yaml.Node) -> str:
+    raw = _scalar(loader, node)
+    base = _maybe_date(raw) or _today()
+    offset = 0 if _maybe_date(raw) else _parse_int(raw, 0)
+    start = _quarter_start(base)
+    return _iso(start + relativedelta(months=3 * offset))
+
+
+def _end_of_quarter(loader: Any, node: yaml.Node) -> str:
+    raw = _scalar(loader, node)
+    base = _maybe_date(raw) or _today()
+    offset = 0 if _maybe_date(raw) else _parse_int(raw, 0)
+    start = _quarter_start(base) + relativedelta(months=3 * offset)
+    return _iso(start + relativedelta(months=3) - _dt.timedelta(days=1))
+
+
+def _start_of_last_quarter(loader: Any, node: yaml.Node) -> str:
+    _scalar(loader, node)
+    start_current = _quarter_start(_today())
+    prev = start_current - relativedelta(months=3)
+    return _iso(prev)
+
+
+def _end_of_last_quarter(loader: Any, node: yaml.Node) -> str:
+    _scalar(loader, node)
+    start_current = _quarter_start(_today())
+    prev = start_current - relativedelta(months=3)
+    return _iso(prev + relativedelta(months=3) - _dt.timedelta(days=1))
+
+
+def _days_ago(loader: Any, node: yaml.Node) -> str:
+    raw = _scalar(loader, node)
+    n = _parse_int(raw, 0)
+    return _iso(_today() - _dt.timedelta(days=n))
+
+
+def _months_ago(loader: Any, node: yaml.Node) -> str:
+    raw = _scalar(loader, node)
+    n = _parse_int(raw, 0)
+    return _iso(_today() - relativedelta(months=n))
+
+
+def _construct_today(loader: Any, node: yaml.Node) -> str:
+    _scalar(loader, node)
+    return _iso(_today())
+
+
+def _generic_start(loader: Any, suffix: str, node: yaml.Node) -> str:
+    s = (suffix or "").strip().lower().replace('-', '_')
+    if s in {"", "month", "months", "this_month"}:
+        return _start_of_month(loader, node)
+    if s in {"last_month", "previous_month"}:
+        return _start_of_last_month(loader, node)
+    if s.startswith("prev_month"):
+        return _start_of_prev_months(loader, node)
+    if s in {"year", "this_year"}:
+        return _start_of_year(loader, node)
+    if s in {"last_year", "previous_year"}:
+        year = _today().year - 1
+        return _iso(_dt.date(year, 1, 1))
+    if s.startswith("prev_year"):
+        return _start_of_prev_years(loader, node)
+    if s in {"quarter", "this_quarter"}:
+        return _start_of_quarter(loader, node)
+    if s in {"last_quarter", "previous_quarter"}:
+        return _start_of_last_quarter(loader, node)
+    return _iso(_today())
+
+
+def _generic_end(loader: Any, suffix: str, node: yaml.Node) -> str:
+    s = (suffix or "").strip().lower().replace('-', '_')
+    if s in {"", "month", "months", "this_month"}:
+        return _end_of_month(loader, node)
+    if s in {"last_month", "previous_month"}:
+        return _end_of_last_month(loader, node)
+    if s.startswith("prev_month"):
+        return _end_of_prev_months(loader, node)
+    if s in {"year", "this_year"}:
+        return _end_of_year(loader, node)
+    if s in {"last_year", "previous_year"}:
+        year = _today().year - 1
+        return _iso(_dt.date(year, 12, 31))
+    if s.startswith("prev_year"):
+        return _end_of_prev_years(loader, node)
+    if s in {"quarter", "this_quarter"}:
+        return _end_of_quarter(loader, node)
+    if s in {"last_quarter", "previous_quarter"}:
+        return _end_of_last_quarter(loader, node)
+    return _iso(_today())
+
+
+GoldenLoader.add_constructor("!today", _construct_today)
+GoldenLoader.add_constructor("!start_of_month", _start_of_month)
+GoldenLoader.add_constructor("!end_of_month", _end_of_month)
+GoldenLoader.add_constructor("!start_of_last_month", _start_of_last_month)
+GoldenLoader.add_constructor("!end_of_last_month", _end_of_last_month)
+GoldenLoader.add_constructor("!days_ago", _days_ago)
+GoldenLoader.add_constructor("!months_ago", _months_ago)
+GoldenLoader.add_constructor("!start_of_prev_months", _start_of_prev_months)
+GoldenLoader.add_constructor("!end_of_prev_months", _end_of_prev_months)
+GoldenLoader.add_constructor("!start_of_year", _start_of_year)
+GoldenLoader.add_constructor("!end_of_year", _end_of_year)
+GoldenLoader.add_constructor("!start_of_prev_years", _start_of_prev_years)
+GoldenLoader.add_constructor("!end_of_prev_years", _end_of_prev_years)
+GoldenLoader.add_constructor("!start_of_quarter", _start_of_quarter)
+GoldenLoader.add_constructor("!end_of_quarter", _end_of_quarter)
+GoldenLoader.add_constructor("!start_of_last_quarter", _start_of_last_quarter)
+GoldenLoader.add_constructor("!end_of_last_quarter", _end_of_last_quarter)
+GoldenLoader.add_multi_constructor("!start_of_", _generic_start)
+GoldenLoader.add_multi_constructor("!end_of_", _generic_end)
 
 # NOTE: Test runner helpers should be resilient to harmless SQL shape differences
 # (aliases, bind names, spacing). We keep comments here in English by request.
@@ -16,22 +293,16 @@ DATE_END_SYNS = (":date_end", ":de")
 
 
 def _normalize_sql(s: str) -> str:
-    """Uppercase and normalize whitespace/punctuation for tolerant comparisons."""
+    """Lower-case and normalize whitespace for tolerant comparisons."""
     s = (s or "").replace("`", "")
     s = re.sub(r"\s+", " ", s)
     s = re.sub(r"\(\s+", "(", s)
     s = re.sub(r",\s+", ",", s)
-    s = s.strip()
-    return s.upper()
+    return s.strip().lower()
 
 
 def _contains_any(sql: str, patterns: Iterable[str]) -> bool:
     return any(re.search(p, sql, flags=re.I) for p in patterns)
-
-import yaml
-from flask import Flask
-
-from .yaml_tags import GoldenLoader, register_yaml_tags
 
 # Stable, package-relative path to the golden YAML file
 GOLDEN_PATH = Path(__file__).with_name("golden_dw_contracts.yaml")
@@ -67,8 +338,6 @@ class GoldenCase:
 def _load_yaml(path: Path) -> Dict[str, Any]:
     try:
         with path.open("r", encoding="utf-8") as f:
-            # Register custom tags then load with our loader:
-            register_yaml_tags()
             data = yaml.load(f, Loader=GoldenLoader) or {}
         if not isinstance(data, dict):
             raise ValueError(f"Golden YAML root must be a mapping, got: {type(data).__name__}")
@@ -114,45 +383,46 @@ def assert_order_direction(sql: str, expect_desc: bool, reasons: List[str]) -> N
 
 def _contains_all(sql: str, fragments: List[str]) -> List[str]:
     """Return list of missing fragments after normalization; empty list means all found."""
-    sql_n = _normalize_sql(sql)
+    sql_norm = _normalize_sql(sql)
     missing: List[str] = []
     for frag in fragments:
-        frag_n = _normalize_sql(frag)
-        if not frag_n:
+        frag_norm = _normalize_sql(frag)
+        if not frag_norm:
             continue
-        if frag_n == "ORDER BY MEASURE DESC":
-            pattern = r"ORDER\s+BY\s+(%s)\s+DESC" % "|".join(MEASURE_ALIASES)
-            if not re.search(pattern, sql_n, flags=re.I):
+        if frag_norm == "order by measure desc":
+            alias_pattern = "|".join(alias.lower() for alias in MEASURE_ALIASES)
+            pattern = rf"order\s+by\s+({alias_pattern})\s+desc"
+            if not re.search(pattern, sql_norm, flags=re.I):
                 missing.append(frag)
             continue
-        match = re.match(r"FETCH\s+FIRST\s+(\d+)\s+ROWS\s+ONLY", frag_n, flags=re.I)
+        match = re.match(r"fetch\s+first\s+(\d+)\s+rows\s+only", frag_norm, flags=re.I)
         if match:
             n = match.group(1)
             candidates = [
-                rf"FETCH\s+FIRST\s+{n}\s+ROWS\s+ONLY",
-                r"FETCH\s+FIRST\s+:TOP_N\s+ROWS\s+ONLY",
+                rf"fetch\s+first\s+{n}\s+rows\s+only",
+                r"fetch\s+first\s+:top_n\s+rows\s+only",
             ]
-            if not _contains_any(sql_n, candidates):
+            if not _contains_any(sql, candidates):
                 missing.append(f"FETCH FIRST {n} ROWS ONLY")
             continue
-        if "REQUEST_DATE BETWEEN :DATE_START AND :DATE_END" in frag_n:
+        if "request_date between :date_start and :date_end" in frag_norm:
             patterns = [
-                rf"REQUEST_DATE\s+BETWEEN\s+{ds}\s+AND\s+{de}" for ds in DATE_START_SYNS for de in DATE_END_SYNS
+                rf"request_date\s+between\s+{ds}\s+and\s+{de}" for ds in DATE_START_SYNS for de in DATE_END_SYNS
             ]
-            if not _contains_any(sql_n, patterns):
+            if not _contains_any(sql, patterns):
                 missing.append(frag)
             continue
-        if "START_DATE <= :DATE_END" in frag_n:
-            patterns = [rf"START_DATE\s*<=\s*{de}" for de in DATE_END_SYNS]
-            if not _contains_any(sql_n, patterns):
+        if "start_date <= :date_end" in frag_norm:
+            patterns = [rf"start_date\s*<=\s*{de}" for de in DATE_END_SYNS]
+            if not _contains_any(sql, patterns):
                 missing.append(frag)
             continue
-        if "END_DATE >= :DATE_START" in frag_n:
-            patterns = [rf"END_DATE\s*>=\s*{ds}" for ds in DATE_START_SYNS]
-            if not _contains_any(sql_n, patterns):
+        if "end_date >= :date_start" in frag_norm:
+            patterns = [rf"end_date\s*>=\s*{ds}" for ds in DATE_START_SYNS]
+            if not _contains_any(sql, patterns):
                 missing.append(frag)
             continue
-        if frag_n not in sql_n:
+        if frag_norm not in sql_norm:
             missing.append(frag)
     return missing
 
