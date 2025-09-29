@@ -24,6 +24,7 @@ class NLIntent(BaseModel):
     measure_sql: Optional[str] = None
     explain_on: bool = True
     date_basis: Optional[str] = None
+    notes: Dict[str, str] = Field(default_factory=dict)
 
     class Config:
         arbitrary_types_allowed = True
