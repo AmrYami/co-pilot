@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import re
 import time
+import datetime as dt
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -106,52 +107,31 @@ def _ensure_date(val: Any) -> Any:
 
 
 
-def _coerce_oracle_binds(binds: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    b: Dict[str, Any] = dict(binds or {})
+def _to_date_obj(x: Any) -> Any:
+    """
+    Ensure bind parameter is a datetime.date for Oracle, not a string.
+    Accepts 'YYYY-MM-DD' strings and datetime-like objects.
+    """
 
-    def _to_date(v):
-        if v is None:
-            return None
-        if isinstance(v, date):
-            return v
-        if isinstance(v, datetime):
-            return v.date()
-        if isinstance(v, str):
-            s = v.strip()
-            # Fast path: YYYY-MM-DD
-            try:
-                return date.fromisoformat(s)
-            except Exception:
-                pass
-            # Common fallbacks
-            for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%Y/%m/%d"):
-                try:
-                    return datetime.strptime(s, fmt).date()
-                except Exception:
-                    continue
-        return None
-
-    for k in ("date_start", "date_end"):
-        dv = _to_date(b.get(k))
-        if dv is not None:
-            b[k] = dv
-
-    if "top_n" in b:
+    if isinstance(x, dt.date):
+        return x
+    if isinstance(x, str):
+        s = x.strip()
         try:
-            b["top_n"] = int(b["top_n"])
-        except Exception:
-            b["top_n"] = 10
-    return b
+            return dt.datetime.strptime(s, "%Y-%m-%d").date()
+        except ValueError:
+            return x
+    if isinstance(x, datetime):
+        return x.date()
+    return x
 
 
-def _coerce_bind_dates(binds: Dict[str, Any]) -> Dict[str, Any]:
-    """Coerce date-like bind values to datetime.date objects."""
+def _normalize_binds(binds: Dict[str, Any]) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
     for k, v in (binds or {}).items():
-        if isinstance(v, (date, datetime)):
-            out[k] = v.date() if isinstance(v, datetime) else v
-        elif isinstance(v, str):
-            out[k] = _ensure_date(v)
+        key = k.lower()
+        if key.endswith(("date", "start", "end", "_ds", "_de")):
+            out[k] = _to_date_obj(v)
         else:
             out[k] = v
     return out
@@ -163,7 +143,7 @@ def _execute_oracle(sql: str, binds: Dict[str, Any]):
     if engine is None:
         return [], [], {"rows": 0}
     # Normalize bind types first (prevents ORA-01861 and removes malformed try/except)
-    safe_binds = _coerce_bind_dates(_coerce_oracle_binds(binds or {}))
+    safe_binds = _normalize_binds(binds or {})
     with engine.connect() as cx:  # type: ignore[union-attr]
         rs = cx.execute(text(sql), safe_binds)
         cols = list(rs.keys()) if hasattr(rs, "keys") else []

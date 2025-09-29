@@ -415,8 +415,10 @@ cases:
         - "SELECT 'PREVIOUS' AS PERIOD"
         - 'SUM('
         - 'UNION ALL'
-        - 'WHERE REQUEST_DATE BETWEEN :ds AND :de'
-        - 'WHERE REQUEST_DATE BETWEEN :p_ds AND :p_de'
+        - 'START_DATE <= :de'
+        - 'END_DATE >= :ds'
+        - 'START_DATE <= :p_de'
+        - 'END_DATE >= :p_ds'
       must_not: []
       notes: "YoY totals comparing overlap windows for current vs previous periods."
     assertions: {}

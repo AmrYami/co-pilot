@@ -252,7 +252,7 @@ def _generic_start(loader: Any, suffix: str, node: yaml.Node) -> str:
         return _start_of_quarter(loader, node)
     if s in {"last_quarter", "previous_quarter"}:
         return _start_of_last_quarter(loader, node)
-    return _iso(_today())
+    return _start_of_last_month(loader, node)
 
 
 def _generic_end(loader: Any, suffix: str, node: yaml.Node) -> str:
@@ -274,7 +274,7 @@ def _generic_end(loader: Any, suffix: str, node: yaml.Node) -> str:
         return _end_of_quarter(loader, node)
     if s in {"last_quarter", "previous_quarter"}:
         return _end_of_last_quarter(loader, node)
-    return _iso(_today())
+    return _end_of_last_month(loader, node)
 
 
 GoldenLoader.add_constructor("!today", _construct_today)
@@ -333,6 +333,10 @@ def _generic_construct(loader: yaml.Loader, node: yaml.Node):
             base = _today().replace(day=1) - relativedelta(months=numeric)
             last = monthrange(base.year, base.month)[1]
             return _iso(base.replace(day=last))
+    if tag.startswith("!start_of_"):
+        return _start_of_last_month(loader, node)
+    if tag.startswith("!end_of_"):
+        return _end_of_last_month(loader, node)
     return _iso(_today())
 
 

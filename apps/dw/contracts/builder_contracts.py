@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from datetime import date, datetime, timedelta
-from typing import Optional, Sequence, Tuple
+from typing import Any, Dict, Optional, Sequence, Tuple
 
 from core.nlu.schema import NLIntent
 
@@ -30,6 +30,176 @@ from .sql_templates import (
     sql_yoy,
     sql_median_gross_by_owner_dept_this_year,
 )
+
+
+# ---------------------------------------------------------------------------
+# Lightweight SQL builder helpers used by the new deterministic planner path.
+# ---------------------------------------------------------------------------
+
+# Re-export a common gross expression so we do not repeat it.
+GROSS_EXPR = (
+    "NVL(CONTRACT_VALUE_NET_OF_VAT,0) + "
+    "CASE WHEN NVL(VAT,0) BETWEEN 0 AND 1 "
+    "THEN NVL(CONTRACT_VALUE_NET_OF_VAT,0) * NVL(VAT,0) ELSE NVL(VAT,0) END"
+)
+
+LOWEST_TOKENS = {"lowest", "bottom", "least", "smallest"}
+HIGHEST_TOKENS = {"highest", "top", "largest", "biggest"}
+
+
+def _has_token(q: str, tokens: set[str]) -> bool:
+    t = q.lower()
+    return any(tok in t for tok in tokens)
+
+
+def infer_sort_desc_from_text(q: str, default_desc: bool = True) -> bool:
+    """
+    If the question contains 'lowest/bottom/least', return False (ASC).
+    If it contains 'highest/top', return True (DESC).
+    Else fall back to default_desc.
+    """
+
+    if _has_token(q, LOWEST_TOKENS):
+        return False
+    if _has_token(q, HIGHEST_TOKENS):
+        return True
+    return default_desc
+
+
+def build_overlap_predicate(ds_bind: str = ":date_start", de_bind: str = ":date_end") -> str:
+    """Active-window overlap predicate between binds."""
+
+    return "(START_DATE IS NOT NULL AND END_DATE IS NOT NULL AND START_DATE <= {de} AND END_DATE >= {ds})".format(
+        de=de_bind, ds=ds_bind
+    )
+
+
+def build_top_contracts_by_net(
+    q: str,
+    use_window: bool,
+    top_n_bind: str = ":top_n",
+    ds_bind: str = ":date_start",
+    de_bind: str = ":date_end",
+) -> Tuple[str, Dict[str, Any], str]:
+    """
+    Build 'Top/Bottom N contracts by NET'. When use_window is True, use OVERLAP window.
+    Returns (sql, binds, explain).
+    """
+
+    order_desc = infer_sort_desc_from_text(q, default_desc=True)
+    order_word = "DESC" if order_desc else "ASC"
+    where_clause = ""
+    explain = "Top contracts by NET"
+    if use_window:
+        where_clause = "WHERE " + build_overlap_predicate(ds_bind, de_bind) + "\n"
+        explain += " in the requested window (OVERLAP)."
+    sql = (
+        'SELECT * FROM "Contract"\n'
+        f"{where_clause}"
+        f"ORDER BY NVL(CONTRACT_VALUE_NET_OF_VAT,0) {order_word}\n"
+        f"FETCH FIRST {top_n_bind} ROWS ONLY"
+    )
+    return sql, {}, explain
+
+
+def build_top_contracts_by_gross(
+    q: str,
+    use_window: bool,
+    top_n_bind: str = ":top_n",
+    ds_bind: str = ":date_start",
+    de_bind: str = ":date_end",
+) -> Tuple[str, Dict[str, Any], str]:
+    """
+    Build 'Top/Bottom N contracts by GROSS'. When use_window is True, use OVERLAP window.
+    """
+
+    order_desc = infer_sort_desc_from_text(q, default_desc=True)
+    order_word = "DESC" if order_desc else "ASC"
+    where_clause = ""
+    explain = "Top contracts by GROSS"
+    if use_window:
+        where_clause = "WHERE " + build_overlap_predicate(ds_bind, de_bind) + "\n"
+        explain += " in the requested window (OVERLAP)."
+    sql = (
+        'SELECT * FROM "Contract"\n'
+        f"{where_clause}"
+        f"ORDER BY {GROSS_EXPR} {order_word}\n"
+        f"FETCH FIRST {top_n_bind} ROWS ONLY"
+    )
+    return sql, {}, explain
+
+
+def build_grouped_gross_per_dim(
+    dim: str,
+    use_window: bool,
+    ds_bind: str = ":date_start",
+    de_bind: str = ":date_end",
+    agg: str = "SUM",
+) -> Tuple[str, Dict[str, Any], str]:
+    """
+    Build 'Gross per DIMENSION' (OWNER_DEPARTMENT / DEPARTMENT_OUL / ENTITY / ENTITY_NO / CONTRACT_STATUS / REQUEST_TYPE).
+    """
+
+    dim_expr = dim
+    where_clause = ""
+    explain = f"{agg} GROSS per {dim}"
+    if use_window:
+        where_clause = "WHERE " + build_overlap_predicate(ds_bind, de_bind) + "\n"
+        explain += " in the requested window (OVERLAP)."
+    sql = (
+        f'SELECT\n  {dim_expr} AS GROUP_KEY,\n'
+        f"  {agg}({GROSS_EXPR}) AS MEASURE\n"
+        'FROM "Contract"\n'
+        f"{where_clause}"
+        f"GROUP BY {dim_expr}\n"
+        "ORDER BY MEASURE DESC"
+    )
+    return sql, {}, explain
+
+
+def build_owner_vs_oul_diff() -> Tuple[str, Dict[str, Any], str]:
+    """
+    Differences between OWNER_DEPARTMENT and DEPARTMENT_OUL with counts, ordered by CNT DESC.
+    """
+
+    sql = (
+        'SELECT\n'
+        "  NVL(TRIM(OWNER_DEPARTMENT),'(None)') AS OWNER_DEPARTMENT,\n"
+        "  NVL(TRIM(DEPARTMENT_OUL),'(None)')  AS DEPARTMENT_OUL,\n"
+        "  COUNT(*) AS CNT\n"
+        'FROM "Contract"\n'
+        "WHERE DEPARTMENT_OUL IS NOT NULL\n"
+        "  AND NVL(TRIM(OWNER_DEPARTMENT),'(None)') <> NVL(TRIM(DEPARTMENT_OUL),'(None)')\n"
+        "GROUP BY NVL(TRIM(OWNER_DEPARTMENT),'(None)'), NVL(TRIM(DEPARTMENT_OUL),'(None)')\n"
+        "ORDER BY CNT DESC"
+    )
+    explain = "Owner vs OUL differences (non-null, non-equal), ordered by CNT DESC."
+    return sql, {}, explain
+
+
+def build_yoy_overlap(
+    ds: str = ":ds",
+    de: str = ":de",
+    p_ds: str = ":p_ds",
+    p_de: str = ":p_de",
+) -> Tuple[str, Dict[str, Any], str]:
+    """
+    YoY gross totals for the same period using OVERLAP windows for 'active' contracts.
+    """
+
+    cur_overlap = build_overlap_predicate(ds_bind=ds, de_bind=de)
+    prv_overlap = build_overlap_predicate(ds_bind=p_ds, de_bind=p_de)
+    sql = (
+        "SELECT 'CURRENT' AS PERIOD, SUM({gross}) AS TOTAL_GROSS\n"
+        'FROM "Contract"\n'
+        f"WHERE {cur_overlap}\n"
+        "UNION ALL\n"
+        "SELECT 'PREVIOUS' AS PERIOD, SUM({gross}) AS TOTAL_GROSS\n"
+        'FROM "Contract"\n'
+        f"WHERE {prv_overlap}"
+    ).format(gross=GROSS_EXPR)
+    explain = "YoY gross totals using active OVERLAP windows (CURRENT vs PREVIOUS)."
+    return sql, {}, explain
 
 
 def _ensure_date(value: date | datetime) -> date:
