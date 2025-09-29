@@ -87,7 +87,7 @@ def _ensure_engine():
         return getattr(pipeline, "app_engine", None)
 
 
-def _coerce_date(val: Any) -> Any:
+def _ensure_date(val: Any) -> Any:
     if isinstance(val, date) and not isinstance(val, datetime):
         return val
     if isinstance(val, datetime):
@@ -97,18 +97,20 @@ def _coerce_date(val: Any) -> Any:
         if len(text) == 10:
             try:
                 return datetime.strptime(text, "%Y-%m-%d").date()
-            except ValueError:
-                return val
+        except ValueError:
+            return val
     return val
 
 
 def _coerce_bind_dates(binds: Dict[str, Any]) -> Dict[str, Any]:
     fixed: Dict[str, Any] = {}
     for key, value in (binds or {}).items():
-        if isinstance(key, str) and key.startswith(("date_", "d30", "d60", "d90")):
-            fixed[key] = _coerce_date(value)
-        else:
-            fixed[key] = value
+        if isinstance(key, str):
+            lower = key.lower()
+            if lower.startswith(("date", "ds", "de", "p_ds", "p_de", "d30", "d60", "d90")):
+                fixed[key] = _ensure_date(value)
+                continue
+        fixed[key] = value
     return fixed
 
 
@@ -196,7 +198,7 @@ DEFAULT_EXPLICIT_FILTER_COLUMNS: List[str] = [
 
 
 def _ensure_oracle_date(value: Optional[Any]) -> Optional[date]:
-    coerced = _coerce_date(value)
+    coerced = _ensure_date(value)
     if isinstance(coerced, date) and not isinstance(coerced, datetime):
         return coerced
     return None

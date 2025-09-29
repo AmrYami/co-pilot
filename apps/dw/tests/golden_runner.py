@@ -122,6 +122,12 @@ def _end_of_prev_months(loader: Any, node: yaml.Node) -> str:
     return _iso(base.replace(day=last))
 
 
+def _days_ahead(loader: Any, node: yaml.Node) -> str:
+    raw = _scalar(loader, node)
+    n = _parse_int(raw, 0)
+    return _iso(_today() + _dt.timedelta(days=n))
+
+
 def _year_from_value(value: Any) -> int:
     base = _today()
     candidate = _maybe_date(value)
@@ -165,6 +171,13 @@ def _end_of_prev_years(loader: Any, node: yaml.Node) -> str:
     n = _parse_int(raw, 1)
     year = _today().year - n
     return _iso(_dt.date(year, 12, 31))
+
+
+def _quarter_ago(loader: Any, node: yaml.Node) -> str:
+    raw = _scalar(loader, node)
+    n = _parse_int(raw, 0)
+    base = _quarter_start(_today()) - relativedelta(months=3 * n)
+    return _iso(base)
 
 
 def _quarter_start(d: _dt.date) -> _dt.date:
@@ -281,8 +294,49 @@ GoldenLoader.add_constructor("!start_of_quarter", _start_of_quarter)
 GoldenLoader.add_constructor("!end_of_quarter", _end_of_quarter)
 GoldenLoader.add_constructor("!start_of_last_quarter", _start_of_last_quarter)
 GoldenLoader.add_constructor("!end_of_last_quarter", _end_of_last_quarter)
+GoldenLoader.add_constructor("!days_ahead", _days_ahead)
+GoldenLoader.add_constructor("!quarter_ago", _quarter_ago)
 GoldenLoader.add_multi_constructor("!start_of_", _generic_start)
 GoldenLoader.add_multi_constructor("!end_of_", _generic_end)
+
+
+def _generic_construct(loader: yaml.Loader, node: yaml.Node):
+    """Fallback for unknown tags; handles simple start/end aliases generically."""
+
+    tag = (getattr(node, "tag", "") or "").lower()
+    try:
+        raw = loader.construct_scalar(node) if isinstance(node, yaml.ScalarNode) else loader.construct_object(node)
+    except Exception:
+        raw = None
+
+    try:
+        numeric = int(str(raw).strip()) if raw is not None else None
+    except Exception:
+        numeric = None
+
+    if tag.startswith("!start_of_"):
+        key = tag[len("!start_of_") :]
+        if key in {"last_month", "previous_month"}:
+            return _start_of_last_month(loader, node)
+        if key in {"year", "this_year"}:
+            return _start_of_year(loader, node)
+        if key in {"months_ago", "prev_months"} and numeric is not None:
+            target = _today().replace(day=1) - relativedelta(months=numeric)
+            return _iso(target)
+    if tag.startswith("!end_of_"):
+        key = tag[len("!end_of_") :]
+        if key in {"last_month", "previous_month"}:
+            return _end_of_last_month(loader, node)
+        if key in {"year", "this_year"}:
+            return _end_of_year(loader, node)
+        if key in {"months_ago", "prev_months"} and numeric is not None:
+            base = _today().replace(day=1) - relativedelta(months=numeric)
+            last = monthrange(base.year, base.month)[1]
+            return _iso(base.replace(day=last))
+    return _iso(_today())
+
+
+GoldenLoader.add_constructor(None, _generic_construct)
 
 # NOTE: Test runner helpers should be resilient to harmless SQL shape differences
 # (aliases, bind names, spacing). We keep comments here in English by request.
@@ -295,10 +349,9 @@ DATE_END_SYNS = (":date_end", ":de")
 def _normalize_sql(s: str) -> str:
     """Lower-case and normalize whitespace for tolerant comparisons."""
     s = (s or "").replace("`", "")
-    s = re.sub(r"\s+", " ", s)
-    s = re.sub(r"\(\s+", "(", s)
-    s = re.sub(r",\s+", ",", s)
-    return s.strip().lower()
+    s = re.sub(r"\s+", " ", s).strip()
+    s = re.sub(r"\s*([(),=+*/<>-])\s*", r"\1", s)
+    return s.lower()
 
 
 def _contains_any(sql: str, patterns: Iterable[str]) -> bool:
