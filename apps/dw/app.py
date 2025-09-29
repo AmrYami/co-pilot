@@ -53,7 +53,7 @@ except Exception:  # pragma: no cover - fallback for tests
 from core.inquiries import create_or_update_inquiry
 
 from apps.dw.tables.contracts import plan_sql
-from .contracts.contract_common import build_fts_clause, coerce_oracle_binds
+from .contracts.contract_common import build_fts_clause
 from .contracts.filters import parse_explicit_filters
 from .contracts.contract_planner import plan_contract_query
 from .rating import rate_bp
@@ -102,6 +102,44 @@ def _ensure_date(val: Any) -> Any:
     return val
 
 
+def _coerce_oracle_binds(binds: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    b: Dict[str, Any] = dict(binds or {})
+
+    def _to_date(v):
+        if v is None:
+            return None
+        if isinstance(v, date):
+            return v
+        if isinstance(v, datetime):
+            return v.date()
+        if isinstance(v, str):
+            s = v.strip()
+            # Fast path: YYYY-MM-DD
+            try:
+                return date.fromisoformat(s)
+            except Exception:
+                pass
+            # Common fallbacks
+            for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%Y/%m/%d"):
+                try:
+                    return datetime.strptime(s, fmt).date()
+                except Exception:
+                    continue
+        return None
+
+    for k in ("date_start", "date_end"):
+        dv = _to_date(b.get(k))
+        if dv is not None:
+            b[k] = dv
+
+    if "top_n" in b:
+        try:
+            b["top_n"] = int(b["top_n"])
+        except Exception:
+            b["top_n"] = 10
+    return b
+
+
 def _coerce_bind_dates(binds: Dict[str, Any]) -> Dict[str, Any]:
     fixed: Dict[str, Any] = {}
     for key, value in (binds or {}).items():
@@ -118,7 +156,8 @@ def _execute_oracle(sql: str, binds: Dict[str, Any]):
     engine = _ensure_engine()
     if engine is None:
         return [], [], {"rows": 0}
-    safe_binds = _coerce_bind_dates(coerce_oracle_binds(binds or {}))
+    # Normalize bind types first (prevents ORA-01861 and removes malformed try/except)
+    safe_binds = _coerce_bind_dates(_coerce_oracle_binds(binds or {}))
     with engine.connect() as cx:  # type: ignore[union-attr]
         rs = cx.execute(text(sql), safe_binds)
         cols = list(rs.keys()) if hasattr(rs, "keys") else []
