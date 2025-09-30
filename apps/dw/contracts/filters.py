@@ -3,7 +3,9 @@ from __future__ import annotations
 import re
 from typing import Dict, List, Tuple
 
+from .aliases import canonicalize_column
 from .semantics import expand_status
+from .synonyms import expand_enum_predicate
 
 # Regex for explicit "column = value" patterns in natural language
 _EQ_PATTERNS = [
@@ -62,3 +64,36 @@ def parse_explicit_filters(
                 )
 
     return snippets, binds
+
+
+# Matches: "... where <col> = <value>"
+EQUALS_RE = re.compile(
+    r"\bwhere\s+([A-Za-z_ \-]+?)\s*=\s*['\"]?([A-Za-z0-9 _\-\/]+)['\"]?",
+    re.IGNORECASE,
+)
+
+
+def try_parse_simple_equals(
+    question: str, table: str, get_setting
+) -> Tuple[str | None, Dict[str, object]]:
+    """
+    Try to parse patterns like:
+      'Show contracts where REQUEST TYPE = Renewal'
+    Returns (sql_where_fragment, binds) or (None, {}).
+    """
+
+    match = EQUALS_RE.search(question or "")
+    if not match:
+        return None, {}
+
+    raw_col = match.group(1) or ""
+    raw_val = match.group(2) or ""
+    col = canonicalize_column(raw_col) or raw_col.strip().upper().replace(" ", "_")
+
+    enum_cfg = (get_setting("DW_ENUM_SYNONYMS", {}) or {}) if callable(get_setting) else {}
+    key = f"{table}.{col}"
+    if key in enum_cfg:
+        frag, binds = expand_enum_predicate(table, col, raw_val, get_setting)
+        return frag, binds
+
+    return f"UPPER({col}) = UPPER(:v_eq)", {"v_eq": raw_val}

@@ -2,6 +2,88 @@ from __future__ import annotations
 
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
+
+def _load_enum_synonyms(get_setting) -> Dict[str, dict]:
+    if not callable(get_setting):
+        return {}
+    for kwargs in ({"default": {}}, {}):
+        try:
+            cfg = get_setting("DW_ENUM_SYNONYMS", **kwargs)
+        except TypeError:
+            continue
+        if cfg is not None:
+            return cfg or {}
+    return {}
+
+
+def expand_enum_predicate(
+    table: str, col: str, user_value: str, get_setting
+) -> Tuple[str, dict]:
+    """
+    Build a robust predicate for Oracle from DW_ENUM_SYNONYMS:
+    equals -> UPPER(col) = UPPER(:v_eq_i)
+    prefix -> UPPER(col) LIKE UPPER(:v_pref_j)  (with '%')
+    Also include the literal user value as a LIKE to be forgiving.
+    """
+
+    cfg = _load_enum_synonyms(get_setting)
+    key = f"{table}.{col}"
+    entry = cfg.get(key) or {}
+
+    uv = (user_value or "").strip()
+    uv_up = uv.upper()
+
+    bucket = None
+    for name, rules in entry.items():
+        equals_list = [s.upper() for s in rules.get("equals", []) if isinstance(s, str)]
+        if uv_up and uv_up in equals_list:
+            bucket = name
+            break
+    if bucket is None and uv_up:
+        for name, rules in entry.items():
+            for p in rules.get("prefix", []) or []:
+                if not isinstance(p, str):
+                    continue
+                if uv_up.startswith(p.upper()):
+                    bucket = name
+                    break
+            if bucket:
+                break
+    if bucket is None and uv_up:
+        for name, rules in entry.items():
+            for c in rules.get("contains", []) or []:
+                if not isinstance(c, str):
+                    continue
+                if c.upper() in uv_up:
+                    bucket = name
+                    break
+            if bucket:
+                break
+
+    binds: Dict[str, object] = {}
+    pieces: List[str] = []
+
+    pieces.append(f"UPPER({col}) LIKE UPPER(:v_like)")
+    binds["v_like"] = f"%{uv}%"
+
+    if bucket and bucket in entry:
+        rules = entry[bucket]
+        eqs = [s for s in rules.get("equals", []) if isinstance(s, str) and s]
+        prefs = [s for s in rules.get("prefix", []) if isinstance(s, str) and s]
+
+        for i, s in enumerate(eqs):
+            name = f"v_eq_{i}"
+            pieces.append(f"UPPER({col}) = UPPER(:{name})")
+            binds[name] = s
+
+        for j, p in enumerate(prefs):
+            name = f"v_pref_{j}"
+            pieces.append(f"UPPER({col}) LIKE UPPER(:{name})")
+            binds[name] = f"{p}%"
+
+    frag = "(" + " OR ".join(pieces) + ")"
+    return frag, binds
+
 DEFAULT_REQUEST_TYPE_SYNONYMS: Dict[str, List[str]] = {
     "RENEWAL": ["renew", "renewal", "renew contract", "renewed", "extension"],
     "NEW CONTRACT": ["new", "new contract"],
