@@ -114,3 +114,21 @@ python3 check_and_import_contracts.py \
 
 
 
+ (case‑insensitive):
+
+filter: CONTRACT_STATUS = expire
+
+
+contains / LIKE:
+
+filter: REQUEST_TYPE ~ renew
+
+
+IN list:
+
+filter: CONTRACT_STATUS in (Active, Pending)
+
+
+BETWEEN :
+
+filter: REQUEST_DATE between 2024-01-01 and 2024-12-31
