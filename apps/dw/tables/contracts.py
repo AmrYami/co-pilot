@@ -93,6 +93,7 @@ def _build_reqtype_condition(value: str, bucket: Optional[Dict]) -> Tuple[str, D
 
     if not bucket:
         key = f"rt_like_{idx}"
+        idx += 1
         binds[key] = f"%{_norm(value)}%"
         parts.append(f"UPPER(TRIM(REQUEST_TYPE)) LIKE UPPER(:{key})")
 
@@ -1104,13 +1105,17 @@ def build_sql(intent: Intent, settings: Optional[Dict[str, object]] = None) -> t
             binds["date_start"] = _to_date(intent.window_start)
             binds["date_end"]   = _to_date(intent.window_end)
             parts.append("REQUEST_DATE BETWEEN :date_start AND :date_end")
-            explain.append(f"Window = REQUEST_DATE between {binds['date_start']} and {binds['date_end']}.")
+            intent.explain_parts.append(
+                f"Window = REQUEST_DATE between {binds['date_start']} and {binds['date_end']}."
+            )
     elif intent.window_kind == "END_ONLY":
         if intent.window_start and intent.window_end:
             binds["date_start"] = _to_date(intent.window_start)
             binds["date_end"]   = _to_date(intent.window_end)
             parts.append("END_DATE BETWEEN :date_start AND :date_end")
-            explain.append(f"Window = END_DATE between {binds['date_start']} and {binds['date_end']}.")
+            intent.explain_parts.append(
+                f"Window = END_DATE between {binds['date_start']} and {binds['date_end']}."
+            )
     elif intent.window_kind == "OVERLAP":
         if intent.window_start and intent.window_end:
             binds["date_start"] = _to_date(intent.window_start)
