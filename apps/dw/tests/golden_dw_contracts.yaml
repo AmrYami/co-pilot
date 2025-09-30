@@ -458,9 +458,14 @@ cases:
         - 'OWNER_DEPARTMENT AS GROUP_KEY'
         - 'SUM(NVL(CONTRACT_VALUE_NET_OF_VAT,0)'
         - 'ORDER BY MEASURE ASC'
-    binds:
-      date_start: !start_of_last_quarter
-      date_end: !end_of_last_quarter
+
+  - question: "Show contracts where REQUEST TYPE = Renewal"
+    expect_sql_contains:
+      - 'FROM "Contract"'
+      - 'UPPER(REQUEST_TYPE) LIKE UPPER(:req_like)'
+      - 'ORDER BY REQUEST_DATE DESC'
+    expect_binds:
+      req_like: "%renew%"
 
   - question: "Total gross value per DEPARTMENT_OUL last quarter"
     expect_sql:
@@ -469,6 +474,9 @@ cases:
         - 'SUM(NVL(CONTRACT_VALUE_NET_OF_VAT,0)'
         - 'START_DATE <= :date_end'
         - 'END_DATE >= :date_start'
+    binds:
+      date_start: !start_of_last_quarter
+      date_end: !end_of_last_quarter
 
   - question: "Count of contracts per ENTITY_NO"
     expect_sql:

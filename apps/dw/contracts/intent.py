@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from datetime import date
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 
 
 @dataclass
@@ -27,6 +27,7 @@ class DWIntent:
     # signals
     is_bottom: bool = False
     by_dimension_hint: Optional[str] = None
+    extra_filters: List[Dict[str, Any]] = field(default_factory=list)
 
 
 _BOTTOM_RE = re.compile(r"\b(bottom|lowest|least|smallest|min)\b", re.I)
@@ -112,5 +113,32 @@ def parse_intent(question: str) -> DWIntent:
         intent.has_time_window = True
     elif re.search(r"\blast\s+\d+\s+months\b", lowered):
         intent.has_time_window = True
+
+    # Explicit REQUEST_TYPE filters
+    req_match = re.search(r"\bREQUEST\s*TYPE\s*=\s*(['\"]?)([A-Za-z0-9 _-]+)\1", q, flags=re.IGNORECASE)
+    if req_match:
+        raw = req_match.group(2).strip()
+        lowered_raw = raw.lower()
+        if lowered_raw.startswith("renew"):
+            like_val = "%renew%"
+        else:
+            like_val = f"%{lowered_raw}%"
+        intent.extra_filters.append(
+            {
+                "col": "REQUEST_TYPE",
+                "op": "like_ci",
+                "bind": "req_like",
+                "value": like_val,
+            }
+        )
+    elif re.search(r"\brenew(al|ed)?\b", q, flags=re.IGNORECASE):
+        intent.extra_filters.append(
+            {
+                "col": "REQUEST_TYPE",
+                "op": "like_ci",
+                "bind": "req_like",
+                "value": "%renew%",
+            }
+        )
 
     return intent

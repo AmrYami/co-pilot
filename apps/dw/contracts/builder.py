@@ -337,6 +337,22 @@ def build_contracts_sql(
             binds["df_val"] = val
             where_parts.append(f"UPPER({col}) {op} UPPER(:df_val)")
 
+    # 3b) Extra column filters inferred from question text
+    for extra in intent.get("extra_filters", []) or []:
+        col = extra.get("col")
+        op = (extra.get("op") or "").lower()
+        bind_name = extra.get("bind")
+        val = extra.get("value")
+        if not col or not bind_name or val is None:
+            continue
+        binds[bind_name] = val
+        if op == "like_ci":
+            where_parts.append(f"UPPER({col}) LIKE UPPER(:{bind_name})")
+        elif op == "eq_ci":
+            where_parts.append(f"UPPER({col}) = UPPER(:{bind_name})")
+        else:
+            where_parts.append(f"{col} = :{bind_name}")
+
     # 4) SELECT list and GROUP BY / measure
     group_by = intent.get("group_by")
     group_by_token = intent.get("group_by_token")
