@@ -9,7 +9,6 @@ from core.model_loader import ensure_model, model_info
 from core.pipeline import Pipeline
 from core.settings import Settings
 
-
 def create_app():
     settings = Settings()
     setup_logging(settings)
