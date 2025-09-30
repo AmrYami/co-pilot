@@ -14,6 +14,139 @@ _NET = "NVL(CONTRACT_VALUE_NET_OF_VAT,0)"
 _BOTTOM_RE = re.compile(r"\b(bottom|lowest|least|أقل)\b", re.IGNORECASE)
 _REQUEST_RE = re.compile(r"\brequest(?:ed|s)?\b", re.IGNORECASE)
 
+
+REQUEST_TYPE_RE = re.compile(
+    r"\bREQUEST[_\s]*TYPE\b\s*(?:=|:|is)?\s*['\"]?([A-Za-z][A-Za-z _/\-]{0,64})['\"]?",
+    re.IGNORECASE,
+)
+
+
+def _get_json_setting(namespace: str, key: str, default=None):
+    """Fetch JSON setting from your settings layer. Falls back to default."""
+    try:
+        from apps.common.settings import get_json_setting
+
+        return get_json_setting(namespace, key, default)
+    except Exception:
+        try:
+            from apps.admin.settings import get_json_setting as _gj
+
+            return _gj(namespace, key, default)
+        except Exception:
+            return default
+
+
+def _resolve_request_type_synonyms(namespace: str) -> Dict[str, Dict[str, List[str]]]:
+    """Load synonyms for Contract.REQUEST_TYPE."""
+
+    enum_map = _get_json_setting(namespace, "DW_ENUM_SYNONYMS", {}) or {}
+    rt_block = enum_map.get("Contract.REQUEST_TYPE", {})
+    if rt_block:
+        normalized = {}
+        for cat, rule in rt_block.items():
+            normalized[cat.strip().lower()] = {
+                "equals": [s for s in rule.get("equals", []) if s],
+                "prefix": [s for s in rule.get("prefix", []) if s],
+                "contains": [s for s in rule.get("contains", []) if s],
+            }
+        return normalized
+
+    legacy = _get_json_setting(namespace, "DW_REQUEST_TYPE_SYNONYMS", {}) or {}
+    normalized = {}
+    for cat, arr in legacy.items():
+        normalized[(cat or "").strip().lower()] = {
+            "equals": list(arr) if isinstance(arr, list) else [],
+            "prefix": [],
+            "contains": [],
+        }
+    return normalized
+
+
+def _match_request_type_category(
+    raw_value: str, rt_map: Dict[str, Dict[str, List[str]]]
+) -> Tuple[str, Dict[str, List[str]]]:
+    """From a raw value in the question pick the best category for synonyms."""
+
+    val = (raw_value or "").strip().lower()
+    if not val:
+        return "", {"equals": [], "prefix": [], "contains": []}
+
+    if val in rt_map:
+        return val, rt_map[val]
+
+    for cat, rule in rt_map.items():
+        for s in rule.get("equals", []):
+            if val == (s or "").strip().lower():
+                return cat, rule
+
+    for cat, rule in rt_map.items():
+        for px in rule.get("prefix", []):
+            if val.startswith((px or "").strip().lower()):
+                return cat, rule
+
+    for cat, rule in rt_map.items():
+        for sub in rule.get("contains", []):
+            if (sub or "").strip().lower() in val:
+                return cat, rule
+
+    return "", {"equals": [], "prefix": [], "contains": []}
+
+
+def _maybe_apply_request_type_filter(
+    namespace: str,
+    question: str,
+    where: List[str],
+    binds: Dict[str, object],
+    order_by: List[str],
+) -> bool:
+    """Apply REQUEST_TYPE filter if user explicitly asked for it."""
+
+    m = REQUEST_TYPE_RE.search(question or "")
+    if not m:
+        return False
+
+    raw = m.group(1).strip()
+    rt_map = _resolve_request_type_synonyms(namespace) or {}
+    cat, rule = _match_request_type_category(raw, rt_map)
+
+    predicates: List[str] = []
+
+    for s in rule.get("equals", []):
+        if not s:
+            continue
+        k = f"rt_eq_{len(binds)}"
+        binds[k] = s
+        predicates.append(f"UPPER(TRIM(REQUEST_TYPE)) = UPPER(:{k})")
+
+    for px in rule.get("prefix", []):
+        if not px:
+            continue
+        k = f"rt_px_{len(binds)}"
+        binds[k] = f"{px}%"
+        predicates.append(f"UPPER(TRIM(REQUEST_TYPE)) LIKE UPPER(:{k})")
+
+    for sub in rule.get("contains", []):
+        if not sub:
+            continue
+        k = f"rt_in_{len(binds)}"
+        binds[k] = f"%{sub}%"
+        predicates.append(f"UPPER(TRIM(REQUEST_TYPE)) LIKE UPPER(:{k})")
+
+    if not predicates:
+        k = f"rt_raw_{len(binds)}"
+        binds[k] = f"%{raw}%"
+        predicates.append(f"UPPER(TRIM(REQUEST_TYPE)) LIKE UPPER(:{k})")
+
+    if cat == "null":
+        predicates.append("REQUEST_TYPE IS NULL OR TRIM(REQUEST_TYPE) = ''")
+
+    where.append("(" + " OR ".join(predicates) + ")")
+
+    if not order_by:
+        order_by.append("REQUEST_DATE DESC")
+
+    return True
+
 def gross_expr(alias: str | None = None) -> str:
     base = "NVL(CONTRACT_VALUE_NET_OF_VAT,0)"
     vat = "NVL(VAT,0)"
@@ -200,6 +333,14 @@ def build_contracts_sql(
         intent["notes"] = notes
     else:
         intent["notes"] = notes
+    settings_obj = intent.get("settings")
+    namespace = (
+        intent.get("namespace")
+        or notes.get("namespace")
+        or getattr(settings_obj, "namespace", None)
+        or "dw::common"
+    )
+    namespace = str(namespace)
     q_text = str(
         notes.get("q")
         or intent.get("raw_question")
@@ -295,6 +436,20 @@ def build_contracts_sql(
 
     # WHERE parts
     where_parts: List[str] = []
+    request_type_order_terms: List[str] = []
+    fallback_order_clause: Optional[str] = None
+    if _maybe_apply_request_type_filter(
+        namespace,
+        q_text,
+        where_parts,
+        binds,
+        request_type_order_terms,
+    ):
+        notes["request_type_filter"] = True
+
+    helper_order_clause: Optional[str] = None
+    if request_type_order_terms:
+        helper_order_clause = ", ".join(request_type_order_terms)
 
     # 1) Time window / expiry semantics
     explicit = intent.get("explicit_dates")
@@ -354,7 +509,6 @@ def build_contracts_sql(
         else:
             where_parts.append(f"{col} = :{bind_name}")
 
-    settings_obj = intent.get("settings")
     settings_get = getattr(settings_obj, "get", None) if settings_obj else None
     synonyms_override = intent.get("request_type_synonyms")
     override_enum_cfg: Optional[Dict[str, dict]] = None
@@ -457,6 +611,14 @@ def build_contracts_sql(
         # Nothing special; ordering will be by sort_by if provided.
         order_by = intent.get("sort_by") or None
 
+    if helper_order_clause and not order_by:
+        match = re.match(r"\s*([^,]+?)\s+(ASC|DESC)\s*$", helper_order_clause, flags=re.IGNORECASE)
+        if match:
+            order_by = match.group(1).strip()
+            desc = match.group(2).upper() == "DESC"
+        else:
+            fallback_order_clause = helper_order_clause
+
     # 5) Build SQL
     q_parts.append(f'SELECT {select_list} FROM "{table}"')
     if where_parts:
@@ -481,6 +643,8 @@ def build_contracts_sql(
 
     if order_by:
         q_parts.append(f"ORDER BY {order_by} {'DESC' if desc else 'ASC'}")
+    elif fallback_order_clause:
+        q_parts.append(f"ORDER BY {fallback_order_clause}")
 
     # 6) Top-N
     if top_n_value:

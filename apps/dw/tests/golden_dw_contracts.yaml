@@ -146,6 +146,16 @@ cases:
     assertions:
       request_window: true
 
+  - id: request_type_equals_renewal
+    question: "Show contracts where REQUEST TYPE = Renewal"
+    expect:
+      sql_like:
+        - 'FROM "Contract"'
+      must_not: []
+    assert_all_of:
+      - 'UPPER(TRIM(REQUEST_TYPE))'
+      - 'ORDER BY REQUEST_DATE DESC'
+
   - id: distinct_entity_counts
     question: "List distinct ENTITY values and their contract counts."
     expect:
