@@ -3,11 +3,8 @@ import re
 from datetime import date, datetime
 from typing import Dict, Tuple, Optional, List
 
+from .filters import try_parse_simple_equals
 from .rules_extra import try_build_special_cases
-from apps.dw.contracts.synonyms import (
-    build_request_type_filter_sql,
-    get_request_type_synonyms,
-)
 
 # NOTE: Keep this module strictly table-specific (Contract).
 #       Cross-table / DocuWare-generic helpers should live elsewhere.
@@ -16,75 +13,6 @@ _NET = "NVL(CONTRACT_VALUE_NET_OF_VAT,0)"
 
 _BOTTOM_RE = re.compile(r"\b(bottom|lowest|least|أقل)\b", re.IGNORECASE)
 _REQUEST_RE = re.compile(r"\brequest(?:ed|s)?\b", re.IGNORECASE)
-
-REQUEST_TYPE_COL_SQL = "REQUEST_TYPE"
-REQUEST_TYPE_TABLECOL = "Contract.REQUEST_TYPE"
-
-_REQTYPE_EQ_RE = re.compile(
-    r"REQUEST\s*TYPE\s*=\s*([A-Za-z0-9 _\-/]+)", re.IGNORECASE
-)
-_REQTYPE_IS_RE = re.compile(
-    r"REQUEST\s*TYPE\s*IS\s*([A-Za-z0-9 _\-/]+)", re.IGNORECASE
-)
-
-
-def _extract_request_type_value(question_text: str) -> Optional[str]:
-    """
-    Extracts a value from phrases like:
-      'REQUEST TYPE = Renewal'
-      'REQUEST TYPE is Renewal'
-    Returns the raw string (e.g., 'Renewal') or None.
-    """
-    if not question_text:
-        return None
-    m = _REQTYPE_EQ_RE.search(question_text) or _REQTYPE_IS_RE.search(question_text)
-    if m:
-        return m.group(1).strip()
-    return None
-
-
-def build_sql_with_reqtype_filter(
-    base_select: str,
-    where_parts: list[str],
-    binds: Dict[str, object],
-    question_text: str,
-    *,
-    settings_get_json=None,
-    synonyms_override: Optional[Dict[str, List[str]]] = None,
-) -> Tuple[Optional[str], Optional[Dict[str, object]]]:
-    """
-    If question asks for REQUEST TYPE = <value>, append a synonym-aware filter and
-    set a sensible default ordering by REQUEST_DATE DESC for listing queries.
-    """
-    val = _extract_request_type_value(question_text)
-    if not val:
-        # No explicit REQUEST TYPE filter in the question
-        return None, None  # signal no change
-
-    synonyms_map = synonyms_override if isinstance(synonyms_override, dict) else None
-    if not synonyms_map:
-        synonyms_map = get_request_type_synonyms(settings_get_json)
-
-    # Build synonym-aware predicate
-    pred, more_binds = build_request_type_filter_sql(
-        val,
-        synonyms_map,
-        use_like=True,
-        bind_prefix="reqtype",
-    )
-    where_parts.append(pred)
-    binds.update(more_binds)
-
-    # Compose final SQL
-    where_sql = ""
-    if where_parts:
-        where_sql = "WHERE " + " AND ".join(where_parts)
-
-    sql = f"""{base_select}
-{where_sql}
-ORDER BY REQUEST_DATE DESC"""
-
-    return sql, binds
 
 def gross_expr(alias: str | None = None) -> str:
     base = "NVL(CONTRACT_VALUE_NET_OF_VAT,0)"
@@ -427,21 +355,52 @@ def build_contracts_sql(
             where_parts.append(f"{col} = :{bind_name}")
 
     settings_obj = intent.get("settings")
-    settings_get_json = getattr(settings_obj, "get_json", None) if settings_obj else None
+    settings_get = getattr(settings_obj, "get", None) if settings_obj else None
     synonyms_override = intent.get("request_type_synonyms")
-    if not isinstance(synonyms_override, dict):
-        synonyms_override = None
+    override_enum_cfg: Optional[Dict[str, dict]] = None
+    if isinstance(synonyms_override, dict) and synonyms_override:
+        mapped: Dict[str, dict] = {}
+        for bucket, values in synonyms_override.items():
+            bucket_text = str(bucket).strip() if bucket is not None else ""
+            key_name = bucket_text or "override"
+            terms: List[str] = []
+            if bucket_text:
+                terms.append(bucket_text)
+            for item in values or []:
+                if item is None:
+                    continue
+                text = str(item).strip()
+                if text:
+                    terms.append(text)
+            if not terms:
+                continue
+            mapped[key_name] = {"equals": terms, "prefix": [], "contains": []}
+        if mapped:
+            override_enum_cfg = {f"{table}.REQUEST_TYPE": mapped}
 
-    base_select = f'SELECT * FROM "{table}"'
-    reqtype_sql, _ = build_sql_with_reqtype_filter(
-        base_select=base_select,
-        where_parts=where_parts,
-        binds=binds,
-        question_text=q_text,
-        settings_get_json=settings_get_json,
-        synonyms_override=synonyms_override,
+    def _settings_getter(key: str, default=None):
+        if key == "DW_ENUM_SYNONYMS" and override_enum_cfg is not None:
+            return override_enum_cfg
+        if callable(settings_get):
+            for kwargs in ({"default": default, "scope": "namespace"}, {"default": default}, {}):
+                try:
+                    value = settings_get(key, **kwargs)
+                except TypeError:
+                    continue
+                if value is not None:
+                    return value
+            return default
+        return default
+
+    simple_eq_frag, simple_eq_binds = try_parse_simple_equals(
+        q_text,
+        table=table,
+        get_setting=_settings_getter,
     )
-    reqtype_filter_applied = bool(reqtype_sql)
+    simple_eq_applied = bool(simple_eq_frag)
+    if simple_eq_applied:
+        where_parts.append(simple_eq_frag)
+        binds.update(simple_eq_binds)
 
     # 4) SELECT list and GROUP BY / measure
     group_by = intent.get("group_by")
@@ -503,12 +462,12 @@ def build_contracts_sql(
     if where_parts:
         q_parts.append("WHERE " + " AND ".join(where_parts))
 
-    if reqtype_filter_applied and not group_by and not (intent.get("sort_by") or order_by):
+    if simple_eq_applied and not group_by and not (intent.get("sort_by") or order_by):
         order_by = "REQUEST_DATE"
         desc = True
 
     if (
-        reqtype_filter_applied
+        simple_eq_applied
         and not group_by
         and not intent.get("agg")
         and not intent.get("measure_sql")
@@ -516,7 +475,9 @@ def build_contracts_sql(
         and top_n_value is None
         and not wants_bottom
     ):
-        return reqtype_sql, binds
+        where_sql = " WHERE " + " AND ".join(where_parts) if where_parts else ""
+        sql = f'SELECT * FROM "{table}"{where_sql} ORDER BY REQUEST_DATE DESC'
+        return sql, binds
 
     if order_by:
         q_parts.append(f"ORDER BY {order_by} {'DESC' if desc else 'ASC'}")

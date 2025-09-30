@@ -140,7 +140,8 @@ cases:
     question: "Show contracts where REQUEST TYPE = Renewal in 2023."
     assert_all_of:
       - 'REQUEST_DATE BETWEEN :date_start AND :date_end'
-      - 'UPPER(REQUEST_TYPE)=UPPER(:req_type)'
+      - 'UPPER(REQUEST_TYPE)'
+      - 'LIKE UPPER(:v_like)'
       - 'ORDER BY REQUEST_DATE DESC'
     assertions:
       request_window: true
