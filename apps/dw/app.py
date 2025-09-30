@@ -52,6 +52,7 @@ except Exception:  # pragma: no cover - fallback for tests
 
 from core.inquiries import create_or_update_inquiry
 
+from apps.dw.rate_hints import append_where, parse_rate_hints, replace_or_add_order_by
 from apps.dw.tables.contracts import plan_sql
 from .contracts.contract_common import build_fts_clause
 from .contracts.filters import parse_explicit_filters
@@ -194,7 +195,12 @@ def _json_safe_binds(binds: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     return safe
 
 
-def derive_sql_for_test(question: str, namespace: str = "dw::common", test_binds: dict | None = None):
+def derive_sql_for_test(
+    question: str,
+    namespace: str = "dw::common",
+    test_binds: dict | None = None,
+    rate_comment: str | None = None,
+):
     """Produce SQL (without execution) for a natural-language question.
     Used by golden tests; merges deterministic planner binds with optional overrides."""
     sql: str = ""
@@ -224,6 +230,14 @@ def derive_sql_for_test(question: str, namespace: str = "dw::common", test_binds
 
     if test_binds:
         binds.update(test_binds)
+
+    if sql and rate_comment and rate_comment.strip():
+        hints = parse_rate_hints(rate_comment)
+        if hints.where_sql:
+            sql = append_where(sql, hints.where_sql)
+            binds.update(hints.where_binds)
+        if hints.order_by_sql:
+            sql = replace_or_add_order_by(sql, hints.order_by_sql)
 
     return sql, _coerce_bind_dates(binds)
 

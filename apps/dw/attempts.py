@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 import time
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 try:  # pragma: no cover - allow import without Flask in unit tests
     from flask import current_app
@@ -18,6 +18,7 @@ except Exception:  # pragma: no cover
 
 from .builder import build_sql
 from .intent import NLIntent, parse_intent_legacy
+from .rate_hints import append_where, parse_rate_hints, replace_or_add_order_by
 from .search import (
     build_fulltext_where,
     extract_search_tokens,
@@ -48,6 +49,7 @@ def run_attempt(
     attempt_no: int,
     strategy: str = "deterministic",
     full_text_search: bool | None = None,
+    rate_comment: Optional[str] = None,
 ) -> Dict[str, Any]:
     app = current_app
     logger = getattr(app, "logger", None)
@@ -108,6 +110,25 @@ def run_attempt(
     elif intent.full_text_search and engine is None:
         fts_meta["error"] = "no_engine"
 
+    hints_meta = {
+        "comment_present": bool(rate_comment and rate_comment.strip()),
+        "where_applied": False,
+        "order_by_applied": False,
+        "group_by": None,
+    }
+
+    if sql and rate_comment and rate_comment.strip():
+        hints = parse_rate_hints(rate_comment)
+        if hints.where_sql:
+            sql = append_where(sql, hints.where_sql)
+            binds.update(hints.where_binds)
+            hints_meta["where_applied"] = True
+        if hints.order_by_sql:
+            sql = replace_or_add_order_by(sql, hints.order_by_sql)
+            hints_meta["order_by_applied"] = True
+        if hints.group_by_cols:
+            hints_meta["group_by"] = list(hints.group_by_cols)
+
     _log(
         logger,
         "fts",
@@ -147,6 +168,7 @@ def run_attempt(
             "attempt_no": attempt_no,
             "strategy": strategy,
             "fts": fts_meta,
+            "rate_hints": hints_meta,
         },
         "debug": {
             "intent": intent.__dict__,
@@ -158,6 +180,7 @@ def run_attempt(
                 "bind_names": list(binds.keys()),
             },
             "fts": fts_meta,
+            "rate_hints": hints_meta,
         },
     }
     return result

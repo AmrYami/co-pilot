@@ -50,6 +50,9 @@ def rate():
     inquiry_id = int(data.get("inquiry_id") or 0)
     rating = int(data.get("rating") or 0)
     feedback = (data.get("feedback") or "").strip() or None
+    comment = (data.get("comment") or "").strip()
+    if not comment and feedback:
+        comment = feedback
     if not inquiry_id or rating < 1 or rating > 5:
         return jsonify({"ok": False, "error": "invalid payload"}), 400
 
@@ -87,7 +90,13 @@ def rate():
             ).fetchone()
         if row:
             ns, q = row[0], row[1]
-            alt = run_attempt(q, ns, attempt_no=2, strategy=alt_strategy)
+            alt = run_attempt(
+                q,
+                ns,
+                attempt_no=2,
+                strategy=alt_strategy,
+                rate_comment=comment or None,
+            )
             with engine.begin() as cx:
                 cx.execute(
                     text(
