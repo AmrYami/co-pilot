@@ -4,6 +4,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+from typing import Dict, Optional, Tuple
+
 from dateutil.relativedelta import relativedelta
 
 _YTD_YEAR_RE = re.compile(
@@ -12,6 +14,112 @@ _YTD_YEAR_RE = re.compile(
 )
 
 _LOWEST_RE = re.compile(r"\b(lowest|bottom|least|smallest|cheapest|min)\b", re.IGNORECASE)
+
+# --- Request Type parsing & synonyms -----------------------------------------
+
+REQTYPE_EQ_RE = re.compile(
+    r"\bREQUEST\s*TYPE\s*=\s*([\"']?)([^\"';,]+)\1",
+    re.IGNORECASE,
+)
+
+REQTYPE_COLON_OR_SPACE_RE = re.compile(
+    r"\bREQUEST\s*TYPE\b\s*[: ]\s*([\"']?)([^\"';,]+)\1",
+    re.IGNORECASE,
+)
+
+
+def _norm(value: str) -> str:
+    return (value or "").strip().lower()
+
+
+def _load_enum_synonyms(settings: Dict) -> Dict:
+    """Return the DW_ENUM_SYNONYMS map from settings (if present)."""
+
+    return (settings or {}).get("DW_ENUM_SYNONYMS", {})
+
+
+def _syn_bucket_for(enum_map: Dict, field: str, value: str) -> Optional[Dict]:
+    """Return the synonym bucket for the given field/value if available."""
+
+    field_map = enum_map.get(field, {})
+    val_key = _norm(value)
+    if val_key in field_map:
+        return field_map[val_key]
+    for key in field_map.keys():
+        if _norm(key) == val_key:
+            return field_map[key]
+    return None
+
+
+def _build_reqtype_condition(value: str, bucket: Optional[Dict]) -> Tuple[str, Dict[str, str]]:
+    """Build a SQL predicate for REQUEST_TYPE from synonyms."""
+
+    parts: list[str] = []
+    binds: Dict[str, str] = {}
+    idx = 0
+
+    equals_list = []
+    prefix_list = []
+    contains_list = []
+
+    if bucket:
+        equals_list = bucket.get("equals") or []
+        prefix_list = bucket.get("prefix") or []
+        contains_list = bucket.get("contains") or []
+
+    if not (equals_list or prefix_list or contains_list):
+        equals_list = [value]
+
+    eq_terms: list[str] = []
+    for candidate in equals_list:
+        key = f"rt_eq_{idx}"
+        idx += 1
+        binds[key] = candidate
+        eq_terms.append(f"UPPER(TRIM(REQUEST_TYPE)) = UPPER(:{key})")
+    if eq_terms:
+        parts.append("(" + " OR ".join(eq_terms) + ")")
+
+    for candidate in prefix_list:
+        key = f"rt_pre_{idx}"
+        idx += 1
+        binds[key] = candidate + "%"
+        parts.append(f"UPPER(TRIM(REQUEST_TYPE)) LIKE UPPER(:{key})")
+
+    for candidate in contains_list:
+        key = f"rt_cont_{idx}"
+        idx += 1
+        binds[key] = "%" + candidate + "%"
+        parts.append(f"UPPER(TRIM(REQUEST_TYPE)) LIKE UPPER(:{key})")
+
+    if not bucket:
+        key = f"rt_like_{idx}"
+        binds[key] = f"%{_norm(value)}%"
+        parts.append(f"UPPER(TRIM(REQUEST_TYPE)) LIKE UPPER(:{key})")
+
+    where_sql = "(" + " OR ".join(parts) + ")" if parts else "1=1"
+    return where_sql, binds
+
+
+def extract_request_type_filter(
+    question: str, settings: Dict
+) -> Optional[Tuple[str, Dict[str, str], str]]:
+    """Detect REQUEST TYPE filters in the question and build SQL using synonyms."""
+
+    text = question or ""
+    match = REQTYPE_EQ_RE.search(text)
+    if not match:
+        match = REQTYPE_COLON_OR_SPACE_RE.search(text)
+
+    if not match:
+        return None
+
+    raw_value = (match.group(2) or "").strip()
+    enum_map = _load_enum_synonyms(settings)
+    bucket = _syn_bucket_for(enum_map, "Contract.REQUEST_TYPE", raw_value)
+
+    where_sql, binds = _build_reqtype_condition(raw_value, bucket)
+    explain = f"Filtering on REQUEST_TYPE ~= '{raw_value}' using synonyms (equals/prefix/contains)."
+    return where_sql, binds, explain
 
 # ---- Gross and helpers -------------------------------------------------------
 GROSS_SQL = (
@@ -982,13 +1090,13 @@ def _build_special(intent: Intent) -> tuple[str, dict, dict]:
     return "", {}, _build_meta(intent, explain=explain_meta)
 
 
-def build_sql(intent: Intent) -> tuple[str, dict, dict]:
+def build_sql(intent: Intent, settings: Optional[Dict[str, object]] = None) -> tuple[str, dict, dict]:
     if intent.special:
         return _build_special(intent)
 
     binds = {}
     parts = []
-    explain = []
+    settings_map: Dict[str, object] = dict(settings or {})
 
     # Window WHERE clause
     if intent.window_kind == "REQUEST":
@@ -1009,13 +1117,24 @@ def build_sql(intent: Intent) -> tuple[str, dict, dict]:
             binds["date_end"]   = _to_date(intent.window_end)
             parts.append("(START_DATE IS NOT NULL AND END_DATE IS NOT NULL "
                          "AND START_DATE <= :date_end AND END_DATE >= :date_start)")
-            explain.append("Window = OVERLAP on START_DATE/END_DATE.")
 
     # Explicit where
     for wc in (intent.where_clauses or []):
         parts.append(wc)
     for k,v in (intent.where_binds or {}).items():
         binds[k] = v
+
+    # REQUEST_TYPE filter via synonyms (avoid duplicate clauses)
+    existing_reqtype = any(
+        "REQUEST_TYPE" in (wc or "").upper() for wc in (intent.where_clauses or [])
+    )
+    if not existing_reqtype:
+        reqtype = extract_request_type_filter(intent.question, settings_map)
+        if reqtype:
+            where_sql, where_binds, note = reqtype
+            parts.append(where_sql)
+            binds.update(where_binds)
+            intent.explain_parts.append(note)
 
     where_sql = ""
     if parts:
@@ -1091,6 +1210,22 @@ def build_sql(intent: Intent) -> tuple[str, dict, dict]:
     return sql, binds, meta
 
 
-def plan_sql(question: str, today: date | None = None) -> tuple[str, dict, dict]:
-    it = parse_intent(question, today=today)
-    return build_sql(it)
+def build_contract_sql(
+    question: str,
+    settings: Dict[str, object],
+    *,
+    today: date | None = None,
+) -> tuple[str, dict, dict]:
+    """Parse the question and build deterministic Contract SQL with settings."""
+
+    intent = parse_intent(question, today=today)
+    return build_sql(intent, settings=settings)
+
+
+def plan_sql(
+    question: str,
+    today: date | None = None,
+    settings: Optional[Dict[str, object]] = None,
+) -> tuple[str, dict, dict]:
+    intent = parse_intent(question, today=today)
+    return build_sql(intent, settings=settings)
