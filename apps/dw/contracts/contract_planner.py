@@ -3,6 +3,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from datetime import date
 
 from .contract_common import GROSS_SQL, OVERLAP_PRED, build_fts_clause, explain_window
+from .filters import build_request_type_filter
 
 # Dimension aliases we support for GROUP BY on Contract table
 DIMENSIONS = {
@@ -75,6 +76,7 @@ def plan_contract_query(
     full_text_search: bool,
     fts_columns: List[str],
     fts_tokens: List[str],
+    settings: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, Dict[str, Any], Dict[str, Any], str]:
     """
     Deterministic planner for Contract table queries.
@@ -203,9 +205,26 @@ def plan_contract_query(
         return sql, binds, {"group_by": "ENTITY", "measure": "COUNT"}, " ".join(explain_bits)
 
     # Fallback: list in window (if any) else all
-    sql = "SELECT * FROM \"Contract\""
+    where_clauses: List[str] = []
     if explicit_dates:
-        sql += f"\nWHERE {window_pred}"
-    sql += fts_where + "\nORDER BY REQUEST_DATE DESC"
+        where_clauses.append(window_pred)
+
+    f_sql, f_binds, f_explain = build_request_type_filter(q, settings)
+    if f_sql:
+        where_clauses.append(f_sql)
+        binds.update(f_binds)
+        if f_explain:
+            explain_bits.append(f_explain)
+
+    fts_clause = fts_where.strip()
+    if fts_clause.upper().startswith("AND "):
+        fts_clause = fts_clause[4:].strip()
+    if fts_clause:
+        where_clauses.append(fts_clause)
+
+    sql = "SELECT * FROM \"Contract\""
+    if where_clauses:
+        sql += "\nWHERE " + " AND ".join(where_clauses)
+    sql += "\nORDER BY REQUEST_DATE DESC"
     explain_bits.append("Fallback listing ordered by REQUEST_DATE DESC.")
     return sql, binds, {"fallback": True, "date_col": date_col}, " ".join(explain_bits)

@@ -222,6 +222,7 @@ def derive_sql_for_test(
             full_text_search=False,
             fts_columns=fts_columns,
             fts_tokens=[],
+            settings=_load_enum_synonym_settings(),
         )
         binds.update(planner_binds or {})
 
@@ -373,6 +374,40 @@ def _get_settings():
     if pipeline is None:
         return None
     return getattr(pipeline, "settings", None)
+
+
+def _load_enum_synonym_settings() -> Dict[str, Any]:
+    """Load enum synonym settings needed for specialized filters."""
+
+    settings_obj = _get_settings()
+    if settings_obj is None:
+        return {}
+
+    getters = []
+    for attr in ("get_json", "get"):
+        func = getattr(settings_obj, attr, None)
+        if callable(func):
+            getters.append(func)
+
+    keys = ("DW_ENUM_SYNONYMS", "DW_REQUEST_TYPE_SYNONYMS")
+    payload: Dict[str, Any] = {}
+
+    for key in keys:
+        for getter in getters:
+            value = None
+            for kwargs in ({"default": None, "scope": "namespace"}, {"default": None}, {}):
+                try:
+                    candidate = getter(key, **kwargs)
+                except TypeError:
+                    continue
+                if candidate is not None:
+                    value = candidate
+                    break
+            if value is not None:
+                payload[key] = value
+                break
+
+    return payload
 
 
 def _get_fts_columns(*, table: str, namespace: str) -> List[str]:
@@ -638,6 +673,7 @@ def answer():
         full_text_search=full_text_search,
         fts_columns=fts_columns,
         fts_tokens=fts_tokens,
+        settings=_load_enum_synonym_settings(),
     )
 
     LOGGER.info("[dw] final_sql: %s", {"size": len(sql), "sql": sql})

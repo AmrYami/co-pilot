@@ -598,7 +598,7 @@ def _hydrate_case(raw: Dict[str, Any]) -> GoldenCase:
     expect = raw.get("expect") or {}
     assert_contains = _ensure_str_list(raw.get("assert_contains"))
     return GoldenCase(
-        question = raw.get("question", "").strip(),
+        question = (raw.get("question") or raw.get("q") or "").strip(),
         namespace = (raw.get("namespace") or DEFAULT_NS).strip(),
         prefixes = raw.get("prefixes", []) or [],
         auth_email = raw.get("auth_email", "golden@local"),
