@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import Dict, Iterable, List, Sequence, Tuple
 
+from dateutil.relativedelta import relativedelta
+
 
 @dataclass
 class BuiltSQL:
@@ -130,7 +132,7 @@ def sql_status_totals_for_entity_no(entity_no: str) -> BuiltSQL:
         'FROM "Contract"\n'
         "WHERE ENTITY_NO = :entity_no\n"
         "GROUP BY CONTRACT_STATUS\n"
-        "ORDER BY TOTAL_GROSS DESC"
+        "ORDER BY CONTRACT_COUNT DESC"
     )
     return BuiltSQL(sql=sql, binds={"entity_no": entity_no})
 
@@ -316,17 +318,23 @@ def sql_duration_mismatch_12m() -> BuiltSQL:
 
 
 def sql_yoy(ds: date, de: date) -> BuiltSQL:
+    prev_start = ds - relativedelta(years=1)
+    prev_end = de - relativedelta(years=1)
+    current_overlap = overlap_predicate(":ds", ":de")
+    previous_overlap = overlap_predicate(":p_ds", ":p_de")
     sql = (
         f"SELECT 'CURRENT' AS PERIOD_LABEL, SUM({gross_expr()}) AS TOTAL_GROSS\n"
         'FROM "Contract"\n'
-        "WHERE "
-        + request_date_between()
-        + "\nUNION ALL\n"
+        f"WHERE {current_overlap}\n"
+        "UNION ALL\n"
         f"SELECT 'PRIOR' AS PERIOD_LABEL, SUM({gross_expr()}) AS TOTAL_GROSS\n"
         'FROM "Contract"\n'
-        "WHERE REQUEST_DATE BETWEEN ADD_MONTHS(:date_start, -12) AND ADD_MONTHS(:date_end, -12)"
+        f"WHERE {previous_overlap}"
     )
-    return BuiltSQL(sql=sql, binds={"date_start": ds, "date_end": de})
+    return BuiltSQL(
+        sql=sql,
+        binds={"ds": ds, "de": de, "p_ds": prev_start, "p_de": prev_end},
+    )
 
 
 def sql_status_in_gross_threshold(statuses: Sequence[str], gross_min: float) -> BuiltSQL:

@@ -42,6 +42,8 @@ _RE_NEXT_N_DAYS = re.compile(r"\bnext\s+(\d+|\w+)\s+days\b", re.I)
 _RE_LAST_MONTH = re.compile(r"\blast\s+month\b", re.I)
 _RE_LAST_N_MONTHS = re.compile(r"\blast\s+(\d+)\s+months?\b", re.I)
 _RE_LAST_QUARTER = re.compile(r"\blast\s+quarter\b", re.I)
+_RE_YEAR_IN = re.compile(r"\bin\s+(20\d{2})\b", re.I)
+_RE_REQUEST_TYPE = re.compile(r"\brequest[_\s]?type\b", re.I)
 
 
 _VALUE_NET = "NVL(CONTRACT_VALUE_NET_OF_VAT,0)"
@@ -179,6 +181,9 @@ def parse_intent_dw(q: str, *, today: Optional[date] = None) -> DWIntent:
         intent.explicit_dates = _next_n_days(today, days)
         intent.has_time_window = True
 
+    if intent.date_column != "END_DATE" and _RE_REQUEST_TYPE.search(text):
+        intent.date_column = "REQUEST_DATE"
+
     if intent.explicit_dates is None:
         if _RE_LAST_MONTH.search(text):
             intent.explicit_dates = _last_month(today)
@@ -199,6 +204,18 @@ def parse_intent_dw(q: str, *, today: Optional[date] = None) -> DWIntent:
             if days is not None:
                 intent.explicit_dates = _next_n_days(today, days)
                 intent.has_time_window = True
+
+    if intent.explicit_dates is None:
+        match_year = _RE_YEAR_IN.search(text)
+        if match_year:
+            year = int(match_year.group(1))
+            intent.explicit_dates = {
+                "start": _iso(date(year, 1, 1)),
+                "end": _iso(date(year, 12, 31)),
+            }
+            intent.has_time_window = True
+            if intent.date_column in (None, DEFAULT_DATE_COL):
+                intent.date_column = "REQUEST_DATE"
 
     if intent.date_column is None:
         intent.date_column = DEFAULT_DATE_COL
