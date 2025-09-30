@@ -11,6 +11,13 @@ cases:
         - 'CONTRACT_STATUS'
       must_not: []
 
+  - id: request_type_synonym_filter
+    question: "Show contracts where REQUEST TYPE = Renewal"
+    expect:
+      contains:
+        - 'WHERE (UPPER(TRIM(REQUEST_TYPE))'
+        - 'ORDER BY REQUEST_DATE DESC'
+
   - id: top10_value_last_month
     question: "top 10 contracts by contract value last month"
     expect:
