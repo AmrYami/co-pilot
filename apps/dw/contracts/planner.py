@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import re
 from datetime import date
 from typing import Dict, List, Optional, Tuple
 
 from .intent import DWIntent
+from .enums import load_enum_synonyms
 from .sql_builder import attach_where_clause, build_where_from_filters
 
 DIMENSIONS_ALLOWED = {"OWNER_DEPARTMENT", "DEPARTMENT_OUL", "ENTITY_NO", "ENTITY"}
@@ -41,6 +43,68 @@ def _apply_sort_asc_if_bottom(intent: DWIntent, default_desc: bool) -> bool:
     if intent.is_bottom:
         return False
     return default_desc
+
+
+def _extract_request_type_value(question: str) -> Optional[str]:
+    """Detect explicit REQUEST TYPE value in the free-form question."""
+
+    if not question:
+        return None
+    match = re.search(
+        r"(?i)\bREQUEST[\s_\-]*TYPE\b\s*(?:=|:|is)?\s*['\"]?([A-Za-z][\w\s/\-]{0,64})",
+        question,
+    )
+    if not match:
+        return None
+    value = match.group(1).strip()
+    return value or None
+
+
+def _build_request_type_predicate(
+    value: str, settings_get
+) -> Tuple[Optional[str], Dict[str, object]]:
+    """Build a predicate for REQUEST_TYPE using DW_ENUM_SYNONYMS when available."""
+
+    token = (value or "").strip()
+    if not token:
+        return None, {}
+
+    synonyms = load_enum_synonyms(settings_get, table="Contract", column="REQUEST_TYPE")
+    rules = synonyms.get(token.lower()) if synonyms else None
+
+    fragments: List[str] = []
+    binds: Dict[str, object] = {}
+    idx = 0
+
+    if rules:
+        for eq in rules.get("equals", []) or []:
+            if not eq:
+                continue
+            key = f"reqtype_eq_{idx}"
+            idx += 1
+            binds[key] = eq
+            fragments.append(f"UPPER(TRIM(REQUEST_TYPE)) = UPPER(:{key})")
+        for pref in rules.get("prefix", []) or []:
+            if not pref:
+                continue
+            key = f"reqtype_px_{idx}"
+            idx += 1
+            binds[key] = f"{pref}%"
+            fragments.append(f"UPPER(TRIM(REQUEST_TYPE)) LIKE UPPER(:{key})")
+        for sub in rules.get("contains", []) or []:
+            if not sub:
+                continue
+            key = f"reqtype_ct_{idx}"
+            idx += 1
+            binds[key] = f"%{sub}%"
+            fragments.append(f"UPPER(TRIM(REQUEST_TYPE)) LIKE UPPER(:{key})")
+
+    key = f"reqtype_like_{idx}"
+    binds[key] = f"%{token}%"
+    fragments.append(f"UPPER(TRIM(REQUEST_TYPE)) LIKE UPPER(:{key})")
+
+    clause = "(" + " OR ".join(fragments) + ")" if fragments else None
+    return clause, binds
 
 
 def build_owner_vs_oul_mismatch_sql() -> str:
@@ -98,6 +162,15 @@ def build_sql(intent: DWIntent) -> Tuple[str, Dict[str, object], Dict[str, objec
         for f in (filters_raw or [])
     ) and filters_applied
 
+    request_type_detected = False
+    explicit_request = _extract_request_type_value(intent.question or "")
+    if explicit_request and not request_type_applied:
+        clause, rt_binds = _build_request_type_predicate(explicit_request, settings_get)
+        if clause:
+            where_parts.append(clause)
+            binds.update(rt_binds)
+            request_type_detected = True
+
     measure = intent.measure_sql or "NVL(CONTRACT_VALUE_NET_OF_VAT,0)"
 
     q_lower = (intent.question or "").lower()
@@ -113,6 +186,8 @@ def build_sql(intent: DWIntent) -> Tuple[str, Dict[str, object], Dict[str, objec
         where_parts.append(where_sql)
     if window_kind:
         meta["window_kind"] = window_kind
+
+    request_type_applied = request_type_applied or request_type_detected
 
     if intent.group_by is None:
         sort_desc = _apply_sort_asc_if_bottom(intent, default_desc=True)
@@ -130,7 +205,7 @@ def build_sql(intent: DWIntent) -> Tuple[str, Dict[str, object], Dict[str, objec
         if filters_applied:
             binds.update(filter_binds)
 
-        if filters_applied and not intent.has_time_window:
+        if (filters_applied or request_type_applied) and not intent.has_time_window:
             order_sql = "ORDER BY REQUEST_DATE DESC"
         else:
             order_sql = f"ORDER BY {measure} {'DESC' if sort_desc else 'ASC'}"
