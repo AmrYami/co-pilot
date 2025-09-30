@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from datetime import date
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, List, Optional, Tuple
 
 
 @dataclass
@@ -40,6 +40,24 @@ _DIMENSION_PATTERNS: Dict[str, str] = {
     r"(entity_no|entity\s*no|entityno)": "ENTITY_NO",
     r"\bentity\b": "ENTITY",
 }
+
+_DIRECT_EQ_PATTERNS: Tuple[Tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"\bREQUEST\s*TYPE\s*=\s*([\"']?)([A-Za-z0-9 _\-]+)\1", re.IGNORECASE), "REQUEST_TYPE"),
+)
+
+
+def _extract_direct_equality_filters(q: str) -> List[Tuple[str, str]]:
+    """Return list of (column, value) for simple equality phrases in the question."""
+    results: List[Tuple[str, str]] = []
+    if not q:
+        return results
+    for pattern, column in _DIRECT_EQ_PATTERNS:
+        match = pattern.search(q)
+        if match:
+            value = match.group(2).strip()
+            if value:
+                results.append((column, value))
+    return results
 
 
 def parse_intent(question: str) -> DWIntent:
@@ -114,23 +132,18 @@ def parse_intent(question: str) -> DWIntent:
     elif re.search(r"\blast\s+\d+\s+months\b", lowered):
         intent.has_time_window = True
 
-    # Explicit REQUEST_TYPE filters
-    req_match = re.search(r"\bREQUEST\s*TYPE\s*=\s*(['\"]?)([A-Za-z0-9 _-]+)\1", q, flags=re.IGNORECASE)
-    if req_match:
-        raw = req_match.group(2).strip()
-        lowered_raw = raw.lower()
-        if lowered_raw.startswith("renew"):
-            like_val = "%renew%"
-        else:
-            like_val = f"%{lowered_raw}%"
-        intent.extra_filters.append(
-            {
-                "col": "REQUEST_TYPE",
-                "op": "like_ci",
-                "bind": "req_like",
-                "value": like_val,
-            }
-        )
+    direct_eq = _extract_direct_equality_filters(q)
+    if direct_eq:
+        for idx, (column, value) in enumerate(direct_eq, start=1):
+            bind_name = f"eq_{column.lower()}_{idx}"
+            intent.extra_filters.append(
+                {
+                    "col": column,
+                    "op": "eq_ci",
+                    "bind": bind_name,
+                    "value": value,
+                }
+            )
     elif re.search(r"\brenew(al|ed)?\b", q, flags=re.IGNORECASE):
         intent.extra_filters.append(
             {
