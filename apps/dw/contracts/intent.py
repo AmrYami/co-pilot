@@ -7,6 +7,8 @@ from dataclasses import dataclass, field
 from datetime import date
 from typing import Any, Dict, List, Optional, Tuple
 
+from .contract_intent import apply_contract_filters_from_text
+
 
 @dataclass
 class DWIntent:
@@ -28,6 +30,7 @@ class DWIntent:
     is_bottom: bool = False
     by_dimension_hint: Optional[str] = None
     extra_filters: List[Dict[str, Any]] = field(default_factory=list)
+    filters: List[Dict[str, Any]] = field(default_factory=list)
 
 
 _BOTTOM_RE = re.compile(r"\b(bottom|lowest|least|smallest|min)\b", re.I)
@@ -153,5 +156,7 @@ def parse_intent(question: str) -> DWIntent:
                 "value": "%renew%",
             }
         )
+
+    apply_contract_filters_from_text(intent)
 
     return intent

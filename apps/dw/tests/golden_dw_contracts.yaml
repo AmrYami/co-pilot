@@ -459,16 +459,17 @@ cases:
         - 'SUM(NVL(CONTRACT_VALUE_NET_OF_VAT,0)'
         - 'ORDER BY MEASURE ASC'
 
-  - question: "Show contracts where REQUEST TYPE = Renewal"
-    expect_contains:
-      - 'FROM "Contract"'
-      - 'UPPER(TRIM(REQUEST_TYPE)) LIKE UPPER(:rt_0)'
-      - 'ORDER BY REQUEST_DATE DESC'
+  - id: request_type_enum_filter
+    question: "Show contracts where REQUEST TYPE = Renewal"
     expect:
+      sql_like:
+        - 'FROM "Contract"'
+        - 'WHERE'
+        - 'REQUEST_TYPE'
+        - 'ORDER BY REQUEST_DATE DESC'
+        - ':rt_0'
       must_not:
         - 'FETCH FIRST'
-    meta:
-      explain_like: 'Applied REQUEST_TYPE filter'
 
   - question: "Total gross value per DEPARTMENT_OUL last quarter"
     expect_sql:
