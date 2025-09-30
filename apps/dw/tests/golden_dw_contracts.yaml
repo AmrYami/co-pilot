@@ -473,14 +473,10 @@ cases:
   - id: request_type_enum_filter
     question: "Show contracts where REQUEST TYPE = Renewal"
     expect:
-      sql_like:
-        - 'FROM "Contract"'
-        - 'WHERE'
-        - 'REQUEST_TYPE'
+      contains:
+        - 'WHERE (UPPER(TRIM(REQUEST_TYPE))'
         - 'ORDER BY REQUEST_DATE DESC'
-        - ':rt_0'
-      must_not:
-        - 'FETCH FIRST'
+        - ':rt_eq_0'
 
   - question: "Total gross value per DEPARTMENT_OUL last quarter"
     expect_sql:

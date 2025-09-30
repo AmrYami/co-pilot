@@ -53,7 +53,8 @@ except Exception:  # pragma: no cover - fallback for tests
 from core.inquiries import create_or_update_inquiry
 
 from apps.dw.rate_hints import append_where, parse_rate_hints, replace_or_add_order_by
-from apps.dw.tables.contracts import plan_sql
+from apps.dw.tables.contracts import build_contract_sql
+from apps.mem.kv import get_settings_for_namespace
 from .contracts.contract_common import build_fts_clause
 from .contracts.filters import parse_explicit_filters
 from .contracts.contract_planner import plan_contract_query
@@ -195,6 +196,17 @@ def _json_safe_binds(binds: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     return safe
 
 
+def _plan_contract_sql(
+    question: str,
+    namespace: str,
+    *,
+    today: date | None = None,
+) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
+    settings = get_settings_for_namespace(namespace)
+    sql, binds, meta = build_contract_sql(question, settings or {}, today=today)
+    return sql, binds, meta
+
+
 def derive_sql_for_test(
     question: str,
     namespace: str = "dw::common",
@@ -206,7 +218,7 @@ def derive_sql_for_test(
     sql: str = ""
     binds: Dict[str, Any] = {}
     try:
-        sql, base_binds, _ = plan_sql(question, today=date.today())
+        sql, base_binds, _ = _plan_contract_sql(question, namespace, today=date.today())
         binds.update(base_binds or {})
     except Exception:  # pragma: no cover - defensive fallback for optional planner
         sql = ""
@@ -486,7 +498,12 @@ def answer():
     auth_email = payload.get("auth_email") or None
     full_text_search = bool(payload.get("full_text_search") or False)
 
-    contract_sql, contract_binds, contract_meta = plan_sql(question, today=date.today())
+    namespace = (payload.get("namespace") or "dw::common").strip() or "dw::common"
+    contract_sql, contract_binds, contract_meta = _plan_contract_sql(
+        question,
+        namespace,
+        today=date.today(),
+    )
     if contract_sql:
         binds = _coerce_bind_dates(dict(contract_binds or {}))
         if ":top_n" in contract_sql and "top_n" not in binds:
