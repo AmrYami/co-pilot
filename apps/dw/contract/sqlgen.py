@@ -122,11 +122,12 @@ def vat_zero_net_positive() -> str:
 
 
 def requested_type_in_year(req_type_literal: str = "Renewal") -> str:
+    _ = req_type_literal  # retained for compatibility; value bound separately
     return (
         'SELECT *\n'
         'FROM "Contract"\n'
-        f"WHERE REQUEST_TYPE = '{req_type_literal}' "
-        f"AND {where_requested_window()}\n"
+        f"WHERE {where_requested_window()}\n"
+        '  AND UPPER(REQUEST_TYPE)=UPPER(:req_type)\n'
         'ORDER BY REQUEST_DATE DESC'
     )
 

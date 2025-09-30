@@ -354,8 +354,23 @@ def _normalize_sql(s: str) -> str:
     return s.lower()
 
 
-def _contains_any(sql: str, patterns: Iterable[str]) -> bool:
-    return any(re.search(p, sql, flags=re.I) for p in patterns)
+def _norm(s: str) -> str:
+    """Normalize string for tolerant comparisons (whitespace + casing)."""
+    return re.sub(r"\s+", " ", (s or "")).strip().upper()
+
+
+def _contains(sql: str, fragment: str) -> bool:
+    if not fragment:
+        return False
+    return _norm(fragment) in _norm(sql)
+
+
+def _contains_any(sql: str, fragments: Iterable[str]) -> bool:
+    norm_sql = _norm(sql)
+    for frag in fragments:
+        if frag and _norm(frag) in norm_sql:
+            return True
+    return False
 
 
 def _canon_ws(s: str) -> str:
@@ -392,6 +407,8 @@ class GoldenCase:
     expect_agg: Optional[str] = None       # e.g. "count", "sum"
     expect_top_n: Optional[int] = None
     assertions: Dict[str, Any] = field(default_factory=dict)
+    assert_all_of: List[str] = field(default_factory=list)
+    assert_any_of: List[str] = field(default_factory=list)
 
 def _load_yaml(path: Path) -> Dict[str, Any]:
     try:
@@ -424,7 +441,7 @@ def _flatten(s: str) -> str:
 def _must_contain(sql: str, frag: str, reasons: List[str]) -> None:
     if not frag:
         return
-    if _flatten(frag) not in _flatten(sql):
+    if not _contains(sql, frag):
         reasons.append(f"SQL does not contain expected fragment: {frag}")
 
 
@@ -441,48 +458,45 @@ def assert_order_direction(sql: str, expect_desc: bool, reasons: List[str]) -> N
 
 def _contains_all(sql: str, fragments: List[str]) -> List[str]:
     """Return list of missing fragments after normalization; empty list means all found."""
-    sql_norm = _normalize_sql(sql)
-    sql_ws = _canon_ws(sql).lower()
     missing: List[str] = []
+    sql_norm = _norm(sql)
     for frag in fragments:
-        frag_norm = _normalize_sql(frag)
-        frag_ws = _canon_ws(frag).lower()
+        frag_norm = _norm(frag)
         if not frag_norm:
             continue
-        if frag_norm == "order by measure desc":
-            alias_pattern = "|".join(alias.lower() for alias in MEASURE_ALIASES)
-            pattern = rf"order\s+by\s+({alias_pattern})\s+desc"
-            if not re.search(pattern, sql_norm, flags=re.I):
+        if frag_norm == _norm("ORDER BY MEASURE DESC"):
+            candidates = [f"ORDER BY {alias} DESC" for alias in MEASURE_ALIASES]
+            if not _contains_any(sql, candidates):
                 missing.append(frag)
             continue
-        match = re.match(r"fetch\s+first\s+(\d+)\s+rows\s+only", frag_norm, flags=re.I)
+        match = re.match(r"FETCH\s+FIRST\s+(\d+)\s+ROWS\s+ONLY", frag_norm, flags=re.I)
         if match:
             n = match.group(1)
             candidates = [
-                rf"fetch\s+first\s+{n}\s+rows\s+only",
-                r"fetch\s+first\s+:top_n\s+rows\s+only",
+                f"FETCH FIRST {n} ROWS ONLY",
+                "FETCH FIRST :top_n ROWS ONLY",
             ]
             if not _contains_any(sql, candidates):
                 missing.append(f"FETCH FIRST {n} ROWS ONLY")
             continue
-        if "request_date between :date_start and :date_end" in frag_norm:
+        if _norm("REQUEST_DATE BETWEEN :date_start AND :date_end") in frag_norm:
             patterns = [
-                rf"request_date\s+between\s+{ds}\s+and\s+{de}" for ds in DATE_START_SYNS for de in DATE_END_SYNS
+                f"REQUEST_DATE BETWEEN {ds} AND {de}" for ds in DATE_START_SYNS for de in DATE_END_SYNS
             ]
             if not _contains_any(sql, patterns):
                 missing.append(frag)
             continue
-        if "start_date <= :date_end" in frag_norm:
-            patterns = [rf"start_date\s*<=\s*{de}" for de in DATE_END_SYNS]
+        if _norm("START_DATE <= :date_end") in frag_norm:
+            patterns = [f"START_DATE <= {de}" for de in DATE_END_SYNS]
             if not _contains_any(sql, patterns):
                 missing.append(frag)
             continue
-        if "end_date >= :date_start" in frag_norm:
-            patterns = [rf"end_date\s*>=\s*{ds}" for ds in DATE_START_SYNS]
+        if _norm("END_DATE >= :date_start") in frag_norm:
+            patterns = [f"END_DATE >= {ds}" for ds in DATE_START_SYNS]
             if not _contains_any(sql, patterns):
                 missing.append(frag)
             continue
-        if frag_norm not in sql_norm and frag_ws not in sql_ws:
+        if frag_norm not in sql_norm:
             missing.append(frag)
     return missing
 
@@ -582,6 +596,7 @@ def _ensure_str_list(value: Any) -> List[str]:
 
 def _hydrate_case(raw: Dict[str, Any]) -> GoldenCase:
     expect = raw.get("expect") or {}
+    assert_contains = _ensure_str_list(raw.get("assert_contains"))
     return GoldenCase(
         question = raw.get("question", "").strip(),
         namespace = (raw.get("namespace") or DEFAULT_NS).strip(),
@@ -601,6 +616,8 @@ def _hydrate_case(raw: Dict[str, Any]) -> GoldenCase:
         expect_agg = raw.get("expect_agg"),
         expect_top_n = raw.get("expect_top_n"),
         assertions = raw.get("assertions") or {},
+        assert_all_of = _ensure_str_list(raw.get("assert_all_of")) + assert_contains,
+        assert_any_of = _ensure_str_list(raw.get("assert_any_of")),
     )
 
 def _check_expectations(case: GoldenCase, resp: Dict[str, Any]) -> Tuple[bool, List[str]]:
@@ -612,10 +629,15 @@ def _check_expectations(case: GoldenCase, resp: Dict[str, Any]) -> Tuple[bool, L
     intent = ((resp or {}).get("debug") or {}).get("intent") or meta.get("clarifier_intent") or {}
 
     # 1) sql contains
-    missing_fragments = _contains_all(sql, case.expect_sql_contains)
+    required_fragments = case.expect_sql_contains + case.assert_all_of
+    missing_fragments = _contains_all(sql, required_fragments)
     if missing_fragments:
         ok = False
         reasons.extend([f"SQL does not contain expected fragment: {frag}" for frag in missing_fragments])
+
+    if case.assert_any_of and not _contains_any(sql, case.assert_any_of):
+        ok = False
+        reasons.append(f"SQL missing any-of: {case.assert_any_of}")
 
     sql_dense = _dense(sql)
     for frag in case.expect_sql_not_contains:

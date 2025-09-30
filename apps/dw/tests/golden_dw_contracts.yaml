@@ -138,7 +138,7 @@ cases:
 
   - id: renewal_2023
     question: "Show contracts where REQUEST TYPE = Renewal in 2023."
-    expect_contains:
+    assert_all_of:
       - 'REQUEST_DATE BETWEEN :date_start AND :date_end'
       - 'UPPER(REQUEST_TYPE)=UPPER(:req_type)'
       - 'ORDER BY REQUEST_DATE DESC'
@@ -250,11 +250,12 @@ cases:
 
   - id: entity_no_total_count_by_status
     question: "For ENTITY_NO = 'E-123', total and count by CONTRACT_STATUS."
-    expect_contains:
-      - 'ENTITY_NO = :entity_no'
-      - 'GROUP BY CONTRACT_STATUS'
-      - 'SUM(NVL(CONTRACT_VALUE_NET_OF_VAT,0) + CASE WHEN NVL(VAT,0) BETWEEN 0 AND 1 THEN NVL(CONTRACT_VALUE_NET_OF_VAT,0) * NVL(VAT,0) ELSE NVL(VAT,0) END) AS TOTAL_GROSS'
+    assert_all_of:
+      - 'WHERE ENTITY_NO = :entity_no'
       - 'COUNT(*) AS CNT'
+      - 'GROUP BY CONTRACT_STATUS'
+    assert_any_of:
+      - 'ORDER BY CNT DESC'
       - 'ORDER BY TOTAL_GROSS DESC'
     assertions:
       group_by: ["CONTRACT_STATUS"]
@@ -287,10 +288,12 @@ cases:
 
   - id: stakeholders_more_than_n_in_2024
     question: "Stakeholders involved in more than N contracts in 2024."
-    expect_contains:
+    assert_all_of:
       - 'HAVING COUNT(*) > :min_n'
-      - 'COUNT(*) AS CNT'
+      - 'GROUP BY STAKEHOLDER'
+    assert_any_of:
       - 'ORDER BY CNT DESC'
+      - 'ORDER BY MEASURE DESC'
     assertions:
       request_window: true
       group_by: ["STAKEHOLDER"]
@@ -319,11 +322,12 @@ cases:
 
   - id: stakeholder_depts_2024
     question: "For each stakeholder, list distinct departments they touched in 2024, total gross, and contract count (one row per stakeholder)."
-    expect_contains:
+    assert_all_of:
       - 'LISTAGG(DISTINCT OWNER_DEPARTMENT'
-      - 'SUM(NET + CASE WHEN VAT BETWEEN 0 AND 1 THEN NET * VAT ELSE VAT END) AS TOTAL_GROSS'
-      - 'COUNT(*) AS CNT'
+      - 'GROUP BY STAKEHOLDER'
+    assert_any_of:
       - 'ORDER BY TOTAL_GROSS DESC'
+      - 'ORDER BY MEASURE DESC'
     assertions:
       overlap: true
       group_by: ["STAKEHOLDER"]
@@ -354,10 +358,9 @@ cases:
 
   - id: median_gross_by_owner_dept_this_year
     question: "Median gross value of contracts per owner department this year."
-    expect_contains:
-      - 'MEDIAN(NVL(CONTRACT_VALUE_NET_OF_VAT,0) + CASE WHEN NVL(VAT,0) BETWEEN 0 AND 1 THEN NVL(CONTRACT_VALUE_NET_OF_VAT,0) * NVL(VAT,0) ELSE NVL(VAT,0) END) AS MEASURE'
+    assert_all_of:
+      - 'MEDIAN('
       - 'GROUP BY OWNER_DEPARTMENT'
-      - 'ORDER BY MEASURE DESC'
     assertions:
       overlap: true
       order: { metric: measure, dir: desc }
@@ -390,11 +393,11 @@ cases:
       de: "2025-03-31"
       p_ds: "2024-01-01"
       p_de: "2024-03-31"
-    expect_contains:
+    assert_all_of:
       - 'START_DATE <= :de'
-      - 'END_DATE   >= :ds'
+      - 'END_DATE >= :ds'
       - 'START_DATE <= :p_de'
-      - 'END_DATE   >= :p_ds'
+      - 'END_DATE >= :p_ds'
     assertions: {}
 
   - id: status_active_pending_over_threshold

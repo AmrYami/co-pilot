@@ -127,6 +127,7 @@ def build_sql_for_question(q: str) -> Tuple[str, Dict[str, Any], str]:
     if ci.action == "reqtype_year":
         year = ci.year_literal or 2023
         explain_parts.append(f"Filter: REQUEST_TYPE = 'Renewal'; window = year {year}.")
+        binds["req_type"] = "Renewal"
         return sqlgen.requested_type_in_year("Renewal"), binds, " ".join(explain_parts)
 
     if ci.action == "entity_counts":
