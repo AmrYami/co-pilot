@@ -118,7 +118,16 @@ def run_attempt(
     }
 
     if sql and rate_comment and rate_comment.strip():
-        hints = parse_rate_hints(rate_comment)
+        getter = None
+        app_config = getattr(app, "config", {}) if app else {}
+        pipeline = None
+        if hasattr(app_config, "get"):
+            pipeline = app_config.get("PIPELINE") or app_config.get("pipeline")
+        elif isinstance(app_config, dict):
+            pipeline = app_config.get("PIPELINE") or app_config.get("pipeline")
+        settings_obj = getattr(pipeline, "settings", None) if pipeline else None
+        getter = getattr(settings_obj, "get_json", None) if settings_obj else None
+        hints = parse_rate_hints(rate_comment, getter)
         if hints.where_sql:
             sql = append_where(sql, hints.where_sql)
             binds.update(hints.where_binds)

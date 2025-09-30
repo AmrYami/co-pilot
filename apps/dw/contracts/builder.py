@@ -4,7 +4,10 @@ from datetime import date, datetime
 from typing import Dict, Tuple, Optional, List
 
 from .rules_extra import try_build_special_cases
-from apps.dw.domain.synonyms import build_synonym_filter_sql
+from apps.dw.contracts.synonyms import (
+    build_request_type_filter_sql,
+    get_request_type_synonyms,
+)
 
 # NOTE: Keep this module strictly table-specific (Contract).
 #       Cross-table / DocuWare-generic helpers should live elsewhere.
@@ -45,7 +48,9 @@ def build_sql_with_reqtype_filter(
     where_parts: list[str],
     binds: Dict[str, object],
     question_text: str,
-    enum_synonyms_cfg: Optional[Dict] = None,
+    *,
+    settings_get_json=None,
+    synonyms_override: Optional[Dict[str, List[str]]] = None,
 ) -> Tuple[Optional[str], Optional[Dict[str, object]]]:
     """
     If question asks for REQUEST TYPE = <value>, append a synonym-aware filter and
@@ -56,12 +61,15 @@ def build_sql_with_reqtype_filter(
         # No explicit REQUEST TYPE filter in the question
         return None, None  # signal no change
 
+    synonyms_map = synonyms_override if isinstance(synonyms_override, dict) else None
+    if not synonyms_map:
+        synonyms_map = get_request_type_synonyms(settings_get_json)
+
     # Build synonym-aware predicate
-    pred, more_binds = build_synonym_filter_sql(
-        column_sql=REQUEST_TYPE_COL_SQL,
-        user_value=val,
-        table_col=REQUEST_TYPE_TABLECOL,
-        cfg=enum_synonyms_cfg,
+    pred, more_binds = build_request_type_filter_sql(
+        val,
+        synonyms_map,
+        use_like=True,
         bind_prefix="reqtype",
     )
     where_parts.append(pred)
@@ -418,17 +426,11 @@ def build_contracts_sql(
         else:
             where_parts.append(f"{col} = :{bind_name}")
 
-    enum_synonyms_cfg = intent.get("enum_synonyms_cfg")
-    if enum_synonyms_cfg is not None and not isinstance(enum_synonyms_cfg, dict):
-        enum_synonyms_cfg = None
-    if enum_synonyms_cfg is None:
-        settings_obj = intent.get("settings")
-        getter = getattr(settings_obj, "get_json", None) if settings_obj else None
-        if callable(getter):
-            try:
-                enum_synonyms_cfg = getter("DW_ENUM_SYNONYMS", default=None, scope="namespace")
-            except TypeError:
-                enum_synonyms_cfg = getter("DW_ENUM_SYNONYMS", default=None)
+    settings_obj = intent.get("settings")
+    settings_get_json = getattr(settings_obj, "get_json", None) if settings_obj else None
+    synonyms_override = intent.get("request_type_synonyms")
+    if not isinstance(synonyms_override, dict):
+        synonyms_override = None
 
     base_select = f'SELECT * FROM "{table}"'
     reqtype_sql, _ = build_sql_with_reqtype_filter(
@@ -436,7 +438,8 @@ def build_contracts_sql(
         where_parts=where_parts,
         binds=binds,
         question_text=q_text,
-        enum_synonyms_cfg=enum_synonyms_cfg,
+        settings_get_json=settings_get_json,
+        synonyms_override=synonyms_override,
     )
     reqtype_filter_applied = bool(reqtype_sql)
 

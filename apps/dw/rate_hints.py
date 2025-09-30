@@ -1,5 +1,10 @@
 import re
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
+
+from apps.dw.contracts.synonyms import (
+    build_request_type_filter_sql,
+    get_request_type_synonyms,
+)
 
 
 class RateHints:
@@ -145,7 +150,7 @@ def replace_or_add_order_by(sql: str, order_by_sql: str) -> str:
     return sql[:ob_pos] + " " + order_by_sql + "\n" + sql[fetch_pos:]
 
 
-def parse_rate_hints(comment: Optional[str]) -> RateHints:
+def parse_rate_hints(comment: Optional[str], settings_get_json=None) -> RateHints:
     """
     Parse micro-language in /dw/rate comment. Examples:
       filter: REQUEST_TYPE ~ renew; order_by: REQUEST_DATE desc;
@@ -163,6 +168,8 @@ def parse_rate_hints(comment: Optional[str]) -> RateHints:
     where_clauses: List[str] = []
     binds: Dict[str, object] = {}
     bind_idx = 0
+    reqtype_synonyms: Optional[Dict[str, List[str]]] = None
+    reqtype_filter_count = 0
 
     def new_bind(val):
         nonlocal bind_idx
@@ -170,6 +177,19 @@ def parse_rate_hints(comment: Optional[str]) -> RateHints:
         bind_idx += 1
         binds[k] = val
         return k
+
+    def ensure_reqtype_synonyms() -> Dict[str, List[str]]:
+        nonlocal reqtype_synonyms
+        if reqtype_synonyms is None:
+            reqtype_synonyms = get_request_type_synonyms(settings_get_json)
+        return reqtype_synonyms
+
+    def apply_reqtype_filter(val: str) -> Tuple[str, Dict[str, object]]:
+        nonlocal reqtype_filter_count
+        syn_map = ensure_reqtype_synonyms()
+        prefix = f"rh_reqtype{reqtype_filter_count}"
+        reqtype_filter_count += 1
+        return build_request_type_filter_sql(val, syn_map, use_like=True, bind_prefix=prefix)
 
     def parse_filter(expr: str):
         """
@@ -247,8 +267,13 @@ def parse_rate_hints(comment: Optional[str]) -> RateHints:
             col = _canon_col(col_raw) or _canon_col(col_raw.replace(" ", "_"))
             if not col:
                 return
-            bk = new_bind(f"%{val_raw}%")
-            where_clauses.append(f"UPPER({col}) LIKE UPPER(:{bk})")
+            if col == "REQUEST_TYPE":
+                frag, extra_binds = apply_reqtype_filter(val_raw)
+                where_clauses.append(frag)
+                binds.update(extra_binds)
+            else:
+                bk = new_bind(f"%{val_raw}%")
+                where_clauses.append(f"UPPER({col}) LIKE UPPER(:{bk})")
             return
 
         # equality / inequality
@@ -258,11 +283,16 @@ def parse_rate_hints(comment: Optional[str]) -> RateHints:
             col = _canon_col(col_raw) or _canon_col(col_raw.replace(" ", "_"))
             if not col:
                 return
-            bk = new_bind(val_raw)
-            if op == "!=":
-                where_clauses.append(f"UPPER({col}) <> UPPER(:{bk})")
+            if col == "REQUEST_TYPE" and op != "!=":
+                frag, extra_binds = apply_reqtype_filter(val_raw)
+                where_clauses.append(frag)
+                binds.update(extra_binds)
             else:
-                where_clauses.append(f"UPPER({col}) = UPPER(:{bk})")
+                bk = new_bind(val_raw)
+                if op == "!=":
+                    where_clauses.append(f"UPPER({col}) <> UPPER(:{bk})")
+                else:
+                    where_clauses.append(f"UPPER({col}) = UPPER(:{bk})")
             return
 
     for p in parts:
