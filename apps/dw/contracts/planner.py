@@ -9,6 +9,8 @@ from typing import Dict, List, Optional, Tuple
 from .intent import DWIntent
 from .enums import load_enum_synonyms
 from .sql_builder import attach_where_clause, build_where_from_filters
+from apps.dw.contracts.eq_filters import detect_explicit_equality_filters
+from apps.settings import get_setting_json
 
 DIMENSIONS_ALLOWED = {"OWNER_DEPARTMENT", "DEPARTMENT_OUL", "ENTITY_NO", "ENTITY"}
 
@@ -151,8 +153,59 @@ def build_sql(intent: DWIntent) -> Tuple[str, Dict[str, object], Dict[str, objec
     where_parts: List[str] = []
 
     settings_get = None
+    namespace = "dw::common"
     if isinstance(intent.notes, dict):
         settings_get = intent.notes.get("settings_get_json")
+        ns_raw = intent.notes.get("namespace")
+        if isinstance(ns_raw, str) and ns_raw.strip():
+            namespace = ns_raw.strip()
+
+    def _load_setting(key: str, default):
+        if callable(settings_get):
+            for kwargs in ({"default": default, "scope": "namespace"}, {"default": default}, {}):
+                try:
+                    value = settings_get(key, **kwargs)
+                except TypeError:
+                    continue
+                if value is not None:
+                    return value
+        try:
+            return get_setting_json(namespace, key, default)
+        except Exception:
+            return default
+
+    def _ensure_list(value) -> List[str]:
+        if isinstance(value, (list, tuple, set)):
+            items: List[str] = []
+            for v in value:
+                if v is None:
+                    continue
+                text = str(v).strip()
+                if text:
+                    items.append(text.upper())
+            return items
+        if isinstance(value, str):
+            return [part.strip().upper() for part in value.split(",") if part.strip()]
+        return []
+
+    def _normalize_explicit_setting(value):
+        if isinstance(value, dict):
+            normalized: Dict[str, List[str]] = {}
+            for key, arr in value.items():
+                normalized[str(key)] = _ensure_list(arr)
+            return normalized
+        return _ensure_list(value)
+
+    explicit_cols_setting = _normalize_explicit_setting(
+        _load_setting("DW_EXPLICIT_FILTER_COLUMNS", []) or []
+    )
+    fts_setting_raw = _load_setting("DW_FTS_COLUMNS", {}) or {}
+    fts_setting = (
+        {str(k): _ensure_list(v) for k, v in fts_setting_raw.items()}
+        if isinstance(fts_setting_raw, dict)
+        else _ensure_list(fts_setting_raw)
+    )
+    enum_syn_setting = _load_setting("DW_ENUM_SYNONYMS", {}) or {}
 
     filters_raw = getattr(intent, "filters", None) or []
     filter_fragments, filter_binds = build_where_from_filters(settings_get, filters_raw)
@@ -189,6 +242,18 @@ def build_sql(intent: DWIntent) -> Tuple[str, Dict[str, object], Dict[str, objec
 
     request_type_applied = request_type_applied or request_type_detected
 
+    eq_where, eq_binds, eq_suggested_order = detect_explicit_equality_filters(
+        intent.question or "",
+        table="Contract",
+        explicit_cols_setting=explicit_cols_setting,
+        fts_setting=fts_setting,
+        enum_syn=enum_syn_setting,
+    )
+    eq_filters_applied = bool(eq_where)
+    if eq_filters_applied:
+        where_parts.append(f"({eq_where})")
+        binds.update(eq_binds)
+
     if intent.group_by is None:
         sort_desc = _apply_sort_asc_if_bottom(intent, default_desc=True)
 
@@ -205,8 +270,14 @@ def build_sql(intent: DWIntent) -> Tuple[str, Dict[str, object], Dict[str, objec
         if filters_applied:
             binds.update(filter_binds)
 
-        if (filters_applied or request_type_applied) and not intent.has_time_window:
-            order_sql = "ORDER BY REQUEST_DATE DESC"
+        default_order_col: Optional[str] = None
+        if eq_filters_applied:
+            default_order_col = eq_suggested_order or "REQUEST_DATE"
+        elif (filters_applied or request_type_applied) and not intent.has_time_window:
+            default_order_col = "REQUEST_DATE"
+
+        if default_order_col:
+            order_sql = f"ORDER BY {default_order_col} DESC"
         else:
             order_sql = f"ORDER BY {measure} {'DESC' if sort_desc else 'ASC'}"
 
@@ -223,11 +294,16 @@ def build_sql(intent: DWIntent) -> Tuple[str, Dict[str, object], Dict[str, objec
             explain = "Applied REQUEST_TYPE filter from question. " + explain
         elif filters_applied:
             explain = "Applied filters from question. " + explain
+        elif eq_filters_applied:
+            explain = "Applied equality filters from question. " + explain
 
-        meta.update({
+        meta_bits = {
             "explain": explain,
             "binds": {k: v for k, v in binds.items() if k == "top_n"},
-        })
+        }
+        if eq_filters_applied:
+            meta_bits["eq_filters"] = True
+        meta.update(meta_bits)
         return sql, binds, meta
 
     group_col = intent.group_by
@@ -276,12 +352,17 @@ def build_sql(intent: DWIntent) -> Tuple[str, Dict[str, object], Dict[str, objec
         explain_group = "Applied REQUEST_TYPE filter from question. " + explain_group
     elif filters_applied:
         explain_group = "Applied filters from question. " + explain_group
+    elif eq_filters_applied:
+        explain_group = "Applied equality filters from question. " + explain_group
 
-    meta.update({
+    meta_bits = {
         "group_by": group_col,
         "agg": agg.lower(),
         "gross": measure != "NVL(CONTRACT_VALUE_NET_OF_VAT,0)",
         "explain": explain_group,
         "binds": {k: v for k, v in binds.items() if k == "top_n"},
-    })
+    }
+    if eq_filters_applied:
+        meta_bits["eq_filters"] = True
+    meta.update(meta_bits)
     return sql, binds, meta
