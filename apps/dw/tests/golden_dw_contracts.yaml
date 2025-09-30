@@ -460,12 +460,15 @@ cases:
         - 'ORDER BY MEASURE ASC'
 
   - question: "Show contracts where REQUEST TYPE = Renewal"
-    expect_sql_contains:
+    expect_contains:
       - 'FROM "Contract"'
-      - 'UPPER(REQUEST_TYPE) LIKE UPPER(:req_like)'
+      - 'UPPER(TRIM(REQUEST_TYPE)) LIKE UPPER(:rt_0)'
       - 'ORDER BY REQUEST_DATE DESC'
-    expect_binds:
-      req_like: "%renew%"
+    expect:
+      must_not:
+        - 'FETCH FIRST'
+    meta:
+      explain_like: 'Applied REQUEST_TYPE filter'
 
   - question: "Total gross value per DEPARTMENT_OUL last quarter"
     expect_sql:

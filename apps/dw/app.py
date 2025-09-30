@@ -232,7 +232,9 @@ def derive_sql_for_test(
         binds.update(test_binds)
 
     if sql and rate_comment and rate_comment.strip():
-        hints = parse_rate_hints(rate_comment)
+        settings_obj = _get_settings()
+        getter = getattr(settings_obj, "get_json", None) if settings_obj else None
+        hints = parse_rate_hints(rate_comment, getter)
         if hints.where_sql:
             sql = append_where(sql, hints.where_sql)
             binds.update(hints.where_binds)

@@ -2,12 +2,46 @@
 
 from __future__ import annotations
 
+import re
 from datetime import date
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from .intent import DWIntent
+from .synonyms import build_request_type_filter_sql, get_request_type_synonyms
 
 DIMENSIONS_ALLOWED = {"OWNER_DEPARTMENT", "DEPARTMENT_OUL", "ENTITY_NO", "ENTITY"}
+
+REQUEST_TYPE_EQ_RE = re.compile(r"\bREQUEST\s*TYPE\s*=\s*([\"']?)([^\n\r]+?)\1", re.IGNORECASE)
+REQUEST_TYPE_CONTAINS_RE = re.compile(r"\bREQUEST\s*TYPE.*?\b(renew|renewal|extension)\b", re.IGNORECASE)
+
+
+def detect_request_type_filter(q: str) -> Optional[str]:
+    """Extract REQUEST TYPE hint from the question if present."""
+
+    if not q:
+        return None
+    match = REQUEST_TYPE_EQ_RE.search(q)
+    if match:
+        return match.group(2).strip()
+    match2 = REQUEST_TYPE_CONTAINS_RE.search(q)
+    if match2:
+        return match2.group(1).strip()
+    return None
+
+
+def apply_request_type_clause_if_any(
+    q: str,
+    settings_get_json,
+) -> Tuple[Optional[str], Dict[str, Any]]:
+    """Return REQUEST_TYPE predicate + binds if question includes a hint."""
+
+    value = detect_request_type_filter(q or "")
+    if not value:
+        return None, {}
+
+    synonyms_map = get_request_type_synonyms(settings_get_json)
+    fragment, binds = build_request_type_filter_sql(value, synonyms_map, use_like=True)
+    return fragment, binds
 
 
 def _overlap_clause() -> str:
@@ -76,11 +110,24 @@ def _apply_intent_binds(intent: DWIntent, binds: Dict[str, object]) -> None:
             binds.setdefault("date_end", today)
 
 
+
+
 def build_sql(intent: DWIntent) -> Tuple[str, Dict[str, object], Dict[str, object]]:
     """Build final SQL + binds + meta for the Contract table based on resolved intent."""
 
     binds: Dict[str, object] = {}
     meta: Dict[str, object] = {}
+    where_parts: List[str] = []
+
+    settings_get_json = None
+    if isinstance(intent.notes, dict):
+        settings_get_json = intent.notes.get("settings_get_json")
+
+    frag_rt, rt_binds = apply_request_type_clause_if_any(intent.question or "", settings_get_json)
+    request_type_applied = bool(frag_rt)
+    if frag_rt:
+        where_parts.append(frag_rt)
+        binds.update(rt_binds)
 
     measure = intent.measure_sql or "NVL(CONTRACT_VALUE_NET_OF_VAT,0)"
 
@@ -93,6 +140,8 @@ def build_sql(intent: DWIntent) -> Tuple[str, Dict[str, object], Dict[str, objec
     _apply_intent_binds(intent, binds)
 
     where_sql, window_kind = _build_window(intent, binds)
+    if where_sql:
+        where_parts.append(where_sql)
     if window_kind:
         meta["window_kind"] = window_kind
 
@@ -100,27 +149,28 @@ def build_sql(intent: DWIntent) -> Tuple[str, Dict[str, object], Dict[str, objec
         sort_desc = _apply_sort_asc_if_bottom(intent, default_desc=True)
         order_sql = f"ORDER BY {measure} {'DESC' if sort_desc else 'ASC'}"
 
-        top_sql = ""
+        top_sql = None
         if intent.top_n:
             binds["top_n"] = intent.top_n
             top_sql = "FETCH FIRST :top_n ROWS ONLY"
 
-        where_clause = f"WHERE {where_sql}
-" if where_sql else ""
-        sql = (
-            'SELECT * FROM "Contract"
-'
-            f"{where_clause}"
-            f"{order_sql}
-"
-            f"{top_sql}"
+        sql_parts = ['SELECT * FROM "Contract"']
+        if where_parts:
+            sql_parts.append("WHERE " + " AND ".join(where_parts))
+        sql_parts.append(order_sql)
+        if top_sql:
+            sql_parts.append(top_sql)
+        sql = "\n".join(sql_parts)
+
+        explain = (
+            f"{'Top' if sort_desc else 'Bottom'} {intent.top_n or ''} by "
+            f"{'GROSS' if measure != 'NVL(CONTRACT_VALUE_NET_OF_VAT,0)' else 'NET'}"
         ).strip()
+        if request_type_applied:
+            explain = "Applied REQUEST_TYPE filter from question. " + explain
 
         meta.update({
-            "explain": (
-                f"{'Top' if sort_desc else 'Bottom'} {intent.top_n or ''} by "
-                f"{'GROSS' if measure != 'NVL(CONTRACT_VALUE_NET_OF_VAT,0)' else 'NET'}"
-            ).strip(),
+            "explain": explain,
             "binds": {k: v for k, v in binds.items() if k == "top_n"},
         })
         return sql, binds, meta
@@ -136,7 +186,7 @@ def build_sql(intent: DWIntent) -> Tuple[str, Dict[str, object], Dict[str, objec
     sort_desc = _apply_sort_asc_if_bottom(intent, default_desc=True)
     order_sql = f"ORDER BY MEASURE {'DESC' if sort_desc else 'ASC'}"
 
-    top_sql = ""
+    top_sql = None
     if intent.top_n:
         binds["top_n"] = intent.top_n
         top_sql = "FETCH FIRST :top_n ROWS ONLY"
@@ -146,33 +196,31 @@ def build_sql(intent: DWIntent) -> Tuple[str, Dict[str, object], Dict[str, objec
     else:
         select_measure = f"{agg}({measure})"
 
-    select_sql = (
-        "SELECT
-"
-        f"  {group_col} AS GROUP_KEY,
-"
-        f"  {select_measure} AS MEASURE
-"
-    )
+    select_lines = [
+        "SELECT",
+        f"  {group_col} AS GROUP_KEY,",
+        f"  {select_measure} AS MEASURE",
+    ]
 
-    where_clause = f"WHERE {where_sql}
-" if where_sql else ""
-    sql = (
-        f'{select_sql}FROM "Contract"
-'
-        f"{where_clause}"
-        f"GROUP BY {group_col}
-"
-        f"{order_sql}
-"
-        f"{top_sql}"
-    ).strip()
+    sql_parts = ["\n".join(select_lines), 'FROM "Contract"']
+    if where_parts:
+        sql_parts.append("WHERE " + " AND ".join(where_parts))
+    sql_parts.append(f"GROUP BY {group_col}")
+    sql_parts.append(order_sql)
+    if top_sql:
+        sql_parts.append(top_sql)
+
+    sql = "\n".join(sql_parts)
+
+    explain_group = f"{agg.title()} per {group_col} using {window_kind or 'ALL_TIME'} window."
+    if request_type_applied:
+        explain_group = "Applied REQUEST_TYPE filter from question. " + explain_group
 
     meta.update({
         "group_by": group_col,
         "agg": agg.lower(),
         "gross": measure != "NVL(CONTRACT_VALUE_NET_OF_VAT,0)",
-        "explain": f"{agg.title()} per {group_col} using {window_kind or 'ALL_TIME'} window.",
+        "explain": explain_group,
         "binds": {k: v for k, v in binds.items() if k == "top_n"},
     })
     return sql, binds, meta
