@@ -201,6 +201,20 @@ cases:
       must_not: []
       notes: "Should test CONTRACT_ID IS NULL or TRIM(CONTRACT_ID) = ''."
 
+  - id: named_filter_request_type_equals
+    question: "Show contracts where REQUEST TYPE = Renewal"
+    expect:
+      sql_like:
+        - 'FROM "Contract"'
+        - 'WHERE'
+        - 'UPPER(TRIM(REQUEST_TYPE))'
+        - 'ORDER BY REQUEST_DATE DESC'
+      must_not:
+        - 'FROM "Contract"\nORDER BY REQUEST_DATE DESC'
+    assertions:
+      binds_any:
+        - ["nf_REQUESTTYPE_eq_0", "nf_REQUESTTYPE_pf_0", "nf_REQUESTTYPE_cf_0", "nf_REQUESTTYPE_raw"]
+
   - id: gross_by_stakeholder_last_90
     question: "For the last 90 days, total gross by stakeholder (across 1..8 slots)."
     expect:
