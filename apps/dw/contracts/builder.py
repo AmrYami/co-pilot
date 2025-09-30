@@ -5,6 +5,7 @@ from typing import Dict, Tuple, Optional, List
 
 from .filters import try_parse_simple_equals
 from .rules_extra import try_build_special_cases
+from .named_filters import build_named_filter_sql
 
 # NOTE: Keep this module strictly table-specific (Contract).
 #       Cross-table / DocuWare-generic helpers should live elsewhere.
@@ -545,6 +546,18 @@ def build_contracts_sql(
                     return value
             return default
         return default
+
+    nf_settings = {
+        "DW_EQ_FILTER_COLUMNS": _settings_getter("DW_EQ_FILTER_COLUMNS", {}) or {},
+        "DW_FTS_COLUMNS": _settings_getter("DW_FTS_COLUMNS", {}) or {},
+        "DW_ENUM_SYNONYMS": _settings_getter("DW_ENUM_SYNONYMS", {}) or {},
+    }
+    nf_sql, nf_binds, nf_notes = build_named_filter_sql(q_text, table, nf_settings)
+    if nf_sql:
+        where_parts.append(nf_sql)
+        binds.update(nf_binds)
+        if nf_notes:
+            notes["named_filters"] = nf_notes
 
     simple_eq_frag, simple_eq_binds = try_parse_simple_equals(
         q_text,
