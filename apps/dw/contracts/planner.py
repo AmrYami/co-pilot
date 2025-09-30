@@ -2,46 +2,13 @@
 
 from __future__ import annotations
 
-import re
 from datetime import date
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from .intent import DWIntent
-from .synonyms import build_request_type_filter_sql, get_request_type_synonyms
+from .sql_builder import attach_where_clause, build_where_from_filters
 
 DIMENSIONS_ALLOWED = {"OWNER_DEPARTMENT", "DEPARTMENT_OUL", "ENTITY_NO", "ENTITY"}
-
-REQUEST_TYPE_EQ_RE = re.compile(r"\bREQUEST\s*TYPE\s*=\s*([\"']?)([^\n\r]+?)\1", re.IGNORECASE)
-REQUEST_TYPE_CONTAINS_RE = re.compile(r"\bREQUEST\s*TYPE.*?\b(renew|renewal|extension)\b", re.IGNORECASE)
-
-
-def detect_request_type_filter(q: str) -> Optional[str]:
-    """Extract REQUEST TYPE hint from the question if present."""
-
-    if not q:
-        return None
-    match = REQUEST_TYPE_EQ_RE.search(q)
-    if match:
-        return match.group(2).strip()
-    match2 = REQUEST_TYPE_CONTAINS_RE.search(q)
-    if match2:
-        return match2.group(1).strip()
-    return None
-
-
-def apply_request_type_clause_if_any(
-    q: str,
-    settings_get_json,
-) -> Tuple[Optional[str], Dict[str, Any]]:
-    """Return REQUEST_TYPE predicate + binds if question includes a hint."""
-
-    value = detect_request_type_filter(q or "")
-    if not value:
-        return None, {}
-
-    synonyms_map = get_request_type_synonyms(settings_get_json)
-    fragment, binds = build_request_type_filter_sql(value, synonyms_map, use_like=True)
-    return fragment, binds
 
 
 def _overlap_clause() -> str:
@@ -119,15 +86,17 @@ def build_sql(intent: DWIntent) -> Tuple[str, Dict[str, object], Dict[str, objec
     meta: Dict[str, object] = {}
     where_parts: List[str] = []
 
-    settings_get_json = None
+    settings_get = None
     if isinstance(intent.notes, dict):
-        settings_get_json = intent.notes.get("settings_get_json")
+        settings_get = intent.notes.get("settings_get_json")
 
-    frag_rt, rt_binds = apply_request_type_clause_if_any(intent.question or "", settings_get_json)
-    request_type_applied = bool(frag_rt)
-    if frag_rt:
-        where_parts.append(frag_rt)
-        binds.update(rt_binds)
+    filters_raw = getattr(intent, "filters", None) or []
+    filter_fragments, filter_binds = build_where_from_filters(settings_get, filters_raw)
+    filters_applied = bool(filter_fragments)
+    request_type_applied = any(
+        isinstance(f, dict) and (f.get("column") or "").upper() == "REQUEST_TYPE"
+        for f in (filters_raw or [])
+    ) and filters_applied
 
     measure = intent.measure_sql or "NVL(CONTRACT_VALUE_NET_OF_VAT,0)"
 
@@ -147,20 +116,29 @@ def build_sql(intent: DWIntent) -> Tuple[str, Dict[str, object], Dict[str, objec
 
     if intent.group_by is None:
         sort_desc = _apply_sort_asc_if_bottom(intent, default_desc=True)
-        order_sql = f"ORDER BY {measure} {'DESC' if sort_desc else 'ASC'}"
 
         top_sql = None
         if intent.top_n:
             binds["top_n"] = intent.top_n
             top_sql = "FETCH FIRST :top_n ROWS ONLY"
 
-        sql_parts = ['SELECT * FROM "Contract"']
+        base_parts = ['SELECT * FROM "Contract"']
         if where_parts:
-            sql_parts.append("WHERE " + " AND ".join(where_parts))
-        sql_parts.append(order_sql)
+            base_parts.append("WHERE " + " AND ".join(where_parts))
+        base_sql = "\n".join(base_parts)
+        base_sql = attach_where_clause(base_sql, filter_fragments)
+        if filters_applied:
+            binds.update(filter_binds)
+
+        if filters_applied and not intent.has_time_window:
+            order_sql = "ORDER BY REQUEST_DATE DESC"
+        else:
+            order_sql = f"ORDER BY {measure} {'DESC' if sort_desc else 'ASC'}"
+
+        sql_parts = [base_sql, order_sql]
         if top_sql:
             sql_parts.append(top_sql)
-        sql = "\n".join(sql_parts)
+        sql = "\n".join(part for part in sql_parts if part)
 
         explain = (
             f"{'Top' if sort_desc else 'Bottom'} {intent.top_n or ''} by "
@@ -168,6 +146,8 @@ def build_sql(intent: DWIntent) -> Tuple[str, Dict[str, object], Dict[str, objec
         ).strip()
         if request_type_applied:
             explain = "Applied REQUEST_TYPE filter from question. " + explain
+        elif filters_applied:
+            explain = "Applied filters from question. " + explain
 
         meta.update({
             "explain": explain,
@@ -202,19 +182,25 @@ def build_sql(intent: DWIntent) -> Tuple[str, Dict[str, object], Dict[str, objec
         f"  {select_measure} AS MEASURE",
     ]
 
-    sql_parts = ["\n".join(select_lines), 'FROM "Contract"']
+    base_parts = ["\n".join(select_lines), 'FROM "Contract"']
     if where_parts:
-        sql_parts.append("WHERE " + " AND ".join(where_parts))
-    sql_parts.append(f"GROUP BY {group_col}")
-    sql_parts.append(order_sql)
+        base_parts.append("WHERE " + " AND ".join(where_parts))
+    base_sql = "\n".join(base_parts)
+    base_sql = attach_where_clause(base_sql, filter_fragments)
+    if filters_applied:
+        binds.update(filter_binds)
+
+    sql_parts = [base_sql, f"GROUP BY {group_col}", order_sql]
     if top_sql:
         sql_parts.append(top_sql)
 
-    sql = "\n".join(sql_parts)
+    sql = "\n".join(part for part in sql_parts if part)
 
     explain_group = f"{agg.title()} per {group_col} using {window_kind or 'ALL_TIME'} window."
     if request_type_applied:
         explain_group = "Applied REQUEST_TYPE filter from question. " + explain_group
+    elif filters_applied:
+        explain_group = "Applied filters from question. " + explain_group
 
     meta.update({
         "group_by": group_col,
