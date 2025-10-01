@@ -1,5 +1,5 @@
 import re
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from apps.dw.contracts.synonyms import (
     build_request_type_filter_sql,
@@ -148,6 +148,124 @@ def replace_or_add_order_by(sql: str, order_by_sql: str) -> str:
     if fetch_pos == -1 or fetch_pos < ob_pos:
         return sql[:ob_pos] + " " + order_by_sql
     return sql[:ob_pos] + " " + order_by_sql + "\n" + sql[fetch_pos:]
+
+
+# --- Lightweight parser used by rate feedback comments ---------------------------------------
+
+# Matches lines like:
+# filter: ENTITY_NO = 'E-123' (ci, trim)
+# filter: REQUEST_TYPE ~ renew
+# filter: ENTITY_NO = E-123
+EQ_LINE_RE = re.compile(
+    r"""
+    (?i)^\s*filter\s*:\s*
+    (?P<col>[A-Z0-9_\. \-]+?)\s*
+    (?P<op>=|~|like|ilike)\s*
+    (?:
+        '(?P<sq>[^']*)' |
+        "(?P<dq>[^"]*)" |
+        (?P<bare>[^);]+)
+    )
+    \s*
+    (?:\((?P<flags>[^)]*)\))?
+    \s*;?\s*$""",
+    re.VERBOSE,
+)
+
+
+def _norm_col(col: str) -> str:
+    """Normalize "REQUEST TYPE" -> "REQUEST_TYPE"."""
+
+    return col.strip().upper().replace(" ", "_")
+
+
+def _parse_flags(flags: Optional[str]) -> Dict[str, bool]:
+    if not flags:
+        return {"ci": False, "trim": False}
+    opts = {t.strip().lower() for t in flags.split(",") if t.strip()}
+    return {"ci": ("ci" in opts), "trim": ("trim" in opts)}
+
+
+def parse_rate_comment(comment: str) -> Dict[str, Any]:
+    """Parse /dw/rate comment micro-language into structured hints."""
+
+    hints: Dict[str, Any] = {}
+    text = comment or ""
+
+    m = re.search(r"(?i)group_by\s*:\s*([A-Z0-9_, \-]+)", text)
+    if m:
+        hints["group_by"] = [
+            _norm_col(x) for x in m.group(1).split(",") if x.strip()
+        ]
+
+    m = re.search(r"(?i)order_by\s*:\s*([A-Z0-9_]+)\s*(asc|desc)?", text)
+    if m:
+        col = _norm_col(m.group(1))
+        desc = (m.group(2) or "DESC").strip().lower() == "desc"
+        hints["order_by"] = (col, desc)
+
+    eq_filters: List[Dict[str, Any]] = []
+    for raw in text.splitlines():
+        match = EQ_LINE_RE.match(raw.strip())
+        if not match:
+            continue
+        col = _norm_col(match.group("col"))
+        op = match.group("op") or "="
+        val = (match.group("sq") or match.group("dq") or match.group("bare") or "").strip()
+        flags = _parse_flags(match.group("flags"))
+
+        if op.lower() in {"~", "like", "ilike"}:
+            eq_filters.append(
+                {
+                    "col": col,
+                    "op": "like",
+                    "val": val,
+                    "ci": flags.get("ci", False),
+                    "trim": flags.get("trim", False),
+                }
+            )
+        else:
+            eq_filters.append(
+                {
+                    "col": col,
+                    "op": "eq",
+                    "val": val,
+                    "ci": flags.get("ci", False),
+                    "trim": flags.get("trim", False),
+                }
+            )
+
+    if eq_filters:
+        hints["eq_filters"] = eq_filters
+
+    return hints
+
+
+def apply_rate_hints(intent: Dict[str, Any], comment: str) -> Dict[str, Any]:
+    """Merge parsed hints into an intent dictionary without dropping existing context."""
+
+    hints = parse_rate_comment(comment or "")
+
+    if hints.get("eq_filters"):
+        intent.setdefault("eq_filters", []).extend(hints["eq_filters"])
+
+    if hints.get("group_by"):
+        intent["group_by"] = ",".join(hints["group_by"])
+
+    if hints.get("order_by"):
+        col, desc = hints["order_by"]
+        if col in {"TOTAL_GROSS", "GROSS", "SUM_GROSS"}:
+            intent["sort_by"] = "TOTAL_GROSS"
+            intent["sort_desc"] = desc
+            intent["gross"] = True
+        else:
+            intent["sort_by"] = col
+            intent["sort_desc"] = desc
+
+    if intent.get("group_by"):
+        intent["agg"] = None
+
+    return intent
 
 
 def parse_rate_hints(comment: Optional[str], settings_get_json=None) -> RateHints:

@@ -1,4 +1,5 @@
 from __future__ import annotations
+import re
 from typing import Any, Dict, List, Optional, Tuple
 from datetime import date
 
@@ -13,6 +14,35 @@ DIMENSIONS = {
     "entity": "ENTITY",
     "entity_no": "ENTITY_NO",
 }
+
+
+RE_EQ_GENERIC = re.compile(
+    r"(?i)\b([A-Z0-9_ ]+?)\s*=\s*(?:'([^']*)'|\"([^\"]*)\"|([^\s]+))"
+)
+
+
+def _norm_col(col: str) -> str:
+    return col.strip().upper().replace(" ", "_")
+
+
+def _extract_eq_filter(question: str) -> Optional[Dict[str, Any]]:
+    match = RE_EQ_GENERIC.search(question or "")
+    if not match:
+        return None
+
+    col = _norm_col(match.group(1))
+    val = (match.group(2) or match.group(3) or match.group(4) or "").strip()
+    if not col or not val:
+        return None
+
+    allowed = {"REQUEST_TYPE", "ENTITY_NO"}
+    if col not in allowed:
+        return None
+
+    bind = "eq_0"
+    predicate = f"UPPER(TRIM({col})) = UPPER(TRIM(:{bind}))"
+    order = "REQUEST_DATE DESC" if col == "REQUEST_TYPE" else None
+    return {"predicate": predicate, "binds": {bind: val}, "order": order, "col": col}
 
 
 def _pick_measure(q: str) -> str:
@@ -107,6 +137,10 @@ def plan_contract_query(
     ql = (q or "").lower()
     sql: str
 
+    eq_filter = _extract_eq_filter(q)
+    if eq_filter:
+        binds.update(eq_filter["binds"])
+
     if "expiring" in ql and wants_count:
         # Contracts expiring in X days (count) → COUNT on END_DATE window (inclusive)
         date_col = "END_DATE"
@@ -116,27 +150,55 @@ def plan_contract_query(
         return sql, binds, {"group_by": None, "measure": "COUNT", "date_col": date_col}, " ".join(explain_bits)
 
     if group_col and not wants_count:
-        # Aggregated by dimension with SUM(measure)
+        where_parts: List[str] = []
         if explicit_dates:
-            where_clause = f"WHERE {window_pred}{fts_where}"
-        elif fts_where:
-            where_clause = "WHERE 1=1" + fts_where
+            where_parts.append(window_pred)
+        if eq_filter:
+            where_parts.append(eq_filter["predicate"])
+
+        sql_lines: List[str] = []
+        if eq_filter:
+            sql_lines.append(
+                "SELECT\n"
+                f"  {group_col} AS GROUP_KEY,\n"
+                f"  SUM({GROSS_SQL}) AS TOTAL_GROSS,\n"
+                "  COUNT(*) AS CNT\n"
+                "FROM \"Contract\""
+            )
         else:
-            where_clause = ""
-        sql = (
-            "SELECT\n"
-            f"  {group_col} AS GROUP_KEY,\n"
-            f"  SUM({measure}) AS MEASURE\n"
-            "FROM \"Contract\"\n"
-            f"{where_clause}\n"
-            f"GROUP BY {group_col}\n"
-            f"ORDER BY MEASURE DESC"
-        )
+            sql_lines.append(
+                "SELECT\n"
+                f"  {group_col} AS GROUP_KEY,\n"
+                f"  SUM({measure}) AS MEASURE\n"
+                "FROM \"Contract\""
+            )
+
+        if where_parts:
+            sql_lines.append("WHERE " + " AND ".join(where_parts))
+        if not where_parts and fts_where:
+            sql_lines.append("WHERE 1=1")
+        if fts_where:
+            sql_lines[-1] = sql_lines[-1] + fts_where if sql_lines else "WHERE 1=1" + fts_where
+
+        sql = "\n".join(sql_lines)
+        sql += f"\nGROUP BY {group_col}"
+        if eq_filter:
+            sql += "\nORDER BY TOTAL_GROSS DESC"
+            explain_bits.append(
+                f"Aggregating gross and count by {group_col} with equality filter."
+            )
+            meta = {"group_by": group_col, "measure": "GROSS", "date_col": date_col}
+        else:
+            sql += "\nORDER BY MEASURE DESC"
+            explain_bits.append(
+                f"Aggregating by {group_col} and ordering by SUM(measure) DESC."
+            )
+            meta = {"group_by": group_col, "measure": "SUM", "date_col": date_col}
+
         if top_n:
             binds["top_n"] = int(top_n)
             sql += "\nFETCH FIRST :top_n ROWS ONLY"
-        explain_bits.append(f"Aggregating by {group_col} and ordering by SUM(measure) DESC.")
-        return sql, binds, {"group_by": group_col, "measure": "SUM", "date_col": date_col}, " ".join(explain_bits)
+        return sql, binds, meta, " ".join(explain_bits)
 
     if wants_count and not group_col:
         # Count by request window (or overlap if mentioned)
@@ -201,6 +263,23 @@ def plan_contract_query(
         sql = "SELECT ENTITY AS GROUP_KEY, COUNT(*) AS CNT FROM \"Contract\" GROUP BY ENTITY ORDER BY CNT DESC"
         explain_bits.append("Distinct ENTITY with counts.")
         return sql, binds, {"group_by": "ENTITY", "measure": "COUNT"}, " ".join(explain_bits)
+
+    if eq_filter:
+        where_parts = []
+        if explicit_dates:
+            where_parts.append(window_pred)
+        where_parts.append(eq_filter["predicate"])
+        sql = "SELECT * FROM \"Contract\""
+        if where_parts:
+            sql += "\nWHERE " + " AND ".join(where_parts)
+        if not where_parts and fts_where:
+            sql += "\nWHERE 1=1"
+        if fts_where:
+            sql += fts_where
+        order = eq_filter.get("order") or "REQUEST_DATE DESC"
+        sql += f"\nORDER BY {order}"
+        explain_bits.append(f"Applied equality filter on {eq_filter['col']} from the question.")
+        return sql, binds, {"group_by": None, "filter": eq_filter["col"], "date_col": date_col}, " ".join(explain_bits)
 
     # Fallback: list in window (if any) else all
     sql = "SELECT * FROM \"Contract\""

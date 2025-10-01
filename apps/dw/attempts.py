@@ -25,7 +25,12 @@ from apps.dw.settings_utils import load_explicit_filter_columns
 
 from .builder import build_sql
 from .intent import NLIntent, parse_intent_legacy
-from .rate_hints import append_where, parse_rate_hints, replace_or_add_order_by
+from .rate_hints import (
+    append_where,
+    apply_rate_hints,
+    parse_rate_hints,
+    replace_or_add_order_by,
+)
 from .search import (
     build_fulltext_where,
     extract_search_tokens,
@@ -61,6 +66,14 @@ def run_attempt(
     app = current_app
     logger = getattr(app, "logger", None)
     intent: NLIntent = parse_intent_legacy(question)
+
+    if rate_comment:
+        patched = apply_rate_hints(intent.dict(), rate_comment)
+        if "eq_filters" in patched:
+            intent.eq_filters = patched["eq_filters"]
+        for key in ("group_by", "sort_by", "sort_desc", "agg", "gross"):
+            if key in patched:
+                setattr(intent, key, patched[key])
     allow_fts = is_fulltext_allowed()
     if allow_fts:
         default_on = env_flag("DW_FTS_DEFAULT_ON", False)

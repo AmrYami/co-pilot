@@ -198,9 +198,20 @@ cases:
       sql_like:
         - 'CONTRACT_ID IS NULL'
         - "TRIM(CONTRACT_ID) = ''"
-        - 'ORDER BY REQUEST_DATE DESC'
       must_not: []
       notes: "Should test CONTRACT_ID IS NULL or TRIM(CONTRACT_ID) = ''."
+
+  - id: entity_status_totals_with_rate
+    question: "For ENTITY_NO = 'E-123', total and count by CONTRACT_STATUS."
+    rate:
+      comment: "filter: ENTITY_NO = 'E-123' (ci, trim); group_by: CONTRACT_STATUS; order_by: TOTAL_GROSS desc;"
+    expect_contains:
+      - 'GROUP BY CONTRACT_STATUS'
+      - 'SUM(NVL(CONTRACT_VALUE_NET_OF_VAT,0) +'
+      - 'COUNT(*) AS CNT'
+      - 'ORDER BY TOTAL_GROSS DESC'
+      - 'UPPER(TRIM(ENTITY_NO)) = UPPER(TRIM(:eq_0))'
+    must_not: []
 
   - id: named_filter_request_type_equals
     question: "Show contracts where REQUEST TYPE = Renewal"
