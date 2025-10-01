@@ -535,8 +535,8 @@ cases:
     payload:
       full_text_search: true
     expect_sql_contains:
-      - 'UPPER("CONTRACT_SUBJECT") LIKE UPPER(:fts_0)'
-      - 'UPPER("CONTRACT_SUBJECT") LIKE UPPER(:fts_1)'
+      - 'LIKE UPPER(:kw_0)'
+      - 'LIKE UPPER(:kw_1)'
       - 'ORDER BY REQUEST_DATE DESC'
 
   - id: fts_has_it_single
@@ -544,5 +544,14 @@ cases:
     payload:
       full_text_search: true
     expect_sql_contains:
-      - 'UPPER("CONTRACT_SUBJECT") LIKE UPPER(:fts_0)'
+      - 'LIKE UPPER(:kw_0)'
       - 'ORDER BY REQUEST_DATE DESC'
+
+  - id: stakeholder_like_or
+    question: "list all contracts where stakeholder has Tamer Said Aly Abdelgawad or u1835 or Amr Taher A Maghrabi"
+    expect_sql_contains:
+      - 'CONTRACT_STAKEHOLDER_1'
+      - 'CONTRACT_STAKEHOLDER_8'
+      - 'LIKE UPPER(:sh_0)'
+      - 'LIKE UPPER(:sh_1)'
+      - 'LIKE UPPER(:sh_2)'

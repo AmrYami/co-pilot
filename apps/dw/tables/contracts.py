@@ -4,7 +4,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from apps.dw.contract.eq_filters import build_eq_sql, detect_eq_filters
 
@@ -124,6 +124,199 @@ def extract_request_type_filter(
     explain = f"Filtering on REQUEST_TYPE ~= '{raw_value}' using synonyms (equals/prefix/contains)."
     return where_sql, binds, explain
 
+
+def _load_fts_columns(cfg: Dict[str, object], table: str = "Contract") -> List[str]:
+    """Return configured FTS columns for the table with fallback to explicit filters."""
+
+    if not isinstance(cfg, dict):
+        return []
+
+    columns: List[str] = []
+    raw_fts = cfg.get("DW_FTS_COLUMNS") or {}
+    if isinstance(raw_fts, dict):
+        table_cols = raw_fts.get(table) or raw_fts.get(f'"{table}"') or raw_fts.get("*") or []
+        if isinstance(table_cols, list):
+            columns.extend(table_cols)
+
+    if not columns:
+        fallback = cfg.get("DW_EXPLICIT_FILTER_COLUMNS") or []
+        if isinstance(fallback, dict):
+            table_fallback = (
+                fallback.get(table)
+                or fallback.get(f'"{table}"')
+                or fallback.get("*")
+                or []
+            )
+        else:
+            table_fallback = fallback
+        if isinstance(table_fallback, list):
+            columns.extend(table_fallback)
+
+    seen: set[str] = set()
+    ordered: List[str] = []
+    for col in columns:
+        if col is None:
+            continue
+        norm = str(col).strip()
+        if not norm:
+            continue
+        norm = norm.strip('"')
+        key = norm.upper()
+        if key not in seen:
+            seen.add(key)
+            ordered.append(key)
+    return ordered
+
+
+def _extract_fts_terms(question: str, prefer_or: bool = True) -> List[str]:
+    """Extract candidate FTS search terms from the natural-language question."""
+
+    q = re.sub(r"\s+", " ", question or "").strip()
+    if not q:
+        return []
+
+    phrases = re.findall(r"'([^']+)'|\"([^\"]+)\"", q)
+    quoted = [p[0] or p[1] for p in phrases]
+    q_no_quotes = re.sub(r"'[^']+'|\"[^\"]+\"", "", q)
+
+    tokens: List[str] = []
+    if re.search(r"\bor\b|\bأو\b", q_no_quotes, flags=re.IGNORECASE):
+        parts = re.split(r"\bor\b|\bأو\b", q_no_quotes, flags=re.IGNORECASE)
+        tokens = [p.strip() for p in parts if p and p.strip()]
+    elif re.search(r"\band\b|\bو\b", q_no_quotes, flags=re.IGNORECASE):
+        parts = re.split(r"\band\b|\bو\b", q_no_quotes, flags=re.IGNORECASE)
+        tokens = [p.strip() for p in parts if p and p.strip()]
+    else:
+        match = re.search(r"(has|contain[s]?|search|find)\s+(.+)$", q_no_quotes, flags=re.IGNORECASE)
+        if match:
+            tokens = [match.group(2).strip()]
+
+    cleaned: List[str] = []
+    combined = quoted + tokens
+    for term in combined:
+        cleaned_term = term.strip(" ,;")
+        if cleaned_term:
+            cleaned.append(cleaned_term)
+    return cleaned
+
+
+STAKEHOLDER_COLS = [
+    "CONTRACT_STAKEHOLDER_1",
+    "CONTRACT_STAKEHOLDER_2",
+    "CONTRACT_STAKEHOLDER_3",
+    "CONTRACT_STAKEHOLDER_4",
+    "CONTRACT_STAKEHOLDER_5",
+    "CONTRACT_STAKEHOLDER_6",
+    "CONTRACT_STAKEHOLDER_7",
+    "CONTRACT_STAKEHOLDER_8",
+]
+
+
+def _apply_full_text_search(
+    cfg: Dict[str, object],
+    intent: Intent,
+    where_parts: List[str],
+    binds: Dict[str, object],
+) -> None:
+    overrides = intent.overrides or {}
+    raw_question = intent.raw_question or intent.question or ""
+
+    if overrides.get("full_text_search"):
+        intent.full_text_search = True
+        intent.fts_mode = "override"
+    elif re.search(r"\b(has|contain[s]?|search|find)\b", raw_question, flags=re.IGNORECASE):
+        intent.full_text_search = True
+        intent.fts_mode = intent.fts_mode or "auto"
+
+    if not intent.full_text_search:
+        intent.fts_tokens = []
+        intent.fts_columns = []
+        intent.fts_bind_keys = []
+        return
+
+    fts_columns = _load_fts_columns(cfg, table="Contract")
+    intent.fts_columns = fts_columns
+    if not fts_columns:
+        intent.full_text_search = False
+        intent.fts_tokens = []
+        intent.fts_bind_keys = []
+        intent.fts_error = "no_columns"
+        return
+
+    terms = _extract_fts_terms(raw_question)
+    if not terms and overrides.get("full_text_search"):
+        match = re.search(r"(has|contain[s]?|search|find)\s+(.+)$", raw_question, flags=re.IGNORECASE)
+        if match:
+            candidate = match.group(2).strip()
+            if candidate:
+                terms = [candidate]
+
+    if not terms:
+        intent.full_text_search = False
+        intent.fts_tokens = []
+        intent.fts_bind_keys = []
+        intent.fts_error = "no_terms"
+        return
+
+    token_groups: List[str] = []
+    bind_keys: List[str] = []
+    next_idx = 0
+
+    for term in terms:
+        key_idx = next_idx
+        while f"kw_{key_idx}" in binds:
+            key_idx += 1
+        bind_name = f"kw_{key_idx}"
+        next_idx = key_idx + 1
+        binds[bind_name] = f"%{term}%"
+        bind_keys.append(bind_name)
+        or_parts = [f"UPPER(TRIM({col})) LIKE UPPER(:{bind_name})" for col in fts_columns]
+        token_groups.append("(" + " OR ".join(or_parts) + ")")
+
+    if not token_groups:
+        intent.full_text_search = False
+        intent.fts_tokens = []
+        intent.fts_bind_keys = []
+        intent.fts_error = "no_terms"
+        return
+
+    where_parts.append("(" + " OR ".join(token_groups) + ")")
+    intent.full_text_search = True
+    intent.fts_tokens = terms
+    intent.fts_bind_keys = bind_keys
+    intent.fts_error = None
+
+
+def _maybe_apply_stakeholder_filters(intent: Intent, where_parts: List[str], binds: Dict[str, object]) -> None:
+    raw_question = intent.raw_question or intent.question or ""
+    if not re.search(r"stake\s*holder|stackholder", raw_question, flags=re.IGNORECASE):
+        return
+
+    match = re.search(r"(has|with|=)\s+(.+)$", raw_question, flags=re.IGNORECASE)
+    if not match:
+        return
+    raw_values = match.group(2)
+    parts = re.split(r"\bor\b|\bأو\b|,|،", raw_values, flags=re.IGNORECASE)
+    values = [p.strip(" '\"") for p in parts if p and p.strip(" '\"")]
+    if not values:
+        return
+
+    token_groups: List[str] = []
+    next_idx = 0
+    for value in values:
+        key_idx = next_idx
+        while f"sh_{key_idx}" in binds:
+            key_idx += 1
+        bind_name = f"sh_{key_idx}"
+        next_idx = key_idx + 1
+        binds[bind_name] = f"%{value}%"
+        or_parts = [f"UPPER(TRIM({col})) LIKE UPPER(:{bind_name})" for col in STAKEHOLDER_COLS]
+        token_groups.append("(" + " OR ".join(or_parts) + ")")
+
+    if token_groups:
+        where_parts.append("(" + " OR ".join(token_groups) + ")")
+
+
 # ---- Gross and helpers -------------------------------------------------------
 GROSS_SQL = (
     "NVL(CONTRACT_VALUE_NET_OF_VAT,0) + "
@@ -234,6 +427,14 @@ class Intent:
     explain_parts: list[str] | None = None
     special: str | None = None
     special_params: dict | None = None
+    raw_question: str | None = None
+    overrides: Dict[str, object] | None = None
+    full_text_search: bool = False
+    fts_tokens: List[str] | None = None
+    fts_columns: List[str] | None = None
+    fts_bind_keys: List[str] | None = None
+    fts_mode: str | None = None
+    fts_error: str | None = None
 
 
 def parse_intent(q: str, today: date | None = None) -> Intent:
@@ -249,6 +450,14 @@ def parse_intent(q: str, today: date | None = None) -> Intent:
                     window_kind=None, window_start=None, window_end=None,
                     explicit_columns=None, where_clauses=[], where_binds={},
                     explain_parts=[])
+    intent.raw_question = qn
+    intent.overrides = intent.overrides or {}
+    intent.full_text_search = False
+    intent.fts_tokens = []
+    intent.fts_columns = []
+    intent.fts_bind_keys = []
+    intent.fts_mode = None
+    intent.fts_error = None
 
     if lowest_hint:
         intent.order_desc = False
@@ -1162,6 +1371,9 @@ def build_sql(intent: Intent, settings: Optional[Dict[str, object]] = None) -> t
                 parts.append(predicate)
             binds.update(extra_binds)
 
+    _apply_full_text_search(settings_map, intent, parts, binds)
+    _maybe_apply_stakeholder_filters(intent, parts, binds)
+
     # REQUEST_TYPE filter via synonyms (avoid duplicate clauses)
     existing_reqtype = any(
         "REQUEST_TYPE" in (wc or "").upper() for wc in (intent.where_clauses or [])
@@ -1245,6 +1457,17 @@ def build_sql(intent: Intent, settings: Optional[Dict[str, object]] = None) -> t
         "agg": intent.agg,
         "gross": intent.gross,
     }
+    tokens = list(intent.fts_tokens or [])
+    columns = list(intent.fts_columns or [])
+    bind_keys = list(intent.fts_bind_keys or [])
+    meta["fts"] = {
+        "enabled": bool(tokens and intent.full_text_search),
+        "mode": intent.fts_mode,
+        "tokens": tokens,
+        "columns": columns,
+        "binds": bind_keys if bind_keys else None,
+        "error": intent.fts_error,
+    }
     return sql, binds, meta
 
 
@@ -1253,10 +1476,13 @@ def build_contract_sql(
     settings: Dict[str, object],
     *,
     today: date | None = None,
+    overrides: Optional[Dict[str, object]] = None,
 ) -> tuple[str, dict, dict]:
     """Parse the question and build deterministic Contract SQL with settings."""
 
     intent = parse_intent(question, today=today)
+    intent.raw_question = question
+    intent.overrides = dict(overrides or {})
     return build_sql(intent, settings=settings)
 
 
