@@ -19,6 +19,7 @@ cases:
         - 'ORDER BY REQUEST_DATE DESC'
       must_not:
         - 'FETCH FIRST'
+        - 'FROM "Contract"\nORDER BY REQUEST_DATE DESC\n'
 
   - id: top10_value_last_month
     question: "top 10 contracts by contract value last month"

@@ -44,6 +44,16 @@ def _parse_flags(s: str) -> Tuple[bool, bool]:
     return ci, trim
 
 
+def _clean_value_literal(val: str) -> str:
+    """Drop trailing hints like (ci, trim) or ; comments from a literal."""
+
+    if not val:
+        return val
+    val = re.split(r"\s*\(", val, 1)[0]
+    val = val.split(";", 1)[0]
+    return val.strip().strip('"').strip("'")
+
+
 def parse_rate_comment(comment: str) -> RateHints:
     """
     Very small grammar:
@@ -68,10 +78,7 @@ def parse_rate_comment(comment: str) -> RateHints:
                 ci, trim = _parse_flags(raw_val)
                 # strip flags from tail
                 raw_val = _flags_re.sub("", raw_val).strip()
-                # strip quotes if any
-                if (raw_val.startswith("'") and raw_val.endswith("'")) or \
-                   (raw_val.startswith('"') and raw_val.endswith('"')):
-                    raw_val = raw_val[1:-1]
+                raw_val = _clean_value_literal(raw_val)
                 hints.eq_filters.append(EqFilter(col=col, value=raw_val, ci=ci, trim=trim))
                 continue
             # like: COL ~ token
@@ -80,7 +87,7 @@ def parse_rate_comment(comment: str) -> RateHints:
                 col = m.group(1).strip()
                 token = m.group(2).strip()
                 ci, trim = _parse_flags(token)
-                token = _flags_re.sub("", token).strip().strip("'\"")
+                token = _clean_value_literal(_flags_re.sub("", token).strip())
                 hints.like_filters.append(LikeFilter(col=col, pattern=token, ci=ci, trim=trim))
                 continue
 
