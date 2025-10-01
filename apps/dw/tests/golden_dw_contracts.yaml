@@ -530,3 +530,19 @@ cases:
         - 'ENTITY_NO AS GROUP_KEY'
         - 'COUNT(*) AS CNT'
         - 'GROUP BY ENTITY_NO'
+  - id: fts_has_it_or_home_care
+    question: "list all contracts has it or home care"
+    payload:
+      full_text_search: true
+    expect_sql_contains:
+      - 'UPPER("CONTRACT_SUBJECT") LIKE UPPER(:fts_0)'
+      - 'UPPER("CONTRACT_SUBJECT") LIKE UPPER(:fts_1)'
+      - 'ORDER BY REQUEST_DATE DESC'
+
+  - id: fts_has_it_single
+    question: "list all contracts has it"
+    payload:
+      full_text_search: true
+    expect_sql_contains:
+      - 'UPPER("CONTRACT_SUBJECT") LIKE UPPER(:fts_0)'
+      - 'ORDER BY REQUEST_DATE DESC'
