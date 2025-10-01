@@ -6,6 +6,290 @@ from datetime import date
 from .contract_common import GROSS_SQL, OVERLAP_PRED, explain_window
 from .fts import extract_fts_terms, build_fts_where
 
+
+# --- utilities (keep comments English only) ---
+
+
+def _get_fts_columns(settings: Any) -> List[str]:
+    """
+    Resolve FTS columns for Contract from settings DW_FTS_COLUMNS.
+    Falls back to '*' list if Contract is not present.
+    """
+
+    cfg: Dict[str, Any] = {}
+    if settings is None:
+        cfg = {}
+    else:
+        getter = getattr(settings, "get_json", None)
+        if callable(getter):
+            cfg = getter("DW_FTS_COLUMNS", {}) or {}
+        elif isinstance(settings, dict):
+            cfg = settings.get("DW_FTS_COLUMNS", {}) or {}
+    cols = (cfg.get("Contract") or cfg.get("*") or [])
+    # Ensure they exist as upper-case column names:
+    resolved: List[str] = []
+    for col in cols:
+        if isinstance(col, str) and col.strip():
+            resolved.append(col.strip().upper())
+    return resolved
+
+
+# allow common aliases -> real columns
+_COLUMN_ALIASES = {
+    # equality aliases
+    "DEPARTMENT": "OWNER_DEPARTMENT",
+    "DEPARTMENTS": "OWNER_DEPARTMENT",
+    "OWNER_DEPT": "OWNER_DEPARTMENT",
+    # stakeholder typos/variants -> special handler across 1..8
+    "STAKEHOLDER": "STAKEHOLDER*",  # marker for 8-slot fanout
+    "STACKHOLDER": "STAKEHOLDER*",
+}
+
+
+# 8-slot stakeholder column list
+_STAKEHOLDER_SLOTS = [
+    "CONTRACT_STAKEHOLDER_1",
+    "CONTRACT_STAKEHOLDER_2",
+    "CONTRACT_STAKEHOLDER_3",
+    "CONTRACT_STAKEHOLDER_4",
+    "CONTRACT_STAKEHOLDER_5",
+    "CONTRACT_STAKEHOLDER_6",
+    "CONTRACT_STAKEHOLDER_7",
+    "CONTRACT_STAKEHOLDER_8",
+]
+
+
+def _alias_column(raw: str) -> str:
+    """Map a free-text column-like token to a real column or special marker."""
+
+    normalized = (raw or "").strip().upper().replace("-", "_").replace(" ", "_")
+    return _COLUMN_ALIASES.get(normalized, normalized)
+
+
+def _split_has_terms(text: str) -> List[str]:
+    """
+    Extract terms after 'has' / 'contains' pattern and split by 'or' / ','.
+    Keep short tokens (like 'it'); trim and deduplicate.
+    """
+
+    import re
+
+    q = text or ""
+    # capture text after 'has' / 'contains'
+    match = re.search(r"\b(?:has|contain[s]?)\b\s+(.+)$", q, flags=re.IGNORECASE)
+    if not match:
+        return []
+    tail = match.group(1)
+    # split by ' or ' or commas
+    parts = re.split(r"\s+or\s+|,", tail, flags=re.IGNORECASE)
+    terms: List[str] = []
+    for part in parts:
+        token = part.strip().strip("\"'")
+        if token:
+            terms.append(token)
+    # deduplicate preserving order
+    seen: set[str] = set()
+    unique_terms: List[str] = []
+    for token in terms:
+        upper_token = token.upper()
+        if upper_token not in seen:
+            seen.add(upper_token)
+            unique_terms.append(token)
+    return unique_terms
+
+
+def _build_like_any_or(columns: List[str], term_bind_name: str) -> str:
+    """
+    Build (col LIKE :b OR col2 LIKE :b OR ...) across provided columns for a single bound name.
+    """
+
+    ors: List[str] = []
+    for column in columns:
+        ors.append(f"UPPER(NVL({column},'')) LIKE UPPER(:{term_bind_name})")
+    return "(" + " OR ".join(ors) + ")"
+
+
+def _apply_fts_if_requested(
+    question: str,
+    payload: Dict[str, Any],
+    settings: Any,
+    where_clauses: List[str],
+    binds: Dict[str, Any],
+) -> Tuple[bool, List[str], List[str]]:
+    """
+    If payload.full_text_search is true OR pattern 'has ...' is present,
+    generate a WHERE clause across FTS columns with OR semantics between terms.
+    """
+
+    import re
+
+    q = (question or "").strip()
+    fts_enabled = bool(payload.get("full_text_search"))
+    terms: List[str] = []
+    if fts_enabled:
+        # try to pull raw tokens from question (fallback tokenizer)
+        # If you already have a tokenizer upstream, you can replace this.
+        terms = _split_has_terms(q) or []
+    else:
+        # no flag set? activate when 'has' / 'contains' pattern exists
+        terms = _split_has_terms(q)
+
+    # If nothing after 'has', try naive pickup (e.g., "has it")
+    if not terms:
+        match = re.search(r"\bhas\s+([^\s].+)$", q, flags=re.IGNORECASE)
+        if match:
+            tail = match.group(1)
+            parts = re.split(r"\s+or\s+|,", tail, flags=re.IGNORECASE)
+            terms = [p.strip().strip("\"'") for p in parts if p.strip()]
+
+    if not terms:
+        return False, [], []
+
+    fts_cols = _get_fts_columns(settings)
+    if not fts_cols:
+        return False, [], []
+
+    # Build OR-of-ANDs: (any column LIKE term1) OR (any column LIKE term2) ...
+    # For your 'has it or home care' → two groups OR'ed together
+    or_groups: List[str] = []
+    for idx, term in enumerate(terms):
+        bind_name = f"fts_{idx}"
+        binds[bind_name] = f"%{term}%"
+        or_groups.append(_build_like_any_or(fts_cols, bind_name))
+
+    where_clauses.append("(" + " OR ".join(or_groups) + ")")
+    return True, terms, fts_cols
+
+
+def _apply_eq_filters_from_text(
+    question: str,
+    settings: Any,
+    where_clauses: List[str],
+    binds: Dict[str, Any],
+) -> bool:
+    """
+    Parse simple 'column = value' expressions from free text using DW_EXPLICIT_FILTER_COLUMNS.
+    Also supports aliases like 'departments' -> OWNER_DEPARTMENT.
+    """
+
+    import re
+
+    allowed_raw: List[str] = []
+    if settings is not None:
+        getter = getattr(settings, "get_json", None)
+        if callable(getter):
+            allowed_raw = getter("DW_EXPLICIT_FILTER_COLUMNS", []) or []
+        elif isinstance(settings, dict):
+            allowed_raw = settings.get("DW_EXPLICIT_FILTER_COLUMNS", []) or []
+    allowed = [str(c).upper() for c in allowed_raw if isinstance(c, str) and c.strip()]
+    if not allowed:
+        return False
+
+    q = question or ""
+    # find patterns: <word(s)> = <value> ; accept quotes or not
+    matches = re.findall(r"(\b[ A-Za-z_]+?)\s*=\s*[\"']?([^\"']+)[\"']?", q)
+    applied = False
+    for raw_col, raw_val in matches:
+        col = _alias_column(raw_col)
+        if col == "STAKEHOLDER*":
+            # treat as multi-slot equality (rare), but here we prefer 'has' pattern; skip
+            continue
+
+        if col not in allowed:
+            continue
+
+        bind_name = f"eq_{len(binds)}"
+        binds[bind_name] = raw_val.strip()
+        where_clauses.append(f"UPPER(TRIM({col})) = UPPER(TRIM(:{bind_name}))")
+        applied = True
+    return applied
+
+
+def _apply_stakeholder_has(
+    question: str,
+    where_clauses: List[str],
+    binds: Dict[str, Any],
+) -> Tuple[bool, List[str]]:
+    """
+    Detect 'stakeholder has X [or Y ...]' (including 'stackholder') and create
+    OR across 8 stakeholder slots for each term, then OR across terms.
+    """
+
+    import re
+
+    match = re.search(r"\b(stackholder|stakeholder)\b\s+has\s+(.+)$", question, flags=re.IGNORECASE)
+    if not match:
+        return False, []
+    tail = match.group(2)
+    parts = re.split(r"\s+or\s+|,", tail, flags=re.IGNORECASE)
+    terms = [p.strip().strip("\"'") for p in parts if p.strip()]
+    if not terms:
+        return False, []
+
+    or_groups: List[str] = []
+    for idx, term in enumerate(terms):
+        bind_name = f"sh_{idx}"
+        binds[bind_name] = f"%{term}%"
+        ors = []
+        for col in _STAKEHOLDER_SLOTS:
+            ors.append(f"UPPER(NVL({col},'')) LIKE UPPER(:{bind_name})")
+        or_groups.append("(" + " OR ".join(ors) + ")")
+    where_clauses.append("(" + " OR ".join(or_groups) + ")")
+    return True, terms
+
+
+def _build_text_filter_sql(
+    question: str,
+    payload: Dict[str, Any],
+    settings: Any,
+) -> Tuple[str, Dict[str, Any], Dict[str, Any], str, bool]:
+    """Attempt to build simple Contract SQL using text-driven filters."""
+
+    where_clauses: List[str] = []
+    binds: Dict[str, Any] = {}
+
+    stakeholder_applied, stakeholder_terms = _apply_stakeholder_has(question, where_clauses, binds)
+    eq_applied = _apply_eq_filters_from_text(question, settings, where_clauses, binds)
+    fts_applied, fts_terms, fts_columns = _apply_fts_if_requested(
+        question, payload, settings, where_clauses, binds
+    )
+
+    applied = stakeholder_applied or eq_applied or fts_applied
+    if not applied:
+        return "", {}, {}, "", False
+
+    sql = 'SELECT * FROM "Contract"\nWHERE ' + "\n  AND ".join(where_clauses) + "\nORDER BY REQUEST_DATE DESC"
+    explain_bits: List[str] = []
+    if stakeholder_applied:
+        explain_bits.append("Matched stakeholder terms across stakeholder slots.")
+    if eq_applied:
+        explain_bits.append("Applied equality filters from the question.")
+    if fts_applied:
+        explain_bits.append("Applied LIKE-based search over configured FTS columns.")
+    if not explain_bits:
+        explain_bits.append("Applied text/FTS filters.")
+    explain = " ".join(explain_bits)
+
+    meta: Dict[str, Any] = {
+        "strategy": "contract_deterministic",
+        "contract_planner": True,
+        "text_filters": True,
+    }
+    if fts_applied:
+        meta["fts"] = {
+            "enabled": True,
+            "mode": "like",
+            "columns": fts_columns,
+            "tokens": fts_terms,
+            "binds": [key for key in binds.keys() if key.startswith("fts_")],
+        }
+    else:
+        meta["fts"] = {"enabled": False}
+    if stakeholder_applied:
+        meta["stakeholder_terms"] = stakeholder_terms
+
+    return sql, binds, meta, explain, True
+
 # Dimension aliases we support for GROUP BY on Contract table
 DIMENSIONS = {
     "stakeholder": "CONTRACT_STAKEHOLDER_1",
@@ -111,6 +395,14 @@ def plan_contract_query(
     Deterministic planner for Contract table queries.
     Returns: (sql, binds, meta, explain)
     """
+    payload = payload or {}
+
+    text_sql, text_binds, text_meta, text_explain, text_applied = _build_text_filter_sql(
+        q or "", payload, settings
+    )
+    if text_applied:
+        return text_sql, text_binds, text_meta, text_explain
+
     measure = _pick_measure(q)
     group_col = _resolve_groupby(q)
     wants_count = "(count" in (q or "").lower() or " count" in (q or "").lower()
@@ -127,7 +419,6 @@ def plan_contract_query(
     else:
         explain_bits.append("No explicit window; using default or none.")
 
-    payload = payload or {}
     fts_flag = bool(payload.get("full_text_search"))
     fts_groups, fts_mode = extract_fts_terms(q, force=fts_flag)
 
