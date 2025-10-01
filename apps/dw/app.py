@@ -58,7 +58,7 @@ from apps.dw.settings_defaults import DEFAULT_EXPLICIT_FILTER_COLUMNS
 from apps.dw.settings_utils import load_explicit_filter_columns
 from apps.dw.tables.contracts import build_contract_sql
 from apps.mem.kv import get_settings_for_namespace
-from .contracts.contract_common import build_fts_clause
+from .contracts.fts import extract_fts_terms, build_fts_where
 from .contracts.filters import parse_explicit_filters
 from .contracts.contract_planner import plan_contract_query
 from .rating import rate_bp
@@ -234,9 +234,9 @@ def derive_sql_for_test(
             question,
             explicit_dates=explicit_dates,
             top_n=top_n,
-            full_text_search=False,
+            payload={"full_text_search": False},
+            settings={"DW_FTS_COLUMNS": {}},
             fts_columns=fts_columns,
-            fts_tokens=[],
         )
         binds.update(planner_binds or {})
 
@@ -310,15 +310,6 @@ def _infer_window_column(question: str) -> str:
     if "request" in ql:
         return "REQUEST_DATE"
     return "REQUEST_DATE"
-
-
-def _normalize_fts_clause(clause: str) -> str:
-    text = (clause or "").strip()
-    if not text:
-        return ""
-    if text.upper().startswith("AND "):
-        text = text[4:].strip()
-    return text
 
 
 _LAST_DAYS_RE = re.compile(r"last\s+(\d+)\s+day", re.IGNORECASE)
@@ -413,37 +404,52 @@ def _get_settings():
     return getattr(pipeline, "settings", None)
 
 
-def _get_fts_columns(*, table: str, namespace: str) -> List[str]:
-    settings = _get_settings()
-    if settings is None:
-        return []
-    getter = getattr(settings, "get_fts_columns", None)
+def _extract_fts_map(settings_obj: Any, namespace: str) -> Dict[str, Any]:
+    if settings_obj is None:
+        return {}
+    getter = getattr(settings_obj, "get_fts_columns", None)
     if callable(getter):
-        return getter(table)  # type: ignore[return-value]
-    fts_map: Dict[str, Any] = {}
-    json_getter = getattr(settings, "get_json", None)
+        try:
+            value = getter(namespace)  # type: ignore[arg-type]
+            if isinstance(value, dict):
+                return value
+        except TypeError:
+            pass
+    json_getter = getattr(settings_obj, "get_json", None)
     if callable(json_getter):
         try:
-            fts_map = json_getter("DW_FTS_COLUMNS", scope="namespace", namespace=namespace) or {}
+            value = json_getter("DW_FTS_COLUMNS", scope="namespace", namespace=namespace)
         except TypeError:
-            fts_map = json_getter("DW_FTS_COLUMNS") or {}
-    elif hasattr(settings, "get"):
+            value = json_getter("DW_FTS_COLUMNS")
+        if isinstance(value, dict):
+            return value
+    plain_get = getattr(settings_obj, "get", None)
+    if callable(plain_get):
         try:
-            fts_map = settings.get("DW_FTS_COLUMNS", scope="namespace", namespace=namespace) or {}
+            value = plain_get("DW_FTS_COLUMNS", scope="namespace", namespace=namespace)
         except TypeError:
-            fts_map = settings.get("DW_FTS_COLUMNS") or {}
-    if isinstance(fts_map, dict):
-        columns = fts_map.get(table) or fts_map.get("*") or []
-        if isinstance(columns, list):
-            return [str(col) for col in columns]
-        if isinstance(columns, str):
-            return [part.strip() for part in columns.split(",") if part.strip()]
+            value = plain_get("DW_FTS_COLUMNS")
+        if isinstance(value, dict):
+            return value
+    return {}
+
+
+def _resolve_fts_columns_from_map(fts_map: Dict[str, Any], table: str) -> List[str]:
+    if not isinstance(fts_map, dict):
+        return []
+    columns = fts_map.get(table) or fts_map.get("*") or []
+    if isinstance(columns, list):
+        return [str(col) if str(col).startswith('"') else f'"{col}"' for col in columns]
+    if isinstance(columns, str):
+        raw = [part.strip() for part in columns.split(",") if part.strip()]
+        return [col if col.startswith('"') else f'"{col}"' for col in raw]
     return []
 
 
-def _extract_fts_tokens(question: str) -> List[str]:
-    tokens = [tok for tok in re.split(r"\W+", question or "") if len(tok) >= 3]
-    return [tok.upper() for tok in tokens]
+def _get_fts_columns(*, table: str, namespace: str) -> List[str]:
+    settings = _get_settings()
+    fts_map = _extract_fts_map(settings, namespace)
+    return _resolve_fts_columns_from_map(fts_map, table)
 
 
 def _extract_top_n(question: str) -> Optional[int]:
@@ -583,8 +589,12 @@ def answer():
         DEFAULT_EXPLICIT_FILTER_COLUMNS,
     )
 
-    fts_columns = _get_fts_columns(table=table_name, namespace=namespace)
-    fts_tokens = _extract_fts_tokens(question) if full_text_search else []
+    fts_map = _extract_fts_map(settings, namespace)
+    fts_columns = _resolve_fts_columns_from_map(fts_map, table_name)
+    fts_groups, fts_mode = extract_fts_terms(question, force=full_text_search)
+    fts_where_sql, fts_binds = ("", {})
+    if fts_groups and fts_columns:
+        fts_where_sql, fts_binds = build_fts_where(fts_groups, fts_columns)
 
     top_n = payload.get("top_n")
     if top_n is None:
@@ -608,12 +618,13 @@ def answer():
                 where_clauses.append(f"{date_col} BETWEEN :date_start AND :date_end")
                 explain_bits.append(f"Used date window {ds} .. {de} on {date_col}.")
 
-        if full_text_search and fts_columns and fts_tokens:
-            fts_clause, fts_binds = build_fts_clause(fts_columns, fts_tokens)
-            normalized = _normalize_fts_clause(fts_clause)
-            if normalized:
-                where_clauses.append(normalized)
-                explain_bits.append(f"Applied full-text search for tokens {fts_tokens}.")
+        if fts_where_sql:
+            where_clauses.append(fts_where_sql)
+            explain_bits.append(
+                "Applied full-text search for tokens "
+                + ", ".join([" AND ".join(group) for group in fts_groups])
+                + "."
+            )
             binds.update(fts_binds)
 
         sql = f'SELECT * FROM "{table_name}"'
@@ -647,6 +658,13 @@ def answer():
             **exec_meta,
             "duration_ms": duration_ms,
         }
+        meta["fts"] = {
+            "enabled": bool(fts_where_sql),
+            "mode": fts_mode,
+            "tokens": fts_groups if fts_where_sql else None,
+            "columns": fts_columns if fts_where_sql else None,
+            "binds": list(fts_binds.keys()) if fts_where_sql else None,
+        }
         response = {
             "ok": True,
             "inquiry_id": inquiry_id,
@@ -661,19 +679,24 @@ def answer():
                     "explicit_dates": _dates_to_iso(explicit_dates),
                     "top_n": top_n,
                     "full_text_search": full_text_search,
-                    "fts_tokens": fts_tokens,
+                    "fts": {
+                        "mode": fts_mode,
+                        "tokens": fts_groups,
+                        "columns": fts_columns,
+                    },
                 },
             },
         }
         return jsonify(response)
 
+    planner_settings = {"DW_FTS_COLUMNS": fts_map} if isinstance(fts_map, dict) else {}
     sql, binds, meta, explain = plan_contract_query(
         question,
         explicit_dates=explicit_dates,
         top_n=top_n,
-        full_text_search=full_text_search,
+        payload=payload,
+        settings=planner_settings,
         fts_columns=fts_columns,
-        fts_tokens=fts_tokens,
     )
 
     LOGGER.info("[dw] final_sql: %s", {"size": len(sql), "sql": sql})
@@ -706,7 +729,11 @@ def answer():
                 "explicit_dates": _dates_to_iso(explicit_dates),
                 "top_n": top_n,
                 "full_text_search": full_text_search,
-                "fts_tokens": fts_tokens,
+                "fts": {
+                    "mode": fts_mode,
+                    "tokens": fts_groups,
+                    "columns": fts_columns,
+                },
             }
         },
     }

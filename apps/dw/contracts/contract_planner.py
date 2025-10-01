@@ -3,7 +3,8 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 from datetime import date
 
-from .contract_common import GROSS_SQL, OVERLAP_PRED, build_fts_clause, explain_window
+from .contract_common import GROSS_SQL, OVERLAP_PRED, explain_window
+from .fts import extract_fts_terms, build_fts_where
 
 # Dimension aliases we support for GROUP BY on Contract table
 DIMENSIONS = {
@@ -102,9 +103,9 @@ def plan_contract_query(
     *,
     explicit_dates: Optional[Tuple[date, date]],
     top_n: Optional[int],
-    full_text_search: bool,
-    fts_columns: List[str],
-    fts_tokens: List[str],
+    payload: Optional[Dict[str, Any]],
+    settings: Optional[Dict[str, Any]] = None,
+    fts_columns: Optional[List[str]] = None,
 ) -> Tuple[str, Dict[str, Any], Dict[str, Any], str]:
     """
     Deterministic planner for Contract table queries.
@@ -126,12 +127,54 @@ def plan_contract_query(
     else:
         explain_bits.append("No explicit window; using default or none.")
 
-    # FULL TEXT SEARCH
-    fts_where, fts_binds = ("", {})
-    if full_text_search and fts_columns and fts_tokens:
-        fts_where, fts_binds = build_fts_clause(fts_columns, fts_tokens)
+    payload = payload or {}
+    fts_flag = bool(payload.get("full_text_search"))
+    fts_groups, fts_mode = extract_fts_terms(q, force=fts_flag)
+
+    configured_cols: List[str] = []
+    if fts_columns:
+        configured_cols = [
+            str(c) if str(c).startswith('"') else f'"{c}"'
+            for c in fts_columns
+        ]
+    else:
+        raw_cfg: Dict[str, Any] = {}
+        if isinstance(settings, dict):
+            cfg = settings.get("DW_FTS_COLUMNS")
+            if isinstance(cfg, dict):
+                raw_cfg = cfg
+        if raw_cfg:
+            table_cols = raw_cfg.get("Contract") or raw_cfg.get("*")
+            if isinstance(table_cols, list):
+                configured_cols = [
+                    str(col) if str(col).startswith('"') else f'"{col}"'
+                    for col in table_cols
+                ]
+
+    fts_where = ""
+    fts_binds: Dict[str, Any] = {}
+    if fts_groups and configured_cols:
+        fts_where, fts_binds = build_fts_where(fts_groups, configured_cols)
         binds.update(fts_binds)
-        explain_bits.append(f"Applied full-text search over {len(fts_columns)} columns for tokens: {fts_tokens}.")
+        tokens_preview = [" AND ".join(group) for group in fts_groups]
+        explain_bits.append(
+            "Applied full-text search over "
+            + str(len(configured_cols))
+            + " columns for tokens: "
+            + ", ".join(tokens_preview)
+            + "."
+        )
+
+    def _with_fts(meta: Dict[str, Any]) -> Dict[str, Any]:
+        enriched = dict(meta)
+        enriched["fts"] = {
+            "enabled": bool(fts_where),
+            "mode": fts_mode,
+            "columns": configured_cols if fts_where else None,
+            "tokens": fts_groups if fts_where else None,
+            "binds": list(fts_binds.keys()) if fts_where else None,
+        }
+        return enriched
 
     # Patterns
     ql = (q or "").lower()
@@ -146,8 +189,13 @@ def plan_contract_query(
         date_col = "END_DATE"
         explain_bits.append("Interpreting 'expiring' as END_DATE between window.")
         window_pred = "END_DATE BETWEEN :date_start AND :date_end"
-        sql = f"SELECT COUNT(*) AS CNT FROM \"Contract\" WHERE {window_pred}{fts_where}"
-        return sql, binds, {"group_by": None, "measure": "COUNT", "date_col": date_col}, " ".join(explain_bits)
+        where_parts = [window_pred]
+        if fts_where:
+            where_parts.append(fts_where)
+        sql = "SELECT COUNT(*) AS CNT FROM \"Contract\""
+        if where_parts:
+            sql += " WHERE " + " AND ".join(where_parts)
+        return sql, binds, _with_fts({"group_by": None, "measure": "COUNT", "date_col": date_col}), " ".join(explain_bits)
 
     if group_col and not wants_count:
         where_parts: List[str] = []
@@ -155,6 +203,8 @@ def plan_contract_query(
             where_parts.append(window_pred)
         if eq_filter:
             where_parts.append(eq_filter["predicate"])
+        if fts_where:
+            where_parts.append(fts_where)
 
         sql_lines: List[str] = []
         if eq_filter:
@@ -175,10 +225,6 @@ def plan_contract_query(
 
         if where_parts:
             sql_lines.append("WHERE " + " AND ".join(where_parts))
-        if not where_parts and fts_where:
-            sql_lines.append("WHERE 1=1")
-        if fts_where:
-            sql_lines[-1] = sql_lines[-1] + fts_where if sql_lines else "WHERE 1=1" + fts_where
 
         sql = "\n".join(sql_lines)
         sql += f"\nGROUP BY {group_col}"
@@ -198,7 +244,7 @@ def plan_contract_query(
         if top_n:
             binds["top_n"] = int(top_n)
             sql += "\nFETCH FIRST :top_n ROWS ONLY"
-        return sql, binds, meta, " ".join(explain_bits)
+        return sql, binds, _with_fts(meta), " ".join(explain_bits)
 
     if wants_count and not group_col:
         # Count by request window (or overlap if mentioned)
@@ -209,24 +255,28 @@ def plan_contract_query(
                 "FROM \"Contract\" GROUP BY CONTRACT_STATUS ORDER BY CNT DESC"
             )
             explain_bits.append("Grouped count by CONTRACT_STATUS.")
-            return sql, binds, {"group_by": "CONTRACT_STATUS", "measure": "COUNT"}, " ".join(explain_bits)
+            return sql, binds, _with_fts({"group_by": "CONTRACT_STATUS", "measure": "COUNT"}), " ".join(explain_bits)
         # Else: simple count in window if exists, else all time
+        where_parts: List[str] = []
         if explicit_dates:
-            sql = f"SELECT COUNT(*) AS CNT FROM \"Contract\" WHERE {window_pred}{fts_where}"
-        else:
-            sql = "SELECT COUNT(*) AS CNT FROM \"Contract\"" + fts_where
+            where_parts.append(window_pred)
+        if fts_where:
+            where_parts.append(fts_where)
+        sql = "SELECT COUNT(*) AS CNT FROM \"Contract\""
+        if where_parts:
+            sql += " WHERE " + " AND ".join(where_parts)
         explain_bits.append("Returning COUNT(*) without grouping.")
-        return sql, binds, {"group_by": None, "measure": "COUNT", "date_col": date_col}, " ".join(explain_bits)
+        return sql, binds, _with_fts({"group_by": None, "measure": "COUNT", "date_col": date_col}), " ".join(explain_bits)
 
     # Top contracts (no group) by measure
     if "top" in ql and "contract" in ql:
         select_cols = "*"
+        where_parts: List[str] = []
         if explicit_dates:
-            where_clause = f"WHERE {window_pred}{fts_where}"
-        elif fts_where:
-            where_clause = "WHERE 1=1" + fts_where
-        else:
-            where_clause = ""
+            where_parts.append(window_pred)
+        if fts_where:
+            where_parts.append(fts_where)
+        where_clause = "WHERE " + " AND ".join(where_parts) if where_parts else ""
         sql = (
             f"SELECT {select_cols} FROM \"Contract\"\n"
             f"{where_clause}\n"
@@ -236,55 +286,63 @@ def plan_contract_query(
             binds["top_n"] = int(top_n)
             sql += "\nFETCH FIRST :top_n ROWS ONLY"
         explain_bits.append("Top contracts by measure (descending).")
-        return sql, binds, {"group_by": None, "measure": measure, "date_col": date_col}, " ".join(explain_bits)
+        return sql, binds, _with_fts({"group_by": None, "measure": measure, "date_col": date_col}), " ".join(explain_bits)
 
     # Requested last X (explicit on REQUEST_DATE)
     if "requested" in ql:
+        where_parts = ["REQUEST_DATE BETWEEN :date_start AND :date_end"]
+        if fts_where:
+            where_parts.append(fts_where)
         sql = (
             "SELECT * FROM \"Contract\"\n"
-            "WHERE REQUEST_DATE BETWEEN :date_start AND :date_end"
-            f"{fts_where}\nORDER BY REQUEST_DATE DESC"
+            "WHERE " + " AND ".join(where_parts) + "\nORDER BY REQUEST_DATE DESC"
         )
         explain_bits.append("Requested window detected; sorting by REQUEST_DATE DESC.")
-        return sql, binds, {"date_col": "REQUEST_DATE"}, " ".join(explain_bits)
+        return sql, binds, _with_fts({"date_col": "REQUEST_DATE"}), " ".join(explain_bits)
 
     # Specific filters:
     if "vat" in ql and ("null" in ql or "zero" in ql):
         # VAT null or zero and positive contract value
         pred = "(NVL(VAT, 0) = 0 AND NVL(CONTRACT_VALUE_NET_OF_VAT,0) > 0)"
-        base = f"SELECT * FROM \"Contract\" WHERE {pred}"
+        where_parts = [pred]
         if explicit_dates:
-            base += f" AND {window_pred}"
-        base += fts_where + "\nORDER BY " + measure + " DESC"
+            where_parts.append(window_pred)
+        if fts_where:
+            where_parts.append(fts_where)
+        base = "SELECT * FROM \"Contract\"\nWHERE " + " AND ".join(where_parts)
+        base += "\nORDER BY " + measure + " DESC"
         explain_bits.append("Applied VAT null/zero and value > 0 predicate.")
-        return base, binds, {"filter": "vat_zero_or_null"}, " ".join(explain_bits)
+        return base, binds, _with_fts({"filter": "vat_zero_or_null"}), " ".join(explain_bits)
 
     if "distinct entity" in ql or ("list" in ql and "entity" in ql and "count" in ql):
         sql = "SELECT ENTITY AS GROUP_KEY, COUNT(*) AS CNT FROM \"Contract\" GROUP BY ENTITY ORDER BY CNT DESC"
         explain_bits.append("Distinct ENTITY with counts.")
-        return sql, binds, {"group_by": "ENTITY", "measure": "COUNT"}, " ".join(explain_bits)
+        return sql, binds, _with_fts({"group_by": "ENTITY", "measure": "COUNT"}), " ".join(explain_bits)
 
     if eq_filter:
         where_parts = []
         if explicit_dates:
             where_parts.append(window_pred)
         where_parts.append(eq_filter["predicate"])
+        if fts_where:
+            where_parts.append(fts_where)
         sql = "SELECT * FROM \"Contract\""
         if where_parts:
             sql += "\nWHERE " + " AND ".join(where_parts)
-        if not where_parts and fts_where:
-            sql += "\nWHERE 1=1"
-        if fts_where:
-            sql += fts_where
         order = eq_filter.get("order") or "REQUEST_DATE DESC"
         sql += f"\nORDER BY {order}"
         explain_bits.append(f"Applied equality filter on {eq_filter['col']} from the question.")
-        return sql, binds, {"group_by": None, "filter": eq_filter["col"], "date_col": date_col}, " ".join(explain_bits)
+        return sql, binds, _with_fts({"group_by": None, "filter": eq_filter["col"], "date_col": date_col}), " ".join(explain_bits)
 
     # Fallback: list in window (if any) else all
     sql = "SELECT * FROM \"Contract\""
+    where_parts = []
     if explicit_dates:
-        sql += f"\nWHERE {window_pred}"
-    sql += fts_where + "\nORDER BY REQUEST_DATE DESC"
+        where_parts.append(window_pred)
+    if fts_where:
+        where_parts.append(fts_where)
+    if where_parts:
+        sql += "\nWHERE " + " AND ".join(where_parts)
+    sql += "\nORDER BY REQUEST_DATE DESC"
     explain_bits.append("Fallback listing ordered by REQUEST_DATE DESC.")
-    return sql, binds, {"fallback": True, "date_col": date_col}, " ".join(explain_bits)
+    return sql, binds, _with_fts({"fallback": True, "date_col": date_col}), " ".join(explain_bits)
