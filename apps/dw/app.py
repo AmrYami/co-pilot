@@ -204,9 +204,15 @@ def _plan_contract_sql(
     namespace: str,
     *,
     today: date | None = None,
+    overrides: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
     settings = get_settings_for_namespace(namespace)
-    sql, binds, meta = build_contract_sql(question, settings or {}, today=today)
+    sql, binds, meta = build_contract_sql(
+        question,
+        settings or {},
+        today=today,
+        overrides=overrides or {},
+    )
     return sql, binds, meta
 
 
@@ -521,20 +527,22 @@ def _log_inquiry(
 @dw_bp.post("/answer")
 def answer():
     t0 = time.time()
-    payload = request.get_json(force=True) or {}
+    payload = request.get_json(force=True, silent=False) or {}
     question = (payload.get("question") or "").strip()
     if not question:
         return jsonify({"ok": False, "error": "question required"}), 400
 
     prefixes = _coerce_prefixes(payload.get("prefixes"))
     auth_email = payload.get("auth_email") or None
-    full_text_search = bool(payload.get("full_text_search") or False)
+    full_text_search = bool(payload.get("full_text_search", False))
+    overrides = {"full_text_search": full_text_search} if "full_text_search" in payload else {}
 
     namespace = (payload.get("namespace") or "dw::common").strip() or "dw::common"
     contract_sql, contract_binds, contract_meta = _plan_contract_sql(
         question,
         namespace,
         today=date.today(),
+        overrides=overrides,
     )
     if contract_sql:
         binds = _coerce_bind_dates(dict(contract_binds or {}))
@@ -664,6 +672,7 @@ def answer():
             "tokens": fts_groups if fts_where_sql else None,
             "columns": fts_columns if fts_where_sql else None,
             "binds": list(fts_binds.keys()) if fts_where_sql else None,
+            "error": None,
         }
         response = {
             "ok": True,
@@ -716,6 +725,7 @@ def answer():
     meta_out: Dict[str, Any] = {**(meta or {}), **exec_meta, "duration_ms": duration_ms, "explicit_filters": False}
     if "binds" not in meta_out:
         meta_out["binds"] = _json_safe_binds(binds or {})
+    meta_fts = (meta_out or {}).get("fts") if isinstance(meta_out, dict) else None
     response = {
         "ok": True,
         "inquiry_id": inquiry_id,
@@ -737,6 +747,15 @@ def answer():
             }
         },
     }
+    if isinstance(response.get("debug"), dict):
+        response["debug"]["fts"] = {
+            "enabled": bool(meta_fts.get("enabled")) if isinstance(meta_fts, dict) else False,
+            "mode": meta_fts.get("mode") if isinstance(meta_fts, dict) else None,
+            "tokens": meta_fts.get("tokens") if isinstance(meta_fts, dict) else [],
+            "columns": meta_fts.get("columns") if isinstance(meta_fts, dict) else [],
+            "binds": meta_fts.get("binds") if isinstance(meta_fts, dict) else None,
+            "error": meta_fts.get("error") if isinstance(meta_fts, dict) else None,
+        }
     return jsonify(response)
 
 
