@@ -4,15 +4,199 @@ from __future__ import annotations
 
 import re
 from datetime import date
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from .intent import DWIntent
 from .enums import load_enum_synonyms
 from .sql_builder import attach_where_clause, build_where_from_filters
-from apps.dw.contracts.eq_filters import detect_explicit_equality_filters
 from apps.settings import get_setting_json
 
 DIMENSIONS_ALLOWED = {"OWNER_DEPARTMENT", "DEPARTMENT_OUL", "ENTITY_NO", "ENTITY"}
+
+
+# ---------- utils: normalization & settings ----------
+
+
+def _norm_col_name(raw: str) -> str:
+    """Normalize human-entered column labels to DB column style."""
+
+    return re.sub(r"\s+", "_", raw.strip()).upper()
+
+
+def _load_json_setting(mem, namespace: str, key: str, default):
+    try:
+        value = mem.get(namespace, key, scope="namespace")
+        return value if isinstance(value, (dict, list)) else default
+    except Exception:
+        return default
+
+
+# ---------- explicit equality extraction ----------
+
+
+_EQ_RE = re.compile(r"(?i)\b([A-Z][A-Z _0-9]+)\s*=\s*([\"\']?)([^\"\';\)\n]+)\2")
+
+
+def _extract_explicit_equals_filters(question: str):
+    """Return list of (raw_col, value) extracted from text like 'COL = value'."""
+
+    out: List[Tuple[str, str]] = []
+    if not question:
+        return out
+    for match in _EQ_RE.finditer(question):
+        raw_col = match.group(1)
+        val = match.group(3).strip()
+        val = re.split(r"\s*\(", val, 1)[0].strip()
+        if val.endswith("'") or val.endswith('"'):
+            val = val[:-1].strip()
+        out.append((raw_col, val))
+    return out
+
+
+def _build_enum_synonym_predicates(
+    table_name: str,
+    col: str,
+    value: str,
+    enum_map: dict,
+    binds: Dict[str, object],
+):
+    """Expand equality using DW_ENUM_SYNONYMS if present."""
+
+    key = f"{table_name}.{col}"
+    col_map = enum_map.get(key) or enum_map.get(col)
+    if not isinstance(col_map, dict):
+        return None, binds
+    value_u = value.strip().upper()
+    equals_list: List[str] = []
+    prefix_list: List[str] = []
+    contains_list: List[str] = []
+
+    for bucket, rules in col_map.items():
+        for eqv in (rules.get("equals", []) or []):
+            if value_u == eqv.upper():
+                equals_list.extend(rules.get("equals", []) or [])
+                prefix_list.extend(rules.get("prefix", []) or [])
+                contains_list.extend(rules.get("contains", []) or [])
+                break
+        if equals_list:
+            continue
+        for px in (rules.get("prefix", []) or []):
+            if value_u.startswith(px.upper()):
+                equals_list.extend(rules.get("equals", []) or [])
+                prefix_list.extend(rules.get("prefix", []) or [])
+                contains_list.extend(rules.get("contains", []) or [])
+                break
+
+    if not (equals_list or prefix_list or contains_list):
+        bind_name = f"eq_{col.lower()}"
+        binds[bind_name] = value
+        fragment = f"UPPER(TRIM({col})) = UPPER(TRIM(:{bind_name}))"
+        return fragment, binds
+
+    ors: List[str] = []
+    for idx, eqv in enumerate(equals_list):
+        if not eqv:
+            continue
+        bind_name = f"eq_{col.lower()}_{idx}"
+        binds[bind_name] = eqv
+        ors.append(f"UPPER(TRIM({col})) = UPPER(TRIM(:{bind_name}))")
+    for idx, px in enumerate(prefix_list):
+        if not px:
+            continue
+        bind_name = f"px_{col.lower()}_{idx}"
+        binds[bind_name] = f"{px}%"
+        ors.append(f"UPPER(TRIM({col})) LIKE UPPER(:{bind_name})")
+    for idx, ct in enumerate(contains_list):
+        if not ct:
+            continue
+        bind_name = f"ct_{col.lower()}_{idx}"
+        binds[bind_name] = f"%{ct}%"
+        ors.append(f"UPPER(TRIM({col})) LIKE UPPER(:{bind_name})")
+
+    fragment = "(" + " OR ".join(ors) + ")"
+    return fragment, binds
+
+
+def apply_explicit_equals_filters(
+    question: str,
+    table_name: str,
+    mem,
+    where_clauses: List[str],
+    binds: Dict[str, object],
+) -> bool:
+    """Detect and apply explicit equality filters from the question text."""
+
+    explicit_cols = _load_json_setting(
+        mem, "dw::common", "DW_EXPLICIT_FILTER_COLUMNS", []
+    )
+    if isinstance(explicit_cols, dict):
+        allowed = set(_norm_col_name(c) for c in explicit_cols.get(table_name, []))
+        allowed |= set(_norm_col_name(c) for c in explicit_cols.get("*", []))
+    else:
+        allowed = set(_norm_col_name(c) for c in explicit_cols)
+
+    enum_map = _load_json_setting(mem, "dw::common", "DW_ENUM_SYNONYMS", {}) or {}
+
+    extracted = _extract_explicit_equals_filters(question)
+    any_applied = False
+
+    for raw_col, raw_val in extracted:
+        col = _norm_col_name(raw_col)
+        if col not in allowed:
+            continue
+
+        fragment, _ = _build_enum_synonym_predicates(
+            table_name, col, raw_val, enum_map, binds
+        )
+        if fragment is None:
+            bind_name = f"eq_{col.lower()}"
+            binds[bind_name] = raw_val
+            fragment = f"UPPER(TRIM({col})) = UPPER(TRIM(:{bind_name}))"
+
+        where_clauses.append(fragment)
+        any_applied = True
+
+    return any_applied
+
+
+class _SettingsMemAdapter:
+    """Adapter to provide a mem.get interface using settings accessors."""
+
+    def __init__(
+        self,
+        namespace: str,
+        settings_get,
+        *,
+        preload: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        self._namespace = namespace
+        self._settings_get = settings_get
+        self._preload = preload or {}
+
+    def get(self, namespace: str, key: str, scope: str = "namespace") -> Any:
+        if key in self._preload:
+            return self._preload[key]
+
+        target_ns = namespace or self._namespace
+        getter = self._settings_get
+        if callable(getter):
+            for kwargs in (
+                {"scope": scope, "namespace": target_ns},
+                {"scope": scope},
+                {"namespace": target_ns},
+                {},
+            ):
+                try:
+                    value = getter(key, **kwargs)
+                except TypeError:
+                    continue
+                if value is not None:
+                    return value
+
+        try:
+            return get_setting_json(target_ns, key, None)
+        except Exception:
+            return None
 
 
 def _overlap_clause() -> str:
@@ -174,38 +358,24 @@ def build_sql(intent: DWIntent) -> Tuple[str, Dict[str, object], Dict[str, objec
         except Exception:
             return default
 
-    def _ensure_list(value) -> List[str]:
-        if isinstance(value, (list, tuple, set)):
-            items: List[str] = []
-            for v in value:
-                if v is None:
-                    continue
-                text = str(v).strip()
-                if text:
-                    items.append(text.upper())
-            return items
-        if isinstance(value, str):
-            return [part.strip().upper() for part in value.split(",") if part.strip()]
-        return []
-
-    def _normalize_explicit_setting(value):
-        if isinstance(value, dict):
-            normalized: Dict[str, List[str]] = {}
-            for key, arr in value.items():
-                normalized[str(key)] = _ensure_list(arr)
-            return normalized
-        return _ensure_list(value)
-
-    explicit_cols_setting = _normalize_explicit_setting(
-        _load_setting("DW_EXPLICIT_FILTER_COLUMNS", []) or []
-    )
-    fts_setting_raw = _load_setting("DW_FTS_COLUMNS", {}) or {}
-    fts_setting = (
-        {str(k): _ensure_list(v) for k, v in fts_setting_raw.items()}
-        if isinstance(fts_setting_raw, dict)
-        else _ensure_list(fts_setting_raw)
-    )
+    explicit_cols_raw = _load_setting("DW_EXPLICIT_FILTER_COLUMNS", []) or []
     enum_syn_setting = _load_setting("DW_ENUM_SYNONYMS", {}) or {}
+
+    mem_settings_client = None
+    if isinstance(intent.notes, dict):
+        for key in ("mem_settings_client", "mem_settings"):
+            candidate = intent.notes.get(key)
+            if hasattr(candidate, "get"):
+                mem_settings_client = candidate
+                break
+    if mem_settings_client is None:
+        preload = {
+            "DW_EXPLICIT_FILTER_COLUMNS": explicit_cols_raw,
+            "DW_ENUM_SYNONYMS": enum_syn_setting,
+        }
+        mem_settings_client = _SettingsMemAdapter(
+            namespace, settings_get, preload=preload
+        )
 
     filters_raw = getattr(intent, "filters", None) or []
     filter_fragments, filter_binds = build_where_from_filters(settings_get, filters_raw)
@@ -214,15 +384,6 @@ def build_sql(intent: DWIntent) -> Tuple[str, Dict[str, object], Dict[str, objec
         isinstance(f, dict) and (f.get("column") or "").upper() == "REQUEST_TYPE"
         for f in (filters_raw or [])
     ) and filters_applied
-
-    request_type_detected = False
-    explicit_request = _extract_request_type_value(intent.question or "")
-    if explicit_request and not request_type_applied:
-        clause, rt_binds = _build_request_type_predicate(explicit_request, settings_get)
-        if clause:
-            where_parts.append(clause)
-            binds.update(rt_binds)
-            request_type_detected = True
 
     measure = intent.measure_sql or "NVL(CONTRACT_VALUE_NET_OF_VAT,0)"
 
@@ -240,19 +401,28 @@ def build_sql(intent: DWIntent) -> Tuple[str, Dict[str, object], Dict[str, objec
     if window_kind:
         meta["window_kind"] = window_kind
 
-    request_type_applied = request_type_applied or request_type_detected
-
-    eq_where, eq_binds, eq_suggested_order = detect_explicit_equality_filters(
-        intent.question or "",
-        table="Contract",
-        explicit_cols_setting=explicit_cols_setting,
-        fts_setting=fts_setting,
-        enum_syn=enum_syn_setting,
+    eq_filters_applied = apply_explicit_equals_filters(
+        question=intent.question or "",
+        table_name="Contract",
+        mem=mem_settings_client,
+        where_clauses=where_parts,
+        binds=binds,
     )
-    eq_filters_applied = bool(eq_where)
-    if eq_filters_applied:
-        where_parts.append(f"({eq_where})")
-        binds.update(eq_binds)
+
+    request_type_detected = False
+    explicit_request = _extract_request_type_value(intent.question or "")
+    if explicit_request and not request_type_applied:
+        has_request_type_clause = any(
+            "REQUEST_TYPE" in clause for clause in where_parts
+        )
+        if not has_request_type_clause:
+            clause, rt_binds = _build_request_type_predicate(explicit_request, settings_get)
+            if clause:
+                where_parts.append(clause)
+                binds.update(rt_binds)
+                request_type_detected = True
+
+    request_type_applied = request_type_applied or request_type_detected
 
     if intent.group_by is None:
         sort_desc = _apply_sort_asc_if_bottom(intent, default_desc=True)
@@ -272,7 +442,7 @@ def build_sql(intent: DWIntent) -> Tuple[str, Dict[str, object], Dict[str, objec
 
         default_order_col: Optional[str] = None
         if eq_filters_applied:
-            default_order_col = eq_suggested_order or "REQUEST_DATE"
+            default_order_col = "REQUEST_DATE"
         elif (filters_applied or request_type_applied) and not intent.has_time_window:
             default_order_col = "REQUEST_DATE"
 
