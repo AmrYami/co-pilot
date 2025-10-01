@@ -52,6 +52,8 @@ except Exception:  # pragma: no cover - fallback for tests
 
 from core.inquiries import create_or_update_inquiry
 
+from apps.dw.contract.rate_apply import apply_rate_hints_to_contract
+from apps.dw.rate_grammar import parse_rate_comment
 from apps.dw.rate_hints import append_where, parse_rate_hints, replace_or_add_order_by
 from apps.dw.tables.contracts import build_contract_sql
 from apps.mem.kv import get_settings_for_namespace
@@ -252,6 +254,18 @@ def derive_sql_for_test(
             binds.update(hints.where_binds)
         if hints.order_by_sql:
             sql = replace_or_add_order_by(sql, hints.order_by_sql)
+
+        structured = parse_rate_comment(rate_comment)
+        if structured.eq_filters or structured.like_filters:
+            extra_where: List[str] = []
+
+            def _rh_bind(prefix: str, counter={"n": 0}) -> str:
+                counter["n"] += 1
+                return f"{prefix}_{counter['n']}"
+
+            apply_rate_hints_to_contract(structured, extra_where, binds, _rh_bind)
+            if extra_where:
+                sql = append_where(sql, " AND ".join(extra_where))
 
     return sql, _coerce_bind_dates(binds)
 

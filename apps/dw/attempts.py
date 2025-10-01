@@ -16,6 +16,9 @@ except Exception:  # pragma: no cover
     def text(sql: str):  # type: ignore
         return sql
 
+from apps.dw.contract.rate_apply import apply_rate_hints_to_contract
+from apps.dw.rate_grammar import parse_rate_comment
+
 from .builder import build_sql
 from .intent import NLIntent, parse_intent_legacy
 from .rate_hints import append_where, parse_rate_hints, replace_or_add_order_by
@@ -137,6 +140,19 @@ def run_attempt(
             hints_meta["order_by_applied"] = True
         if hints.group_by_cols:
             hints_meta["group_by"] = list(hints.group_by_cols)
+
+        structured = parse_rate_comment(rate_comment)
+        if structured.eq_filters or structured.like_filters:
+            extra_where: list[str] = []
+
+            def _rh_bind(prefix: str, counter={"n": 0}) -> str:
+                counter["n"] += 1
+                return f"{prefix}_{counter['n']}"
+
+            apply_rate_hints_to_contract(structured, extra_where, binds, _rh_bind)
+            if extra_where:
+                sql = append_where(sql, " AND ".join(extra_where))
+                hints_meta["where_applied"] = True
 
     _log(
         logger,
