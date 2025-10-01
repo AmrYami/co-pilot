@@ -283,6 +283,8 @@ def parse_rate_hints(comment: Optional[str], settings_get_json=None) -> RateHint
             col = _canon_col(col_raw) or _canon_col(col_raw.replace(" ", "_"))
             if not col:
                 return
+            if op in ("=", "=="):
+                return  # handled by strict parser / builder
             if col == "REQUEST_TYPE" and op != "!=":
                 frag, extra_binds = apply_reqtype_filter(val_raw)
                 where_clauses.append(frag)

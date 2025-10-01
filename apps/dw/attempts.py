@@ -16,8 +16,12 @@ except Exception:  # pragma: no cover
     def text(sql: str):  # type: ignore
         return sql
 
-from apps.dw.contract.rate_apply import apply_rate_hints_to_contract
-from apps.dw.rate_grammar import parse_rate_comment
+from apps.dw.rate_grammar import (
+    merge_rate_comment_hints,
+    parse_rate_comment_strict,
+)
+from apps.dw.settings_defaults import DEFAULT_EXPLICIT_FILTER_COLUMNS
+from apps.dw.settings_utils import load_explicit_filter_columns
 
 from .builder import build_sql
 from .intent import NLIntent, parse_intent_legacy
@@ -76,6 +80,23 @@ def run_attempt(
         if intent.has_time_window and not intent.expire:
             intent.date_column = None
 
+    app_config = getattr(app, "config", {}) if app else {}
+    pipeline = None
+    if hasattr(app_config, "get"):
+        pipeline = app_config.get("PIPELINE") or app_config.get("pipeline")
+    elif isinstance(app_config, dict):
+        pipeline = app_config.get("PIPELINE") or app_config.get("pipeline")
+    settings_obj = getattr(pipeline, "settings", None) if pipeline else None
+    settings_getter = None
+    if settings_obj is not None:
+        settings_getter = getattr(settings_obj, "get_json", None) or getattr(settings_obj, "get", None)
+    allowed_columns = load_explicit_filter_columns(
+        settings_getter, namespace, DEFAULT_EXPLICIT_FILTER_COLUMNS
+    )
+
+    strict_hints = parse_rate_comment_strict(rate_comment)
+    if rate_comment and not strict_hints.is_empty():
+        intent = merge_rate_comment_hints(intent, strict_hints, allowed_columns)
     sql, binds = build_sql(intent)
 
     fts_meta: Dict[str, Any] = {
@@ -115,22 +136,14 @@ def run_attempt(
 
     hints_meta = {
         "comment_present": bool(rate_comment and rate_comment.strip()),
-        "where_applied": False,
-        "order_by_applied": False,
-        "group_by": None,
+        "where_applied": bool(strict_hints.filters),
+        "order_by_applied": bool(strict_hints.order_by),
+        "group_by": list(strict_hints.group_by) if strict_hints.group_by else None,
+        "eq_filters": len(getattr(intent, "eq_filters", [])),
     }
 
     if sql and rate_comment and rate_comment.strip():
-        getter = None
-        app_config = getattr(app, "config", {}) if app else {}
-        pipeline = None
-        if hasattr(app_config, "get"):
-            pipeline = app_config.get("PIPELINE") or app_config.get("pipeline")
-        elif isinstance(app_config, dict):
-            pipeline = app_config.get("PIPELINE") or app_config.get("pipeline")
-        settings_obj = getattr(pipeline, "settings", None) if pipeline else None
-        getter = getattr(settings_obj, "get_json", None) if settings_obj else None
-        hints = parse_rate_hints(rate_comment, getter)
+        hints = parse_rate_hints(rate_comment, settings_getter)
         if hints.where_sql:
             sql = append_where(sql, hints.where_sql)
             binds.update(hints.where_binds)
@@ -140,19 +153,6 @@ def run_attempt(
             hints_meta["order_by_applied"] = True
         if hints.group_by_cols:
             hints_meta["group_by"] = list(hints.group_by_cols)
-
-        structured = parse_rate_comment(rate_comment)
-        if structured.eq_filters or structured.like_filters:
-            extra_where: list[str] = []
-
-            def _rh_bind(prefix: str, counter={"n": 0}) -> str:
-                counter["n"] += 1
-                return f"{prefix}_{counter['n']}"
-
-            apply_rate_hints_to_contract(structured, extra_where, binds, _rh_bind)
-            if extra_where:
-                sql = append_where(sql, " AND ".join(extra_where))
-                hints_meta["where_applied"] = True
 
     _log(
         logger,

@@ -4,7 +4,7 @@ from typing import Optional, List, Dict, Any, TYPE_CHECKING
 from apps.dw.tables import for_namespace
 from apps.dw.tables.base import TableSpec
 from apps.dw.tables.contract import ContractSpec
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from word2number import w2n
 from dateutil.relativedelta import relativedelta
 from datetime import date, timedelta
@@ -30,6 +30,7 @@ class NLIntent(BaseModel):
     full_text_search: Optional[bool] = None
     fts_tokens: Optional[List[str]] = None
     notes: Dict[str, Any] = {}
+    eq_filters: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 _RE_REQUESTED = re.compile(r'\b(requested|request\s+date|request_date|request type|request\s*type)\b', re.I)
