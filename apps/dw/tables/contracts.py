@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Dict, Optional, Tuple
 
+from apps.dw.contract.eq_filters import build_eq_sql, detect_eq_filters
+
 from dateutil.relativedelta import relativedelta
 
 _YTD_YEAR_RE = re.compile(
@@ -1099,6 +1101,30 @@ def build_sql(intent: Intent, settings: Optional[Dict[str, object]] = None) -> t
     parts = []
     settings_map: Dict[str, object] = dict(settings or {})
 
+    # Auto-detected equality filters from the natural language question.
+    explicit_setting = settings_map.get("DW_EXPLICIT_FILTER_COLUMNS", [])
+    if isinstance(explicit_setting, dict):
+        explicit_cols_raw = (
+            explicit_setting.get("Contract")
+            or explicit_setting.get("\"Contract\"")
+            or []
+        )
+    else:
+        explicit_cols_raw = explicit_setting or []
+    explicit_cols = [str(col).upper() for col in explicit_cols_raw]
+    enum_synonyms = settings_map.get("DW_ENUM_SYNONYMS", {}) or {}
+
+    eq_specs = detect_eq_filters(
+        intent.question or "",
+        "Contract",
+        explicit_cols,
+        enum_synonyms,
+    )
+
+    def _make_bind(prefix: str, counter={"n": 0}) -> str:
+        counter["n"] += 1
+        return f"{prefix}_{counter['n']}"
+
     # Window WHERE clause
     if intent.window_kind == "REQUEST":
         if intent.window_start and intent.window_end:
@@ -1128,6 +1154,13 @@ def build_sql(intent: Intent, settings: Optional[Dict[str, object]] = None) -> t
         parts.append(wc)
     for k,v in (intent.where_binds or {}).items():
         binds[k] = v
+
+    if eq_specs:
+        for col, spec in eq_specs:
+            predicate, extra_binds = build_eq_sql(col, spec, _make_bind)
+            if predicate:
+                parts.append(predicate)
+            binds.update(extra_binds)
 
     # REQUEST_TYPE filter via synonyms (avoid duplicate clauses)
     existing_reqtype = any(
