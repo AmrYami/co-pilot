@@ -52,9 +52,10 @@ except Exception:  # pragma: no cover - fallback for tests
 
 from core.inquiries import create_or_update_inquiry
 
-from apps.dw.contract.rate_apply import apply_rate_hints_to_contract
-from apps.dw.rate_grammar import parse_rate_comment
+from apps.dw.rate_grammar import parse_rate_comment_strict
 from apps.dw.rate_hints import append_where, parse_rate_hints, replace_or_add_order_by
+from apps.dw.settings_defaults import DEFAULT_EXPLICIT_FILTER_COLUMNS
+from apps.dw.settings_utils import load_explicit_filter_columns
 from apps.dw.tables.contracts import build_contract_sql
 from apps.mem.kv import get_settings_for_namespace
 from .contracts.contract_common import build_fts_clause
@@ -247,39 +248,50 @@ def derive_sql_for_test(
 
     if sql and rate_comment and rate_comment.strip():
         settings_obj = _get_settings()
-        getter = getattr(settings_obj, "get_json", None) if settings_obj else None
+        getter = None
+        if settings_obj is not None:
+            getter = getattr(settings_obj, "get_json", None) or getattr(settings_obj, "get", None)
+        allowed_cols = load_explicit_filter_columns(
+            getter, namespace, DEFAULT_EXPLICIT_FILTER_COLUMNS
+        )
+        strict_hints = parse_rate_comment_strict(rate_comment)
+        if strict_hints.filters:
+            allowed_map = {col.upper(): col.upper() for col in allowed_cols}
+            extra_where: List[str] = []
+            for idx, filt in enumerate(strict_hints.filters):
+                canonical = allowed_map.get(filt.col.upper())
+                if not canonical:
+                    continue
+                safe_col = re.sub(r"[^A-Z0-9]+", "_", canonical)
+                bind_name = f"rh_eq_{safe_col}_{idx}"
+                value = filt.value.strip() if filt.trim and isinstance(filt.value, str) else filt.value
+                binds[bind_name] = value
+                lhs = canonical
+                if filt.trim:
+                    lhs = f"TRIM({lhs})"
+                if filt.ci:
+                    lhs = f"UPPER({lhs})"
+                rhs = f":{bind_name}"
+                if filt.ci:
+                    rhs = f"UPPER({rhs})"
+                if filt.trim:
+                    rhs = f"TRIM({rhs})"
+                extra_where.append(f"{lhs} = {rhs}")
+            if extra_where:
+                sql = append_where(sql, " AND ".join(extra_where))
+
         hints = parse_rate_hints(rate_comment, getter)
         if hints.where_sql:
             sql = append_where(sql, hints.where_sql)
             binds.update(hints.where_binds)
         if hints.order_by_sql:
             sql = replace_or_add_order_by(sql, hints.order_by_sql)
-
-        structured = parse_rate_comment(rate_comment)
-        if structured.eq_filters or structured.like_filters:
-            extra_where: List[str] = []
-
-            def _rh_bind(prefix: str, counter={"n": 0}) -> str:
-                counter["n"] += 1
-                return f"{prefix}_{counter['n']}"
-
-            apply_rate_hints_to_contract(structured, extra_where, binds, _rh_bind)
-            if extra_where:
-                sql = append_where(sql, " AND ".join(extra_where))
+        elif strict_hints.order_by:
+            first = strict_hints.order_by[0]
+            clause = f"ORDER BY {first.expr} {'DESC' if first.desc else 'ASC'}"
+            sql = replace_or_add_order_by(sql, clause)
 
     return sql, _coerce_bind_dates(binds)
-
-
-DEFAULT_EXPLICIT_FILTER_COLUMNS: List[str] = [
-    "CONTRACT_STATUS",
-    "REQUEST_TYPE",
-    "ENTITY",
-    "ENTITY_NO",
-    "OWNER_DEPARTMENT",
-    "DEPARTMENT_OUL",
-    "CONTRACT_OWNER",
-    "CONTRACT_ID",
-]
 
 
 def _ensure_oracle_date(value: Optional[Any]) -> Optional[date]:
@@ -565,18 +577,11 @@ def answer():
 
     explicit_dates = _resolve_window(question)
 
-    allowed_columns = DEFAULT_EXPLICIT_FILTER_COLUMNS
-    if callable(getter):
-        try:
-            raw_cols = getter("DW_EXPLICIT_FILTER_COLUMNS", scope="namespace", namespace=namespace)
-        except TypeError:
-            raw_cols = getter("DW_EXPLICIT_FILTER_COLUMNS")
-        if isinstance(raw_cols, (list, tuple, set)):
-            cols = [str(col).strip() for col in raw_cols if col is not None]
-            allowed_columns = [col for col in cols if col]
-        elif isinstance(raw_cols, str):
-            parsed = [part.strip() for part in raw_cols.split(",")]
-            allowed_columns = [col for col in parsed if col]
+    allowed_columns = load_explicit_filter_columns(
+        getattr(settings, "get_json", None) or getter,
+        namespace,
+        DEFAULT_EXPLICIT_FILTER_COLUMNS,
+    )
 
     fts_columns = _get_fts_columns(table=table_name, namespace=namespace)
     fts_tokens = _extract_fts_tokens(question) if full_text_search else []
