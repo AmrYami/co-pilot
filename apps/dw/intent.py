@@ -26,6 +26,7 @@ class NLIntent(BaseModel):
     top_n: Optional[int] = None
     user_requested_top_n: Optional[bool] = None
     wants_all_columns: Optional[bool] = None
+    gross: Optional[bool] = None
     # Full-text search hook
     full_text_search: Optional[bool] = None
     fts_tokens: Optional[List[str]] = None
