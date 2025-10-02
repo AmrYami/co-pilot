@@ -4,17 +4,13 @@ from typing import Any, Dict, List, Optional, Tuple
 from datetime import date
 
 from .contract_common import GROSS_SQL, OVERLAP_PRED, explain_window
-from .fts import extract_fts_terms, build_fts_where
 
 
 # --- utilities (keep comments English only) ---
 
 
 def _get_fts_columns(settings: Any) -> List[str]:
-    """
-    Resolve FTS columns for Contract from settings DW_FTS_COLUMNS.
-    Falls back to '*' list if Contract is not present.
-    """
+    """Load configured FTS columns for Contract from dw::common settings."""
 
     cfg: Dict[str, Any] = {}
     if settings is None:
@@ -22,15 +18,27 @@ def _get_fts_columns(settings: Any) -> List[str]:
     else:
         getter = getattr(settings, "get_json", None)
         if callable(getter):
-            cfg = getter("DW_FTS_COLUMNS", {}) or {}
+            try:
+                cfg = getter("DW_FTS_COLUMNS", {}) or {}
+            except TypeError:
+                cfg = getter("DW_FTS_COLUMNS") or {}
         elif isinstance(settings, dict):
             cfg = settings.get("DW_FTS_COLUMNS", {}) or {}
-    cols = (cfg.get("Contract") or cfg.get("*") or [])
-    # Ensure they exist as upper-case column names:
+
+    raw_cols = cfg.get("Contract") or cfg.get("*") or []
+    seen: set[str] = set()
     resolved: List[str] = []
-    for col in cols:
-        if isinstance(col, str) and col.strip():
-            resolved.append(col.strip().upper())
+    if isinstance(raw_cols, list):
+        for col in raw_cols:
+            if not isinstance(col, str):
+                continue
+            norm = col.strip().strip('"')
+            if not norm:
+                continue
+            upper = norm.upper()
+            if upper not in seen:
+                seen.add(upper)
+                resolved.append(upper)
     return resolved
 
 
@@ -66,47 +74,153 @@ def _alias_column(raw: str) -> str:
     return _COLUMN_ALIASES.get(normalized, normalized)
 
 
-def _split_has_terms(text: str) -> List[str]:
-    """
-    Extract terms after 'has' / 'contains' pattern and split by 'or' / ','.
-    Keep short tokens (like 'it'); trim and deduplicate.
-    """
+def _extract_has_terms(q: str) -> List[str]:
+    """Extract unique search terms following 'has' or 'where has'."""
 
-    import re
-
-    q = text or ""
-    # capture text after 'has' / 'contains'
-    match = re.search(r"\b(?:has|contain[s]?)\b\s+(.+)$", q, flags=re.IGNORECASE)
-    if not match:
+    m = re.search(r"\b(?:where\s+)?has\s+(.+)$", q or "", flags=re.IGNORECASE)
+    if not m:
         return []
-    tail = match.group(1)
-    # split by ' or ' or commas
+    tail = m.group(1).strip()
+    if not tail:
+        return []
     parts = re.split(r"\s+or\s+|,", tail, flags=re.IGNORECASE)
     terms: List[str] = []
+    seen: set[str] = set()
     for part in parts:
         token = part.strip().strip("\"'")
-        if token:
-            terms.append(token)
-    # deduplicate preserving order
-    seen: set[str] = set()
-    unique_terms: List[str] = []
-    for token in terms:
-        upper_token = token.upper()
-        if upper_token not in seen:
-            seen.add(upper_token)
-            unique_terms.append(token)
-    return unique_terms
+        if not token:
+            continue
+        upper = token.upper()
+        if upper in seen:
+            continue
+        seen.add(upper)
+        terms.append(token)
+    return terms
 
 
-def _build_like_any_or(columns: List[str], term_bind_name: str) -> str:
-    """
-    Build (col LIKE :b OR col2 LIKE :b OR ...) across provided columns for a single bound name.
-    """
+def _word_boundary_regex(term: str) -> str:
+    """Build a UPPER-case REGEXP for whole-word matching of short terms."""
 
-    ors: List[str] = []
-    for column in columns:
-        ors.append(f"UPPER(NVL({column},'')) LIKE UPPER(:{term_bind_name})")
-    return "(" + " OR ".join(ors) + ")"
+    base = (term or "").upper()
+    cleaned = re.sub(r"\W+", "", base)
+    if not cleaned:
+        cleaned = re.sub(r"\s+", "", base)
+    if not cleaned:
+        cleaned = base
+    return rf"(^|[^A-Z]){re.escape(cleaned)}([^A-Z]|$)"
+
+
+def _fts_where(terms: List[str], cols: List[str], binds: Dict[str, Any]) -> str:
+    if not terms or not cols:
+        return ""
+    groups: List[str] = []
+    idx = 0
+    for term in terms:
+        t_clean = term.strip()
+        if not t_clean:
+            continue
+        if len(t_clean) <= 2 or t_clean.lower() == "it":
+            bind = f"fts_re_{idx}"
+            binds[bind] = _word_boundary_regex(t_clean)
+            groups.append(
+                "(" + " OR ".join([f"REGEXP_LIKE(UPPER({c}), :{bind})" for c in cols]) + ")"
+            )
+        else:
+            bind = f"fts_{idx}"
+            binds[bind] = f"%{t_clean}%"
+            groups.append(
+                "(" + " OR ".join(
+                    [f"UPPER(TRIM({c})) LIKE UPPER(:{bind}) ESCAPE '\\'" for c in cols]
+                )
+                + ")"
+            )
+        idx += 1
+    if not groups:
+        return ""
+    return "(" + " OR ".join(groups) + ")"
+
+
+def _build_fts_clause(
+    question: str,
+    overrides: Optional[Dict[str, Any]],
+    settings: Any,
+    binds: Dict[str, Any],
+    *,
+    columns_override: Optional[List[str]] = None,
+) -> Tuple[str, Dict[str, Any]]:
+    q = question or ""
+    overrides = overrides or {}
+
+    terms: List[str] = []
+    if overrides.get("full_text_search"):
+        terms = _extract_has_terms(q)
+    if not terms and re.search(r"\bhas\b", q, flags=re.IGNORECASE):
+        terms = _extract_has_terms(q)
+
+    cols: List[str] = []
+    if columns_override:
+        seen: set[str] = set()
+        for raw in columns_override:
+            if not isinstance(raw, str):
+                continue
+            norm = raw.strip().strip('"')
+            if not norm:
+                continue
+            upper = norm.upper()
+            if upper not in seen:
+                seen.add(upper)
+                cols.append(upper)
+    else:
+        cols = _get_fts_columns(settings)
+
+    predicate = ""
+    error: Optional[str] = None
+    new_bind_keys: List[str] = []
+    if terms and cols:
+        before = set(binds.keys())
+        predicate = _fts_where(terms, cols, binds)
+        new_bind_keys = [key for key in binds.keys() if key not in before]
+    elif terms and not cols:
+        error = "no_columns"
+
+    mode = "override" if overrides.get("full_text_search") else ("implicit" if terms else None)
+    meta: Dict[str, Any] = {
+        "enabled": bool(predicate),
+        "columns": cols if predicate else (cols or []),
+        "tokens": terms if predicate else [],
+        "mode": mode,
+        "error": error,
+    }
+    if predicate:
+        meta["binds"] = new_bind_keys
+
+    return predicate, meta
+
+
+ALIAS = {
+    "DEPARTMENTS": "OWNER_DEPARTMENT",
+    "DEPARTMENT": "OWNER_DEPARTMENT",
+    "OWNER DEPARTMENT": "OWNER_DEPARTMENT",
+}
+
+
+def _eq_pairs(q: str) -> List[Tuple[str, str]]:
+    pairs = re.findall(
+        r"\bwhere\s+([a-zA-Z0-9_ \-]+)\s*=\s*[\"']?(.+?)[\"']?(?:$|[.;,])",
+        q or "",
+        flags=re.IGNORECASE,
+    )
+    out: List[Tuple[str, str]] = []
+    for raw_col, raw_val in pairs:
+        norm = raw_col.strip().upper()
+        if not norm:
+            continue
+        col = ALIAS.get(norm, norm.replace(" ", "_"))
+        col = re.sub(r"[^A-Z0-9_]+", "_", col).strip("_")
+        if not col:
+            continue
+        out.append((col.upper(), raw_val.strip()))
+    return out
 
 
 def _apply_fts_if_requested(
@@ -115,50 +229,13 @@ def _apply_fts_if_requested(
     settings: Any,
     where_clauses: List[str],
     binds: Dict[str, Any],
-) -> Tuple[bool, List[str], List[str]]:
-    """
-    If payload.full_text_search is true OR pattern 'has ...' is present,
-    generate a WHERE clause across FTS columns with OR semantics between terms.
-    """
+) -> Tuple[bool, Dict[str, Any]]:
+    """Append FTS clause when requested and return FTS metadata."""
 
-    import re
-
-    q = (question or "").strip()
-    fts_enabled = bool(payload.get("full_text_search"))
-    terms: List[str] = []
-    if fts_enabled:
-        # try to pull raw tokens from question (fallback tokenizer)
-        # If you already have a tokenizer upstream, you can replace this.
-        terms = _split_has_terms(q) or []
-    else:
-        # no flag set? activate when 'has' / 'contains' pattern exists
-        terms = _split_has_terms(q)
-
-    # If nothing after 'has', try naive pickup (e.g., "has it")
-    if not terms:
-        match = re.search(r"\bhas\s+([^\s].+)$", q, flags=re.IGNORECASE)
-        if match:
-            tail = match.group(1)
-            parts = re.split(r"\s+or\s+|,", tail, flags=re.IGNORECASE)
-            terms = [p.strip().strip("\"'") for p in parts if p.strip()]
-
-    if not terms:
-        return False, [], []
-
-    fts_cols = _get_fts_columns(settings)
-    if not fts_cols:
-        return False, [], []
-
-    # Build OR-of-ANDs: (any column LIKE term1) OR (any column LIKE term2) ...
-    # For your 'has it or home care' → two groups OR'ed together
-    or_groups: List[str] = []
-    for idx, term in enumerate(terms):
-        bind_name = f"fts_{idx}"
-        binds[bind_name] = f"%{term}%"
-        or_groups.append(_build_like_any_or(fts_cols, bind_name))
-
-    where_clauses.append("(" + " OR ".join(or_groups) + ")")
-    return True, terms, fts_cols
+    clause, meta = _build_fts_clause(question, payload, settings, binds)
+    if clause:
+        where_clauses.append(clause)
+    return bool(clause), meta
 
 
 def _apply_eq_filters_from_text(
@@ -250,7 +327,7 @@ def _build_text_filter_sql(
 
     stakeholder_applied, stakeholder_terms = _apply_stakeholder_has(question, where_clauses, binds)
     eq_applied = _apply_eq_filters_from_text(question, settings, where_clauses, binds)
-    fts_applied, fts_terms, fts_columns = _apply_fts_if_requested(
+    fts_applied, fts_meta = _apply_fts_if_requested(
         question, payload, settings, where_clauses, binds
     )
 
@@ -265,7 +342,15 @@ def _build_text_filter_sql(
     if eq_applied:
         explain_bits.append("Applied equality filters from the question.")
     if fts_applied:
-        explain_bits.append("Applied LIKE-based search over configured FTS columns.")
+        tokens_preview = ", ".join(fts_meta.get("tokens", [])) if isinstance(fts_meta, dict) else ""
+        if tokens_preview:
+            explain_bits.append(
+                "Applied LIKE-based search over configured FTS columns for tokens: "
+                + tokens_preview
+                + "."
+            )
+        else:
+            explain_bits.append("Applied LIKE-based search over configured FTS columns.")
     if not explain_bits:
         explain_bits.append("Applied text/FTS filters.")
     explain = " ".join(explain_bits)
@@ -275,16 +360,7 @@ def _build_text_filter_sql(
         "contract_planner": True,
         "text_filters": True,
     }
-    if fts_applied:
-        meta["fts"] = {
-            "enabled": True,
-            "mode": "like",
-            "columns": fts_columns,
-            "tokens": fts_terms,
-            "binds": [key for key in binds.keys() if key.startswith("fts_")],
-        }
-    else:
-        meta["fts"] = {"enabled": False}
+    meta["fts"] = fts_meta if isinstance(fts_meta, dict) else {"enabled": bool(fts_applied)}
     if stakeholder_applied:
         meta["stakeholder_terms"] = stakeholder_terms
 
@@ -419,61 +495,60 @@ def plan_contract_query(
     else:
         explain_bits.append("No explicit window; using default or none.")
 
-    fts_flag = bool(payload.get("full_text_search"))
-    fts_groups, fts_mode = extract_fts_terms(q, force=fts_flag)
+    fts_clause, fts_meta = _build_fts_clause(
+        q or "",
+        payload,
+        settings,
+        binds,
+        columns_override=fts_columns,
+    )
+    if not isinstance(fts_meta, dict):
+        fts_meta = {"enabled": False}
 
-    configured_cols: List[str] = []
-    if fts_columns:
-        configured_cols = [
-            str(c) if str(c).startswith('"') else f'"{c}"'
-            for c in fts_columns
-        ]
-    else:
-        raw_cfg: Dict[str, Any] = {}
-        if isinstance(settings, dict):
-            cfg = settings.get("DW_FTS_COLUMNS")
-            if isinstance(cfg, dict):
-                raw_cfg = cfg
-        if raw_cfg:
-            table_cols = raw_cfg.get("Contract") or raw_cfg.get("*")
-            if isinstance(table_cols, list):
-                configured_cols = [
-                    str(col) if str(col).startswith('"') else f'"{col}"'
-                    for col in table_cols
-                ]
+    if fts_meta.get("enabled"):
+        tokens_preview = ", ".join(fts_meta.get("tokens", []))
+        if tokens_preview:
+            explain_bits.append(
+                "Applied full-text search over "
+                + str(len(fts_meta.get("columns", [])))
+                + " columns for tokens: "
+                + tokens_preview
+                + "."
+            )
+        else:
+            explain_bits.append("Applied full-text search over configured FTS columns.")
+    elif fts_meta.get("error") == "no_columns" and payload.get("full_text_search"):
+        explain_bits.append("Full-text search requested but no FTS columns configured.")
 
-    fts_where = ""
-    fts_binds: Dict[str, Any] = {}
-    if fts_groups and configured_cols:
-        fts_where, fts_binds = build_fts_where(fts_groups, configured_cols)
-        binds.update(fts_binds)
-        tokens_preview = [" AND ".join(group) for group in fts_groups]
-        explain_bits.append(
-            "Applied full-text search over "
-            + str(len(configured_cols))
-            + " columns for tokens: "
-            + ", ".join(tokens_preview)
-            + "."
-        )
+    eq_filter = _extract_eq_filter(q)
+    if eq_filter:
+        binds.update(eq_filter["binds"])
 
-    def _with_fts(meta: Dict[str, Any]) -> Dict[str, Any]:
+    eq_pairs = _eq_pairs(q or "")
+    skip_eq_cols = {eq_filter["col"]} if eq_filter else set()
+    eq_predicates: List[str] = []
+    for col, val in eq_pairs:
+        if col in skip_eq_cols:
+            continue
+        base = re.sub(r"[^A-Z0-9]+", "_", col).strip("_").lower()
+        if not base:
+            continue
+        bind_name = f"eq_{base}"
+        suffix = 1
+        while bind_name in binds:
+            bind_name = f"eq_{base}_{suffix}"
+            suffix += 1
+        binds[bind_name] = val
+        eq_predicates.append(f"UPPER(TRIM({col})) = UPPER(TRIM(:{bind_name}))")
+
+    def _attach_fts(meta: Dict[str, Any]) -> Dict[str, Any]:
         enriched = dict(meta)
-        enriched["fts"] = {
-            "enabled": bool(fts_where),
-            "mode": fts_mode,
-            "columns": configured_cols if fts_where else None,
-            "tokens": fts_groups if fts_where else None,
-            "binds": list(fts_binds.keys()) if fts_where else None,
-        }
+        enriched["fts"] = dict(fts_meta)
         return enriched
 
     # Patterns
     ql = (q or "").lower()
     sql: str
-
-    eq_filter = _extract_eq_filter(q)
-    if eq_filter:
-        binds.update(eq_filter["binds"])
 
     if "expiring" in ql and wants_count:
         # Contracts expiring in X days (count) → COUNT on END_DATE window (inclusive)
@@ -481,12 +556,16 @@ def plan_contract_query(
         explain_bits.append("Interpreting 'expiring' as END_DATE between window.")
         window_pred = "END_DATE BETWEEN :date_start AND :date_end"
         where_parts = [window_pred]
-        if fts_where:
-            where_parts.append(fts_where)
+        if eq_filter:
+            where_parts.append(eq_filter["predicate"])
+        if eq_predicates:
+            where_parts.extend(eq_predicates)
+        if fts_clause:
+            where_parts.append(fts_clause)
         sql = "SELECT COUNT(*) AS CNT FROM \"Contract\""
         if where_parts:
             sql += " WHERE " + " AND ".join(where_parts)
-        return sql, binds, _with_fts({"group_by": None, "measure": "COUNT", "date_col": date_col}), " ".join(explain_bits)
+        return sql, binds, _attach_fts({"group_by": None, "measure": "COUNT", "date_col": date_col}), " ".join(explain_bits)
 
     if group_col and not wants_count:
         where_parts: List[str] = []
@@ -494,8 +573,10 @@ def plan_contract_query(
             where_parts.append(window_pred)
         if eq_filter:
             where_parts.append(eq_filter["predicate"])
-        if fts_where:
-            where_parts.append(fts_where)
+        if eq_predicates:
+            where_parts.extend(eq_predicates)
+        if fts_clause:
+            where_parts.append(fts_clause)
 
         sql_lines: List[str] = []
         if eq_filter:
@@ -535,29 +616,40 @@ def plan_contract_query(
         if top_n:
             binds["top_n"] = int(top_n)
             sql += "\nFETCH FIRST :top_n ROWS ONLY"
-        return sql, binds, _with_fts(meta), " ".join(explain_bits)
+        return sql, binds, _attach_fts(meta), " ".join(explain_bits)
 
     if wants_count and not group_col:
         # Count by request window (or overlap if mentioned)
         if "status" in ql:
             # "Count of contracts by status" → grouped count
-            sql = (
-                "SELECT CONTRACT_STATUS AS GROUP_KEY, COUNT(*) AS CNT "
-                "FROM \"Contract\" GROUP BY CONTRACT_STATUS ORDER BY CNT DESC"
-            )
+            where_parts: List[str] = []
+            if eq_filter:
+                where_parts.append(eq_filter["predicate"])
+            if eq_predicates:
+                where_parts.extend(eq_predicates)
+            if fts_clause:
+                where_parts.append(fts_clause)
+            sql = "SELECT CONTRACT_STATUS AS GROUP_KEY, COUNT(*) AS CNT FROM \"Contract\""
+            if where_parts:
+                sql += " WHERE " + " AND ".join(where_parts)
+            sql += " GROUP BY CONTRACT_STATUS ORDER BY CNT DESC"
             explain_bits.append("Grouped count by CONTRACT_STATUS.")
-            return sql, binds, _with_fts({"group_by": "CONTRACT_STATUS", "measure": "COUNT"}), " ".join(explain_bits)
+            return sql, binds, _attach_fts({"group_by": "CONTRACT_STATUS", "measure": "COUNT"}), " ".join(explain_bits)
         # Else: simple count in window if exists, else all time
         where_parts: List[str] = []
         if explicit_dates:
             where_parts.append(window_pred)
-        if fts_where:
-            where_parts.append(fts_where)
+        if eq_filter:
+            where_parts.append(eq_filter["predicate"])
+        if eq_predicates:
+            where_parts.extend(eq_predicates)
+        if fts_clause:
+            where_parts.append(fts_clause)
         sql = "SELECT COUNT(*) AS CNT FROM \"Contract\""
         if where_parts:
             sql += " WHERE " + " AND ".join(where_parts)
         explain_bits.append("Returning COUNT(*) without grouping.")
-        return sql, binds, _with_fts({"group_by": None, "measure": "COUNT", "date_col": date_col}), " ".join(explain_bits)
+        return sql, binds, _attach_fts({"group_by": None, "measure": "COUNT", "date_col": date_col}), " ".join(explain_bits)
 
     # Top contracts (no group) by measure
     if "top" in ql and "contract" in ql:
@@ -565,8 +657,12 @@ def plan_contract_query(
         where_parts: List[str] = []
         if explicit_dates:
             where_parts.append(window_pred)
-        if fts_where:
-            where_parts.append(fts_where)
+        if eq_filter:
+            where_parts.append(eq_filter["predicate"])
+        if eq_predicates:
+            where_parts.extend(eq_predicates)
+        if fts_clause:
+            where_parts.append(fts_clause)
         where_clause = "WHERE " + " AND ".join(where_parts) if where_parts else ""
         sql = (
             f"SELECT {select_cols} FROM \"Contract\"\n"
@@ -577,19 +673,23 @@ def plan_contract_query(
             binds["top_n"] = int(top_n)
             sql += "\nFETCH FIRST :top_n ROWS ONLY"
         explain_bits.append("Top contracts by measure (descending).")
-        return sql, binds, _with_fts({"group_by": None, "measure": measure, "date_col": date_col}), " ".join(explain_bits)
+        return sql, binds, _attach_fts({"group_by": None, "measure": measure, "date_col": date_col}), " ".join(explain_bits)
 
     # Requested last X (explicit on REQUEST_DATE)
     if "requested" in ql:
         where_parts = ["REQUEST_DATE BETWEEN :date_start AND :date_end"]
-        if fts_where:
-            where_parts.append(fts_where)
+        if eq_filter:
+            where_parts.append(eq_filter["predicate"])
+        if eq_predicates:
+            where_parts.extend(eq_predicates)
+        if fts_clause:
+            where_parts.append(fts_clause)
         sql = (
             "SELECT * FROM \"Contract\"\n"
             "WHERE " + " AND ".join(where_parts) + "\nORDER BY REQUEST_DATE DESC"
         )
         explain_bits.append("Requested window detected; sorting by REQUEST_DATE DESC.")
-        return sql, binds, _with_fts({"date_col": "REQUEST_DATE"}), " ".join(explain_bits)
+        return sql, binds, _attach_fts({"date_col": "REQUEST_DATE"}), " ".join(explain_bits)
 
     # Specific filters:
     if "vat" in ql and ("null" in ql or "zero" in ql):
@@ -598,42 +698,60 @@ def plan_contract_query(
         where_parts = [pred]
         if explicit_dates:
             where_parts.append(window_pred)
-        if fts_where:
-            where_parts.append(fts_where)
+        if eq_filter:
+            where_parts.append(eq_filter["predicate"])
+        if eq_predicates:
+            where_parts.extend(eq_predicates)
+        if fts_clause:
+            where_parts.append(fts_clause)
         base = "SELECT * FROM \"Contract\"\nWHERE " + " AND ".join(where_parts)
         base += "\nORDER BY " + measure + " DESC"
         explain_bits.append("Applied VAT null/zero and value > 0 predicate.")
-        return base, binds, _with_fts({"filter": "vat_zero_or_null"}), " ".join(explain_bits)
+        return base, binds, _attach_fts({"filter": "vat_zero_or_null"}), " ".join(explain_bits)
 
     if "distinct entity" in ql or ("list" in ql and "entity" in ql and "count" in ql):
-        sql = "SELECT ENTITY AS GROUP_KEY, COUNT(*) AS CNT FROM \"Contract\" GROUP BY ENTITY ORDER BY CNT DESC"
+        where_parts: List[str] = []
+        if eq_filter:
+            where_parts.append(eq_filter["predicate"])
+        if eq_predicates:
+            where_parts.extend(eq_predicates)
+        if fts_clause:
+            where_parts.append(fts_clause)
+        sql = "SELECT ENTITY AS GROUP_KEY, COUNT(*) AS CNT FROM \"Contract\""
+        if where_parts:
+            sql += " WHERE " + " AND ".join(where_parts)
+        sql += " GROUP BY ENTITY ORDER BY CNT DESC"
         explain_bits.append("Distinct ENTITY with counts.")
-        return sql, binds, _with_fts({"group_by": "ENTITY", "measure": "COUNT"}), " ".join(explain_bits)
+        return sql, binds, _attach_fts({"group_by": "ENTITY", "measure": "COUNT"}), " ".join(explain_bits)
 
     if eq_filter:
         where_parts = []
         if explicit_dates:
             where_parts.append(window_pred)
         where_parts.append(eq_filter["predicate"])
-        if fts_where:
-            where_parts.append(fts_where)
+        if eq_predicates:
+            where_parts.extend(eq_predicates)
+        if fts_clause:
+            where_parts.append(fts_clause)
         sql = "SELECT * FROM \"Contract\""
         if where_parts:
             sql += "\nWHERE " + " AND ".join(where_parts)
         order = eq_filter.get("order") or "REQUEST_DATE DESC"
         sql += f"\nORDER BY {order}"
         explain_bits.append(f"Applied equality filter on {eq_filter['col']} from the question.")
-        return sql, binds, _with_fts({"group_by": None, "filter": eq_filter["col"], "date_col": date_col}), " ".join(explain_bits)
+        return sql, binds, _attach_fts({"group_by": None, "filter": eq_filter["col"], "date_col": date_col}), " ".join(explain_bits)
 
     # Fallback: list in window (if any) else all
     sql = "SELECT * FROM \"Contract\""
     where_parts = []
     if explicit_dates:
         where_parts.append(window_pred)
-    if fts_where:
-        where_parts.append(fts_where)
+    if eq_predicates:
+        where_parts.extend(eq_predicates)
+    if fts_clause:
+        where_parts.append(fts_clause)
     if where_parts:
         sql += "\nWHERE " + " AND ".join(where_parts)
     sql += "\nORDER BY REQUEST_DATE DESC"
     explain_bits.append("Fallback listing ordered by REQUEST_DATE DESC.")
-    return sql, binds, _with_fts({"fallback": True, "date_col": date_col}), " ".join(explain_bits)
+    return sql, binds, _attach_fts({"fallback": True, "date_col": date_col}), " ".join(explain_bits)
