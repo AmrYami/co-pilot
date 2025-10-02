@@ -8,6 +8,7 @@ from apps.dw.contracts.text_filters import (
     extract_eq_filters,
     build_eq_where,
 )
+from apps.dw.fts_utils import resolve_fts_columns
 from .planner_contracts import apply_equality_aliases, apply_full_text_search
 
 from .filters import try_parse_simple_equals
@@ -139,6 +140,29 @@ def _normalize_columns(columns: Optional[List[str]]) -> List[str]:
     return sorted(set(normalized))
 
 
+def _make_settings_getter(settings_obj, fallback: Optional[Dict[str, object]] = None):
+    def _getter(key: str, default=None):
+        for source in (settings_obj, fallback):
+            if source is None:
+                continue
+            getter = getattr(source, "get_json", None)
+            if callable(getter):
+                try:
+                    value = getter(key, default)
+                except TypeError:
+                    value = getter(key)
+                if value is not None:
+                    return value
+                continue
+            if isinstance(source, dict):
+                value = source.get(key, default)
+                if value is not None:
+                    return value
+        return default
+
+    return _getter
+
+
 def _get_fts_columns(settings: dict | None, override: Optional[List[str]] = None) -> List[str]:
     if override:
         cols = _normalize_columns(list(override))
@@ -146,20 +170,9 @@ def _get_fts_columns(settings: dict | None, override: Optional[List[str]] = None
             return cols
 
     settings_map = _as_settings_dict(settings)
-    cfg = settings_map.get("DW_FTS_COLUMNS") if isinstance(settings_map, dict) else {}
-    if not isinstance(cfg, dict):
-        return []
-
-    raw_cols: Optional[List[str]] = None
-    table_cols = cfg.get("Contract")
-    if isinstance(table_cols, list):
-        raw_cols = table_cols
-    else:
-        wildcard_cols = cfg.get("*")
-        if isinstance(wildcard_cols, list):
-            raw_cols = wildcard_cols
-
-    return _normalize_columns(raw_cols)
+    getter = _make_settings_getter(settings, settings_map)
+    resolved = resolve_fts_columns(getter, "Contract")
+    return _normalize_columns(resolved)
 
 
 def build_contract_sql(

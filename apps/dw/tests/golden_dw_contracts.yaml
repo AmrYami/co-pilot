@@ -199,6 +199,24 @@ cases:
         - 'CONTRACT_ID IS NULL'
         - "TRIM(CONTRACT_ID) = ''"
 
+  - id: fts_or_tokens_auto
+    question: "list all contracts has it or home care"
+    expect:
+      sql_contains:
+        - 'LIKE'
+        - ' OR '
+      fts:
+        join: 'OR'
+
+  - id: fts_and_tokens_auto
+    question: "list all contracts has it and home care"
+    expect:
+      sql_contains:
+        - 'LIKE'
+        - ') AND ('
+      fts:
+        join: 'AND'
+
   - id: fts_short_token_it
     question: "list all contracts has it"
     flags: { full_text_search: true }
