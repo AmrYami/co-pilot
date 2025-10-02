@@ -3,6 +3,14 @@ import re
 from datetime import date, datetime
 from typing import Dict, Tuple, Optional, List
 
+from apps.dw.contracts.text_filters import (
+    extract_has_tokens,
+    extract_eq_filters,
+    build_fts_where,
+    build_eq_where,
+)
+from apps.dw.contracts.column_synonyms import CONTRACT_STAKEHOLDER_COLS
+
 from .filters import try_parse_simple_equals
 from .rules_extra import try_build_special_cases
 from .named_filters import build_named_filter_sql
@@ -91,6 +99,120 @@ def _match_request_type_category(
                 return cat, rule
 
     return "", {"equals": [], "prefix": [], "contains": []}
+
+
+def _as_settings_dict(settings_obj) -> Dict[str, object]:
+    if isinstance(settings_obj, dict):
+        return settings_obj
+    if settings_obj is None:
+        return {}
+    if hasattr(settings_obj, "to_dict"):
+        try:
+            candidate = settings_obj.to_dict()
+            if isinstance(candidate, dict):
+                return candidate
+        except Exception:
+            return {}
+    if hasattr(settings_obj, "items"):
+        try:
+            return dict(settings_obj.items())
+        except Exception:
+            return {}
+    if hasattr(settings_obj, "__dict__"):
+        try:
+            return dict(vars(settings_obj))
+        except Exception:
+            return {}
+    return {}
+
+
+def _normalize_columns(columns: Optional[List[str]]) -> List[str]:
+    if not columns:
+        return []
+    normalized: List[str] = []
+    for col in columns:
+        if not isinstance(col, str):
+            continue
+        stripped = col.strip()
+        if not stripped:
+            continue
+        normalized.append(stripped.upper())
+    return sorted(set(normalized))
+
+
+def _get_fts_columns(settings: dict | None, override: Optional[List[str]] = None) -> List[str]:
+    if override:
+        cols = _normalize_columns(list(override))
+        if cols:
+            return cols
+
+    settings_map = _as_settings_dict(settings)
+    cfg = settings_map.get("DW_FTS_COLUMNS") if isinstance(settings_map, dict) else {}
+    if not isinstance(cfg, dict):
+        return []
+
+    raw_cols: Optional[List[str]] = None
+    table_cols = cfg.get("Contract")
+    if isinstance(table_cols, list):
+        raw_cols = table_cols
+    else:
+        wildcard_cols = cfg.get("*")
+        if isinstance(wildcard_cols, list):
+            raw_cols = wildcard_cols
+
+    return _normalize_columns(raw_cols)
+
+
+def build_contract_sql(
+    *,
+    question: str,
+    settings: dict | None,
+    request_flags: Dict[str, object],
+    base_where: List[str],
+    binds: Dict[str, object],
+    fts_columns_override: Optional[List[str]] = None,
+) -> Tuple[List[str], Dict[str, object]]:
+    """
+    This function represents the core point where we add FTS/equality filters.
+    - question: raw user text
+    - settings: merged namespace settings
+    - request_flags: includes 'full_text_search' boolean if provided in /dw/answer body
+    - base_where: list of WHERE strings to be AND-ed
+    - binds: dictionary for bind variables
+
+    Returns updated (where_list, binds)
+    """
+    q = (question or "").strip()
+
+    # 1) equality filters like "where departments = SUPPORT SERVICES"
+    eq_filters = extract_eq_filters(q)
+    if eq_filters:
+        eq_sql, binds = build_eq_where(eq_filters, binds, bind_prefix="eq")
+        if eq_sql:
+            base_where.append(eq_sql)
+
+    # 2) full-text tokens from 'has ...' or explicit flag full_text_search=true
+    tokens, narrowed = extract_has_tokens(q)
+
+    # enforce FTS if flag set even without "has ..."
+    if not tokens and bool(request_flags.get("full_text_search")):
+        # placeholder for future heuristics when flag forces FTS without explicit tokens
+        pass
+
+    # decide candidate FTS columns
+    fts_columns = _get_fts_columns(settings, override=fts_columns_override)
+    # if narrowed, override
+    if narrowed == "STAKEHOLDER*":
+        fts_columns = list(CONTRACT_STAKEHOLDER_COLS)
+    elif narrowed == "OWNER_DEPARTMENT":
+        fts_columns = ["OWNER_DEPARTMENT"]
+
+    if tokens and fts_columns:
+        fts_sql, binds = build_fts_where(tokens, fts_columns, binds, bind_prefix="fts")
+        if fts_sql:
+            base_where.append(fts_sql)
+
+    return base_where, binds
 
 
 def _maybe_apply_request_type_filter(
@@ -470,8 +592,36 @@ def build_contracts_sql(
             # Fallback: safe overlap
             where_parts.append(_overlap_pred())
 
+    settings_map = _as_settings_dict(settings_obj)
+    request_flags: Dict[str, object] = {}
+    raw_request_flags = intent.get("request_flags")
+    if isinstance(raw_request_flags, dict):
+        request_flags.update(raw_request_flags)
+    request_flags.setdefault("full_text_search", bool(intent.get("full_text_search")))
+
+    where_len_before = len(where_parts)
+    bind_keys_before = set(binds.keys())
+    where_parts, binds = build_contract_sql(
+        question=q_text,
+        settings=settings_map,
+        request_flags=request_flags,
+        base_where=where_parts,
+        binds=binds,
+        fts_columns_override=fts_columns,
+    )
+    new_where_parts = where_parts[where_len_before:]
+    new_bind_keys = {k for k in binds.keys() if k not in bind_keys_before}
+    question_fts_applied = any(k.startswith("fts") for k in new_bind_keys)
+    if not question_fts_applied:
+        question_fts_applied = any("REGEXP_LIKE" in frag or ":fts_" in frag for frag in new_where_parts)
+
     # 2) Full-text-like filtering over configured columns (simple LIKE ORs)
-    if intent.get("full_text_search") and intent.get("fts_tokens") and fts_columns:
+    if (
+        not question_fts_applied
+        and intent.get("full_text_search")
+        and intent.get("fts_tokens")
+        and fts_columns
+    ):
         like_terms = []
         k = 0
         for tok in intent["fts_tokens"]:
