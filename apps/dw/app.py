@@ -535,7 +535,7 @@ def answer():
     prefixes = _coerce_prefixes(payload.get("prefixes"))
     auth_email = payload.get("auth_email") or None
     full_text_search = bool(payload.get("full_text_search", False))
-    overrides = {"full_text_search": full_text_search} if "full_text_search" in payload else {}
+    overrides = {"full_text_search": full_text_search}
 
     namespace = (payload.get("namespace") or "dw::common").strip() or "dw::common"
     contract_sql, contract_binds, contract_meta = _plan_contract_sql(
