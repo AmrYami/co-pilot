@@ -1,34 +1,79 @@
-import re
-from typing import List, Dict, Any, Tuple
+from __future__ import annotations
 
-_RE_TOKEN = re.compile(r"[A-Za-z0-9_]{2,}")
-_STOP = {"the", "and", "or", "of", "a", "an", "by", "per", "for", "to", "in", "on"}
+"""Lightweight FTS token extraction and SQL helpers."""
 
-
-def tokenize(q: str) -> List[str]:
-    toks = [t.upper() for t in _RE_TOKEN.findall(q or "") if t.lower() not in _STOP]
-    return toks
+from typing import Dict, List, Tuple
 
 
-def load_columns(settings, table: str) -> List[str]:
-    cfg = settings.get("DW_FTS_COLUMNS") or {}
-    if isinstance(cfg, str):
-        # If stored as text JSON by caller, Settings already parses to object; just be safe
+def extract_fts_tokens(question: str) -> List[str]:
+    """Return ordered, deduplicated tokens from simple ``has`` patterns."""
+
+    if not question:
         return []
-    cols = cfg.get(table) or cfg.get("*") or []
-    return cols
+
+    q = " ".join((question or "").strip().split()).lower()
+    if not q or " has " not in q:
+        return []
+
+    tail = q.split(" has ", 1)[1]
+    normalized = (
+        tail.replace(" and ", " or ")
+        .replace(",", " or ")
+        .replace("/", " or ")
+    )
+    raw_terms = [part.strip() for part in normalized.split(" or ")]
+
+    tokens: List[str] = []
+    seen: set[str] = set()
+    for term in raw_terms:
+        if not term:
+            continue
+        cleaned = term.strip("'\"")
+        cleaned = " ".join(cleaned.split())
+        if not cleaned:
+            continue
+        key = cleaned.lower()
+        if key in {"or", "and", "=", "=="}:
+            continue
+        if key not in seen:
+            seen.add(key)
+            tokens.append(cleaned)
+    return tokens
 
 
-def build_predicate(cols: List[str], tokens: List[str]) -> Tuple[str, Dict[str, Any]]:
-    if not cols or not tokens:
+def build_fts_where(
+    table: str,
+    columns: List[str],
+    tokens: List[str],
+    *,
+    start_index: int = 0,
+) -> Tuple[str, Dict[str, str]]:
+    """Construct a SQL WHERE fragment for case-insensitive LIKE search across columns."""
+
+    if not columns or not tokens:
         return "", {}
-    ors = []
-    binds: Dict[str, Any] = {}
-    k = 0
-    for c in cols:
-        for t in tokens:
-            k += 1
-            name = f"fts{k}"
-            ors.append(f"UPPER({c}) LIKE :{name}")
-            binds[name] = f"%{t}%"
-    return "(" + " OR ".join(ors) + ")", binds
+
+    clauses: List[str] = []
+    binds: Dict[str, str] = {}
+
+    def _quote(col: str) -> str:
+        c = col.strip()
+        if c.startswith('"') and c.endswith('"'):
+            return c
+        return f'"{c}"'
+
+    quoted_cols = [_quote(col) for col in columns if col]
+    for idx, token in enumerate(tokens):
+        bind = f"fts_{start_index + idx}"
+        binds[bind] = f"%{token}%"
+        like_parts = [f"UPPER(TRIM({col})) LIKE UPPER(:{bind})" for col in quoted_cols]
+        if like_parts:
+            clauses.append("(" + " OR ".join(like_parts) + ")")
+
+    if not clauses:
+        return "", {}
+
+    return "(" + " OR ".join(clauses) + ")", binds
+
+
+__all__ = ["extract_fts_tokens", "build_fts_where"]
