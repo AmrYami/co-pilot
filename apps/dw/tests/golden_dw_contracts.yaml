@@ -556,3 +556,38 @@ cases:
     expect_binds:
       - fts_re_0
       - fts_1
+  - ns: dw::common
+    q: "list all contracts has it or home care"
+    expect:
+      contains_sql:
+        - "LIKE UPPER(:fts_0)"
+        - "LIKE UPPER(:fts_1)"
+        - "LIKE UPPER(:fts_2)"
+        - "ORDER BY REQUEST_DATE DESC"
+
+  - ns: dw::common
+    q: "list all contracts where has it"
+    expect:
+      contains_sql:
+        - "LIKE UPPER(:fts_0)"
+        - "ORDER BY REQUEST_DATE DESC"
+
+  - ns: dw::common
+    q: "list all contracts where departments = SUPPORT SERVICES"
+    expect:
+      contains_sql:
+        - "OWNER_DEPARTMENT"
+        - "DEPARTMENT_OUL"
+        - "DEPARTMENT_1"
+        - "DEPARTMENT_8"
+        - "ORDER BY REQUEST_DATE DESC"
+
+  - ns: dw::common
+    q: "list all contracts where stakeholder has Tamer Said Aly Abdelgawad or u1835 or Amr Taher A Maghrabi"
+    expect:
+      contains_sql:
+        - "CONTRACT_STAKEHOLDER_1"
+        - "CONTRACT_STAKEHOLDER_8"
+        - "LIKE UPPER(:st_0)"
+        - "LIKE UPPER(:st_1)"
+        - "LIKE UPPER(:st_2)"
