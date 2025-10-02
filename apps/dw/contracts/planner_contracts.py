@@ -4,8 +4,8 @@ from __future__ import annotations
 import re
 from typing import Dict, List, Optional, Set
 
-from apps.dw.fts import build_fts_where as build_generic_fts_where
 from apps.dw.fts import extract_fts_tokens
+from apps.dw.fts_utils import build_boolean_fts_where, resolve_fts_columns
 from apps.dw.settings import get_fts_columns, get_short_token_allow
 from apps.dw.settings_util import get_fts_columns_for
 
@@ -29,6 +29,33 @@ def _sanitize_columns(columns: Optional[List[str]]) -> List[str]:
     return out
 
 
+def _settings_getter_from(source):
+    def _getter(key: str, default=None):
+        if source is None:
+            return default
+        getter_json = getattr(source, "get_json", None)
+        if callable(getter_json):
+            try:
+                value = getter_json(key, default)
+            except TypeError:
+                value = getter_json(key)
+            if value is not None:
+                return value
+        if isinstance(source, dict):
+            return source.get(key, default)
+        getter_plain = getattr(source, "get", None)
+        if callable(getter_plain):
+            try:
+                value = getter_plain(key, default)
+            except TypeError:
+                value = getter_plain(key)
+            if value is not None:
+                return value
+        return default
+
+    return _getter
+
+
 def apply_full_text_search(
     db,
     question: str,
@@ -49,6 +76,9 @@ def apply_full_text_search(
         fts_cols = _sanitize_columns(get_fts_columns_for(base_table, config=settings_map))
         if not fts_cols:
             fts_cols = _sanitize_columns(get_fts_columns(db, base_table))
+    if not fts_cols:
+        getter = _settings_getter_from(db)
+        fts_cols = _sanitize_columns(resolve_fts_columns(getter, base_table))
     fts_meta: Dict[str, object] = {}
     debug.setdefault("fts", fts_meta)
 
@@ -72,16 +102,26 @@ def apply_full_text_search(
         return False
 
     existing = len([k for k in binds.keys() if isinstance(k, str) and k.startswith("fts_")])
-    where_sql, new_binds = build_generic_fts_where(base_table, fts_cols, terms, start_index=existing)
-    if not where_sql:
+    prefix = "fts" if existing == 0 else f"fts{existing}"
+    raw_sql, binds, join_op = build_boolean_fts_where(
+        question_text=question or "",
+        terms=terms,
+        fts_columns=fts_cols,
+        binds=binds,
+        bind_prefix=prefix,
+    )
+    if not raw_sql:
         fts_meta.update({"enabled": False, "error": "build_failed", "columns": fts_cols})
         return False
 
-    for key, value in new_binds.items():
-        binds[key] = value
-
-    where_clauses.append(where_sql)
-    new_bind_keys = [k for k in new_binds.keys() if k.startswith("fts_") and k not in before_keys]
+    where_clauses.append("(" + raw_sql + ")")
+    new_bind_keys = [
+        k
+        for k in binds.keys()
+        if isinstance(k, str)
+        and k not in before_keys
+        and k.startswith(f"{prefix}_")
+    ]
     fts_meta.update(
         {
             "enabled": True,
@@ -89,6 +129,7 @@ def apply_full_text_search(
             "tokens": terms,
             "mode": "override" if full_text_search else "implicit",
             "binds": new_bind_keys,
+            "join": join_op,
         }
     )
     return True

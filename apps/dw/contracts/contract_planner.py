@@ -3,6 +3,8 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 from datetime import date
 
+from apps.dw.fts_utils import build_boolean_fts_where, resolve_fts_columns
+
 from .contract_common import GROSS_SQL, OVERLAP_PRED, explain_window
 
 
@@ -12,34 +14,34 @@ from .contract_common import GROSS_SQL, OVERLAP_PRED, explain_window
 def _get_fts_columns(settings: Any) -> List[str]:
     """Load configured FTS columns for Contract from dw::common settings."""
 
-    cfg: Dict[str, Any] = {}
-    if settings is None:
-        cfg = {}
-    else:
+    def _settings_getter(key: str, default=None):
+        if settings is None:
+            return default
         getter = getattr(settings, "get_json", None)
         if callable(getter):
             try:
-                cfg = getter("DW_FTS_COLUMNS", {}) or {}
+                value = getter(key, default)
             except TypeError:
-                cfg = getter("DW_FTS_COLUMNS") or {}
-        elif isinstance(settings, dict):
-            cfg = settings.get("DW_FTS_COLUMNS", {}) or {}
+                value = getter(key)  # type: ignore[misc]
+            return value if value is not None else default
+        if isinstance(settings, dict):
+            return settings.get(key, default)
+        return default
 
-    raw_cols = cfg.get("Contract") or cfg.get("*") or []
+    resolved = resolve_fts_columns(_settings_getter, "Contract")
     seen: set[str] = set()
-    resolved: List[str] = []
-    if isinstance(raw_cols, list):
-        for col in raw_cols:
-            if not isinstance(col, str):
-                continue
-            norm = col.strip().strip('"')
-            if not norm:
-                continue
-            upper = norm.upper()
-            if upper not in seen:
-                seen.add(upper)
-                resolved.append(upper)
-    return resolved
+    normalized: List[str] = []
+    for col in resolved:
+        if not isinstance(col, str):
+            continue
+        norm = col.strip().strip('"')
+        if not norm:
+            continue
+        upper = norm.upper()
+        if upper not in seen:
+            seen.add(upper)
+            normalized.append(upper)
+    return normalized
 
 
 # allow common aliases -> real columns
@@ -98,48 +100,6 @@ def _extract_has_terms(q: str) -> List[str]:
     return terms
 
 
-def _word_boundary_regex(term: str) -> str:
-    """Build a UPPER-case REGEXP for whole-word matching of short terms."""
-
-    base = (term or "").upper()
-    cleaned = re.sub(r"\W+", "", base)
-    if not cleaned:
-        cleaned = re.sub(r"\s+", "", base)
-    if not cleaned:
-        cleaned = base
-    return rf"(^|[^A-Z]){re.escape(cleaned)}([^A-Z]|$)"
-
-
-def _fts_where(terms: List[str], cols: List[str], binds: Dict[str, Any]) -> str:
-    if not terms or not cols:
-        return ""
-    groups: List[str] = []
-    idx = 0
-    for term in terms:
-        t_clean = term.strip()
-        if not t_clean:
-            continue
-        if len(t_clean) <= 2 or t_clean.lower() == "it":
-            bind = f"fts_re_{idx}"
-            binds[bind] = _word_boundary_regex(t_clean)
-            groups.append(
-                "(" + " OR ".join([f"REGEXP_LIKE(UPPER({c}), :{bind})" for c in cols]) + ")"
-            )
-        else:
-            bind = f"fts_{idx}"
-            binds[bind] = f"%{t_clean}%"
-            groups.append(
-                "(" + " OR ".join(
-                    [f"UPPER(TRIM({c})) LIKE UPPER(:{bind}) ESCAPE '\\'" for c in cols]
-                )
-                + ")"
-            )
-        idx += 1
-    if not groups:
-        return ""
-    return "(" + " OR ".join(groups) + ")"
-
-
 def _build_fts_clause(
     question: str,
     overrides: Optional[Dict[str, Any]],
@@ -170,15 +130,24 @@ def _build_fts_clause(
             if upper not in seen:
                 seen.add(upper)
                 cols.append(upper)
-    else:
+    if not cols:
         cols = _get_fts_columns(settings)
 
     predicate = ""
     error: Optional[str] = None
     new_bind_keys: List[str] = []
+    join_op: Optional[str] = None
     if terms and cols:
         before = set(binds.keys())
-        predicate = _fts_where(terms, cols, binds)
+        raw_sql, binds, join_op = build_boolean_fts_where(
+            question_text=q,
+            terms=terms,
+            fts_columns=cols,
+            binds=binds,
+            bind_prefix="fts",
+        )
+        if raw_sql:
+            predicate = "(" + raw_sql + ")"
         new_bind_keys = [key for key in binds.keys() if key not in before]
     elif terms and not cols:
         error = "no_columns"
@@ -193,6 +162,8 @@ def _build_fts_clause(
     }
     if predicate:
         meta["binds"] = new_bind_keys
+        if join_op:
+            meta["join"] = join_op
 
     return predicate, meta
 

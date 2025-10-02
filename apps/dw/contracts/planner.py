@@ -10,6 +10,7 @@ from .intent import DWIntent
 from .enums import load_enum_synonyms
 from .sql_builder import attach_where_clause, build_where_from_filters
 from apps.settings import get_setting_json
+from apps.dw.fts_utils import build_boolean_fts_where, resolve_fts_columns
 
 DIMENSIONS_ALLOWED = {"OWNER_DEPARTMENT", "DEPARTMENT_OUL", "ENTITY_NO", "ENTITY"}
 
@@ -44,18 +45,9 @@ def _get_fts_columns(ns_settings: Optional[Dict[str, Any]]) -> List[str]:
     Auto-include numbered columns 1..8 when one of them appears.
     """
 
-    cfg = (ns_settings or {}).get("DW_FTS_COLUMNS") or {}
-    cols = cfg.get("Contract") or cfg.get("*") or []
-    if not cols:
-        cols = [
-            "CONTRACT_SUBJECT",
-            "CONTRACT_PURPOSE",
-            "OWNER_DEPARTMENT",
-            "DEPARTMENT_OUL",
-            "CONTRACT_STAKEHOLDER_1",
-            "DEPARTMENT_1",
-        ]
-    cols = [c.upper() for c in cols]
+    getter = lambda key, default=None: (ns_settings or {}).get(key, default)
+    cols = resolve_fts_columns(getter, "Contract")
+    cols = [c.strip().strip('"').upper() for c in cols if isinstance(c, str)]
     cols = _expand_numbered_columns(cols)
     seen: set[str] = set()
     uniq: List[str] = []
@@ -120,26 +112,29 @@ def _build_fts_clause(
     op: str = "AND",
     binds: Optional[Dict[str, object]] = None,
     bind_prefix: str = "fts",
-) -> Tuple[Optional[str], Dict[str, object]]:
+) -> Tuple[Optional[str], Dict[str, object], Optional[str]]:
     """
     Build ( (C1 LIKE :b0 OR C2 LIKE :b0 ...) [op] (C1 LIKE :b1 OR ...) ... )
-    Returns: (sql_fragment, new_binds)
+    Returns: (sql_fragment, new_binds, join_op)
     """
 
-    binds = binds or {}
-    disjunctions: List[str] = []
-    idx = 0
-    for token in tokens:
-        like_bind = f"{bind_prefix}_{idx}"
-        binds[like_bind] = f"%{token}%"
-        predicates = [f"UPPER({col}) LIKE UPPER(:{like_bind})" for col in fts_columns]
-        disjunctions.append("(" + " OR ".join(predicates) + ")")
-        idx += 1
-    if not disjunctions:
-        return None, binds
-    glue = " OR " if op.upper() == "OR" else " AND "
-    fragment = "(" + glue.join(disjunctions) + ")"
-    return fragment, binds
+    binds_dict: Dict[str, object] = binds if isinstance(binds, dict) else {}
+    if not fts_columns or not tokens:
+        return None, binds_dict, None
+
+    question_hint = "and" if (op or "").upper() == "AND" else ""
+    raw_sql, binds_dict, join_op = build_boolean_fts_where(
+        question_text=question_hint,
+        terms=tokens,
+        fts_columns=fts_columns,
+        binds=binds_dict,
+        bind_prefix=bind_prefix,
+    )
+    if not raw_sql:
+        return None, binds_dict, join_op
+
+    fragment = "(" + raw_sql + ")"
+    return fragment, binds_dict, join_op
 
 
 _DEPT_ALIAS_COLS = [
@@ -599,7 +594,7 @@ def build_sql(intent: DWIntent) -> Tuple[str, Dict[str, object], Dict[str, objec
         fts_cols = _get_fts_columns(ns_settings)
         tokens, op = _extract_fts_terms(question or "", force_short=True)
         if fts_cols and tokens:
-            frag, binds = _build_fts_clause(fts_cols, tokens, op, binds, bind_prefix="fts")
+            frag, binds, join_op = _build_fts_clause(fts_cols, tokens, op, binds, bind_prefix="fts")
             if frag:
                 where_parts.append(frag)
                 fts_debug = debug.setdefault("fts", {})
@@ -607,6 +602,8 @@ def build_sql(intent: DWIntent) -> Tuple[str, Dict[str, object], Dict[str, objec
                 fts_debug["columns"] = fts_cols
                 fts_debug["tokens"] = tokens
                 fts_debug["mode"] = "override"
+                if join_op:
+                    fts_debug["join"] = join_op
         else:
             fts_debug = debug.setdefault("fts", {})
             fts_debug["enabled"] = False
@@ -637,7 +634,7 @@ def build_sql(intent: DWIntent) -> Tuple[str, Dict[str, object], Dict[str, objec
         raw = re.split(r"\bor\b|,|;", names_src, flags=re.I)
         tokens = [t.strip(" '\"") for t in raw if t and t.strip(" '\"")]
         if tokens:
-            frag, binds = _build_fts_clause(
+            frag, binds, _ = _build_fts_clause(
                 _STAKEHOLDER_ALIAS_COLS, tokens, op="OR", binds=binds, bind_prefix="st"
             )
             if frag:
