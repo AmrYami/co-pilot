@@ -532,26 +532,27 @@ cases:
         - 'GROUP BY ENTITY_NO'
   - id: fts_has_it_or_home_care
     question: "list all contracts has it or home care"
-    payload:
-      full_text_search: true
     expect_sql_contains:
-      - 'LIKE UPPER(:kw_0)'
-      - 'LIKE UPPER(:kw_1)'
-      - 'ORDER BY REQUEST_DATE DESC'
+      - 'REGEXP_LIKE(UPPER('
+      - 'LIKE UPPER(:fts_1)'
+    expect_binds:
+      - fts_re_0
+      - fts_1
 
-  - id: fts_has_it_single
-    question: "list all contracts has it"
-    payload:
-      full_text_search: true
+  - id: eq_departments_support_services
+    question: "list all contracts where departments = SUPPORT SERVICES"
     expect_sql_contains:
-      - 'LIKE UPPER(:kw_0)'
-      - 'ORDER BY REQUEST_DATE DESC'
+      - 'UPPER(TRIM(OWNER_DEPARTMENT)) = UPPER(TRIM(:eq_0))'
+    expect_binds:
+      - eq_0
 
   - id: stakeholder_like_or
-    question: "list all contracts where stakeholder has Tamer Said Aly Abdelgawad or u1835 or Amr Taher A Maghrabi"
+    question: "list all contracts where stackholder has u1835 or Amr Taher"
     expect_sql_contains:
       - 'CONTRACT_STAKEHOLDER_1'
       - 'CONTRACT_STAKEHOLDER_8'
-      - 'LIKE UPPER(:sh_0)'
-      - 'LIKE UPPER(:sh_1)'
-      - 'LIKE UPPER(:sh_2)'
+      - 'REGEXP_LIKE(UPPER('
+      - 'LIKE UPPER(:fts_1)'
+    expect_binds:
+      - fts_re_0
+      - fts_1

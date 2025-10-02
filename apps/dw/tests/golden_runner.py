@@ -406,6 +406,7 @@ class GoldenCase:
     expect_date_col: Optional[str] = None  # e.g. "REQUEST_DATE", "OVERLAP", "END_DATE"
     expect_agg: Optional[str] = None       # e.g. "count", "sum"
     expect_top_n: Optional[int] = None
+    expect_binds: List[str] = field(default_factory=list)
     assertions: Dict[str, Any] = field(default_factory=dict)
     assert_all_of: List[str] = field(default_factory=list)
     assert_any_of: List[str] = field(default_factory=list)
@@ -615,6 +616,7 @@ def _hydrate_case(raw: Dict[str, Any]) -> GoldenCase:
         expect_date_col = raw.get("expect_date_col"),
         expect_agg = raw.get("expect_agg"),
         expect_top_n = raw.get("expect_top_n"),
+        expect_binds = _ensure_str_list(raw.get("expect_binds")),
         assertions = raw.get("assertions") or {},
         assert_all_of = _ensure_str_list(raw.get("assert_all_of")) + assert_contains,
         assert_any_of = _ensure_str_list(raw.get("assert_any_of")),
@@ -627,6 +629,7 @@ def _check_expectations(case: GoldenCase, resp: Dict[str, Any]) -> Tuple[bool, L
     sql = (resp or {}).get("sql") or ""
     meta = (resp or {}).get("meta") or {}
     intent = ((resp or {}).get("debug") or {}).get("intent") or meta.get("clarifier_intent") or {}
+    meta_binds = meta.get("binds") if isinstance(meta, dict) else {}
 
     # 1) sql contains
     required_fragments = case.expect_sql_contains + case.assert_all_of
@@ -644,6 +647,13 @@ def _check_expectations(case: GoldenCase, resp: Dict[str, Any]) -> Tuple[bool, L
         if _dense(frag) in sql_dense:
             ok = False
             reasons.append(f"SQL unexpectedly contained fragment: {frag}")
+
+    if case.expect_binds:
+        bind_keys = set(meta_binds.keys()) if isinstance(meta_binds, dict) else set()
+        missing_binds = [b for b in case.expect_binds if b not in bind_keys]
+        if missing_binds:
+            ok = False
+            reasons.append(f"Missing expected bind keys: {missing_binds}")
 
     # 2) group by
     if case.expect_group_by:
