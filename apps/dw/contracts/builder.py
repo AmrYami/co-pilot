@@ -3,6 +3,7 @@ import re
 from datetime import date, datetime
 from typing import Dict, Tuple, Optional, List
 
+from apps.dw.aliases import resolve_column_alias
 from apps.dw.contracts.text_filters import (
     extract_eq_filters,
     build_eq_where,
@@ -191,12 +192,18 @@ def build_contract_sql(
 
     handled_cols = set(alias_result.get("handled_columns", set()))
 
+    alias_settings = settings.get("DW_COLUMN_ALIASES") if isinstance(settings, dict) else settings
+
     eq_filters = extract_eq_filters(q)
     if eq_filters:
         filtered: List[Dict] = []
         stakeholder_terms = alias_result.get("stakeholder")
         for entry in eq_filters:
             col = entry.get("col")
+            resolved = resolve_column_alias(col, settings=alias_settings)
+            if resolved:
+                entry["col"] = resolved
+                col = resolved
             if col in handled_cols:
                 continue
             if col == "STAKEHOLDER*" and stakeholder_terms:

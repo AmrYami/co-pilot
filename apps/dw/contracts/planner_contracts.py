@@ -4,10 +4,13 @@ from __future__ import annotations
 import re
 from typing import Dict, List, Optional, Set
 
+from apps.dw.fts import build_fts_where as build_generic_fts_where
+from apps.dw.fts import extract_fts_tokens
 from apps.dw.settings import get_fts_columns, get_short_token_allow
+from apps.dw.settings_util import get_fts_columns_for
 
 from .columns_map import COLUMN_SYNONYMS, STAKEHOLDER_COLUMNS
-from .fts import build_fts_where, normalize_terms, parse_fts_terms_from_question
+from .fts import normalize_terms, parse_fts_terms_from_question
 
 
 def _sanitize_columns(columns: Optional[List[str]]) -> List[str]:
@@ -39,7 +42,13 @@ def apply_full_text_search(
 ) -> bool:
     """Append a LIKE-based FTS predicate when possible."""
 
-    fts_cols = _sanitize_columns(columns_override) if columns_override else get_fts_columns(db, base_table)
+    if columns_override:
+        fts_cols = _sanitize_columns(columns_override)
+    else:
+        settings_map = db if isinstance(db, dict) else None
+        fts_cols = _sanitize_columns(get_fts_columns_for(base_table, config=settings_map))
+        if not fts_cols:
+            fts_cols = _sanitize_columns(get_fts_columns(db, base_table))
     fts_meta: Dict[str, object] = {}
     debug.setdefault("fts", fts_meta)
 
@@ -49,24 +58,30 @@ def apply_full_text_search(
 
     short_allow = get_short_token_allow(db)
     before_keys = set(binds.keys())
-    terms = parse_fts_terms_from_question(question or "")
-    terms = normalize_terms(terms, short_allow)
+    tokens = extract_fts_tokens(question or "")
+    terms = normalize_terms(tokens, short_allow)
 
     if full_text_search and not terms:
-        fallback_terms = re.findall(r"[A-Za-z0-9][A-Za-z0-9\- ]{2,}", question or "")
+        fallback_terms = parse_fts_terms_from_question(question or "")
+        if not fallback_terms:
+            fallback_terms = re.findall(r"[A-Za-z0-9][A-Za-z0-9\- ]{2,}", question or "")
         terms = normalize_terms(fallback_terms, short_allow)
 
     if not terms:
         fts_meta.update({"enabled": False, "error": "no_terms", "columns": fts_cols})
         return False
 
-    where_sql, updated_binds = build_fts_where(fts_cols, terms, binds)
+    existing = len([k for k in binds.keys() if isinstance(k, str) and k.startswith("fts_")])
+    where_sql, new_binds = build_generic_fts_where(base_table, fts_cols, terms, start_index=existing)
     if not where_sql:
         fts_meta.update({"enabled": False, "error": "build_failed", "columns": fts_cols})
         return False
 
+    for key, value in new_binds.items():
+        binds[key] = value
+
     where_clauses.append(where_sql)
-    new_bind_keys = [k for k in updated_binds.keys() if k.startswith("fts_t") and k not in before_keys]
+    new_bind_keys = [k for k in new_binds.keys() if k.startswith("fts_") and k not in before_keys]
     fts_meta.update(
         {
             "enabled": True,
