@@ -4,12 +4,10 @@ from datetime import date, datetime
 from typing import Dict, Tuple, Optional, List
 
 from apps.dw.contracts.text_filters import (
-    extract_has_tokens,
     extract_eq_filters,
-    build_fts_where,
     build_eq_where,
 )
-from apps.dw.contracts.column_synonyms import CONTRACT_STAKEHOLDER_COLS
+from .planner_contracts import apply_equality_aliases, apply_full_text_search
 
 from .filters import try_parse_simple_equals
 from .rules_extra import try_build_special_cases
@@ -171,6 +169,8 @@ def build_contract_sql(
     base_where: List[str],
     binds: Dict[str, object],
     fts_columns_override: Optional[List[str]] = None,
+    notes: Optional[Dict[str, object]] = None,
+    table_name: str = "Contract",
 ) -> Tuple[List[str], Dict[str, object]]:
     """
     This function represents the core point where we add FTS/equality filters.
@@ -184,34 +184,47 @@ def build_contract_sql(
     """
     q = (question or "").strip()
 
-    # 1) equality filters like "where departments = SUPPORT SERVICES"
+    alias_debug: Dict[str, object] = {}
+    alias_result = apply_equality_aliases(q, base_where, binds, alias_debug)
+    if notes is not None and alias_debug.get("eq_alias"):
+        notes.setdefault("eq_alias", alias_debug["eq_alias"])
+
+    handled_cols = set(alias_result.get("handled_columns", set()))
+
     eq_filters = extract_eq_filters(q)
     if eq_filters:
-        eq_sql, binds = build_eq_where(eq_filters, binds, bind_prefix="eq")
-        if eq_sql:
-            base_where.append(eq_sql)
+        filtered: List[Dict] = []
+        stakeholder_terms = alias_result.get("stakeholder")
+        for entry in eq_filters:
+            col = entry.get("col")
+            if col in handled_cols:
+                continue
+            if col == "STAKEHOLDER*" and stakeholder_terms:
+                continue
+            filtered.append(entry)
 
-    # 2) full-text tokens from 'has ...' or explicit flag full_text_search=true
-    tokens, narrowed = extract_has_tokens(q)
+        if filtered:
+            eq_sql, binds = build_eq_where(filtered, binds, bind_prefix="eq")
+            if eq_sql:
+                base_where.append(eq_sql)
 
-    # enforce FTS if flag set even without "has ..."
-    if not tokens and bool(request_flags.get("full_text_search")):
-        # placeholder for future heuristics when flag forces FTS without explicit tokens
-        pass
+    fts_debug: Dict[str, object] = {}
+    skip_fts = bool(alias_result.get("stakeholder"))
+    if not skip_fts:
+        apply_full_text_search(
+            settings,
+            q,
+            bool(request_flags.get("full_text_search")),
+            table_name,
+            base_where,
+            binds,
+            fts_debug,
+            columns_override=fts_columns_override,
+        )
+        if notes is not None and fts_debug.get("fts"):
+            notes.setdefault("fts", fts_debug["fts"])
 
-    # decide candidate FTS columns
-    fts_columns = _get_fts_columns(settings, override=fts_columns_override)
-    # if narrowed, override
-    if narrowed == "STAKEHOLDER*":
-        fts_columns = list(CONTRACT_STAKEHOLDER_COLS)
-    elif narrowed == "OWNER_DEPARTMENT":
-        fts_columns = ["OWNER_DEPARTMENT"]
-
-    if tokens and fts_columns:
-        fts_sql, binds = build_fts_where(tokens, fts_columns, binds, bind_prefix="fts")
-        if fts_sql:
-            base_where.append(fts_sql)
-
+    
     return base_where, binds
 
 
@@ -608,6 +621,8 @@ def build_contracts_sql(
         base_where=where_parts,
         binds=binds,
         fts_columns_override=fts_columns,
+        notes=notes,
+        table_name=table,
     )
     new_where_parts = where_parts[where_len_before:]
     new_bind_keys = {k for k in binds.keys() if k not in bind_keys_before}
