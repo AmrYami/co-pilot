@@ -14,6 +14,152 @@ from apps.settings import get_setting_json
 DIMENSIONS_ALLOWED = {"OWNER_DEPARTMENT", "DEPARTMENT_OUL", "ENTITY_NO", "ENTITY"}
 
 
+# ---------- helpers: FTS + aliases ----------
+
+
+def _expand_numbered_columns(cols: List[str]) -> List[str]:
+    """Expand patterns like DEPARTMENT_1 to DEPARTMENT_1..8 and CONTRACT_STAKEHOLDER_1..8."""
+
+    out: List[str] = []
+    seen = set()
+    for col in cols:
+        if col in seen:
+            continue
+        seen.add(col)
+        out.append(col)
+        match = re.match(r"^(DEPARTMENT|CONTRACT_STAKEHOLDER)_(\d+)$", col, re.I)
+        if match:
+            base = match.group(1).upper()
+            for i in range(1, 9):
+                expanded = f"{base}_{i}"
+                if expanded not in seen:
+                    seen.add(expanded)
+                    out.append(expanded)
+    return out
+
+
+def _get_fts_columns(ns_settings: Optional[Dict[str, Any]]) -> List[str]:
+    """
+    Try to read DW_FTS_COLUMNS['Contract'] or ['*'], else provide a sane fallback.
+    Auto-include numbered columns 1..8 when one of them appears.
+    """
+
+    cfg = (ns_settings or {}).get("DW_FTS_COLUMNS") or {}
+    cols = cfg.get("Contract") or cfg.get("*") or []
+    if not cols:
+        cols = [
+            "CONTRACT_SUBJECT",
+            "CONTRACT_PURPOSE",
+            "OWNER_DEPARTMENT",
+            "DEPARTMENT_OUL",
+            "CONTRACT_STAKEHOLDER_1",
+            "DEPARTMENT_1",
+        ]
+    cols = [c.upper() for c in cols]
+    cols = _expand_numbered_columns(cols)
+    seen: set[str] = set()
+    uniq: List[str] = []
+    for col in cols:
+        if col not in seen:
+            seen.add(col)
+            uniq.append(col)
+    return uniq
+
+
+def _extract_fts_terms(text: str, force_short: bool = False) -> Tuple[List[str], str]:
+    """
+    Extract FTS tokens/phrases.
+    - If 'or' appears => OR logic, otherwise AND.
+    - Keep short tokens when force_short=True (for full_text_search=true).
+    - Preserve dashes (e.g. E-123), allow phrases like 'home care'.
+    """
+
+    match = re.search(r"\b(has|contains|with)\s+(.+)$", text, re.I)
+    source = match.group(2) if match else text
+
+    op = "OR" if re.search(r"\bor\b", source, re.I) else "AND"
+
+    parts = re.split(r"\b(?:and|or)\b", source, flags=re.I)
+    tokens: List[str] = []
+    for part in parts:
+        chunk = part.strip(" ,;")
+        if not chunk:
+            continue
+        quoted = re.findall(r"'([^']+)'|\"([^\"]+)\"", chunk)
+        if quoted:
+            for a, b in quoted:
+                phrase = (a or b).strip()
+                if phrase:
+                    tokens.append(phrase)
+            chunk = re.sub(r"'[^']+'|\"[^\"]+\"", " ", chunk)
+
+        for word in re.split(r"[\s,;]+", chunk):
+            word = word.strip()
+            if not word:
+                continue
+            if not force_short and len(word) < 3:
+                continue
+            tokens.append(word)
+
+    seen_tokens: set[str] = set()
+    ordered: List[str] = []
+    for token in tokens:
+        token = token.strip()
+        if not token:
+            continue
+        lowered = token.lower()
+        if lowered not in seen_tokens:
+            seen_tokens.add(lowered)
+            ordered.append(token)
+    return ordered, op
+
+
+def _build_fts_clause(
+    fts_columns: List[str],
+    tokens: List[str],
+    op: str = "AND",
+    binds: Optional[Dict[str, object]] = None,
+    bind_prefix: str = "fts",
+) -> Tuple[Optional[str], Dict[str, object]]:
+    """
+    Build ( (C1 LIKE :b0 OR C2 LIKE :b0 ...) [op] (C1 LIKE :b1 OR ...) ... )
+    Returns: (sql_fragment, new_binds)
+    """
+
+    binds = binds or {}
+    disjunctions: List[str] = []
+    idx = 0
+    for token in tokens:
+        like_bind = f"{bind_prefix}_{idx}"
+        binds[like_bind] = f"%{token}%"
+        predicates = [f"UPPER({col}) LIKE UPPER(:{like_bind})" for col in fts_columns]
+        disjunctions.append("(" + " OR ".join(predicates) + ")")
+        idx += 1
+    if not disjunctions:
+        return None, binds
+    glue = " OR " if op.upper() == "OR" else " AND "
+    fragment = "(" + glue.join(disjunctions) + ")"
+    return fragment, binds
+
+
+_DEPT_ALIAS_COLS = [
+    "OWNER_DEPARTMENT",
+    "DEPARTMENT_OUL",
+] + [f"DEPARTMENT_{i}" for i in range(1, 9)]
+_STAKEHOLDER_ALIAS_COLS = [f"CONTRACT_STAKEHOLDER_{i}" for i in range(1, 9)]
+
+
+def _build_eq_alias_or(
+    cols: List[str], value: str, binds: Dict[str, object], bind_prefix: str
+) -> str:
+    predicates: List[str] = []
+    for idx, col in enumerate(cols):
+        bind_name = f"{bind_prefix}_{idx}"
+        binds[bind_name] = value
+        predicates.append(f"UPPER(TRIM({col})) = UPPER(TRIM(:{bind_name}))")
+    return "(" + " OR ".join(predicates) + ")"
+
+
 # ---------- utils: normalization & settings ----------
 
 
@@ -335,6 +481,14 @@ def build_sql(intent: DWIntent) -> Tuple[str, Dict[str, object], Dict[str, objec
     binds: Dict[str, object] = {}
     meta: Dict[str, object] = {}
     where_parts: List[str] = []
+    debug: Dict[str, object] = meta.setdefault("debug", {})
+
+    question = intent.question or ""
+    payload: Dict[str, Any] = {}
+    if isinstance(intent.notes, dict):
+        payload_raw = intent.notes.get("payload")
+        if isinstance(payload_raw, dict):
+            payload = payload_raw
 
     settings_get = None
     namespace = "dw::common"
@@ -376,6 +530,20 @@ def build_sql(intent: DWIntent) -> Tuple[str, Dict[str, object], Dict[str, objec
         mem_settings_client = _SettingsMemAdapter(
             namespace, settings_get, preload=preload
         )
+
+    ns_settings: Optional[Dict[str, Any]] = None
+    if isinstance(intent.notes, dict):
+        ns_settings_raw = intent.notes.get("namespace_settings")
+        if isinstance(ns_settings_raw, dict):
+            ns_settings = ns_settings_raw
+    if ns_settings is None:
+        try:
+            fts_cols_setting = mem_settings_client.get(
+                namespace, "DW_FTS_COLUMNS", scope="namespace"
+            )
+        except Exception:
+            fts_cols_setting = None
+        ns_settings = {"DW_FTS_COLUMNS": fts_cols_setting} if fts_cols_setting else {}
 
     filters_raw = getattr(intent, "filters", None) or []
     filter_fragments, filter_binds = build_where_from_filters(settings_get, filters_raw)
@@ -424,6 +592,60 @@ def build_sql(intent: DWIntent) -> Tuple[str, Dict[str, object], Dict[str, objec
 
     request_type_applied = request_type_applied or request_type_detected
 
+    # ------------- Forced / Heuristic FTS -------------
+    wants_fts = bool(payload.get("full_text_search"))
+    has_fts_cue = bool(re.search(r"\b(has|contains|with)\b", question or "", re.I))
+    if wants_fts or has_fts_cue:
+        fts_cols = _get_fts_columns(ns_settings)
+        tokens, op = _extract_fts_terms(question or "", force_short=True)
+        if fts_cols and tokens:
+            frag, binds = _build_fts_clause(fts_cols, tokens, op, binds, bind_prefix="fts")
+            if frag:
+                where_parts.append(frag)
+                fts_debug = debug.setdefault("fts", {})
+                fts_debug["enabled"] = True
+                fts_debug["columns"] = fts_cols
+                fts_debug["tokens"] = tokens
+                fts_debug["mode"] = "override"
+        else:
+            fts_debug = debug.setdefault("fts", {})
+            fts_debug["enabled"] = False
+            fts_debug["error"] = "no_columns" if not fts_cols else "no_tokens"
+
+    # ------------- Departments = X (alias across OWNER/DEPARTMENT_1..8/OUL) -------------
+    m_dept = re.search(
+        r"\bdepartments?\s*=\s*['\"]?([^'\"\n\r;]+)", (question or ""), re.I
+    )
+    if m_dept:
+        dept_val = m_dept.group(1).strip()
+        if dept_val:
+            frag = _build_eq_alias_or(_DEPT_ALIAS_COLS, dept_val, binds, "eq_dept")
+            where_parts.append(frag)
+            debug.setdefault("eq_alias", {})["departments"] = {
+                "value": dept_val,
+                "cols": _DEPT_ALIAS_COLS,
+            }
+
+    # ------------- Stakeholder has A or B or C -------------
+    m_st = re.search(
+        r"\bstakeholder[s]?\b.*?\b(has|contains|with)\b\s+(.+)$",
+        (question or ""),
+        re.I,
+    )
+    if m_st:
+        names_src = m_st.group(2)
+        raw = re.split(r"\bor\b|,|;", names_src, flags=re.I)
+        tokens = [t.strip(" '\"") for t in raw if t and t.strip(" '\"")]
+        if tokens:
+            frag, binds = _build_fts_clause(
+                _STAKEHOLDER_ALIAS_COLS, tokens, op="OR", binds=binds, bind_prefix="st"
+            )
+            if frag:
+                where_parts.append(frag)
+                stake_debug = debug.setdefault("stakeholder", {})
+                stake_debug["tokens"] = tokens
+                stake_debug["cols"] = _STAKEHOLDER_ALIAS_COLS
+
     if intent.group_by is None:
         sort_desc = _apply_sort_asc_if_bottom(intent, default_desc=True)
 
@@ -446,10 +668,19 @@ def build_sql(intent: DWIntent) -> Tuple[str, Dict[str, object], Dict[str, objec
         elif (filters_applied or request_type_applied) and not intent.has_time_window:
             default_order_col = "REQUEST_DATE"
 
+        explicit_order_by = (
+            bool(intent.sort_by) or intent.sort_desc is not None or bool(intent.top_n)
+        )
+
         if default_order_col:
             order_sql = f"ORDER BY {default_order_col} DESC"
         else:
-            order_sql = f"ORDER BY {measure} {'DESC' if sort_desc else 'ASC'}"
+            if (not explicit_order_by) and (
+                debug.get("fts", {}).get("enabled") or debug.get("stakeholder")
+            ):
+                order_sql = "ORDER BY REQUEST_DATE DESC"
+            else:
+                order_sql = f"ORDER BY {measure} {'DESC' if sort_desc else 'ASC'}"
 
         sql_parts = [base_sql, order_sql]
         if top_sql:
