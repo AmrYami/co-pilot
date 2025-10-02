@@ -198,8 +198,42 @@ cases:
       sql_like:
         - 'CONTRACT_ID IS NULL'
         - "TRIM(CONTRACT_ID) = ''"
-      must_not: []
-      notes: "Should test CONTRACT_ID IS NULL or TRIM(CONTRACT_ID) = ''."
+
+  - id: fts_short_token_it
+    question: "list all contracts has it"
+    flags: { full_text_search: true }
+    full_text_search: true
+    expect_sql_contains:
+      - 'LIKE UPPER(:fts_t0)'
+      - 'ORDER BY REQUEST_DATE DESC'
+    expect_binds:
+      - fts_t0
+
+  - id: fts_multiple_terms
+    question: "list all contracts has it or home care"
+    flags: { full_text_search: true }
+    full_text_search: true
+    expect_sql_contains:
+      - 'LIKE UPPER(:fts_t0)'
+      - 'LIKE UPPER(:fts_t1)'
+      - 'LIKE UPPER(:fts_t2)'
+    expect_binds:
+      - fts_t0
+      - fts_t1
+      - fts_t2
+
+  - id: dept_equality_alias
+    question: "list all contracts where departments = SUPPORT SERVICES"
+    expect_sql_contains:
+      - 'UPPER(TRIM(OWNER_DEPARTMENT)) = UPPER(:eq_dept_0)'
+
+  - id: stakeholder_alias_has
+    question: "list all contracts where stakeholder has Tamer Said Aly Abdelgawad or u1835 or Amr Taher A Maghrabi"
+    expect_sql_contains:
+      - 'CONTRACT_STAKEHOLDER_1'
+      - 'LIKE UPPER(:eq_stk_0)'
+      - 'LIKE UPPER(:eq_stk_1)'
+      - 'LIKE UPPER(:eq_stk_2)'
 
   - id: entity_status_totals_with_rate
     question: "For ENTITY_NO = 'E-123', total and count by CONTRACT_STATUS."

@@ -43,7 +43,9 @@ def extract_fts_terms(question: str, force: bool = False) -> Tuple[List[List[str
 
     return [], "none"
 
-def build_fts_where(groups: List[List[str]], columns: List[str], bind_prefix: str = "fts") -> Tuple[str, Dict[str, str]]:
+def build_fts_where_groups(
+    groups: List[List[str]], columns: List[str], bind_prefix: str = "fts"
+) -> Tuple[str, Dict[str, str]]:
     """
     Build a SQL WHERE predicate using UPPER(col) LIKE UPPER(:bind) across the provided columns.
     OR between groups; AND within a group; OR across columns for the same term.
@@ -75,3 +77,71 @@ def build_fts_where(groups: List[List[str]], columns: List[str], bind_prefix: st
         return "", {}
 
     return "(" + " OR ".join(group_sql) + ")", binds
+
+
+# --- New helper APIs used by the planner --------------------------------------------------
+
+
+def parse_fts_terms_from_question(q: str) -> List[str]:
+    """Extract candidate FTS terms from the question following a ``has`` clause."""
+
+    s = (q or "").strip().lower()
+    if not s:
+        return []
+    match = re.search(r"\bhas\b(.*)$", s)
+    tail = match.group(1) if match else s
+    parts = re.split(r"\s*(?:or|and|,|/)\s*", tail)
+    terms: List[str] = []
+    for part in parts:
+        token = part.strip(" ' \"")
+        if token:
+            terms.append(token)
+    return terms
+
+
+def normalize_terms(terms: List[str], short_allow: List[str]) -> List[str]:
+    """Normalize, deduplicate, and cap the term list."""
+
+    allow_set = {tok.upper() for tok in short_allow or []}
+    filtered: List[str] = []
+    for term in terms:
+        upper = term.strip().upper()
+        if not upper:
+            continue
+        if len(upper) < 3 and upper not in allow_set:
+            continue
+        filtered.append(term)
+
+    seen: set[str] = set()
+    dedup: List[str] = []
+    for term in filtered:
+        key = term.strip().upper()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        dedup.append(term)
+    return dedup[:10]
+
+
+def build_fts_where(
+    table_cols: List[str], terms: List[str], binds: Dict[str, str]
+) -> Tuple[str, Dict[str, str]]:
+    """Construct a SQL WHERE fragment for the provided columns and terms."""
+
+    if not table_cols or not terms:
+        return "", binds
+
+    clauses: List[str] = []
+    for idx, term in enumerate(terms):
+        bind = f"fts_t{idx}"
+        binds[bind] = f"%{term}%"
+        per_term = " OR ".join(
+            [f"UPPER(TRIM({col})) LIKE UPPER(:{bind})" for col in table_cols]
+        )
+        clauses.append(f"({per_term})")
+
+    if not clauses:
+        return "", binds
+
+    where_sql = "(" + " OR ".join(clauses) + ")"
+    return where_sql, binds

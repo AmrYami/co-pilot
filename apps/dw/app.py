@@ -58,7 +58,7 @@ from apps.dw.settings_defaults import DEFAULT_EXPLICIT_FILTER_COLUMNS
 from apps.dw.settings_utils import load_explicit_filter_columns
 from apps.dw.tables.contracts import build_contract_sql
 from apps.mem.kv import get_settings_for_namespace
-from .contracts.fts import extract_fts_terms, build_fts_where
+from .contracts.fts import extract_fts_terms, build_fts_where_groups
 from .contracts.filters import parse_explicit_filters
 from .contracts.contract_planner import plan_contract_query
 from .rating import rate_bp
@@ -602,7 +602,7 @@ def answer():
     fts_groups, fts_mode = extract_fts_terms(question, force=full_text_search)
     fts_where_sql, fts_binds = ("", {})
     if fts_groups and fts_columns:
-        fts_where_sql, fts_binds = build_fts_where(fts_groups, fts_columns)
+        fts_where_sql, fts_binds = build_fts_where_groups(fts_groups, fts_columns)
 
     top_n = payload.get("top_n")
     if top_n is None:
