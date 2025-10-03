@@ -1,6 +1,6 @@
 from __future__ import annotations
 import re
-from typing import Optional, List, Dict, Any, TYPE_CHECKING
+from typing import Optional, List, Dict, Any, TYPE_CHECKING, Iterable
 from apps.dw.tables import for_namespace
 from apps.dw.tables.base import TableSpec
 from apps.dw.tables.contract import ContractSpec
@@ -32,6 +32,8 @@ class NLIntent(BaseModel):
     fts_tokens: Optional[List[str]] = None
     notes: Dict[str, Any] = {}
     eq_filters: List[Dict[str, Any]] = Field(default_factory=list)
+    fts_columns: Optional[List[str]] = None
+    fts_operator: Optional[str] = None
 
 
 _RE_REQUESTED = re.compile(r'\b(requested|request\s+date|request_date|request type|request\s*type)\b', re.I)
@@ -49,6 +51,10 @@ _RE_YTD_EXPLICIT  = re.compile(r'\b(20\d{2})\s*(?:ytd|year\s*to\s*date)\b', re.I
 _RE_RENEWAL       = re.compile(r'\brenewal\b', re.I)
 _RE_GROSS         = re.compile(r'\bgross\b', re.I)
 _RE_NET           = re.compile(r'\bnet\b', re.I)
+
+_EQ_COL_RE = re.compile(
+    r"(?i)\b([A-Za-z0-9_ ]+?)\s*=\s*(?:'([^']*)'|\"([^\"]*)\"|([^\s,;]+))"
+)
 
 
 def _num_from_word_or_digit(s: str) -> Optional[int]:
@@ -253,4 +259,178 @@ def parse_intent(question: str, settings: "Settings") -> Dict[str, Any]:
     intent.setdefault("full_text_search", False)
     intent.setdefault("fts_tokens", [])
 
+    _merge_eq_filters_from_text(intent, q, settings, spec)
+    _prepare_fts(intent, q, settings, spec)
+
     return intent
+
+
+def _settings_get(settings: "Settings", key: str, default: Any = None) -> Any:
+    if settings is None:
+        return default
+    getter_json = getattr(settings, "get_json", None)
+    if callable(getter_json):
+        try:
+            value = getter_json(key, default)
+        except TypeError:
+            value = getter_json(key)
+        if value is not None:
+            return value
+    getter = getattr(settings, "get", None)
+    if callable(getter):
+        try:
+            value = getter(key, default)
+        except TypeError:
+            value = getter(key)
+        if value is not None:
+            return value
+    if isinstance(settings, dict):
+        return settings.get(key, default)
+    return default
+
+
+def _normalize_column(raw: str) -> str:
+    return re.sub(r"\s+", "_", (raw or "").strip()).upper()
+
+
+def _iter_columns_from_setting(raw: Any, table: str) -> Iterable[str]:
+    if isinstance(raw, dict):
+        table_keys = {
+            table,
+            table.strip('"'),
+            table.upper(),
+            table.lower(),
+        }
+        values: List[Any] = []
+        for key in table_keys:
+            if key in raw:
+                candidate = raw[key]
+                if isinstance(candidate, list):
+                    values.extend(candidate)
+        star = raw.get("*")
+        if isinstance(star, list):
+            values.extend(star)
+        for item in values:
+            if isinstance(item, str):
+                yield item
+    elif isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, str):
+                yield item
+
+
+def _expand_enum_synonyms(enum_map: Any, table: str, column: str, value: str) -> Dict[str, List[str]]:
+    if not isinstance(enum_map, dict):
+        return {"equals": [], "prefix": [], "contains": []}
+
+    candidates = [f"{table}.{column}", column, column.upper(), column.lower()]
+    normalized = (value or "").strip().lower()
+    for key in candidates:
+        entry = enum_map.get(key)
+        if not isinstance(entry, dict):
+            continue
+        for bucket, cfg in entry.items():
+            if not isinstance(cfg, dict):
+                continue
+            bucket_name = str(bucket).strip().lower()
+            equals_vals = [str(v) for v in cfg.get("equals", []) or [] if str(v).strip()]
+            prefix_vals = [str(v) for v in cfg.get("prefix", []) or [] if str(v).strip()]
+            contains_vals = [str(v) for v in cfg.get("contains", []) or [] if str(v).strip()]
+            equals_norm = {bucket_name} | {val.lower() for val in equals_vals}
+            if normalized in equals_norm:
+                return {
+                    "equals": equals_vals,
+                    "prefix": prefix_vals,
+                    "contains": contains_vals,
+                }
+    return {"equals": [], "prefix": [], "contains": []}
+
+
+def _merge_eq_filters_from_text(intent: Dict[str, Any], question: str, settings: "Settings", spec: TableSpec) -> None:
+    text = question or ""
+    if not text:
+        return
+
+    explicit_setting = _settings_get(settings, "DW_EXPLICIT_FILTER_COLUMNS", [])
+    allowed_cols = {
+        _normalize_column(col)
+        for col in _iter_columns_from_setting(explicit_setting, spec.name)
+    }
+    if not allowed_cols:
+        return
+
+    enum_map = _settings_get(settings, "DW_ENUM_SYNONYMS", {}) or {}
+
+    eq_filters: List[Dict[str, Any]] = intent.setdefault("eq_filters", [])
+
+    for match in _EQ_COL_RE.finditer(text):
+        raw_col = match.group(1) or ""
+        val = match.group(2) or match.group(3) or match.group(4) or ""
+        column = _normalize_column(raw_col)
+        if column not in allowed_cols:
+            continue
+        raw_val = (val or "").strip().rstrip(";")
+        synonyms = _expand_enum_synonyms(enum_map, spec.name, column, raw_val)
+        equals_vals = [v for v in synonyms.get("equals", []) if v]
+        prefix_vals = [v for v in synonyms.get("prefix", []) if v]
+        contains_vals = [v for v in synonyms.get("contains", []) if v]
+        if not (equals_vals or prefix_vals or contains_vals):
+            synonyms = {"equals": [raw_val], "prefix": [], "contains": []}
+        else:
+            synonyms = {
+                "equals": equals_vals,
+                "prefix": prefix_vals,
+                "contains": contains_vals,
+            }
+        eq_filters.append(
+            {
+                "col": column,
+                "val": raw_val,
+                "ci": True,
+                "trim": True,
+                "synonyms": synonyms,
+            }
+        )
+
+
+def _prepare_fts(intent: Dict[str, Any], question: str, settings: "Settings", spec: TableSpec) -> None:
+    if not intent.get("full_text_search"):
+        return
+
+    from .fts import build_fts_where, extract_fts_tokens
+
+    where_sql, binds, join_op = build_fts_where(
+        question or "", settings, table=spec.name, mode="override"
+    )
+    if not where_sql:
+        intent["full_text_search"] = False
+        intent["fts_tokens"] = []
+        intent["fts_columns"] = None
+        intent["fts_operator"] = None
+        return
+
+    existing_manual = intent.get("manual_where")
+    if existing_manual:
+        intent["manual_where"] = f"({existing_manual}) AND ({where_sql})"
+    else:
+        intent["manual_where"] = where_sql
+
+    manual_binds = intent.setdefault("manual_binds", {})
+    manual_binds.update(binds)
+
+    tokens = extract_fts_tokens(question or "")
+    if not tokens:
+        tokens = [value.strip('%') for value in binds.values() if isinstance(value, str)]
+
+    intent["fts_tokens"] = tokens
+
+    fts_setting = _settings_get(settings, "DW_FTS_COLUMNS", {})
+    seen_cols: set[str] = set()
+    columns: List[str] = []
+    for raw_col in _iter_columns_from_setting(fts_setting, spec.name):
+        norm_col = _normalize_column(raw_col)
+        if norm_col and norm_col not in seen_cols:
+            seen_cols.add(norm_col)
+            columns.append(norm_col)
+    intent["fts_columns"] = columns or None
+    intent["fts_operator"] = join_op or "OR"

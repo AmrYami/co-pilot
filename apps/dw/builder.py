@@ -34,12 +34,49 @@ def _where_from_eq_filters(eq_filters: List[dict], binds: Dict[str, Any]) -> str
             if raw.get("value") is not None
             else raw.get("pattern")
         )
-        if val is None:
-            continue
+        synonyms = raw.get("synonyms") if isinstance(raw.get("synonyms"), dict) else None
         ci = bool(raw.get("ci"))
         trim = bool(raw.get("trim"))
-        bind = f"eq_{idx}"
 
+        def _compose(bind_name: str, operator: str) -> str:
+            col_expr = col.upper()
+            rhs_expr = f":{bind_name}"
+            if trim:
+                col_expr = f"TRIM({col_expr})"
+                rhs_expr = f"TRIM({rhs_expr})"
+            if ci:
+                col_expr = f"UPPER({col_expr})"
+                rhs_expr = f"UPPER({rhs_expr})"
+            if operator == "like":
+                return f"{col_expr} LIKE {rhs_expr}"
+            return f"{col_expr} = {rhs_expr}"
+
+        if synonyms:
+            equals_vals = [v for v in synonyms.get("equals", []) if v]
+            prefix_vals = [v for v in synonyms.get("prefix", []) if v]
+            contains_vals = [v for v in synonyms.get("contains", []) if v]
+            terms: List[str] = []
+            for j, eq_val in enumerate(equals_vals):
+                bind_name = f"eq_{idx}" if j == 0 else f"eq_{idx}_{j}"
+                bind_value = eq_val.strip() if trim and isinstance(eq_val, str) else eq_val
+                binds[bind_name] = bind_value
+                terms.append(_compose(bind_name, "eq"))
+            for j, pre_val in enumerate(prefix_vals):
+                bind_name = f"pre_{idx}_{j}"
+                binds[bind_name] = f"{pre_val}%"
+                terms.append(_compose(bind_name, "like"))
+            for j, contains_val in enumerate(contains_vals):
+                bind_name = f"con_{idx}_{j}"
+                binds[bind_name] = f"%{contains_val}%"
+                terms.append(_compose(bind_name, "like"))
+            if terms:
+                clauses.append("(" + " OR ".join(terms) + ")")
+                continue
+
+        if val is None:
+            continue
+
+        bind = f"eq_{idx}"
         bind_val = val
         if trim and isinstance(bind_val, str):
             bind_val = bind_val.strip()
@@ -47,20 +84,7 @@ def _where_from_eq_filters(eq_filters: List[dict], binds: Dict[str, Any]) -> str
             bind_val = f"%{bind_val}%"
 
         binds[bind] = bind_val
-
-        col_expr = col.upper()
-        rhs_expr = f":{bind}"
-        if trim:
-            col_expr = f"TRIM({col_expr})"
-            rhs_expr = f"TRIM({rhs_expr})"
-        if ci:
-            col_expr = f"UPPER({col_expr})"
-            rhs_expr = f"UPPER({rhs_expr})"
-
-        if op == "like":
-            clauses.append(f"{col_expr} LIKE {rhs_expr}")
-        else:
-            clauses.append(f"{col_expr} = {rhs_expr}")
+        clauses.append(_compose(bind, op))
 
     return " AND ".join(clauses)
 
