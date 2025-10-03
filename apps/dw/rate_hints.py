@@ -152,24 +152,12 @@ def replace_or_add_order_by(sql: str, order_by_sql: str) -> str:
 
 # --- Lightweight parser used by rate feedback comments ---------------------------------------
 
-# Matches lines like:
-# filter: ENTITY_NO = 'E-123' (ci, trim)
-# filter: REQUEST_TYPE ~ renew
-# filter: ENTITY_NO = E-123
-EQ_LINE_RE = re.compile(
-    r"""
-    (?i)^\s*filter\s*:\s*
-    (?P<col>[A-Z0-9_\. \-]+?)\s*
-    (?P<op>=|~|like|ilike)\s*
-    (?:
-        '(?P<sq>[^']*)' |
-        "(?P<dq>[^"]*)" |
-        (?P<bare>[^);]+)
-    )
-    \s*
-    (?:\((?P<flags>[^)]*)\))?
-    \s*;?\s*$""",
-    re.VERBOSE,
+FILTER_EQ_RE = re.compile(
+    r"(?i)filter:\s*([A-Z0-9_. \-]+?)\s*=\s*(?:'([^']*)'|\"([^\"]*)\"|([^();]+))\s*(?:\(([^)]*)\))?"
+)
+
+FILTER_LIKE_RE = re.compile(
+    r"(?i)filter:\s*([A-Z0-9_. \-]+?)\s*(?:~|like|ilike)\s*(?:'([^']*)'|\"([^\"]*)\"|([^();]+))\s*(?:\(([^)]*)\))?"
 )
 
 
@@ -205,35 +193,41 @@ def parse_rate_comment(comment: str) -> Dict[str, Any]:
         hints["order_by"] = (col, desc)
 
     eq_filters: List[Dict[str, Any]] = []
-    for raw in text.splitlines():
-        match = EQ_LINE_RE.match(raw.strip())
-        if not match:
-            continue
-        col = _norm_col(match.group("col"))
-        op = match.group("op") or "="
-        val = (match.group("sq") or match.group("dq") or match.group("bare") or "").strip()
-        flags = _parse_flags(match.group("flags"))
+    seen_eq: set[Tuple[str, str, bool, bool]] = set()
 
-        if op.lower() in {"~", "like", "ilike"}:
-            eq_filters.append(
-                {
-                    "col": col,
-                    "op": "like",
-                    "val": val,
-                    "ci": flags.get("ci", False),
-                    "trim": flags.get("trim", False),
-                }
-            )
-        else:
-            eq_filters.append(
-                {
-                    "col": col,
-                    "op": "eq",
-                    "val": val,
-                    "ci": flags.get("ci", False),
-                    "trim": flags.get("trim", False),
-                }
-            )
+    for match in FILTER_EQ_RE.finditer(text):
+        col = _norm_col(match.group(1))
+        raw_val = match.group(2) or match.group(3) or match.group(4) or ""
+        val = raw_val.strip().rstrip(";")
+        flags = _parse_flags(match.group(5))
+        key = (col, val.lower(), flags.get("ci", False), flags.get("trim", False))
+        if key in seen_eq:
+            continue
+        seen_eq.add(key)
+        eq_filters.append(
+            {
+                "col": col,
+                "op": "eq",
+                "val": val,
+                "ci": flags.get("ci", False),
+                "trim": flags.get("trim", False),
+            }
+        )
+
+    for match in FILTER_LIKE_RE.finditer(text):
+        col = _norm_col(match.group(1))
+        raw_val = match.group(2) or match.group(3) or match.group(4) or ""
+        val = raw_val.strip().rstrip(";")
+        flags = _parse_flags(match.group(5))
+        eq_filters.append(
+            {
+                "col": col,
+                "op": "like",
+                "val": val,
+                "ci": flags.get("ci", False),
+                "trim": flags.get("trim", False),
+            }
+        )
 
     if eq_filters:
         hints["eq_filters"] = eq_filters
@@ -247,7 +241,23 @@ def apply_rate_hints(intent: Dict[str, Any], comment: str) -> Dict[str, Any]:
     hints = parse_rate_comment(comment or "")
 
     if hints.get("eq_filters"):
-        intent.setdefault("eq_filters", []).extend(hints["eq_filters"])
+        intent.setdefault("eq_filters", [])
+        for filt in hints["eq_filters"]:
+            entry = {
+                "col": filt["col"],
+                "val": filt["val"],
+                "ci": filt.get("ci", False),
+                "trim": filt.get("trim", False),
+            }
+            if filt.get("op") == "like":
+                entry["op"] = "like"
+            else:
+                entry["synonyms"] = {
+                    "equals": [filt["val"]],
+                    "prefix": [],
+                    "contains": [],
+                }
+            intent["eq_filters"].append(entry)
 
     if hints.get("group_by"):
         intent["group_by"] = ",".join(hints["group_by"])
