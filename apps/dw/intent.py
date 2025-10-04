@@ -1,6 +1,7 @@
 from __future__ import annotations
 import re
 from typing import Optional, List, Dict, Any, TYPE_CHECKING, Iterable
+
 from apps.dw.tables import for_namespace
 from apps.dw.tables.base import TableSpec
 from apps.dw.tables.contract import ContractSpec
@@ -8,6 +9,22 @@ from pydantic import BaseModel, Field
 from word2number import w2n
 from dateutil.relativedelta import relativedelta
 from datetime import date, timedelta
+
+
+_SETTINGS_CACHE: Any = None
+
+
+def _get_default_settings() -> Any:
+    global _SETTINGS_CACHE
+    if _SETTINGS_CACHE is not None:
+        return _SETTINGS_CACHE
+    try:
+        from core.settings import Settings  # type: ignore
+
+        _SETTINGS_CACHE = Settings(namespace="dw::common")
+    except Exception:
+        _SETTINGS_CACHE = None
+    return _SETTINGS_CACHE
 
 # NOTE: English-first parsing. Arabic can be added later once EN is rock-solid.
 
@@ -35,6 +52,117 @@ class NLIntent(BaseModel):
     fts_columns: Optional[List[str]] = None
     fts_operator: Optional[str] = None
 
+
+def _intent_get(intent: Any, key: str, default: Any = None) -> Any:
+    if isinstance(intent, dict):
+        return intent.get(key, default)
+    return getattr(intent, key, default)
+
+
+def _intent_set(intent: Any, key: str, value: Any) -> None:
+    if isinstance(intent, dict):
+        intent[key] = value
+    else:
+        setattr(intent, key, value)
+
+
+def _get_fts_columns(table_name: str = "Contract", settings: Any = None) -> List[str]:
+    settings_obj = settings if settings is not None else _get_default_settings()
+    raw = None
+    if settings_obj is None:
+        raw = {}
+    elif isinstance(settings_obj, dict):
+        raw = settings_obj.get("DW_FTS_COLUMNS", {})
+    else:
+        getter = getattr(settings_obj, "get_json", None)
+        if callable(getter):
+            try:
+                raw = getter("DW_FTS_COLUMNS", {})
+            except TypeError:
+                raw = getter("DW_FTS_COLUMNS")
+        if raw is None:
+            raw = {}
+    columns: List[str] = []
+    if isinstance(raw, dict):
+        candidates = [
+            table_name,
+            table_name.strip('"'),
+            table_name.upper(),
+            table_name.lower(),
+            "*",
+        ]
+        for key in candidates:
+            vals = raw.get(key)
+            if isinstance(vals, list):
+                columns.extend(vals)
+    elif isinstance(raw, list):
+        columns.extend(raw)
+    cleaned: List[str] = []
+    for col in columns:
+        if isinstance(col, str):
+            stripped = col.strip()
+            if stripped:
+                cleaned.append(stripped)
+    return cleaned
+
+
+def _extract_fts_from_question(q: str) -> tuple[Optional[List[str]], Optional[str]]:
+    if not q:
+        return None, None
+    text = q.lower()
+    match = re.search(r"\bhas\s+(.+)$", text)
+    if not match:
+        return None, None
+    tail = match.group(1).strip()
+    op = "AND" if " and " in tail and " or " not in tail else "OR"
+    if " or " in tail:
+        tokens = [tok.strip() for tok in tail.split(" or ") if tok.strip()]
+    elif " and " in tail:
+        tokens = [tok.strip() for tok in tail.split(" and ") if tok.strip()]
+    else:
+        tokens = [tail]
+    tokens = [tok.strip(" '\"") for tok in tokens if tok]
+    return tokens or None, op
+
+
+def populate_intent_from_request(
+    payload: Dict[str, Any],
+    intent: Any,
+    *,
+    table_name: str = "Contract",
+    settings: Any = None,
+) -> None:
+    if not isinstance(payload, dict):
+        payload = {}
+    if payload.get("full_text_search"):
+        _intent_set(intent, "full_text_search", True)
+
+    if not _intent_get(intent, "full_text_search"):
+        return
+
+    existing_cols = _intent_get(intent, "fts_columns") or []
+    if not existing_cols:
+        cols = _get_fts_columns(table_name, settings=settings)
+        if cols:
+            _intent_set(intent, "fts_columns", cols)
+
+    existing_tokens = _intent_get(intent, "fts_tokens") or []
+    if not existing_tokens:
+        notes = _intent_get(intent, "notes") or {}
+        question = ""
+        if isinstance(notes, dict):
+            question = notes.get("q") or ""
+        else:
+            getter = getattr(notes, "get", None)
+            if callable(getter):
+                question = getter("q", "") or ""
+        question = question or payload.get("question") or ""
+        tokens, op = _extract_fts_from_question(question)
+        if tokens:
+            _intent_set(intent, "fts_tokens", tokens)
+            _intent_set(intent, "fts_operator", (op or "OR"))
+        elif not _intent_get(intent, "fts_operator"):
+            _intent_set(intent, "fts_operator", "OR")
 
 _RE_REQUESTED = re.compile(r'\b(requested|request\s+date|request_date|request type|request\s*type)\b', re.I)
 _RE_COUNT     = re.compile(r'\b(count|how many|number of)\b', re.I)
