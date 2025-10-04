@@ -6,7 +6,12 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
-from apps.dw.contract.eq_filters import build_eq_sql, detect_eq_filters
+from apps.dw.intent_utils import (
+    build_fts_predicates,
+    collect_fts_tokens,
+    extract_eq_filters,
+    synonyms_to_like_clauses,
+)
 
 from dateutil.relativedelta import relativedelta
 
@@ -168,38 +173,6 @@ def _load_fts_columns(cfg: Dict[str, object], table: str = "Contract") -> List[s
     return ordered
 
 
-def _extract_fts_terms(question: str, prefer_or: bool = True) -> List[str]:
-    """Extract candidate FTS search terms from the natural-language question."""
-
-    q = re.sub(r"\s+", " ", question or "").strip()
-    if not q:
-        return []
-
-    phrases = re.findall(r"'([^']+)'|\"([^\"]+)\"", q)
-    quoted = [p[0] or p[1] for p in phrases]
-    q_no_quotes = re.sub(r"'[^']+'|\"[^\"]+\"", "", q)
-
-    tokens: List[str] = []
-    if re.search(r"\bor\b|\bأو\b", q_no_quotes, flags=re.IGNORECASE):
-        parts = re.split(r"\bor\b|\bأو\b", q_no_quotes, flags=re.IGNORECASE)
-        tokens = [p.strip() for p in parts if p and p.strip()]
-    elif re.search(r"\band\b|\bو\b", q_no_quotes, flags=re.IGNORECASE):
-        parts = re.split(r"\band\b|\bو\b", q_no_quotes, flags=re.IGNORECASE)
-        tokens = [p.strip() for p in parts if p and p.strip()]
-    else:
-        match = re.search(r"(has|contain[s]?|search|find)\s+(.+)$", q_no_quotes, flags=re.IGNORECASE)
-        if match:
-            tokens = [match.group(2).strip()]
-
-    cleaned: List[str] = []
-    combined = quoted + tokens
-    for term in combined:
-        cleaned_term = term.strip(" ,;")
-        if cleaned_term:
-            cleaned.append(cleaned_term)
-    return cleaned
-
-
 STAKEHOLDER_COLS = [
     "CONTRACT_STAKEHOLDER_1",
     "CONTRACT_STAKEHOLDER_2",
@@ -243,47 +216,39 @@ def _apply_full_text_search(
         intent.fts_error = "no_columns"
         return
 
-    terms = _extract_fts_terms(raw_question)
-    if not terms and overrides.get("full_text_search"):
-        match = re.search(r"(has|contain[s]?|search|find)\s+(.+)$", raw_question, flags=re.IGNORECASE)
-        if match:
-            candidate = match.group(2).strip()
-            if candidate:
-                terms = [candidate]
+    tokens, _ = collect_fts_tokens(raw_question)
+    if not tokens and overrides.get("full_text_search"):
+        candidate = raw_question.strip()
+        if candidate:
+            tokens = [candidate]
 
-    if not terms:
+    if not tokens:
         intent.full_text_search = False
         intent.fts_tokens = []
         intent.fts_bind_keys = []
         intent.fts_error = "no_terms"
         return
 
-    token_groups: List[str] = []
-    bind_keys: List[str] = []
-    next_idx = 0
+    prefix = "fts"
+    suffix = 0
+    while any(isinstance(k, str) and k.startswith(f"{prefix}_") for k in binds):
+        suffix += 1
+        prefix = f"fts{suffix}"
 
-    for term in terms:
-        key_idx = next_idx
-        while f"kw_{key_idx}" in binds:
-            key_idx += 1
-        bind_name = f"kw_{key_idx}"
-        next_idx = key_idx + 1
-        binds[bind_name] = f"%{term}%"
-        bind_keys.append(bind_name)
-        or_parts = [f"UPPER(TRIM({col})) LIKE UPPER(:{bind_name})" for col in fts_columns]
-        token_groups.append("(" + " OR ".join(or_parts) + ")")
-
-    if not token_groups:
+    predicate, new_binds = build_fts_predicates(raw_question, fts_columns, bind_prefix=prefix)
+    if not predicate:
         intent.full_text_search = False
         intent.fts_tokens = []
         intent.fts_bind_keys = []
         intent.fts_error = "no_terms"
         return
 
-    where_parts.append("(" + " OR ".join(token_groups) + ")")
+    where_parts.append(predicate)
+    binds.update(new_binds)
+
     intent.full_text_search = True
-    intent.fts_tokens = terms
-    intent.fts_bind_keys = bind_keys
+    intent.fts_tokens = tokens
+    intent.fts_bind_keys = list(new_binds.keys())
     intent.fts_error = None
 
 
@@ -1320,19 +1285,68 @@ def build_sql(intent: Intent, settings: Optional[Dict[str, object]] = None) -> t
         )
     else:
         explicit_cols_raw = explicit_setting or []
-    explicit_cols = [str(col).upper() for col in explicit_cols_raw]
+    explicit_cols = [str(col).strip() for col in explicit_cols_raw if col is not None]
     enum_synonyms = settings_map.get("DW_ENUM_SYNONYMS", {}) or {}
 
-    eq_specs = detect_eq_filters(
-        intent.question or "",
-        "Contract",
-        explicit_cols,
+    def _normalize_col_name(col: str) -> str:
+        token = str(col or "")
+        if "." in token:
+            token = token.split(".")[-1]
+        return token.strip().strip('"').upper()
+
+    explicit_allowed = { _normalize_col_name(col) for col in explicit_cols }
+    explicit_for_matching = explicit_cols if explicit_cols else list(explicit_allowed)
+
+    question_text = intent.raw_question or intent.question or ""
+    eq_candidates = extract_eq_filters(
+        question_text,
+        explicit_for_matching,
         enum_synonyms,
     )
 
-    def _make_bind(prefix: str, counter={"n": 0}) -> str:
-        counter["n"] += 1
-        return f"{prefix}_{counter['n']}"
+    extra_filters = []
+    seen_pairs: set[tuple[str, str]] = set()
+
+    def _push_filter(entry: Dict[str, object]) -> None:
+        col_raw = entry.get("col")  # type: ignore[attr-defined]
+        val_raw = entry.get("val")  # type: ignore[attr-defined]
+        if not col_raw or val_raw is None:
+            return
+        col_norm = _normalize_col_name(col_raw)
+        if explicit_allowed and col_norm not in explicit_allowed:
+            return
+        val_text = str(val_raw)
+        key = (col_norm, val_text.strip().lower())
+        if key in seen_pairs:
+            return
+        seen_pairs.add(key)
+        synmap_raw = entry.get("synonyms")
+        synmap = None
+        if isinstance(synmap_raw, dict) and all(isinstance(v, dict) for v in synmap_raw.values()):
+            synmap = synmap_raw
+        payload = {
+            "col": col_norm,
+            "val": val_text,
+            "ci": bool(entry.get("ci", True)),
+            "trim": bool(entry.get("trim", True)),
+            "op": (entry.get("op") or "eq").lower(),
+            "synonyms": synmap,
+        }
+        extra_filters.append(payload)
+
+    for entry in eq_candidates:
+        _push_filter(entry)
+
+    for entry in getattr(intent, "eq_filters", []) or []:
+        synmap = entry.get("synonyms") if isinstance(entry, dict) else None
+        if not synmap:
+            for fq, spec in enum_synonyms.items():
+                if _normalize_col_name(fq) == _normalize_col_name(entry.get("col")):
+                    synmap = spec
+                    break
+        payload = dict(entry or {})
+        payload["synonyms"] = synmap
+        _push_filter(payload)
 
     # Window WHERE clause
     if intent.window_kind == "REQUEST":
@@ -1364,12 +1378,54 @@ def build_sql(intent: Intent, settings: Optional[Dict[str, object]] = None) -> t
     for k,v in (intent.where_binds or {}).items():
         binds[k] = v
 
-    if eq_specs:
-        for col, spec in eq_specs:
-            predicate, extra_binds = build_eq_sql(col, spec, _make_bind)
-            if predicate:
-                parts.append(predicate)
-            binds.update(extra_binds)
+    if extra_filters:
+        eq_bind_counter = 0
+        for filt in extra_filters:
+            col = filt.get("col")
+            val = filt.get("val")
+            if not col or val is None:
+                continue
+            op = (filt.get("op") or "eq").lower()
+            ci = bool(filt.get("ci", True))
+            trim = bool(filt.get("trim", True))
+            synonyms_map = filt.get("synonyms")
+            safe_token = re.sub(r"[^A-Za-z0-9_]", "_", str(col).lower()) or "col"
+            prefix = f"eq_{safe_token}_{eq_bind_counter}"
+            eq_bind_counter += 1
+
+            predicate = ""
+            new_binds: Dict[str, object] = {}
+
+            if synonyms_map:
+                predicate, new_binds = synonyms_to_like_clauses(col, val, synonyms_map, bind_prefix=prefix)
+            elif op == "like":
+                bind_name = f"{prefix}_like"
+                new_binds[bind_name] = val
+                if ci and trim:
+                    predicate = f"UPPER(TRIM({col})) LIKE UPPER(TRIM(:{bind_name}))"
+                elif ci:
+                    predicate = f"UPPER({col}) LIKE UPPER(:{bind_name})"
+                elif trim:
+                    predicate = f"TRIM({col}) LIKE TRIM(:{bind_name})"
+                else:
+                    predicate = f"{col} LIKE :{bind_name}"
+            else:
+                bind_name = f"{prefix}_eq"
+                new_binds[bind_name] = val
+                if ci and trim:
+                    predicate = f"UPPER(TRIM({col})) = UPPER(TRIM(:{bind_name}))"
+                elif ci:
+                    predicate = f"UPPER({col}) = UPPER(:{bind_name})"
+                elif trim:
+                    predicate = f"TRIM({col}) = TRIM(:{bind_name})"
+                else:
+                    predicate = f"{col} = :{bind_name}"
+
+            if not predicate:
+                continue
+
+            parts.append(predicate)
+            binds.update(new_binds)
 
     _apply_full_text_search(settings_map, intent, parts, binds)
     _maybe_apply_stakeholder_filters(intent, parts, binds)

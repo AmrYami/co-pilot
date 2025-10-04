@@ -152,12 +152,12 @@ def replace_or_add_order_by(sql: str, order_by_sql: str) -> str:
 
 # --- Lightweight parser used by rate feedback comments ---------------------------------------
 
-FILTER_EQ_RE = re.compile(
-    r"(?i)filter:\s*([A-Z0-9_. \-]+?)\s*=\s*(?:'([^']*)'|\"([^\"]*)\"|([^();]+))\s*(?:\(([^)]*)\))?"
+_EQ_CMD = re.compile(
+    r"(?i)\bfilter:\s*([A-Z0-9_.]+)\s*=\s*(?:'([^']*)'|\"([^\"]*)\"|([^;\)]+?))(?=\s*(?:\(|;|$))"
 )
 
 FILTER_LIKE_RE = re.compile(
-    r"(?i)filter:\s*([A-Z0-9_. \-]+?)\s*(?:~|like|ilike)\s*(?:'([^']*)'|\"([^\"]*)\"|([^();]+))\s*(?:\(([^)]*)\))?"
+    r"(?i)filter:\s*([A-Z0-9_. \-]+?)\s*(?:~|like|ilike)\s*(?:'([^']*)'|\"([^\"]*)\"|([^;\)]+?))(?=\s*(?:\(|;|$))"
 )
 
 
@@ -165,13 +165,6 @@ def _norm_col(col: str) -> str:
     """Normalize "REQUEST TYPE" -> "REQUEST_TYPE"."""
 
     return col.strip().upper().replace(" ", "_")
-
-
-def _parse_flags(flags: Optional[str]) -> Dict[str, bool]:
-    if not flags:
-        return {"ci": False, "trim": False}
-    opts = {t.strip().lower() for t in flags.split(",") if t.strip()}
-    return {"ci": ("ci" in opts), "trim": ("trim" in opts)}
 
 
 def parse_rate_comment(comment: str) -> Dict[str, Any]:
@@ -193,14 +186,21 @@ def parse_rate_comment(comment: str) -> Dict[str, Any]:
         hints["order_by"] = (col, desc)
 
     eq_filters: List[Dict[str, Any]] = []
-    seen_eq: set[Tuple[str, str, bool, bool]] = set()
+    seen_eq: set[tuple[str, str, bool, bool]] = set()
 
-    for match in FILTER_EQ_RE.finditer(text):
+    for match in _EQ_CMD.finditer(text):
         col = _norm_col(match.group(1))
         raw_val = match.group(2) or match.group(3) or match.group(4) or ""
-        val = raw_val.strip().rstrip(";")
-        flags = _parse_flags(match.group(5))
-        key = (col, val.lower(), flags.get("ci", False), flags.get("trim", False))
+        val = raw_val.strip()
+        tail = text[match.end() :]
+        ci = False
+        trim = False
+        flag_match = re.match(r"\s*\(([^)]*)\)", tail)
+        if flag_match:
+            opts = {opt.strip().lower() for opt in flag_match.group(1).split(",") if opt.strip()}
+            ci = "ci" in opts
+            trim = "trim" in opts
+        key = (col, val.lower(), ci, trim)
         if key in seen_eq:
             continue
         seen_eq.add(key)
@@ -209,23 +209,30 @@ def parse_rate_comment(comment: str) -> Dict[str, Any]:
                 "col": col,
                 "op": "eq",
                 "val": val,
-                "ci": flags.get("ci", False),
-                "trim": flags.get("trim", False),
+                "ci": ci,
+                "trim": trim,
             }
         )
 
     for match in FILTER_LIKE_RE.finditer(text):
         col = _norm_col(match.group(1))
         raw_val = match.group(2) or match.group(3) or match.group(4) or ""
-        val = raw_val.strip().rstrip(";")
-        flags = _parse_flags(match.group(5))
+        val = raw_val.strip()
+        tail = text[match.end() :]
+        ci = False
+        trim = False
+        flag_match = re.match(r"\s*\(([^)]*)\)", tail)
+        if flag_match:
+            opts = {opt.strip().lower() for opt in flag_match.group(1).split(",") if opt.strip()}
+            ci = "ci" in opts
+            trim = "trim" in opts
         eq_filters.append(
             {
                 "col": col,
                 "op": "like",
                 "val": val,
-                "ci": flags.get("ci", False),
-                "trim": flags.get("trim", False),
+                "ci": ci,
+                "trim": trim,
             }
         )
 

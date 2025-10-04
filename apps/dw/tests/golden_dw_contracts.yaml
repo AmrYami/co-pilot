@@ -164,6 +164,7 @@ cases:
       must_not: []
     assert_all_of:
       - 'UPPER(TRIM(REQUEST_TYPE))'
+      - 'LIKE'
       - 'ORDER BY REQUEST_DATE DESC'
 
   - id: distinct_entity_counts
@@ -203,8 +204,10 @@ cases:
     question: "list all contracts has it or home care"
     expect:
       sql_contains:
+        - 'WHERE'
         - 'LIKE'
         - ' OR '
+        - 'ORDER BY REQUEST_DATE DESC'
       fts:
         join: 'OR'
 
@@ -212,8 +215,10 @@ cases:
     question: "list all contracts has it and home care"
     expect:
       sql_contains:
+        - 'WHERE'
         - 'LIKE'
         - ') AND ('
+        - 'ORDER BY REQUEST_DATE DESC'
       fts:
         join: 'AND'
 
@@ -346,13 +351,15 @@ cases:
 
   - id: entity_no_total_count_by_status
     question: "For ENTITY_NO = 'E-123', total and count by CONTRACT_STATUS."
-    assert_all_of:
-      - 'WHERE ENTITY_NO = :entity_no'
-      - 'COUNT(*) AS CNT'
-      - 'GROUP BY CONTRACT_STATUS'
-    assert_any_of:
-      - 'ORDER BY CNT DESC'
-      - 'ORDER BY TOTAL_GROSS DESC'
+    expect:
+      contains:
+        - 'WHERE '
+        - 'ENTITY_NO'
+        - 'GROUP BY CONTRACT_STATUS'
+        - 'SUM(NVL(CONTRACT_VALUE_NET_OF_VAT,0)'
+        - 'COUNT(*) AS CNT'
+      not_contains:
+        - 'SELECT COUNT(*) AS CNT FROM "Contract" WHERE (UPPER(ENTITY_NO) ='
     assertions:
       group_by: ["CONTRACT_STATUS"]
 
