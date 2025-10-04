@@ -74,6 +74,14 @@ def run_attempt(
         for key in ("group_by", "sort_by", "sort_desc", "agg", "gross"):
             if key in patched:
                 setattr(intent, key, patched[key])
+        if "full_text_search" in patched:
+            intent.full_text_search = bool(patched["full_text_search"])
+        if "fts_tokens" in patched and patched.get("fts_tokens") is not None:
+            intent.fts_tokens = patched["fts_tokens"]
+        if "fts_operator" in patched and patched.get("fts_operator"):
+            intent.fts_operator = patched["fts_operator"]
+        if "fts_columns" in patched and patched.get("fts_columns"):
+            intent.fts_columns = patched["fts_columns"]
     allow_fts = is_fulltext_allowed()
     if allow_fts:
         default_on = env_flag("DW_FTS_DEFAULT_ON", False)

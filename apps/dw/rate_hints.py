@@ -222,16 +222,33 @@ def append_where(sql: str, where_sql: str) -> str:
 
 def replace_or_add_order_by(sql: str, order_by_sql: str) -> str:
     """Replace existing ORDER BY or add a new one, preserving trailing FETCH clauses."""
+
     upper = sql.upper()
-    ob_pos = upper.find(" ORDER BY ")
-    fetch_pos = upper.find(" FETCH FIRST ")
-    if ob_pos == -1:
-        if fetch_pos != -1:
-            return f"{sql[:fetch_pos]}\n{order_by_sql}\n{sql[fetch_pos:]}"
-        return f"{sql}\n{order_by_sql}"
-    if fetch_pos == -1 or fetch_pos < ob_pos:
-        return sql[:ob_pos] + " " + order_by_sql
-    return sql[:ob_pos] + " " + order_by_sql + "\n" + sql[fetch_pos:]
+    fetch_match = re.search(r"\bFETCH\s+FIRST\b", upper)
+    fetch_start = fetch_match.start() if fetch_match else len(sql)
+    order_match = re.search(r"\bORDER\s+BY\b", upper)
+
+    if order_match and order_match.start() < fetch_start:
+        prefix = sql[: order_match.start()].rstrip()
+    else:
+        prefix = sql[:fetch_start].rstrip()
+
+    suffix = sql[fetch_start:] if fetch_start < len(sql) else ""
+
+    parts: List[str] = []
+    if prefix:
+        parts.append(prefix)
+        if not prefix.endswith("\n"):
+            parts.append("\n")
+    parts.append(order_by_sql)
+
+    if suffix:
+        cleaned_suffix = suffix.lstrip("\n")
+        if cleaned_suffix:
+            parts.append("\n")
+            parts.append(cleaned_suffix)
+
+    return "".join(parts)
 
 
 # --- Lightweight parser used by rate feedback comments ---------------------------------------
