@@ -53,12 +53,20 @@ except Exception:  # pragma: no cover - fallback for tests
 from core.inquiries import create_or_update_inquiry
 
 from apps.dw.rate_grammar import parse_rate_comment_strict
-from apps.dw.rate_hints import append_where, parse_rate_hints, replace_or_add_order_by
+from apps.dw.rate_hints import (
+    append_where,
+    apply_rate_hints,
+    parse_rate_hints,
+    replace_or_add_order_by,
+)
 from apps.dw.fts_utils import DEFAULT_CONTRACT_FTS_COLUMNS
 from apps.dw.settings_defaults import DEFAULT_EXPLICIT_FILTER_COLUMNS
 from apps.dw.settings_utils import load_explicit_filter_columns
 from apps.dw.tables.contracts import build_contract_sql
 from apps.mem.kv import get_settings_for_namespace
+from apps.dw.online_learning import load_recent_hints
+from apps.dw.sql_builder import build_fts_where
+from apps.dw.builder import _where_from_eq_filters
 from .contracts.fts import extract_fts_terms, build_fts_where_groups
 from .contracts.filters import parse_explicit_filters
 from .contracts.contract_planner import plan_contract_query
@@ -198,6 +206,79 @@ def _json_safe_binds(binds: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         else:
             safe[key] = value
     return safe
+
+
+def _apply_online_rate_hints(
+    sql: str,
+    binds: Dict[str, Any],
+    intent_patch: Dict[str, Any],
+) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
+    meta: Dict[str, Any] = {}
+    if not intent_patch:
+        return sql, binds, meta
+
+    combined_binds: Dict[str, Any] = {}
+    where_clauses: List[str] = []
+
+    eq_filters = intent_patch.get("eq_filters") or []
+    eq_applied = False
+    if eq_filters:
+        eq_temp_binds: Dict[str, Any] = {}
+        eq_clause = _where_from_eq_filters(eq_filters, eq_temp_binds)
+        if eq_clause:
+            rename_map: Dict[str, str] = {}
+            for key in eq_temp_binds.keys():
+                base = f"ol_{key}"
+                new_key = base
+                suffix = 1
+                while new_key in binds or new_key in combined_binds or new_key in rename_map.values():
+                    new_key = f"{base}_{suffix}"
+                    suffix += 1
+                rename_map[key] = new_key
+            for old, new in rename_map.items():
+                eq_clause = eq_clause.replace(f":{old}", f":{new}")
+            renamed_binds = {rename_map[k]: v for k, v in eq_temp_binds.items()}
+            combined_binds.update(renamed_binds)
+            where_clauses.append(f"({eq_clause})")
+            eq_applied = True
+
+    fts_clause, fts_temp_binds = build_fts_where(intent_patch, bind_prefix="ol_fts")
+    fts_meta = {
+        "enabled": bool(fts_clause),
+        "tokens": intent_patch.get("fts_tokens") or [],
+        "columns": intent_patch.get("fts_columns") or [],
+        "operator": (intent_patch.get("fts_operator") or "OR"),
+    }
+    if fts_clause:
+        rename_map: Dict[str, str] = {}
+        for key in fts_temp_binds.keys():
+            new_key = key
+            suffix = 1
+            while new_key in binds or new_key in combined_binds or new_key in rename_map.values():
+                new_key = f"{key}_{suffix}"
+                suffix += 1
+            rename_map[key] = new_key
+        for old, new in rename_map.items():
+            fts_clause = fts_clause.replace(f":{old}", f":{new}")
+        renamed = {rename_map.get(k, k): v for k, v in fts_temp_binds.items()}
+        combined_binds.update(renamed)
+        where_clauses.append(fts_clause)
+
+    if where_clauses:
+        sql = append_where(sql, " AND ".join(where_clauses))
+
+    if combined_binds:
+        binds.update(combined_binds)
+
+    if intent_patch.get("sort_by"):
+        sort_desc = intent_patch.get("sort_desc", True)
+        clause = f"ORDER BY {intent_patch['sort_by']} {'DESC' if sort_desc else 'ASC'}"
+        sql = replace_or_add_order_by(sql, clause)
+        meta["order_by"] = clause
+
+    meta["eq_filters"] = eq_applied
+    meta["fts"] = fts_meta
+    return sql, binds, meta
 
 
 def _plan_contract_sql(
@@ -570,6 +651,19 @@ def answer():
     if not question:
         return jsonify({"ok": False, "error": "question required"}), 400
 
+    settings = _get_settings()
+    online_intent: Dict[str, Any] = {}
+    online_hints_applied = 0
+    try:
+        recent_hints = load_recent_hints(question, ttl_seconds=900)
+        online_hints_applied = len(recent_hints)
+        for hint in recent_hints:
+            apply_rate_hints(online_intent, hint, settings)
+    except Exception as exc:
+        LOGGER.warning("[dw] failed to load online hints: %s", exc)
+        online_intent = {}
+        online_hints_applied = 0
+
     prefixes = _coerce_prefixes(payload.get("prefixes"))
     auth_email = payload.get("auth_email") or None
     full_text_search = bool(payload.get("full_text_search", False))
@@ -584,6 +678,9 @@ def answer():
     )
     if contract_sql:
         binds = _coerce_bind_dates(dict(contract_binds or {}))
+        contract_sql, binds, online_meta = _apply_online_rate_hints(
+            contract_sql, binds, online_intent
+        )
         if ":top_n" in contract_sql and "top_n" not in binds:
             binds["top_n"] = 10
         rows, cols, exec_meta = _execute_oracle(contract_sql, binds)
@@ -608,14 +705,19 @@ def answer():
                 **(contract_meta or {}),
                 **exec_meta,
                 "duration_ms": duration_ms,
+                "online_learning": {
+                    "hints": online_hints_applied,
+                    **({} if not online_meta else online_meta),
+                },
             },
             "explain": (contract_meta or {}).get("explain"),
             "debug": {"contract_planner": True},
         }
+        if response["meta"].get("online_learning", {}).get("fts"):
+            response["meta"]["fts"] = response["meta"]["online_learning"]["fts"]
         return jsonify(response)
 
     namespace = "dw::common"
-    settings = _get_settings()
 
     table_name = "Contract"
     getter = getattr(settings, "get", None) if settings is not None else None
@@ -747,6 +849,7 @@ def answer():
     )
 
     LOGGER.info("[dw] final_sql: %s", {"size": len(sql), "sql": sql})
+    sql, binds, online_meta = _apply_online_rate_hints(sql, binds or {}, online_intent)
     binds = _coerce_bind_dates(binds or {})
     rows, cols, exec_meta = _execute_oracle(sql, binds)
 
@@ -760,7 +863,18 @@ def answer():
     )
 
     duration_ms = int((time.time() - t0) * 1000)
-    meta_out: Dict[str, Any] = {**(meta or {}), **exec_meta, "duration_ms": duration_ms, "explicit_filters": False}
+    meta_out: Dict[str, Any] = {
+        **(meta or {}),
+        **exec_meta,
+        "duration_ms": duration_ms,
+        "explicit_filters": False,
+        "online_learning": {
+            "hints": online_hints_applied,
+            **({} if not online_meta else online_meta),
+        },
+    }
+    if isinstance(online_meta, dict) and online_meta.get("fts"):
+        meta_out["fts"] = online_meta["fts"]
     if "binds" not in meta_out:
         meta_out["binds"] = _json_safe_binds(binds or {})
     meta_fts = (meta_out or {}).get("fts") if isinstance(meta_out, dict) else None
@@ -793,6 +907,10 @@ def answer():
             "columns": meta_fts.get("columns") if isinstance(meta_fts, dict) else [],
             "binds": meta_fts.get("binds") if isinstance(meta_fts, dict) else None,
             "error": meta_fts.get("error") if isinstance(meta_fts, dict) else None,
+        }
+        response["debug"]["online_learning"] = {
+            "hints": online_hints_applied,
+            **({} if not online_meta else online_meta),
         }
     return jsonify(response)
 
