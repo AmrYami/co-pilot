@@ -54,6 +54,7 @@ from core.inquiries import create_or_update_inquiry
 
 from apps.dw.rate_grammar import parse_rate_comment_strict
 from apps.dw.rate_hints import append_where, parse_rate_hints, replace_or_add_order_by
+from apps.dw.fts_utils import DEFAULT_CONTRACT_FTS_COLUMNS
 from apps.dw.settings_defaults import DEFAULT_EXPLICIT_FILTER_COLUMNS
 from apps.dw.settings_utils import load_explicit_filter_columns
 from apps.dw.tables.contracts import build_contract_sql
@@ -441,15 +442,52 @@ def _extract_fts_map(settings_obj: Any, namespace: str) -> Dict[str, Any]:
 
 
 def _resolve_fts_columns_from_map(fts_map: Dict[str, Any], table: str) -> List[str]:
-    if not isinstance(fts_map, dict):
-        return []
-    columns = fts_map.get(table) or fts_map.get("*") or []
-    if isinstance(columns, list):
-        return [str(col) if str(col).startswith('"') else f'"{col}"' for col in columns]
-    if isinstance(columns, str):
-        raw = [part.strip() for part in columns.split(",") if part.strip()]
-        return [col if col.startswith('"') else f'"{col}"' for col in raw]
-    return []
+    """Return normalized FTS columns for ``table`` with sensible fallbacks."""
+
+    def _normalize(cols: List[str]) -> List[str]:
+        seen: set[str] = set()
+        normalized: List[str] = []
+        for col in cols:
+            text = str(col).strip().strip('"')
+            if not text:
+                continue
+            upper = text.upper()
+            if upper in seen:
+                continue
+            seen.add(upper)
+            normalized.append(f'"{upper}"')
+        return normalized
+
+    if isinstance(fts_map, dict):
+        def _coerce(raw: Any) -> List[str]:
+            if isinstance(raw, dict):
+                for key in ("columns", "values", "cols"):
+                    if key in raw:
+                        return _coerce(raw.get(key))
+                return []
+            if isinstance(raw, (list, tuple, set)):
+                return [str(item) for item in raw if str(item).strip()]
+            if isinstance(raw, str):
+                return [part.strip() for part in raw.split(",") if part.strip()]
+            return []
+
+        normalized_table = table.strip('"')
+        lookup_keys = [
+            table,
+            normalized_table,
+            normalized_table.upper(),
+            normalized_table.lower(),
+            f'"{normalized_table}"',
+            "*",
+        ]
+        for key in lookup_keys:
+            if key not in fts_map:
+                continue
+            cols = _normalize(_coerce(fts_map.get(key)))
+            if cols:
+                return cols
+
+    return _normalize(list(DEFAULT_CONTRACT_FTS_COLUMNS))
 
 
 def _get_fts_columns(*, table: str, namespace: str) -> List[str]:
