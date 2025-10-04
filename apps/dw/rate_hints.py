@@ -415,65 +415,118 @@ def merge_eq_filters(intent: Dict[str, Any], new_eq_filters: Optional[List[Dict[
     intent["eq_filters"] = merged
 
 
-def apply_rate_hints(intent: Dict[str, Any], comment: str) -> Dict[str, Any]:
+def apply_rate_hints(intent: Dict[str, Any], comment: str, settings: Any = None) -> Dict[str, Any]:
     """Merge parsed hints into an intent dictionary without dropping existing context."""
 
-    hints = parse_rate_comment(comment or "")
+    raw_hints: Dict[str, Any]
+    if isinstance(comment, dict):
+        raw_hints = dict(comment)
+    else:
+        raw_hints = parse_rate_comment(comment or "")
 
     eq_entries: List[Dict[str, Any]] = []
-    if hints.get("eq_filters"):
-        for filt in hints["eq_filters"]:
-            entry = {
-                "col": filt["col"],
-                "val": filt["val"],
-                "ci": filt.get("ci", False),
-                "trim": filt.get("trim", False),
+    for filt in raw_hints.get("eq_filters") or []:
+        if not isinstance(filt, dict):
+            continue
+        entry = {
+            "col": filt.get("col"),
+            "val": filt.get("val"),
+            "ci": bool(filt.get("ci", False)),
+            "trim": bool(filt.get("trim", False)),
+        }
+        if (filt.get("op") or "eq").lower() == "like":
+            entry["op"] = "like"
+        else:
+            entry["synonyms"] = {
+                "equals": [filt.get("val")],
+                "prefix": [],
+                "contains": [],
             }
-            if filt.get("op") == "like":
-                entry["op"] = "like"
-            else:
-                entry["synonyms"] = {
-                    "equals": [filt["val"]],
-                    "prefix": [],
-                    "contains": [],
-                }
-            eq_entries.append(entry)
+        eq_entries.append(entry)
     if eq_entries:
         merge_eq_filters(intent, eq_entries)
 
-    if hints.get("full_text_search"):
-        intent["full_text_search"] = True
-        tokens = hints.get("fts_tokens") or []
-        if tokens:
-            intent["fts_tokens"] = tokens
-            intent["fts_operator"] = hints.get("fts_operator") or "OR"
-        elif hints.get("fts_operator") and not intent.get("fts_operator"):
-            intent["fts_operator"] = hints["fts_operator"]
-        cols = hints.get("fts_columns")
-        if cols:
-            norm_cols = [col.strip().upper() for col in cols if isinstance(col, str) and col.strip()]
-            if norm_cols:
-                intent["fts_columns"] = norm_cols
-        elif not intent.get("fts_columns"):
-            defaults = _default_fts_columns()
-            if defaults:
-                intent["fts_columns"] = defaults
+    if raw_hints.get("group_by"):
+        groups = raw_hints.get("group_by")
+        if isinstance(groups, (list, tuple)):
+            intent["group_by"] = ",".join(str(g).strip() for g in groups if str(g).strip())
+        else:
+            intent["group_by"] = str(groups)
+        if "agg" not in raw_hints:
+            intent["agg"] = None
 
-    if hints.get("group_by"):
-        intent["group_by"] = ",".join(hints["group_by"])
+    if "agg" in raw_hints and raw_hints.get("agg") is not None:
+        intent["agg"] = raw_hints.get("agg")
 
-    if hints.get("order_by"):
-        col, desc = hints["order_by"]
+    if raw_hints.get("order_by"):
+        col, desc = raw_hints["order_by"]
+        direction = bool(desc) if isinstance(desc, bool) else str(desc).strip().lower() != "asc"
         if col in {"TOTAL_GROSS", "GROSS", "SUM_GROSS"}:
             intent["sort_by"] = "TOTAL_GROSS"
-            intent["sort_desc"] = desc
             intent["gross"] = True
         else:
             intent["sort_by"] = col
-            intent["sort_desc"] = desc
+        intent["sort_desc"] = direction
 
-    if intent.get("group_by"):
-        intent["agg"] = None
+    def _resolve_default_cols() -> List[str]:
+        table_name = "Contract"
+        raw_cols: Any = None
+        source = settings
+        if isinstance(source, dict):
+            raw_cols = source.get("DW_FTS_COLUMNS")
+        elif hasattr(source, "get") and callable(getattr(source, "get")):
+            getter = getattr(source, "get")
+            try:
+                raw_cols = getter("DW_FTS_COLUMNS")
+            except TypeError:
+                raw_cols = getter("DW_FTS_COLUMNS", {})
+        if isinstance(raw_cols, dict):
+            for key in (table_name, table_name.strip('"'), table_name.upper(), table_name.lower(), "*"):
+                cols = raw_cols.get(key)
+                if isinstance(cols, list) and cols:
+                    return [str(c).strip().upper() for c in cols if isinstance(c, str) and c.strip()]
+        if isinstance(raw_cols, list):
+            return [str(c).strip().upper() for c in raw_cols if isinstance(c, str) and c.strip()]
+        defaults = _default_fts_columns()
+        return [c for c in defaults if isinstance(c, str) and c.strip()]
+
+    tokens = [t for t in (raw_hints.get("fts_tokens") or []) if str(t).strip()]
+    columns = raw_hints.get("fts_columns") or []
+    normalized_columns = [
+        str(col).strip().upper()
+        for col in columns
+        if isinstance(col, str) and str(col).strip()
+    ]
+    if tokens and not normalized_columns:
+        normalized_columns = _resolve_default_cols()
+
+    should_enable_fts = bool(raw_hints.get("full_text_search")) or bool(tokens)
+    if should_enable_fts and normalized_columns and tokens:
+        intent["full_text_search"] = True
+        intent["fts_tokens"] = tokens
+        intent["fts_columns"] = normalized_columns
+        op = raw_hints.get("fts_operator") or raw_hints.get("fts_op") or intent.get("fts_operator") or "OR"
+        op_norm = op.upper() if isinstance(op, str) else "OR"
+        intent["fts_operator"] = op_norm if op_norm in ("AND", "OR") else "OR"
+    elif should_enable_fts and tokens and intent.get("fts_columns"):
+        intent["full_text_search"] = True
+        intent["fts_tokens"] = tokens
+        if not intent.get("fts_operator"):
+            intent["fts_operator"] = "OR"
+    elif should_enable_fts:
+        intent["full_text_search"] = True
+        if normalized_columns:
+            intent["fts_columns"] = normalized_columns
+        if tokens:
+            intent["fts_tokens"] = tokens
+        op = raw_hints.get("fts_operator") or raw_hints.get("fts_op") or "OR"
+        if isinstance(op, str):
+            intent["fts_operator"] = op.upper() if op.upper() in ("AND", "OR") else "OR"
+        elif not intent.get("fts_operator"):
+            intent["fts_operator"] = "OR"
+
+    if intent.get("fts_operator") not in ("AND", "OR"):
+        intent["fts_operator"] = "OR"
 
     return intent
 

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from typing import Dict
+from typing import Any, Dict
 
 try:  # pragma: no cover - allow unit tests without Flask dependency
     from flask import Blueprint, current_app, jsonify, request
@@ -37,6 +37,8 @@ except Exception:  # pragma: no cover
         return sql
 
 from .attempts import run_attempt
+from .online_learning import store_rate_hints
+from .rate_hints import parse_rate_comment
 from .utils import env_flag, env_int
 
 rate_bp = Blueprint("dw_rate", __name__)
@@ -71,14 +73,10 @@ def rate():
             {"r": rating, "fb": feedback, "iid": inquiry_id},
         )
 
-    if rating < 3 and env_int("DW_MAX_RERUNS", 1) > 0:
-        alt_strategy = (
-            request.args.get("strategy")
-            or (env_flag("DW_ACCURACY_FIRST", True) and "det_overlaps_gross")
-            or "deterministic"
-        )
+    inquiry_row = None
+    if rating < 3:
         with engine.connect() as cx:
-            row = cx.execute(
+            inquiry_row = cx.execute(
                 text(
                     """
                 SELECT namespace, question
@@ -88,8 +86,32 @@ def rate():
                 ),
                 {"iid": inquiry_id},
             ).fetchone()
-        if row:
-            ns, q = row[0], row[1]
+
+    hints_dict: Dict[str, Any] = {}
+    if comment:
+        try:
+            hints_dict = parse_rate_comment(comment)
+        except Exception:
+            hints_dict = {}
+
+    if (
+        rating <= 2
+        and comment
+        and isinstance(inquiry_row, tuple)
+        and len(inquiry_row) >= 2
+        and hints_dict
+    ):
+        _, question_text = inquiry_row[0], inquiry_row[1]
+        store_rate_hints(question_text, hints_dict)
+
+    if rating < 3 and env_int("DW_MAX_RERUNS", 1) > 0:
+        alt_strategy = (
+            request.args.get("strategy")
+            or (env_flag("DW_ACCURACY_FIRST", True) and "det_overlaps_gross")
+            or "deterministic"
+        )
+        if inquiry_row:
+            ns, q = inquiry_row[0], inquiry_row[1]
             alt = run_attempt(
                 q,
                 ns,
@@ -97,6 +119,8 @@ def rate():
                 strategy=alt_strategy,
                 rate_comment=comment or None,
             )
+            if comment and hints_dict:
+                store_rate_hints(q, hints_dict)
             with engine.begin() as cx:
                 cx.execute(
                     text(

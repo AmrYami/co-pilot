@@ -1,7 +1,11 @@
 from typing import Dict, Any, Optional, Tuple, List
+import logging
 import re
 from datetime import date
 from dateutil.relativedelta import relativedelta
+
+
+LOGGER = logging.getLogger("dw.sql_builder")
 
 
 # Helper to read optional strict overlap from Settings
@@ -44,32 +48,44 @@ def _gross_expr() -> str:
     )
 
 
-def build_fts_where(intent: Dict[str, Any]) -> Tuple[Optional[str], Dict[str, Any]]:
+def build_fts_where(intent: Dict[str, Any], bind_prefix: str = "fts") -> Tuple[Optional[str], Dict[str, Any]]:
     if not intent.get("full_text_search"):
         return None, {}
+
     columns = intent.get("fts_columns") or []
     tokens = intent.get("fts_tokens") or []
     if not columns or not tokens:
         return None, {}
+
+    def _quote(col: str) -> str:
+        cleaned = col.strip()
+        if cleaned.startswith('"') and cleaned.endswith('"'):
+            return cleaned
+        if re.fullmatch(r"[A-Z0-9_]+", cleaned):
+            return f'"{cleaned}"'
+        return cleaned
+
     binds: Dict[str, Any] = {}
-    token_groups: List[str] = []
-    for ti, token in enumerate(tokens):
+    token_parts: List[str] = []
+    for token in tokens:
         if not isinstance(token, str) or not token.strip():
             continue
-        per_token: List[str] = []
-        for ci, col in enumerate(columns):
-            if not isinstance(col, str) or not col.strip():
-                continue
-            bind_name = f"fts_{ti}_{ci}"
-            binds[bind_name] = f"%{token.strip()}%"
-            per_token.append(f"UPPER(TRIM({col})) LIKE UPPER(:{bind_name})")
-        if per_token:
-            token_groups.append("(" + " OR ".join(per_token) + ")")
-    if not token_groups:
+        bind_key = f"{bind_prefix}_{len(binds)}"
+        binds[bind_key] = f"%{token.strip()}%"
+        col_predicates = [
+            f"UPPER(TRIM({_quote(col)})) LIKE UPPER(:{bind_key})"
+            for col in columns
+            if isinstance(col, str) and col.strip()
+        ]
+        if col_predicates:
+            token_parts.append("(" + " OR ".join(col_predicates) + ")")
+
+    if not token_parts:
         return None, {}
+
     operator = (intent.get("fts_operator") or "OR").upper()
     joiner = " AND " if operator == "AND" else " OR "
-    clause = "(" + joiner.join(token_groups) + ")"
+    clause = "(" + joiner.join(token_parts) + ")"
     return clause, binds
 
 
@@ -130,6 +146,18 @@ def build_sql(intent: Dict[str, Any], settings, *, table: str = "Contract") -> T
     if fts_clause:
         where_parts.append(fts_clause)
         binds.update(fts_binds)
+        LOGGER.info(
+            '[dw] {"fts": {"enabled": true, "tokens": %s, "columns": %s, "binds": %s}}',
+            intent.get("fts_tokens", []),
+            intent.get("fts_columns", []),
+            list(fts_binds.keys()),
+        )
+    else:
+        LOGGER.info(
+            '[dw] {"fts": {"enabled": false, "tokens": %s, "columns": %s}}',
+            intent.get("fts_tokens", []),
+            intent.get("fts_columns", []),
+        )
 
     # Special "by status (all time)" — detect quickly
     # handled by group_by==CONTRACT_STATUS + agg="count"
@@ -275,6 +303,7 @@ def build_sql(intent: Dict[str, Any], settings, *, table: str = "Contract") -> T
         lines.append(f"GROUP BY {group_by}")
         sql = "\n".join(lines)
         sql = apply_order_by(sql, order_col, order_desc)
+        sql = _ensure_single_order_by(sql)
         if top_n:
             binds["top_n"] = top_n
             sql += "\nFETCH FIRST :top_n ROWS ONLY"
@@ -302,7 +331,22 @@ def build_sql(intent: Dict[str, Any], settings, *, table: str = "Contract") -> T
         order_col = measure
         order_desc = sort_desc
     sql = apply_order_by(sql, order_col, order_desc)
+    sql = _ensure_single_order_by(sql)
     if top_n:
         binds["top_n"] = top_n
         sql += "\nFETCH FIRST :top_n ROWS ONLY"
     return sql, binds, {"pattern": "generic_non_agg"}
+
+
+def _ensure_single_order_by(sql: str) -> str:
+    lines = [ln for ln in sql.splitlines() if ln.strip()]
+    order_indices = [i for i, ln in enumerate(lines) if ln.strip().upper().startswith("ORDER BY ")]
+    if len(order_indices) <= 1:
+        return "\n".join(lines)
+    last = order_indices[-1]
+    kept: List[str] = []
+    for idx, line in enumerate(lines):
+        if idx in order_indices and idx != last:
+            continue
+        kept.append(line)
+    return "\n".join(kept)
