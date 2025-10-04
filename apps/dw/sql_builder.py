@@ -1,4 +1,5 @@
 from typing import Dict, Any, Optional, Tuple, List
+import re
 from datetime import date
 from dateutil.relativedelta import relativedelta
 
@@ -41,6 +42,41 @@ def _gross_expr() -> str:
         "CASE WHEN NVL(VAT,0) BETWEEN 0 AND 1 "
         "THEN NVL(CONTRACT_VALUE_NET_OF_VAT,0)*NVL(VAT,0) ELSE NVL(VAT,0) END"
     )
+
+
+def build_fts_where(intent: Dict[str, Any]) -> Tuple[Optional[str], Dict[str, Any]]:
+    if not intent.get("full_text_search"):
+        return None, {}
+    columns = intent.get("fts_columns") or []
+    tokens = intent.get("fts_tokens") or []
+    if not columns or not tokens:
+        return None, {}
+    binds: Dict[str, Any] = {}
+    token_groups: List[str] = []
+    for ti, token in enumerate(tokens):
+        if not isinstance(token, str) or not token.strip():
+            continue
+        per_token: List[str] = []
+        for ci, col in enumerate(columns):
+            if not isinstance(col, str) or not col.strip():
+                continue
+            bind_name = f"fts_{ti}_{ci}"
+            binds[bind_name] = f"%{token.strip()}%"
+            per_token.append(f"UPPER(TRIM({col})) LIKE UPPER(:{bind_name})")
+        if per_token:
+            token_groups.append("(" + " OR ".join(per_token) + ")")
+    if not token_groups:
+        return None, {}
+    operator = (intent.get("fts_operator") or "OR").upper()
+    joiner = " AND " if operator == "AND" else " OR "
+    clause = "(" + joiner.join(token_groups) + ")"
+    return clause, binds
+
+
+def apply_order_by(sql: str, col: str, desc: bool) -> str:
+    sql_no_ob = re.sub(r"\bORDER\s+BY\b.*$", "", sql, flags=re.IGNORECASE | re.DOTALL).rstrip()
+    direction = "DESC" if desc else "ASC"
+    return f"{sql_no_ob}\nORDER BY {col} {direction}"
 
 
 def build_sql(intent: Dict[str, Any], settings, *, table: str = "Contract") -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
@@ -89,6 +125,11 @@ def build_sql(intent: Dict[str, Any], settings, *, table: str = "Contract") -> T
         binds["date_start"] = exp_dates["start"]
         binds["date_end"] = exp_dates["end"]
         where_parts.append("REQUEST_DATE BETWEEN :date_start AND :date_end")
+
+    fts_clause, fts_binds = build_fts_where(it)
+    if fts_clause:
+        where_parts.append(fts_clause)
+        binds.update(fts_binds)
 
     # Special "by status (all time)" — detect quickly
     # handled by group_by==CONTRACT_STATUS + agg="count"
@@ -214,18 +255,26 @@ def build_sql(intent: Dict[str, Any], settings, *, table: str = "Contract") -> T
         sel_dim = f"{group_by} AS GROUP_KEY"
         if agg == "count":
             sel_mea = "COUNT(*) AS CNT"
-            order = "CNT"
+            order_col = "CNT"
+            order_desc = True
         elif agg == "avg":
             sel_mea = f"AVG({measure}) AS MEASURE"
-            order = "MEASURE"
+            order_col = "MEASURE"
+            order_desc = True
         else:
             sel_mea = f"SUM({measure}) AS MEASURE"
-            order = "MEASURE"
-        where_sql = ("WHERE " + " AND ".join(where_parts)) if where_parts else ""
-        sql = (
-            f"SELECT {sel_dim}, {sel_mea}\nFROM \"{table}\"\n{where_sql}\n"
-            f"GROUP BY {group_by}\nORDER BY {order} DESC"
-        )
+            order_col = "MEASURE"
+            order_desc = True
+        where_expr = " AND ".join(where_parts)
+        lines = [
+            f"SELECT {sel_dim}, {sel_mea}",
+            f"FROM \"{table}\"",
+        ]
+        if where_expr:
+            lines.append(f"WHERE {where_expr}")
+        lines.append(f"GROUP BY {group_by}")
+        sql = "\n".join(lines)
+        sql = apply_order_by(sql, order_col, order_desc)
         if top_n:
             binds["top_n"] = top_n
             sql += "\nFETCH FIRST :top_n ROWS ONLY"
@@ -233,9 +282,26 @@ def build_sql(intent: Dict[str, Any], settings, *, table: str = "Contract") -> T
 
     # Non-aggregated (top contracts by value, overlap or request_date)
     sel = _select_for_non_agg(wants_all=wants_all)
-    where_sql = ("WHERE " + " AND ".join(where_parts)) if where_parts else ""
-    order_sql = f"ORDER BY {sort_by} {'DESC' if sort_desc else 'ASC'}"
-    sql = f"SELECT {sel} FROM \"{table}\"\n{where_sql}\n{order_sql}"
+    where_expr = " AND ".join(where_parts)
+    lines = [f"SELECT {sel} FROM \"{table}\""]
+    if where_expr:
+        lines.append(f"WHERE {where_expr}")
+    sql = "\n".join(lines)
+    eq_filters_present = bool(it.get("eq_filters"))
+
+    if sort_by:
+        order_col = sort_by
+        order_desc = sort_desc
+    elif it.get("user_requested_top_n"):
+        order_col = measure
+        order_desc = True
+    elif eq_filters_present:
+        order_col = "REQUEST_DATE"
+        order_desc = True
+    else:
+        order_col = measure
+        order_desc = sort_desc
+    sql = apply_order_by(sql, order_col, order_desc)
     if top_n:
         binds["top_n"] = top_n
         sql += "\nFETCH FIRST :top_n ROWS ONLY"

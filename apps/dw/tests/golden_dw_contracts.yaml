@@ -243,6 +243,17 @@ cases:
       - fts_0
       - fts_1
 
+  - id: fts_tokens_from_settings
+    question: "list all contracts has it or home care"
+    full_text_search: true
+    expect:
+      sql_contains:
+        - 'UPPER(TRIM(CONTRACT_SUBJECT)) LIKE'
+        - 'UPPER(TRIM(CONTRACT_PURPOSE)) LIKE'
+        - 'ORDER BY REQUEST_DATE DESC'
+      not_contains:
+        - 'ORDER BY REQUEST_DATE DESC\nORDER BY REQUEST_DATE DESC'
+
   - id: dept_equality_alias
     question: "list all contracts where departments = SUPPORT SERVICES"
     expect_sql_contains:

@@ -6,6 +6,90 @@ from apps.dw.contracts.synonyms import (
     get_request_type_synonyms,
 )
 
+_SETTINGS_CACHE: Any = None
+
+
+def _get_default_settings() -> Any:
+    global _SETTINGS_CACHE
+    if _SETTINGS_CACHE is not None:
+        return _SETTINGS_CACHE
+    try:
+        from core.settings import Settings  # type: ignore
+
+        _SETTINGS_CACHE = Settings(namespace="dw::common")
+    except Exception:
+        _SETTINGS_CACHE = None
+    return _SETTINGS_CACHE
+
+
+FTS_RE = re.compile(r"\bfts\s*:\s*([^\n;]+)", re.IGNORECASE)
+FTS_COLS_RE = re.compile(r"\bfts-cols\s*:\s*([^\n;]+)", re.IGNORECASE)
+
+
+def _normalize_list(text: str) -> Tuple[List[str], str]:
+    raw = (text or "").strip()
+    if not raw:
+        return [], "OR"
+    lowered = raw.lower()
+    if "|" in raw:
+        tokens = [part.strip() for part in raw.split("|")]
+        op = "OR"
+    elif "&" in raw:
+        tokens = [part.strip() for part in raw.split("&")]
+        op = "AND"
+    elif " and " in lowered:
+        tokens = [part.strip() for part in re.split(r"\band\b", raw, flags=re.IGNORECASE)]
+        op = "AND"
+    elif " or " in lowered:
+        tokens = [part.strip() for part in re.split(r"\bor\b", raw, flags=re.IGNORECASE)]
+        op = "OR"
+    else:
+        tokens = [raw]
+        op = "OR"
+    cleaned = [tok.strip(" '\"") for tok in tokens if tok and tok.strip(" '\"")]
+    return cleaned, op
+
+
+def _default_fts_columns(table_name: str = "Contract") -> List[str]:
+    settings = _get_default_settings()
+    raw: Any = {}
+    if settings is None:
+        raw = {}
+    else:
+        getter = getattr(settings, "get_json", None)
+        if callable(getter):
+            try:
+                raw = getter("DW_FTS_COLUMNS", {})
+            except TypeError:
+                raw = getter("DW_FTS_COLUMNS")
+        if raw is None:
+            raw = {}
+    columns: List[str] = []
+    if isinstance(raw, dict):
+        for key in (
+            table_name,
+            table_name.strip('"'),
+            table_name.upper(),
+            table_name.lower(),
+            "*",
+        ):
+            vals = raw.get(key)
+            if isinstance(vals, list):
+                columns.extend(vals)
+    elif isinstance(raw, list):
+        columns.extend(raw)
+    normalized: List[str] = []
+    seen: set[str] = set()
+    for col in columns:
+        if not isinstance(col, str):
+            continue
+        stripped = col.strip().upper()
+        if not stripped or stripped in seen:
+            continue
+        seen.add(stripped)
+        normalized.append(stripped)
+    return normalized
+
 
 class RateHints:
     """Structured hints extracted from /dw/rate comment."""
@@ -173,6 +257,24 @@ def parse_rate_comment(comment: str) -> Dict[str, Any]:
     hints: Dict[str, Any] = {}
     text = comment or ""
 
+    m_fts = FTS_RE.search(text)
+    if m_fts:
+        tokens, op = _normalize_list(m_fts.group(1))
+        if tokens:
+            hints["full_text_search"] = True
+            hints["fts_tokens"] = tokens
+            hints["fts_operator"] = op
+
+    m_cols = FTS_COLS_RE.search(text)
+    if m_cols:
+        cols = [
+            part.strip().upper()
+            for part in re.split(r"[\s,]+", m_cols.group(1))
+            if part.strip()
+        ]
+        if cols:
+            hints["fts_columns"] = cols
+
     m = re.search(r"(?i)group_by\s*:\s*([A-Z0-9_, \-]+)", text)
     if m:
         hints["group_by"] = [
@@ -242,13 +344,67 @@ def parse_rate_comment(comment: str) -> Dict[str, Any]:
     return hints
 
 
+def _eq_filter_signature(filter_spec: Dict[str, Any]) -> Optional[Tuple[str, str, bool, bool, Any]]:
+    col = (filter_spec.get("col") or filter_spec.get("column") or "").strip().upper()
+    if not col:
+        return None
+    op = (filter_spec.get("op") or "eq").strip().lower()
+    ci = bool(filter_spec.get("ci"))
+    trim = bool(filter_spec.get("trim"))
+    synonyms = filter_spec.get("synonyms") if isinstance(filter_spec.get("synonyms"), dict) else None
+    if synonyms:
+        equals = tuple(sorted(str(v).strip() for v in synonyms.get("equals", []) if v))
+        prefix = tuple(sorted(str(v).strip() for v in synonyms.get("prefix", []) if v))
+        contains = tuple(sorted(str(v).strip() for v in synonyms.get("contains", []) if v))
+        value_sig: Any = ("syn", equals, prefix, contains)
+    else:
+        raw_val = (
+            filter_spec.get("val")
+            if filter_spec.get("val") is not None
+            else filter_spec.get("value")
+            if filter_spec.get("value") is not None
+            else filter_spec.get("pattern")
+        )
+        if isinstance(raw_val, str):
+            value_sig = raw_val.strip()
+        elif isinstance(raw_val, (list, tuple, set)):
+            value_sig = tuple(str(v).strip() for v in raw_val)
+        else:
+            value_sig = raw_val
+    return col, op, ci, trim, value_sig
+
+
+def merge_eq_filters(intent: Dict[str, Any], new_eq_filters: Optional[List[Dict[str, Any]]]) -> None:
+    if not isinstance(intent, dict):
+        return
+    existing = intent.get("eq_filters")
+    base: List[Dict[str, Any]] = list(existing) if isinstance(existing, list) else []
+    combined = base + (list(new_eq_filters) if new_eq_filters else [])
+    if not combined:
+        intent["eq_filters"] = []
+        return
+    merged: List[Dict[str, Any]] = []
+    seen: set[Tuple[str, str, bool, bool, Any]] = set()
+    for spec in combined:
+        if not isinstance(spec, dict):
+            continue
+        signature = _eq_filter_signature(spec)
+        if signature is None:
+            continue
+        if signature in seen:
+            continue
+        seen.add(signature)
+        merged.append(spec)
+    intent["eq_filters"] = merged
+
+
 def apply_rate_hints(intent: Dict[str, Any], comment: str) -> Dict[str, Any]:
     """Merge parsed hints into an intent dictionary without dropping existing context."""
 
     hints = parse_rate_comment(comment or "")
 
+    eq_entries: List[Dict[str, Any]] = []
     if hints.get("eq_filters"):
-        intent.setdefault("eq_filters", [])
         for filt in hints["eq_filters"]:
             entry = {
                 "col": filt["col"],
@@ -264,7 +420,27 @@ def apply_rate_hints(intent: Dict[str, Any], comment: str) -> Dict[str, Any]:
                     "prefix": [],
                     "contains": [],
                 }
-            intent["eq_filters"].append(entry)
+            eq_entries.append(entry)
+    if eq_entries:
+        merge_eq_filters(intent, eq_entries)
+
+    if hints.get("full_text_search"):
+        intent["full_text_search"] = True
+        tokens = hints.get("fts_tokens") or []
+        if tokens:
+            intent["fts_tokens"] = tokens
+            intent["fts_operator"] = hints.get("fts_operator") or "OR"
+        elif hints.get("fts_operator") and not intent.get("fts_operator"):
+            intent["fts_operator"] = hints["fts_operator"]
+        cols = hints.get("fts_columns")
+        if cols:
+            norm_cols = [col.strip().upper() for col in cols if isinstance(col, str) and col.strip()]
+            if norm_cols:
+                intent["fts_columns"] = norm_cols
+        elif not intent.get("fts_columns"):
+            defaults = _default_fts_columns()
+            if defaults:
+                intent["fts_columns"] = defaults
 
     if hints.get("group_by"):
         intent["group_by"] = ",".join(hints["group_by"])
