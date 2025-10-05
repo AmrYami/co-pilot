@@ -1,6 +1,7 @@
 """DocuWare DW blueprint backed by a deterministic contract planner."""
 from __future__ import annotations
 
+import json
 import logging
 import re
 import time
@@ -66,7 +67,6 @@ from apps.dw.tables.contracts import build_contract_sql
 from apps.mem.kv import get_settings_for_namespace
 from apps.dw.online_learning import load_recent_hints
 from apps.dw.learning import load_rules_for_question
-from apps.dw.sql_builder import build_fts_where
 from apps.dw.builder import _where_from_eq_filters
 from .contracts.fts import extract_fts_terms, build_fts_where_groups
 from .contracts.filters import parse_explicit_filters
@@ -231,6 +231,213 @@ def _json_safe_binds(binds: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     return safe
 
 
+_GROSS_EXPR = (
+    "NVL(CONTRACT_VALUE_NET_OF_VAT,0) + "
+    "CASE WHEN NVL(VAT,0) BETWEEN 0 AND 1 "
+    "THEN NVL(CONTRACT_VALUE_NET_OF_VAT,0) * NVL(VAT,0) "
+    "ELSE NVL(VAT,0) END"
+)
+
+
+def _coalesce_rate_intent(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Normalize hints coming from /dw/rate regardless of nesting."""
+
+    if not isinstance(raw, dict):
+        return {}
+
+    sources: List[Dict[str, Any]] = []
+
+    def _collect(obj: Optional[Dict[str, Any]]) -> None:
+        if not isinstance(obj, dict):
+            return
+        sources.append(obj)
+        for key in ("intent", "rate_hints"):
+            candidate = obj.get(key)
+            if isinstance(candidate, dict):
+                _collect(candidate)
+
+    _collect(raw)
+
+    def _has_value(val: Any) -> bool:
+        if val is None:
+            return False
+        if isinstance(val, bool):
+            return True
+        if isinstance(val, (int, float)):
+            return True
+        if isinstance(val, str):
+            return bool(val.strip())
+        if isinstance(val, (list, tuple, set, dict)):
+            return bool(val)
+        return True
+
+    intent: Dict[str, Any] = {}
+    merged_eq: List[Dict[str, Any]] = []
+
+    for source in sources:
+        if "eq_filters" in source and isinstance(source.get("eq_filters"), list):
+            for entry in source["eq_filters"]:
+                if isinstance(entry, dict):
+                    merged_eq.append(dict(entry))
+        for key in (
+            "namespace",
+            "full_text_search",
+            "fts_tokens",
+            "fts_columns",
+            "fts_operator",
+            "sort_by",
+            "sort_desc",
+            "group_by",
+            "gross",
+        ):
+            if key not in source:
+                continue
+            value = source[key]
+            if key in {"sort_desc", "gross", "full_text_search"}:
+                if key not in intent and value is not None:
+                    intent[key] = value
+                elif key == "full_text_search" and bool(value):
+                    intent[key] = True
+                continue
+            existing = intent.get(key)
+            if not _has_value(existing) and _has_value(value):
+                intent[key] = value
+            elif key not in intent:
+                intent[key] = value
+
+    if merged_eq:
+        intent["eq_filters"] = merged_eq
+
+    for source in sources:
+        fts = source.get("fts")
+        if not isinstance(fts, dict):
+            continue
+        if not _has_value(intent.get("fts_tokens")) and _has_value(fts.get("tokens")):
+            intent["fts_tokens"] = fts.get("tokens")
+        if not _has_value(intent.get("fts_columns")) and _has_value(fts.get("columns")):
+            intent["fts_columns"] = fts.get("columns")
+        if "operator" in fts and not intent.get("fts_operator"):
+            intent["fts_operator"] = fts.get("operator")
+        if fts.get("enabled") and not intent.get("full_text_search"):
+            intent["full_text_search"] = True
+
+    tokens = intent.get("fts_tokens")
+    if tokens and not intent.get("full_text_search"):
+        intent["full_text_search"] = True
+
+    if "sort_desc" in intent:
+        intent["sort_desc"] = _coerce_bool_flag(intent.get("sort_desc"), default=True)
+    if "gross" in intent:
+        intent["gross"] = _coerce_bool_flag(intent.get("gross"))
+    if "full_text_search" in intent:
+        intent["full_text_search"] = _coerce_bool_flag(intent.get("full_text_search"), default=False)
+
+    return intent
+
+
+def _normalize_columns(columns: Sequence[Any]) -> List[str]:
+    normalized: List[str] = []
+    seen: set[str] = set()
+    for col in columns:
+        if not isinstance(col, str):
+            continue
+        text = col.strip().strip('"')
+        if not text:
+            continue
+        upper = text.upper()
+        if upper in seen:
+            continue
+        seen.add(upper)
+        normalized.append(upper)
+    return normalized
+
+
+def _normalize_token_groups(raw_tokens: Any) -> List[List[str]]:
+    groups: List[List[str]] = []
+    if raw_tokens is None:
+        return groups
+    tokens = raw_tokens if isinstance(raw_tokens, list) else [raw_tokens]
+    for token in tokens:
+        if isinstance(token, (list, tuple, set)):
+            group = [str(t).strip() for t in token if str(t).strip()]
+            if group:
+                groups.append(group)
+        else:
+            text = str(token).strip()
+            if text:
+                groups.append([text])
+    return groups
+
+
+def _quote_column(col: str) -> str:
+    cleaned = col.strip()
+    if cleaned.startswith('"') and cleaned.endswith('"'):
+        return cleaned
+    if re.fullmatch(r"[A-Z0-9_]+", cleaned):
+        return f'"{cleaned}"'
+    return cleaned
+
+
+def _build_rate_fts_where(
+    columns: Sequence[str],
+    token_groups: List[List[str]],
+    *,
+    operator: str,
+    bind_prefix: str = "ol_fts",
+) -> Tuple[str, Dict[str, Any]]:
+    if not columns or not token_groups:
+        return "", {}
+
+    binds: Dict[str, Any] = {}
+    pieces: List[str] = []
+    bind_idx = 0
+
+    def _column_predicate(col: str, bind_name: str) -> str:
+        quoted = _quote_column(col)
+        return f"UPPER(TRIM(NVL({quoted},''))) LIKE UPPER(:{bind_name})"
+
+    for group in token_groups:
+        if not group:
+            continue
+        group_parts: List[str] = []
+        for token in group:
+            bind_name = f"{bind_prefix}_{bind_idx}"
+            bind_idx += 1
+            binds[bind_name] = f"%{token}%"
+            group_parts.append(
+                "(" + " OR ".join(_column_predicate(col, bind_name) for col in columns) + ")"
+            )
+        if group_parts:
+            pieces.append("(" + " AND ".join(group_parts) + ")")
+
+    if not pieces:
+        return "", {}
+
+    top_op = "AND" if operator == "AND" else "OR"
+    where_sql = "(" + f" {top_op} ".join(pieces) + ")"
+    return where_sql, binds
+
+
+def _strip_trailing_order_by(sql: str) -> str:
+    return re.sub(r"\s+ORDER\s+BY[\s\S]*$", "", sql, flags=re.IGNORECASE).rstrip()
+
+
+def _coerce_bool_flag(value: Any, *, default: Optional[bool] = None) -> Optional[bool]:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "t", "yes", "y", "on", "desc"}:
+            return True
+        if lowered in {"0", "false", "f", "no", "n", "off", "asc"}:
+            return False
+    return default
+
+
 def _apply_online_rate_hints(
     sql: str,
     binds: Dict[str, Any],
@@ -241,14 +448,36 @@ def _apply_online_rate_hints(
         return sql, binds, meta
 
     patch: Dict[str, Any] = dict(intent_patch)
+    intent = _coalesce_rate_intent(patch)
     combined_binds: Dict[str, Any] = {}
     where_clauses: List[str] = []
 
-    eq_filters = patch.get("eq_filters") or []
+    eq_filters_raw = intent.get("eq_filters") or []
+    deduped_filters: List[Dict[str, Any]] = []
+    seen_filters: set[Tuple[Any, ...]] = set()
+    for entry in eq_filters_raw:
+        if not isinstance(entry, dict):
+            continue
+        normalized = dict(entry)
+        key = (
+            (normalized.get("col") or normalized.get("column") or "").strip().upper(),
+            json.dumps(normalized.get("synonyms"), sort_keys=True)
+            if isinstance(normalized.get("synonyms"), dict)
+            else None,
+            normalized.get("val"),
+            normalized.get("op"),
+            bool(normalized.get("ci")),
+            bool(normalized.get("trim")),
+        )
+        if key in seen_filters:
+            continue
+        seen_filters.add(key)
+        deduped_filters.append(normalized)
+
     eq_applied = False
-    if eq_filters:
+    if deduped_filters:
         eq_temp_binds: Dict[str, Any] = {}
-        eq_clause = _where_from_eq_filters(eq_filters, eq_temp_binds)
+        eq_clause = _where_from_eq_filters(deduped_filters, eq_temp_binds)
         if eq_clause:
             rename_map: Dict[str, str] = {}
             for key in eq_temp_binds.keys():
@@ -266,59 +495,45 @@ def _apply_online_rate_hints(
             where_clauses.append(f"({eq_clause})")
             eq_applied = True
 
-    namespace_hint = patch.get("namespace")
+    namespace_hint = intent.get("namespace") or patch.get("namespace")
     namespace = namespace_hint if isinstance(namespace_hint, str) and namespace_hint.strip() else "dw::common"
 
-    tokens = [t for t in (patch.get("fts_tokens") or []) if isinstance(t, str) and t.strip()]
-    if tokens and not patch.get("full_text_search"):
-        patch["full_text_search"] = True
-    patch["fts_tokens"] = tokens
-
-    raw_operator = patch.get("fts_operator") or patch.get("fts_op") or "OR"
-    operator = str(raw_operator).upper() if isinstance(raw_operator, str) else "OR"
-    if operator not in ("AND", "OR"):
+    tokens_groups = _normalize_token_groups(intent.get("fts_tokens") or [])
+    operator_raw = intent.get("fts_operator") or intent.get("fts_op") or "OR"
+    operator = str(operator_raw).upper() if isinstance(operator_raw, str) else "OR"
+    if operator not in {"AND", "OR"}:
         operator = "OR"
-    patch["fts_operator"] = operator
 
-    def _normalize_columns(columns: Sequence[Any]) -> List[str]:
-        normalized: List[str] = []
-        seen: set[str] = set()
-        for col in columns:
-            if not isinstance(col, str):
-                continue
-            text = col.strip().strip('"')
-            if not text:
-                continue
-            upper = text.upper()
-            if upper in seen:
-                continue
-            seen.add(upper)
-            normalized.append(upper)
-        return normalized
-
-    columns = _normalize_columns(patch.get("fts_columns") or [])
-    if patch.get("full_text_search") and not columns:
+    columns = _normalize_columns(intent.get("fts_columns") or [])
+    if (intent.get("full_text_search") or tokens_groups) and not columns:
         settings_obj = _get_settings()
         fts_map = _extract_fts_map(settings_obj, namespace)
         fallback = _resolve_fts_columns_from_map(fts_map, "Contract")
         columns = _normalize_columns(fallback)
-    patch["fts_columns"] = columns
 
     fts_error: str | None = None
-    if patch.get("full_text_search") and (not tokens or not columns):
-        fts_error = "missing_tokens" if not tokens else "missing_columns"
-        patch["full_text_search"] = False
-        patch["fts_tokens"] = []
+    fts_meta_tokens = tokens_groups if tokens_groups else intent.get("fts_tokens") or []
+    if (intent.get("full_text_search") or tokens_groups) and (not tokens_groups or not columns):
+        fts_error = "missing_tokens" if not tokens_groups else "missing_columns"
+    fts_clause = ""
+    fts_temp_binds: Dict[str, Any] = {}
+    if not fts_error and tokens_groups and columns:
+        fts_clause, fts_temp_binds = _build_rate_fts_where(
+            columns,
+            tokens_groups,
+            operator=operator,
+            bind_prefix="ol_fts",
+        )
 
-    fts_clause, fts_temp_binds = build_fts_where(patch, bind_prefix="ol_fts")
     fts_meta = {
         "enabled": bool(fts_clause),
-        "tokens": tokens,
+        "tokens": fts_meta_tokens,
         "columns": columns,
         "operator": operator,
         "binds": [],
         "error": fts_error,
     }
+
     if fts_clause:
         rename_map: Dict[str, str] = {}
         for key in fts_temp_binds.keys():
@@ -343,9 +558,39 @@ def _apply_online_rate_hints(
     if combined_binds:
         binds.update(combined_binds)
 
-    if patch.get("sort_by"):
-        sort_desc = patch.get("sort_desc", True)
-        clause = f"ORDER BY {patch['sort_by']} {'DESC' if sort_desc else 'ASC'}"
+    group_by_raw = intent.get("group_by")
+    group_by_clause = ""
+    if isinstance(group_by_raw, (list, tuple, set)):
+        group_items = [str(item).strip() for item in group_by_raw if str(item).strip()]
+        group_by_clause = ", ".join(group_items)
+    elif isinstance(group_by_raw, str) and group_by_raw.strip():
+        group_by_clause = group_by_raw.strip()
+
+    gross_flag = intent.get("gross")
+    if group_by_clause:
+        sql = _strip_trailing_order_by(sql)
+        inner = sql.strip()
+        measure_sql = "COUNT(*) AS CNT"
+        if gross_flag is True:
+            measure_sql = f"SUM({_GROSS_EXPR}) AS TOTAL_GROSS"
+        sql = (
+            "SELECT "
+            + group_by_clause
+            + (", " if measure_sql else "")
+            + measure_sql
+            + "\nFROM (\n"
+            + inner
+            + "\n) RATE_WRAP\nGROUP BY "
+            + group_by_clause
+        )
+        meta["group_by"] = group_by_clause
+        if gross_flag is not None:
+            meta["gross"] = bool(gross_flag)
+
+    sort_by = intent.get("sort_by")
+    if isinstance(sort_by, str) and sort_by.strip():
+        sort_desc = _coerce_bool_flag(intent.get("sort_desc"), default=True)
+        clause = f"ORDER BY {sort_by.strip()} {'DESC' if sort_desc else 'ASC'}"
         sql = replace_or_add_order_by(sql, clause)
         meta["order_by"] = clause
 
