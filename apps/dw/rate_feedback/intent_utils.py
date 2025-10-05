@@ -1,5 +1,7 @@
 from typing import Any, Dict, List
 
+from apps.dw.sql_utils import resolve_group_by
+
 
 def get_fts_columns(settings) -> List[str]:
     """
@@ -77,4 +79,10 @@ def apply_rate_hints_to_intent(intent: Dict[str, Any], hints, settings) -> None:
             seen.add(key)
             dedup.append(f)
     intent["eq_filters"] = dedup
+
+    group_col = resolve_group_by(getattr(hints, "group_by", None))
+    if group_col:
+        intent["group_by"] = group_col
+    if getattr(hints, "gross", None) is not None:
+        intent["gross"] = bool(hints.gross)
 

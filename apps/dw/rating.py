@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 try:  # pragma: no cover - allow unit tests without Flask dependency
     from flask import Blueprint, current_app, jsonify, request
@@ -43,6 +43,7 @@ from .rate_feedback import (
     build_contract_sql,
     parse_rate_comment,
 )
+from .learning import save_patch, save_positive_rule
 from .utils import env_flag, env_int
 
 rate_bp = Blueprint("dw_rate", __name__)
@@ -77,10 +78,10 @@ def rate():
             {"r": rating, "fb": feedback, "iid": inquiry_id},
         )
 
-    inquiry_row = None
-    if rating < 3:
+    inquiry_row: Optional[tuple[str, str]] = None
+    if rating < 3 or rating >= 4:
         with engine.connect() as cx:
-            inquiry_row = cx.execute(
+            row = cx.execute(
                 text(
                     """
                 SELECT namespace, question
@@ -90,6 +91,17 @@ def rate():
                 ),
                 {"iid": inquiry_id},
             ).fetchone()
+        if row is not None:
+            if hasattr(row, "_mapping"):
+                ns = row._mapping.get("namespace")
+                qtext = row._mapping.get("question")
+            else:
+                try:
+                    ns, qtext = row[0], row[1]
+                except (TypeError, IndexError):
+                    ns, qtext = None, None
+            if ns is not None or qtext is not None:
+                inquiry_row = (ns, qtext)
 
     def _rate_hints_to_dict(hints_obj) -> Dict[str, Any]:
         if not hints_obj:
@@ -114,6 +126,10 @@ def rate():
             )
         if filters:
             payload["eq_filters"] = filters
+        if getattr(hints_obj, "group_by", None):
+            payload["group_by"] = hints_obj.group_by
+        if getattr(hints_obj, "gross", None) is not None:
+            payload["gross"] = bool(hints_obj.gross)
         return payload
 
     hints_dict: Dict[str, Any] = {}
@@ -127,13 +143,13 @@ def rate():
             hints_dict = {}
 
     hints_debug: Dict[str, Any] = {}
+    intent_snapshot: Dict[str, Any] = {}
     if hints_obj:
         try:
             settings = current_app.config.get("NAMESPACE_SETTINGS", {}) if current_app else {}
         except Exception:
             settings = {}
         try:
-            intent_snapshot: Dict[str, Any] = {}
             apply_rate_hints_to_intent(intent_snapshot, hints_obj, settings)
             sql, binds = build_contract_sql(intent_snapshot, settings)
             hints_debug = {
@@ -144,15 +160,20 @@ def rate():
         except Exception as exc:
             hints_debug = {"error": str(exc)}
 
-    if (
-        rating <= 2
-        and comment
-        and isinstance(inquiry_row, tuple)
-        and len(inquiry_row) >= 2
-        and hints_dict
-    ):
-        _, question_text = inquiry_row[0], inquiry_row[1]
+    question_text = inquiry_row[1] if inquiry_row and len(inquiry_row) >= 2 else None
+
+    if rating >= 4 and question_text and intent_snapshot:
+        try:
+            save_positive_rule(engine, question_text, intent_snapshot)
+        except Exception:
+            pass
+
+    if rating <= 2 and comment and question_text and hints_dict:
         store_rate_hints(question_text, hints_dict)
+        try:
+            save_patch(engine, inquiry_id, question_text, rating, comment, hints_dict)
+        except Exception:
+            pass
 
     if rating < 3 and env_int("DW_MAX_RERUNS", 1) > 0:
         alt_strategy = (
