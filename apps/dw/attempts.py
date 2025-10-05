@@ -67,6 +67,7 @@ def run_attempt(
     logger = getattr(app, "logger", None)
     intent: NLIntent = parse_intent_legacy(question)
 
+    patched: Optional[Dict[str, Any]] = None
     if rate_comment:
         patched = apply_rate_hints(intent.dict(), rate_comment)
         if "eq_filters" in patched:
@@ -85,8 +86,16 @@ def run_attempt(
     allow_fts = is_fulltext_allowed()
     if allow_fts:
         default_on = env_flag("DW_FTS_DEFAULT_ON", False)
+        # Respect an explicit FTS signal coming from /dw/rate.
+        rate_forced_fts = bool(
+            patched and (patched.get("full_text_search") or patched.get("fts_tokens"))
+        )
+        current_fts = getattr(intent, "full_text_search", None)
         if full_text_search is None:
-            intent.full_text_search = default_on
+            # If /dw/rate did not force FTS and the intent does not have an explicit value, use default.
+            if not rate_forced_fts and current_fts is None:
+                intent.full_text_search = default_on
+            # Otherwise keep the value already set on the intent.
         else:
             intent.full_text_search = bool(full_text_search)
     else:

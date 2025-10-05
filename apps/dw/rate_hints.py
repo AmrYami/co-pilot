@@ -221,34 +221,22 @@ def append_where(sql: str, where_sql: str) -> str:
 
 
 def replace_or_add_order_by(sql: str, order_by_sql: str) -> str:
-    """Replace existing ORDER BY or add a new one, preserving trailing FETCH clauses."""
+    """
+    Replace an existing ORDER BY clause or append a new one if missing.
+    Avoid duplicating ORDER BY.
+    """
 
-    upper = sql.upper()
-    fetch_match = re.search(r"\bFETCH\s+FIRST\b", upper)
-    fetch_start = fetch_match.start() if fetch_match else len(sql)
-    order_match = re.search(r"\bORDER\s+BY\b", upper)
-
-    if order_match and order_match.start() < fetch_start:
-        prefix = sql[: order_match.start()].rstrip()
-    else:
-        prefix = sql[:fetch_start].rstrip()
-
-    suffix = sql[fetch_start:] if fetch_start < len(sql) else ""
-
-    parts: List[str] = []
-    if prefix:
-        parts.append(prefix)
-        if not prefix.endswith("\n"):
-            parts.append("\n")
-    parts.append(order_by_sql)
-
-    if suffix:
-        cleaned_suffix = suffix.lstrip("\n")
-        if cleaned_suffix:
-            parts.append("\n")
-            parts.append(cleaned_suffix)
-
-    return "".join(parts)
+    lower = sql.lower()
+    idx = lower.rfind("\norder by")
+    if idx != -1:
+        # Find the end of the ORDER BY section to preserve trailing clauses (FETCH/LIMIT/OFFSET/etc.).
+        tail_idx = len(sql)
+        for kw in ("\nfetch ", "\nlimit ", "\noffset ", "\nfor ", "\nunion ", "\nintersect ", "\nexcept "):
+            k = lower.find(kw, idx + 1)
+            if k != -1 and k < tail_idx:
+                tail_idx = k
+        return sql[:idx].rstrip() + "\n" + order_by_sql + sql[tail_idx:]
+    return sql.rstrip() + "\n" + order_by_sql
 
 
 # --- Lightweight parser used by rate feedback comments ---------------------------------------

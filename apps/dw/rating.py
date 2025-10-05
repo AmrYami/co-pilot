@@ -183,11 +183,18 @@ def rate():
         )
         if inquiry_row:
             ns, q = inquiry_row[0], inquiry_row[1]
+            fts_present = bool(
+                (hints_dict.get("fts_tokens") if hints_dict else None)
+                or (hints_dict.get("full_text_search") if hints_dict else None)
+                or getattr(hints_obj, "fts_tokens", None)
+                or getattr(hints_obj, "full_text_search", None)
+            )
             alt = run_attempt(
                 q,
                 ns,
                 attempt_no=2,
                 strategy=alt_strategy,
+                full_text_search=True if fts_present else None,
                 rate_comment=comment or None,
             )
             if comment and hints_dict:
