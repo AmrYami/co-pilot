@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 try:  # pragma: no cover - allow unit tests without Flask dependency
     from flask import Blueprint, current_app, jsonify, request
@@ -41,10 +41,78 @@ from .online_learning import store_rate_hints
 from .rate_feedback import (
     apply_rate_hints_to_intent,
     build_contract_sql,
-    parse_rate_comment,
+    parse_rate_comment as parse_rate_comment_legacy,
 )
 from .learning import save_patch, save_positive_rule
 from .utils import env_flag, env_int
+from .rate_comment import parse_rate_comment as parse_rate_comment_structured
+from .sql_builders import GROSS_EXPR, group_by_sql, select_all_sql
+from .settings_defaults import DEFAULT_EXPLICIT_FILTER_COLUMNS
+from .fts_utils import DEFAULT_CONTRACT_FTS_COLUMNS
+from .learn.store import save_feedback
+
+
+def _settings_lookup(settings_obj: Any, key: str, namespace: Optional[str]) -> Any:
+    if settings_obj is None:
+        return None
+    for attr in ("get_json", "get"):
+        getter = getattr(settings_obj, attr, None)
+        if not callable(getter):
+            continue
+        try:
+            value = getter(key, scope="namespace", namespace=namespace)
+        except TypeError:
+            value = getter(key)
+        except Exception:
+            continue
+        if value:
+            return value
+    return None
+
+
+def _normalize_columns(raw: Sequence[Any]) -> List[str]:
+    seen = set()
+    result: List[str] = []
+    for col in raw or []:
+        text = str(col or "").strip()
+        if not text:
+            continue
+        upper = text.upper()
+        if upper in seen:
+            continue
+        result.append(upper)
+        seen.add(upper)
+    return result
+
+
+def _resolve_fts_columns(settings_obj: Any, namespace: Optional[str]) -> List[str]:
+    raw = _settings_lookup(settings_obj, "DW_FTS_COLUMNS", namespace)
+    candidates: Sequence[Any]
+    if isinstance(raw, dict):
+        candidates = raw.get("Contract") or raw.get("*") or []
+    elif isinstance(raw, (list, tuple, set)):
+        candidates = list(raw)
+    else:
+        candidates = []
+    if not candidates:
+        candidates = DEFAULT_CONTRACT_FTS_COLUMNS
+    return _normalize_columns(candidates)
+
+
+def _resolve_eq_columns(settings_obj: Any, namespace: Optional[str]) -> List[str]:
+    raw = _settings_lookup(settings_obj, "DW_EXPLICIT_FILTER_COLUMNS", namespace)
+    candidates: Sequence[Any]
+    if isinstance(raw, dict):
+        candidates = raw.get("Contract") or raw.get("*") or []
+    elif isinstance(raw, (list, tuple, set)):
+        candidates = list(raw)
+    elif isinstance(raw, str):
+        candidates = [part.strip() for part in raw.split(",") if part.strip()]
+    else:
+        candidates = []
+    if not candidates:
+        candidates = DEFAULT_EXPLICIT_FILTER_COLUMNS
+    return _normalize_columns(candidates)
 
 rate_bp = Blueprint("dw_rate", __name__)
 
@@ -60,6 +128,7 @@ def rate():
     comment = (data.get("comment") or "").strip()
     if not comment and feedback:
         comment = feedback
+    structured_hints = parse_rate_comment_structured(comment or "")
     if not inquiry_id or rating < 1 or rating > 5:
         return jsonify({"ok": False, "error": "invalid payload"}), 400
 
@@ -103,6 +172,14 @@ def rate():
             if ns is not None or qtext is not None:
                 inquiry_row = (ns, qtext)
 
+    pipeline_obj = app.config.get("PIPELINE") if app else None
+    inquiry_namespace = inquiry_row[0] if inquiry_row else None
+    default_namespace = getattr(pipeline_obj, "namespace", None)
+    effective_namespace = inquiry_namespace or default_namespace
+    settings_obj = app.config.get("SETTINGS") if app else None
+    fts_columns = _resolve_fts_columns(settings_obj, effective_namespace)
+    eq_allowed = _resolve_eq_columns(settings_obj, effective_namespace)
+
     def _rate_hints_to_dict(hints_obj) -> Dict[str, Any]:
         if not hints_obj:
             return {}
@@ -136,7 +213,7 @@ def rate():
     hints_obj = None
     if comment:
         try:
-            hints_obj = parse_rate_comment(comment)
+            hints_obj = parse_rate_comment_legacy(comment)
             hints_dict = _rate_hints_to_dict(hints_obj)
         except Exception:
             hints_obj = None
@@ -159,6 +236,137 @@ def rate():
             }
         except Exception as exc:
             hints_debug = {"error": str(exc)}
+
+    structured_hint_present = bool(comment) and any(
+        (
+            structured_hints.get("fts_tokens"),
+            structured_hints.get("eq_filters"),
+            structured_hints.get("group_by"),
+            structured_hints.get("sort_by"),
+            structured_hints.get("gross") is not None,
+        )
+    )
+    rate_sql: Optional[str] = None
+    rate_binds: Dict[str, str] = {}
+    rate_debug: Dict[str, Any] = {}
+    if structured_hint_present:
+        try:
+            if structured_hints.get("group_by"):
+                rate_sql, rate_binds = group_by_sql(
+                    group_by=structured_hints.get("group_by") or "",
+                    gross=bool(structured_hints.get("gross")),
+                    fts_tokens=list(structured_hints.get("fts_tokens") or []),
+                    fts_cols=fts_columns,
+                    fts_operator=str(structured_hints.get("fts_operator") or "OR"),
+                    eq_filters=list(structured_hints.get("eq_filters") or []),
+                    allowed_eq_cols=eq_allowed,
+                    sort_by=structured_hints.get("sort_by") or None,
+                    sort_desc=structured_hints.get("sort_desc"),
+                )
+            else:
+                rate_sql, rate_binds = select_all_sql(
+                    fts_tokens=list(structured_hints.get("fts_tokens") or []),
+                    fts_cols=fts_columns,
+                    fts_operator=str(structured_hints.get("fts_operator") or "OR"),
+                    eq_filters=list(structured_hints.get("eq_filters") or []),
+                    allowed_eq_cols=eq_allowed,
+                    sort_by=structured_hints.get("sort_by") or None,
+                    sort_desc=structured_hints.get("sort_desc"),
+                )
+        except Exception as exc:
+            rate_sql = None
+            rate_binds = {}
+            rate_debug = {"error": str(exc)}
+
+    if rate_sql:
+        fts_tokens = list(structured_hints.get("fts_tokens") or [])
+        eq_filters = list(structured_hints.get("eq_filters") or [])
+        sort_by_hint = structured_hints.get("sort_by") or None
+        sort_desc_hint = (
+            structured_hints.get("sort_desc")
+            if structured_hints.get("sort_desc") is not None
+            else True
+        )
+        rate_debug = {
+            "intent": {
+                "full_text_search": bool(fts_tokens),
+                "fts_tokens": fts_tokens,
+                "fts_operator": structured_hints.get("fts_operator") or "OR",
+                "fts_columns": fts_columns,
+                "eq_filters": eq_filters,
+                "group_by": structured_hints.get("group_by"),
+                "gross": structured_hints.get("gross"),
+                "sort_by": sort_by_hint,
+                "sort_desc": sort_desc_hint,
+            },
+            "fts": {
+                "enabled": bool(fts_tokens),
+                "tokens": fts_tokens,
+                "columns": fts_columns,
+                "binds": {k: v for k, v in rate_binds.items() if k.startswith("fts_")},
+                "error": None,
+            },
+            "rate_hints": {
+                "comment_present": bool(comment),
+                "eq_filters": len(eq_filters),
+                "group_by": [structured_hints.get("group_by")] if structured_hints.get("group_by") else None,
+                "order_by_applied": bool(sort_by_hint),
+                "where_applied": bool(fts_tokens or eq_filters),
+                "gross": bool(structured_hints.get("gross")),
+                "gross_expr": GROSS_EXPR if structured_hints.get("gross") else None,
+            },
+            "validation": {
+                "ok": True,
+                "errors": [],
+                "binds": list(rate_binds.keys()),
+                "bind_names": list(rate_binds.keys()),
+            },
+        }
+        if hints_debug:
+            rate_debug.setdefault("legacy", {})["rate_hints"] = hints_debug
+    elif rate_debug:
+        if hints_debug:
+            rate_debug.setdefault("legacy", {})["rate_hints"] = hints_debug
+
+    if structured_hint_present:
+        try:
+            save_feedback(
+                inquiry_id,
+                rating,
+                comment or "",
+                {
+                    "hints": structured_hints,
+                    "sql": rate_sql,
+                    "binds": rate_binds,
+                    "namespace": effective_namespace,
+                },
+            )
+        except Exception:
+            pass
+
+    def _augment_response(payload: Dict[str, Any]) -> Dict[str, Any]:
+        if rate_sql:
+            payload["sql"] = rate_sql
+            meta = payload.setdefault("meta", {})
+            meta.setdefault("attempt_no", 2)
+            meta.setdefault("strategy", "rate_overrides")
+            meta["binds"] = rate_binds
+            payload.setdefault("rows", [])
+            payload["retry"] = payload.get("retry") or True
+            debug_section = payload.setdefault("debug", {})
+            for key, value in rate_debug.items():
+                if value is None:
+                    continue
+                if (
+                    isinstance(value, dict)
+                    and isinstance(debug_section.get(key), dict)
+                ):
+                    debug_section[key].update(value)
+                else:
+                    debug_section[key] = value
+        elif hints_debug:
+            payload.setdefault("debug", {})["rate_hints"] = hints_debug
+        return payload
 
     question_text = inquiry_row[1] if inquiry_row and len(inquiry_row) >= 2 else None
 
@@ -222,13 +430,11 @@ def rate():
                     },
                 )
             response_payload = {"ok": True, "retry": True, "inquiry_id": inquiry_id, **alt}
-            if hints_debug:
-                response_payload.setdefault("debug", {})["rate_hints"] = hints_debug
+            response_payload = _augment_response(response_payload)
             return jsonify(response_payload)
 
         response = {"ok": True, "retry": False, "inquiry_id": inquiry_id}
-        if hints_debug:
-            response.setdefault("debug", {})["rate_hints"] = hints_debug
+        response = _augment_response(response)
         return jsonify(response)
 
     if rating < 3 and env_flag("DW_ESCALATE_ON_LOW_RATING", True):
@@ -250,6 +456,5 @@ def rate():
             )
 
     response: Dict[str, Any] = {"ok": True, "retry": False, "inquiry_id": inquiry_id}
-    if hints_debug:
-        response.setdefault("debug", {})["rate_hints"] = hints_debug
+    response = _augment_response(response)
     return jsonify(response)
