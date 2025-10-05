@@ -65,6 +65,7 @@ from apps.dw.settings_utils import load_explicit_filter_columns
 from apps.dw.tables.contracts import build_contract_sql
 from apps.mem.kv import get_settings_for_namespace
 from apps.dw.online_learning import load_recent_hints
+from apps.dw.learning import load_rules_for_question
 from apps.dw.sql_builder import build_fts_where
 from apps.dw.builder import _where_from_eq_filters
 from .contracts.fts import extract_fts_terms, build_fts_where_groups
@@ -704,15 +705,24 @@ def answer():
     settings = _get_settings()
     online_intent: Dict[str, Any] = {}
     online_hints_applied = 0
+    pipeline = _get_pipeline()
+    mem_engine = getattr(pipeline, "mem_engine", None) if pipeline else None
+    learned_hints = {}
+    try:
+        learned_hints = load_rules_for_question(mem_engine, question)
+        if learned_hints:
+            apply_rate_hints(online_intent, learned_hints, settings)
+            online_hints_applied += 1
+    except Exception as exc:
+        LOGGER.warning("[dw] failed to load persisted rules: %s", exc)
     try:
         recent_hints = load_recent_hints(question, ttl_seconds=900)
-        online_hints_applied = len(recent_hints)
+        online_hints_applied += len(recent_hints)
         for hint in recent_hints:
             apply_rate_hints(online_intent, hint, settings)
     except Exception as exc:
         LOGGER.warning("[dw] failed to load online hints: %s", exc)
-        online_intent = {}
-        online_hints_applied = 0
+        online_hints_applied = 1 if learned_hints else 0
 
     prefixes = _coerce_prefixes(payload.get("prefixes"))
     auth_email = payload.get("auth_email") or None

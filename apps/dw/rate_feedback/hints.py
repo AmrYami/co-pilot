@@ -2,6 +2,8 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 import re
 
+from apps.dw.sql_utils import resolve_group_by
+
 
 @dataclass
 class EqFilter:
@@ -18,6 +20,8 @@ class RateHints:
     fts_operator: str = "OR"  # OR | AND
     order_by: Optional[Tuple[str, bool]] = None  # (column, desc)
     eq_filters: List[EqFilter] = field(default_factory=list)
+    group_by: Optional[str] = None
+    gross: Optional[bool] = None
 
 
 _RE_ORDER_BY = re.compile(r"order_by\s*:\s*([A-Za-z0-9_]+)\s+(asc|desc)", re.I)
@@ -26,7 +30,8 @@ _RE_EQ = re.compile(
     r"filter\s*:\s*([A-Za-z0-9_]+)\s*=\s*'?([^';\)]+?)'?\s*(\((.*?)\))?",
     re.I,
 )
-
+_RE_GROUP_BY = re.compile(r"group_by\s*:\s*([A-Za-z0-9_\- ]+)", re.I)
+_RE_GROSS = re.compile(r"gross\s*:\s*(true|false)", re.I)
 
 def _split_fts_tokens(s: str) -> Tuple[List[str], str]:
     """
@@ -34,15 +39,16 @@ def _split_fts_tokens(s: str) -> Tuple[List[str], str]:
     Accepts separators: '|', ',', ';', ' or ', ' OR ', ' and ' (rare).
     """
     # Normalize common textual separators to '|'
+    has_and = bool(re.search(r"\band\b", s, flags=re.I))
     s = re.sub(r"\s+or\s+", "|", s, flags=re.I)
-    s = re.sub(r"\s+and\s+", "&", s, flags=re.I)  # explicit AND marker
+    s = re.sub(r"\s+and\s+", "|", s, flags=re.I)
     # Replace commas/semicolons with '|'
     s = s.replace(",", "|").replace(";", "|")
     # Remove quotes if user added any
     s = s.replace('"', '').replace("'", "")
     # Detect AND vs OR
-    op = "AND" if "&" in s and "|" not in s else "OR"
-    parts = [p.strip() for p in re.split(r"[|&]", s) if p.strip()]
+    op = "AND" if has_and else "OR"
+    parts = [p.strip() for p in re.split(r"[|]", s) if p.strip()]
     return parts, op
 
 
@@ -87,6 +93,18 @@ def parse_rate_comment(comment: str) -> RateHints:
             ci = "ci" in flags or "case_insensitive" in flags
             trim = "trim" in flags or "t" in flags
             hints.eq_filters.append(EqFilter(col=col, val=val, ci=ci, trim=trim))
+
+        # Group by
+        m = _RE_GROUP_BY.search(clause)
+        if m:
+            resolved = resolve_group_by(m.group(1))
+            if resolved:
+                hints.group_by = resolved
+
+        # Gross toggle
+        m = _RE_GROSS.search(clause)
+        if m:
+            hints.gross = m.group(1).lower() == "true"
 
     # Deduplicate eq filters by (col, normalized val, ci, trim)
     seen = set()
