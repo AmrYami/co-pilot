@@ -217,10 +217,11 @@ def _apply_online_rate_hints(
     if not intent_patch:
         return sql, binds, meta
 
+    patch: Dict[str, Any] = dict(intent_patch)
     combined_binds: Dict[str, Any] = {}
     where_clauses: List[str] = []
 
-    eq_filters = intent_patch.get("eq_filters") or []
+    eq_filters = patch.get("eq_filters") or []
     eq_applied = False
     if eq_filters:
         eq_temp_binds: Dict[str, Any] = {}
@@ -242,12 +243,58 @@ def _apply_online_rate_hints(
             where_clauses.append(f"({eq_clause})")
             eq_applied = True
 
-    fts_clause, fts_temp_binds = build_fts_where(intent_patch, bind_prefix="ol_fts")
+    namespace_hint = patch.get("namespace")
+    namespace = namespace_hint if isinstance(namespace_hint, str) and namespace_hint.strip() else "dw::common"
+
+    tokens = [t for t in (patch.get("fts_tokens") or []) if isinstance(t, str) and t.strip()]
+    if tokens and not patch.get("full_text_search"):
+        patch["full_text_search"] = True
+    patch["fts_tokens"] = tokens
+
+    raw_operator = patch.get("fts_operator") or patch.get("fts_op") or "OR"
+    operator = str(raw_operator).upper() if isinstance(raw_operator, str) else "OR"
+    if operator not in ("AND", "OR"):
+        operator = "OR"
+    patch["fts_operator"] = operator
+
+    def _normalize_columns(columns: Sequence[Any]) -> List[str]:
+        normalized: List[str] = []
+        seen: set[str] = set()
+        for col in columns:
+            if not isinstance(col, str):
+                continue
+            text = col.strip().strip('"')
+            if not text:
+                continue
+            upper = text.upper()
+            if upper in seen:
+                continue
+            seen.add(upper)
+            normalized.append(upper)
+        return normalized
+
+    columns = _normalize_columns(patch.get("fts_columns") or [])
+    if patch.get("full_text_search") and not columns:
+        settings_obj = _get_settings()
+        fts_map = _extract_fts_map(settings_obj, namespace)
+        fallback = _resolve_fts_columns_from_map(fts_map, "Contract")
+        columns = _normalize_columns(fallback)
+    patch["fts_columns"] = columns
+
+    fts_error: str | None = None
+    if patch.get("full_text_search") and (not tokens or not columns):
+        fts_error = "missing_tokens" if not tokens else "missing_columns"
+        patch["full_text_search"] = False
+        patch["fts_tokens"] = []
+
+    fts_clause, fts_temp_binds = build_fts_where(patch, bind_prefix="ol_fts")
     fts_meta = {
         "enabled": bool(fts_clause),
-        "tokens": intent_patch.get("fts_tokens") or [],
-        "columns": intent_patch.get("fts_columns") or [],
-        "operator": (intent_patch.get("fts_operator") or "OR"),
+        "tokens": tokens,
+        "columns": columns,
+        "operator": operator,
+        "binds": [],
+        "error": fts_error,
     }
     if fts_clause:
         rename_map: Dict[str, str] = {}
@@ -263,6 +310,9 @@ def _apply_online_rate_hints(
         renamed = {rename_map.get(k, k): v for k, v in fts_temp_binds.items()}
         combined_binds.update(renamed)
         where_clauses.append(fts_clause)
+        fts_meta["enabled"] = True
+        fts_meta["binds"] = list(renamed.keys())
+        fts_meta["error"] = None
 
     if where_clauses:
         sql = append_where(sql, " AND ".join(where_clauses))
@@ -270,9 +320,9 @@ def _apply_online_rate_hints(
     if combined_binds:
         binds.update(combined_binds)
 
-    if intent_patch.get("sort_by"):
-        sort_desc = intent_patch.get("sort_desc", True)
-        clause = f"ORDER BY {intent_patch['sort_by']} {'DESC' if sort_desc else 'ASC'}"
+    if patch.get("sort_by"):
+        sort_desc = patch.get("sort_desc", True)
+        clause = f"ORDER BY {patch['sort_by']} {'DESC' if sort_desc else 'ASC'}"
         sql = replace_or_add_order_by(sql, clause)
         meta["order_by"] = clause
 
