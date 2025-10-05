@@ -38,7 +38,11 @@ except Exception:  # pragma: no cover
 
 from .attempts import run_attempt
 from .online_learning import store_rate_hints
-from .rate_hints import parse_rate_comment
+from .rate_feedback import (
+    apply_rate_hints_to_intent,
+    build_contract_sql,
+    parse_rate_comment,
+)
 from .utils import env_flag, env_int
 
 rate_bp = Blueprint("dw_rate", __name__)
@@ -87,12 +91,58 @@ def rate():
                 {"iid": inquiry_id},
             ).fetchone()
 
+    def _rate_hints_to_dict(hints_obj) -> Dict[str, Any]:
+        if not hints_obj:
+            return {}
+        payload: Dict[str, Any] = {}
+        if getattr(hints_obj, "fts_tokens", None):
+            payload["fts_tokens"] = list(hints_obj.fts_tokens)
+            payload["fts_operator"] = hints_obj.fts_operator
+            payload["full_text_search"] = True
+        if getattr(hints_obj, "order_by", None):
+            payload["order_by"] = hints_obj.order_by
+        filters = []
+        for f in getattr(hints_obj, "eq_filters", []) or []:
+            filters.append(
+                {
+                    "col": f.col,
+                    "val": f.val,
+                    "ci": f.ci,
+                    "trim": f.trim,
+                    "op": f.op,
+                }
+            )
+        if filters:
+            payload["eq_filters"] = filters
+        return payload
+
     hints_dict: Dict[str, Any] = {}
+    hints_obj = None
     if comment:
         try:
-            hints_dict = parse_rate_comment(comment)
+            hints_obj = parse_rate_comment(comment)
+            hints_dict = _rate_hints_to_dict(hints_obj)
         except Exception:
+            hints_obj = None
             hints_dict = {}
+
+    hints_debug: Dict[str, Any] = {}
+    if hints_obj:
+        try:
+            settings = current_app.config.get("NAMESPACE_SETTINGS", {}) if current_app else {}
+        except Exception:
+            settings = {}
+        try:
+            intent_snapshot: Dict[str, Any] = {}
+            apply_rate_hints_to_intent(intent_snapshot, hints_obj, settings)
+            sql, binds = build_contract_sql(intent_snapshot, settings)
+            hints_debug = {
+                "sql": sql,
+                "binds": binds,
+                "intent": intent_snapshot,
+            }
+        except Exception as exc:
+            hints_debug = {"error": str(exc)}
 
     if (
         rating <= 2
@@ -121,6 +171,8 @@ def rate():
             )
             if comment and hints_dict:
                 store_rate_hints(q, hints_dict)
+            if hints_debug:
+                alt.setdefault("debug", {})["rate_hints"] = hints_debug
             with engine.begin() as cx:
                 cx.execute(
                     text(
@@ -141,9 +193,15 @@ def rate():
                         ),
                     },
                 )
-            return jsonify({"ok": True, "retry": True, "inquiry_id": inquiry_id, **alt})
+            response_payload = {"ok": True, "retry": True, "inquiry_id": inquiry_id, **alt}
+            if hints_debug:
+                response_payload.setdefault("debug", {})["rate_hints"] = hints_debug
+            return jsonify(response_payload)
 
-        return jsonify({"ok": True, "retry": False, "inquiry_id": inquiry_id})
+        response = {"ok": True, "retry": False, "inquiry_id": inquiry_id}
+        if hints_debug:
+            response.setdefault("debug", {})["rate_hints"] = hints_debug
+        return jsonify(response)
 
     if rating < 3 and env_flag("DW_ESCALATE_ON_LOW_RATING", True):
         with engine.begin() as cx:
@@ -163,4 +221,7 @@ def rate():
                 },
             )
 
-    return jsonify({"ok": True, "retry": False, "inquiry_id": inquiry_id})
+    response: Dict[str, Any] = {"ok": True, "retry": False, "inquiry_id": inquiry_id}
+    if hints_debug:
+        response.setdefault("debug", {})["rate_hints"] = hints_debug
+    return jsonify(response)
