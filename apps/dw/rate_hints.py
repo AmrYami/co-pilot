@@ -271,8 +271,13 @@ def _norm_col(col: str) -> str:
 def parse_rate_comment(comment: str) -> Dict[str, Any]:
     """Parse /dw/rate comment micro-language into structured hints."""
 
-    hints: Dict[str, Any] = {}
-    text = comment or ""
+    hints: Dict[str, Any] = {
+        "fts_tokens": [],
+        "fts_operator": None,
+    }
+    text = (comment or "").strip()
+    if not text:
+        return {}
 
     m_fts = FTS_RE.search(text)
     if m_fts:
@@ -291,6 +296,15 @@ def parse_rate_comment(comment: str) -> Dict[str, Any]:
         ]
         if cols:
             hints["fts_columns"] = cols
+
+    m_op = re.search(r"\bfts[_-]?op\s*:\s*(and|or)\b", text, flags=re.IGNORECASE)
+    if m_op:
+        hints["fts_operator"] = m_op.group(1).upper()
+    elif hints["fts_tokens"]:
+        if " and " in text.lower():
+            hints["fts_operator"] = "AND"
+        elif not hints.get("fts_operator"):
+            hints["fts_operator"] = "OR"
 
     m = re.search(r"(?i)group_by\s*:\s*([A-Z0-9_, \-]+)", text)
     if m:
@@ -357,6 +371,11 @@ def parse_rate_comment(comment: str) -> Dict[str, Any]:
 
     if eq_filters:
         hints["eq_filters"] = eq_filters
+
+    if not hints.get("fts_tokens"):
+        hints.pop("fts_tokens", None)
+    if not hints.get("fts_operator"):
+        hints.pop("fts_operator", None)
 
     return hints
 
@@ -527,6 +546,11 @@ def apply_rate_hints(intent: Dict[str, Any], comment: str, settings: Any = None)
 
     if intent.get("fts_operator") not in ("AND", "OR"):
         intent["fts_operator"] = "OR"
+
+    if intent.get("full_text_search") and not intent.get("fts_columns"):
+        intent["full_text_search"] = False
+        if intent.get("fts_tokens"):
+            intent["fts_tokens"] = []
 
     return intent
 
