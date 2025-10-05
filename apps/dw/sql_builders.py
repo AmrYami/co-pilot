@@ -90,3 +90,123 @@ def build_scan_all_sql(text_columns: List[str]) -> str:
         f"FETCH FIRST 200 ROWS ONLY"
     )
 
+
+# --- Rate overrides helpers -------------------------------------------------
+
+GROSS_EXPR = (
+    "NVL(CONTRACT_VALUE_NET_OF_VAT,0) + CASE "
+    "WHEN NVL(VAT,0) BETWEEN 0 AND 1 "
+    "THEN NVL(CONTRACT_VALUE_NET_OF_VAT,0) * NVL(VAT,0) "
+    "ELSE NVL(VAT,0) END"
+)
+
+
+def _ci_trim_eq(col: str, bind: str) -> str:
+    return f"UPPER(TRIM({col})) = UPPER(TRIM(:{bind}))"
+
+
+def build_rate_fts_where(
+    tokens: List[str], columns: List[str], op: str, binds: Dict[str, str]
+) -> Tuple[str, Dict[str, str]]:
+    if not tokens or not columns:
+        return "", binds
+    token_clauses: List[str] = []
+    for index, token in enumerate(tokens):
+        bind_name = f"fts_{index}"
+        binds[bind_name] = f"%{token}%"
+        column_matches = [f"UPPER(NVL({col},'')) LIKE UPPER(:{bind_name})" for col in columns]
+        token_clauses.append("(" + " OR ".join(column_matches) + ")")
+    glue = " AND " if (op or "OR").upper() == "AND" else " OR "
+    return "(" + glue.join(token_clauses) + ")", binds
+
+
+def build_rate_eq_where(
+    eq_filters: List[Dict[str, str]], allowed_cols: List[str], binds: Dict[str, str]
+) -> Tuple[str, Dict[str, str]]:
+    if not eq_filters:
+        return "", binds
+    allowed = {col.upper() for col in allowed_cols or []}
+    clauses: List[str] = []
+    bind_index = 0
+    for filt in eq_filters:
+        col = str(filt.get("col") or "").upper().strip()
+        if allowed and col not in allowed:
+            continue
+        bind_name = f"eq_{bind_index}"
+        binds[bind_name] = filt.get("val") or ""
+        clauses.append(_ci_trim_eq(col, bind_name))
+        bind_index += 1
+    if not clauses:
+        return "", binds
+    return "(" + " AND ".join(clauses) + ")", binds
+
+
+def _merge_where_clauses(lhs: str, rhs: str) -> str:
+    if lhs and rhs:
+        return f"{lhs} AND {rhs}"
+    return lhs or rhs
+
+
+def _order_clause(sort_by: str | None, sort_desc: bool | None) -> str:
+    if not sort_by:
+        return "ORDER BY REQUEST_DATE DESC"
+    direction = "DESC" if sort_desc is not False else "ASC"
+    return f"ORDER BY {sort_by} {direction}"
+
+
+def select_all_sql(
+    fts_tokens: List[str],
+    fts_cols: List[str],
+    fts_operator: str,
+    eq_filters: List[Dict[str, str]],
+    allowed_eq_cols: List[str],
+    sort_by: str | None,
+    sort_desc: bool | None,
+) -> Tuple[str, Dict[str, str]]:
+    binds: Dict[str, str] = {}
+    fts_where, binds = build_rate_fts_where(fts_tokens, fts_cols, fts_operator, binds)
+    eq_where, binds = build_rate_eq_where(eq_filters, allowed_eq_cols, binds)
+    where_sql = _merge_where_clauses(fts_where, eq_where)
+    sql = 'SELECT * FROM "Contract"'
+    if where_sql:
+        sql += f"\nWHERE {where_sql}"
+    sql += "\n" + _order_clause(sort_by, sort_desc)
+    return sql, binds
+
+
+def group_by_sql(
+    group_by: str,
+    gross: bool,
+    fts_tokens: List[str],
+    fts_cols: List[str],
+    fts_operator: str,
+    eq_filters: List[Dict[str, str]],
+    allowed_eq_cols: List[str],
+    sort_by: str | None,
+    sort_desc: bool | None,
+) -> Tuple[str, Dict[str, str]]:
+    binds: Dict[str, str] = {}
+    fts_where, binds = build_rate_fts_where(fts_tokens, fts_cols, fts_operator, binds)
+    eq_where, binds = build_rate_eq_where(eq_filters, allowed_eq_cols, binds)
+    where_sql = _merge_where_clauses(fts_where, eq_where)
+
+    select_expr = f"{group_by} AS GROUP_KEY"
+    order_metric = "CNT"
+    if gross:
+        select_expr += f",\n       SUM({GROSS_EXPR}) AS TOTAL_GROSS"
+        select_expr += ",\n       COUNT(*) AS CNT"
+        order_metric = "TOTAL_GROSS"
+    else:
+        select_expr += ",\n       COUNT(*) AS CNT"
+
+    sql = f'SELECT {select_expr}\nFROM "Contract"'
+    if where_sql:
+        sql += f"\nWHERE {where_sql}"
+    sql += f"\nGROUP BY {group_by}"
+
+    if not sort_by:
+        sort_by = order_metric
+        sort_desc = True
+    sql += "\n" + _order_clause(sort_by, sort_desc)
+    return sql, binds
+
