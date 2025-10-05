@@ -199,6 +199,28 @@ def _dates_to_iso(explicit: Optional[Tuple[date, date]]) -> Optional[Dict[str, s
     return {"start": start.isoformat(), "end": end.isoformat()}
 
 
+def _append_order_by(sql: str, column: str, *, descending: bool = True) -> str:
+    """Ensure ``ORDER BY`` appears once, replacing an existing clause if needed."""
+
+    if not column:
+        return sql
+    clause = f"ORDER BY {column} {'DESC' if descending else 'ASC'}"
+    return replace_or_add_order_by(sql, clause)
+
+
+def _resolve_contract_table(settings: Any, namespace: str, default: str = "Contract") -> str:
+    table_name = default
+    getter = getattr(settings, "get", None) if settings is not None else None
+    if callable(getter):
+        try:
+            configured = getter("DW_CONTRACT_TABLE", scope="namespace", namespace=namespace)
+        except TypeError:
+            configured = getter("DW_CONTRACT_TABLE")
+        if configured:
+            table_name = str(configured)
+    return table_name
+
+
 def _json_safe_binds(binds: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     safe: Dict[str, Any] = {}
     for key, value in (binds or {}).items():
@@ -546,12 +568,21 @@ def _get_settings():
 def _extract_fts_map(settings_obj: Any, namespace: str) -> Dict[str, Any]:
     if settings_obj is None:
         return {}
+    
+    def _coerce(value: Any) -> Optional[Dict[str, Any]]:
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, (list, tuple, set)):
+            return {"*": list(value)}
+        return None
+
     getter = getattr(settings_obj, "get_fts_columns", None)
     if callable(getter):
         try:
             value = getter(namespace)  # type: ignore[arg-type]
-            if isinstance(value, dict):
-                return value
+            coerced = _coerce(value)
+            if coerced is not None:
+                return coerced
         except TypeError:
             pass
     json_getter = getattr(settings_obj, "get_json", None)
@@ -560,16 +591,18 @@ def _extract_fts_map(settings_obj: Any, namespace: str) -> Dict[str, Any]:
             value = json_getter("DW_FTS_COLUMNS", scope="namespace", namespace=namespace)
         except TypeError:
             value = json_getter("DW_FTS_COLUMNS")
-        if isinstance(value, dict):
-            return value
+        coerced = _coerce(value)
+        if coerced is not None:
+            return coerced
     plain_get = getattr(settings_obj, "get", None)
     if callable(plain_get):
         try:
             value = plain_get("DW_FTS_COLUMNS", scope="namespace", namespace=namespace)
         except TypeError:
             value = plain_get("DW_FTS_COLUMNS")
-        if isinstance(value, dict):
-            return value
+        coerced = _coerce(value)
+        if coerced is not None:
+            return coerced
     return {}
 
 
@@ -618,6 +651,9 @@ def _resolve_fts_columns_from_map(fts_map: Dict[str, Any], table: str) -> List[s
             cols = _normalize(_coerce(fts_map.get(key)))
             if cols:
                 return cols
+
+    if isinstance(fts_map, (list, tuple, set)):
+        return _normalize([str(item) for item in fts_map if str(item).strip()])
 
     return _normalize(list(DEFAULT_CONTRACT_FTS_COLUMNS))
 
@@ -730,6 +766,71 @@ def answer():
     overrides = {"full_text_search": full_text_search}
 
     namespace = (payload.get("namespace") or "dw::common").strip() or "dw::common"
+    table_name = _resolve_contract_table(settings, namespace)
+    if full_text_search:
+        fts_map_direct = _extract_fts_map(settings, namespace)
+        fts_columns_direct = _resolve_fts_columns_from_map(fts_map_direct, table_name)
+        direct_groups, direct_mode = extract_fts_terms(question, force=False)
+        if direct_mode == "explicit" and direct_groups and fts_columns_direct:
+            direct_where, direct_binds = build_fts_where_groups(direct_groups, fts_columns_direct)
+            if direct_where:
+                direct_sql = f'SELECT * FROM "{table_name}"\nWHERE {direct_where}'
+            else:
+                direct_sql = f'SELECT * FROM "{table_name}"'
+            direct_sql = _append_order_by(direct_sql, "REQUEST_DATE", descending=True)
+
+            sanitized_patch = {
+                key: value
+                for key, value in online_intent.items()
+                if key not in {"fts_tokens", "fts_columns", "fts_operator", "fts_op", "full_text_search"}
+            }
+            binds = dict(direct_binds)
+            online_meta: Dict[str, Any] = {}
+            if sanitized_patch:
+                direct_sql, binds, online_meta = _apply_online_rate_hints(
+                    direct_sql, binds, sanitized_patch
+                )
+
+            binds = _coerce_bind_dates(binds)
+            rows, cols, exec_meta = _execute_oracle(direct_sql, binds)
+            inquiry_id = _log_inquiry(
+                question,
+                auth_email,
+                status="answered",
+                rows=len(rows),
+                prefixes=prefixes,
+                payload=payload,
+            )
+            duration_ms = int((time.time() - t0) * 1000)
+            meta = {
+                "strategy": "fts_direct",
+                "binds": _json_safe_binds(binds),
+                **exec_meta,
+                "duration_ms": duration_ms,
+                "online_learning": {"hints": online_hints_applied, **online_meta},
+                "fts": {
+                    "enabled": True,
+                    "mode": direct_mode,
+                    "tokens": direct_groups,
+                    "columns": fts_columns_direct,
+                    "binds": list(binds.keys()),
+                    "error": None,
+                },
+            }
+            response = {
+                "ok": True,
+                "inquiry_id": inquiry_id,
+                "rows": rows,
+                "columns": cols,
+                "sql": direct_sql,
+                "meta": meta,
+                "debug": {
+                    "fts": meta["fts"],
+                    "online_learning": meta.get("online_learning"),
+                },
+            }
+            return jsonify(response)
+
     contract_sql, contract_binds, contract_meta = _plan_contract_sql(
         question,
         namespace,
@@ -779,15 +880,8 @@ def answer():
 
     namespace = "dw::common"
 
-    table_name = "Contract"
     getter = getattr(settings, "get", None) if settings is not None else None
-    if callable(getter):
-        try:
-            configured_table = getter("DW_CONTRACT_TABLE", scope="namespace", namespace=namespace)
-        except TypeError:
-            configured_table = getter("DW_CONTRACT_TABLE")
-        if configured_table:
-            table_name = str(configured_table)
+    table_name = _resolve_contract_table(settings, namespace)
 
     explicit_dates = _resolve_window(question)
 
@@ -839,7 +933,7 @@ def answer():
         if where_clauses:
             sql += " WHERE " + " AND ".join(where_clauses)
         order_by = "NVL(CONTRACT_VALUE_NET_OF_VAT,0)"
-        sql += f" ORDER BY {order_by} DESC"
+        sql = _append_order_by(sql, order_by, descending=True)
         if top_n:
             binds["top_n"] = int(top_n)
             sql += " FETCH FIRST :top_n ROWS ONLY"
