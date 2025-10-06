@@ -358,7 +358,41 @@ cases:
       notes: "A pure SELECT with REQUEST_DATE window is acceptable; a grouped month bucket is nicer but optional."
     assertions:
       request_window: true
-      group_by: ["TRUNC(REQUEST_DATE, 'MM')"]
+
+  - id: fts_like_fallback_single_token
+    question: "list all contracts has it"
+    expect_sql_contains:
+      - "UPPER(NVL(CONTRACT_SUBJECT,'')) LIKE UPPER(:fts_0)"
+      - "ORDER BY REQUEST_DATE DESC"
+    expect_sql_not_contains:
+      - "ORDER BY REQUEST_DATE DESC\nORDER BY REQUEST_DATE DESC"
+    expect_binds:
+      - fts_0
+    assertions: {}
+
+  - id: fts_like_fallback_or_tokens
+    question: "list all contracts has it or home care"
+    expect_sql_contains:
+      - "UPPER(NVL(CONTRACT_SUBJECT,'')) LIKE UPPER(:fts_0)"
+      - "UPPER(NVL(CONTRACT_SUBJECT,'')) LIKE UPPER(:fts_1)"
+      - " ORDER BY REQUEST_DATE DESC"
+    expect_binds:
+      - fts_0
+      - fts_1
+
+  - id: fts_like_fallback_with_eq
+    question: "list all contracts has it or home care and ENTITY = DSFH and REPRESENTATIVE_EMAIL = samer@procare-sa.com"
+    expect_sql_contains:
+      - "UPPER(NVL(CONTRACT_SUBJECT,'')) LIKE UPPER(:fts_0)"
+      - "UPPER(NVL(CONTRACT_SUBJECT,'')) LIKE UPPER(:fts_1)"
+      - "UPPER(TRIM(ENTITY)) = UPPER(TRIM(:eq_0))"
+      - "UPPER(TRIM(REPRESENTATIVE_EMAIL)) = UPPER(TRIM(:eq_1))"
+      - " ORDER BY REQUEST_DATE DESC"
+    expect_binds:
+      - fts_0
+      - fts_1
+      - eq_0
+      - eq_1
 
   - id: entity_no_total_count_by_status
     question: "For ENTITY_NO = 'E-123', total and count by CONTRACT_STATUS."
