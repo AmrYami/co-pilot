@@ -101,8 +101,16 @@ GROSS_EXPR = (
 )
 
 
-def _ci_trim_eq(col: str, bind: str) -> str:
-    return f"UPPER(TRIM({col})) = UPPER(TRIM(:{bind}))"
+def _eq_condition(col: str, bind: str, *, ci: bool, trim: bool) -> str:
+    lhs = col
+    rhs = f":{bind}"
+    if trim:
+        lhs = f"TRIM({lhs})"
+        rhs = f"TRIM({rhs})"
+    if ci:
+        lhs = f"UPPER({lhs})"
+        rhs = f"UPPER({rhs})"
+    return f"{lhs} = {rhs}"
 
 
 def build_rate_fts_where(
@@ -134,7 +142,14 @@ def build_rate_eq_where(
             continue
         bind_name = f"eq_{bind_index}"
         binds[bind_name] = filt.get("val") or ""
-        clauses.append(_ci_trim_eq(col, bind_name))
+        clauses.append(
+            _eq_condition(
+                col,
+                bind_name,
+                ci=bool(filt.get("ci")),
+                trim=bool(filt.get("trim")),
+            )
+        )
         bind_index += 1
     if not clauses:
         return "", binds
