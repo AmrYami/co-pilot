@@ -60,3 +60,9 @@ REQUEST_SYNONYMS = re.compile(r"\b(request|requested|request date)\b", re.I)
 
 def mentions_requested(text: str) -> bool:
     return bool(REQUEST_SYNONYMS.search(text or ""))
+
+
+def safe_upper(s: str | None) -> str | None:
+    if s is None:
+        return None
+    return s.upper()
