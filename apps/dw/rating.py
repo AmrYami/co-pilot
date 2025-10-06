@@ -129,6 +129,7 @@ def rate():
     if not comment and feedback:
         comment = feedback
     structured_hints = parse_rate_comment_structured(comment or "")
+    structured_hints["full_text_search"] = bool(structured_hints.get("fts_tokens"))
     if not inquiry_id or rating < 1 or rating > 5:
         return jsonify({"ok": False, "error": "invalid payload"}), 400
 
@@ -289,6 +290,7 @@ def rate():
         )
         rate_debug = {
             "intent": {
+                "wants_all_columns": True,
                 "full_text_search": bool(fts_tokens),
                 "fts_tokens": fts_tokens,
                 "fts_operator": structured_hints.get("fts_operator") or "OR",
@@ -351,6 +353,9 @@ def rate():
             meta.setdefault("attempt_no", 2)
             meta.setdefault("strategy", "rate_overrides")
             meta["binds"] = rate_binds
+            intent_debug = rate_debug.get("intent")
+            if intent_debug:
+                meta["clarifier_intent"] = intent_debug
             payload.setdefault("rows", [])
             payload["retry"] = payload.get("retry") or True
             debug_section = payload.setdefault("debug", {})
