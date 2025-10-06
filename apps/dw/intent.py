@@ -2,6 +2,10 @@ from __future__ import annotations
 import re
 from typing import Optional, List, Dict, Any, TYPE_CHECKING, Iterable
 
+from apps.dw.filters import eq_filters_to_where
+from apps.dw.fts import build_like_fts_where, build_fts_tokens
+from apps.dw.nlp.parse import extract_equalities_first, normalize_question
+
 from apps.dw.tables import for_namespace
 from apps.dw.tables.base import TableSpec
 from apps.dw.tables.contract import ContractSpec
@@ -562,3 +566,51 @@ def _prepare_fts(intent: Dict[str, Any], question: str, settings: "Settings", sp
             columns.append(norm_col)
     intent["fts_columns"] = columns or None
     intent["fts_operator"] = join_op or "OR"
+
+
+def derive_intent(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Build a lightweight intent structure from a /dw/answer payload."""
+
+    if not isinstance(payload, dict):
+        payload = {}
+
+    raw_question = (payload.get("question") or "").strip()
+    full_text_search = bool(payload.get("full_text_search"))
+    schema_key = "Contract"
+
+    normalized = normalize_question(raw_question)
+    question_wo_eq, extracted_eqs = extract_equalities_first(normalized)
+
+    eq_filters = [
+        {"col": col, "val": val, "ci": True, "trim": True}
+        for col, val in extracted_eqs
+    ]
+
+    fts_groups = build_fts_tokens(question_wo_eq) if full_text_search else []
+    fts_where, fts_binds = ("", {})
+    if full_text_search and fts_groups:
+        fts_where, fts_binds = build_like_fts_where(schema_key, fts_groups)
+
+    eq_where, eq_binds = eq_filters_to_where(eq_filters)
+
+    intent = {
+        "schema_key": schema_key,
+        "full_text_search": full_text_search,
+        "q": raw_question,
+        "fts": {
+            "enabled": bool(fts_where),
+            "where": fts_where,
+            "binds": fts_binds,
+        },
+        "eq_filters": eq_filters,
+        "eq": {
+            "where": eq_where,
+            "binds": eq_binds,
+        },
+        "sort_by": "REQUEST_DATE",
+        "sort_desc": True,
+        "group_by": None,
+        "gross": None,
+    }
+
+    return intent
