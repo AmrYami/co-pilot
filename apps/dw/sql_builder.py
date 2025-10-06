@@ -1,4 +1,4 @@
-from typing import Dict, Any, Optional, Tuple, List
+from typing import Dict, Any, Iterable, Optional, Sequence, Tuple, List
 import logging
 import re
 from datetime import date
@@ -6,6 +6,123 @@ from dateutil.relativedelta import relativedelta
 
 
 LOGGER = logging.getLogger("dw.sql_builder")
+
+try:  # pragma: no cover - optional settings backend
+    from apps.dw.settings_util import get_setting as _get_setting
+except Exception:  # pragma: no cover - fallback used in tests
+    def _get_setting(key: str, *, scope=None, namespace=None, default=None):
+        return default
+
+from apps.dw.fts_utils import DEFAULT_CONTRACT_FTS_COLUMNS
+from apps.dw.settings_defaults import DEFAULT_EXPLICIT_FILTER_COLUMNS
+
+
+def _wrap_ci_trim(col_expr: str, bind_name: str, ci: bool, trim: bool) -> str:
+    """Build a case-insensitive / trimmed equality predicate when requested."""
+
+    col = col_expr
+    val = f":{bind_name}"
+    if trim:
+        col = f"TRIM({col})"
+        val = f"TRIM({val})"
+    if ci:
+        col = f"UPPER({col})"
+        val = f"UPPER({val})"
+    return f"{col} = {val}"
+
+
+def build_eq_where(
+    eq_filters: List[Dict[str, Any]],
+    binds: Dict[str, Any],
+    *,
+    allowed_columns: Optional[Iterable[str]] = None,
+) -> List[str]:
+    """Translate equality filters into SQL predicates limited to allowed columns."""
+
+    if not eq_filters:
+        return []
+
+    if allowed_columns is None:
+        configured = _get_setting(
+            "DW_EXPLICIT_FILTER_COLUMNS",
+            scope="namespace",
+            namespace="dw::common",
+            default=None,
+        )
+        if configured is None:
+            configured = DEFAULT_EXPLICIT_FILTER_COLUMNS
+    else:
+        configured = allowed_columns
+
+    allowed_set = {
+        str(col).strip().upper().replace(" ", "_")
+        for col in configured
+        if isinstance(col, str) and col.strip()
+    }
+
+    predicates: List[str] = []
+    idx = 0
+    for filt in eq_filters:
+        col = str(filt.get("col") or "").strip().upper()
+        if not col or col not in allowed_set:
+            continue
+        bind_name = f"eq_{idx}"
+        binds[bind_name] = filt.get("val")
+        predicates.append(
+            _wrap_ci_trim(col, bind_name, bool(filt.get("ci")), bool(filt.get("trim")))
+        )
+        idx += 1
+    return predicates
+
+
+def build_fts_where(
+    tokens: Sequence[str],
+    binds: Dict[str, Any],
+    operator: str = "OR",
+    *,
+    columns: Optional[Iterable[str]] = None,
+) -> str:
+    """Build a LIKE-based FTS predicate over configured columns."""
+
+    token_list = [tok.strip() for tok in tokens or [] if isinstance(tok, str) and tok.strip()]
+    if not token_list:
+        return ""
+
+    if columns is None:
+        mapping = _get_setting(
+            "DW_FTS_COLUMNS",
+            scope="namespace",
+            namespace="dw::common",
+            default={},
+        )
+        if isinstance(mapping, dict):
+            column_candidates = mapping.get("Contract") or mapping.get("CONTRACT") or mapping.get("*")
+        else:
+            column_candidates = None
+        if not column_candidates:
+            column_candidates = DEFAULT_CONTRACT_FTS_COLUMNS
+    else:
+        column_candidates = columns
+
+    cols = [
+        col if (isinstance(col, str) and col.strip().startswith("\""))
+        else str(col).strip().upper()
+        for col in column_candidates
+        if isinstance(col, str) and col.strip()
+    ]
+
+    if not cols:
+        return ""
+
+    groups: List[str] = []
+    for idx, token in enumerate(token_list):
+        bind_name = f"fts_{idx}"
+        binds[bind_name] = f"%{token}%"
+        per_column = [f"UPPER(NVL({col},'')) LIKE UPPER(:{bind_name})" for col in cols]
+        groups.append("(" + " OR ".join(per_column) + ")")
+
+    joiner = " AND " if (operator or "OR").strip().upper() == "AND" else " OR "
+    return "(" + joiner.join(groups) + ")"
 
 
 def build_measure_sql() -> str:
@@ -139,7 +256,7 @@ def _gross_expr() -> str:
     )
 
 
-def build_fts_where(intent: Dict[str, Any], bind_prefix: str = "fts") -> Tuple[Optional[str], Dict[str, Any]]:
+def _build_fts_where_from_intent(intent: Dict[str, Any], bind_prefix: str = "fts") -> Tuple[Optional[str], Dict[str, Any]]:
     if not intent.get("full_text_search"):
         return None, {}
 
@@ -178,6 +295,16 @@ def build_fts_where(intent: Dict[str, Any], bind_prefix: str = "fts") -> Tuple[O
     joiner = " AND " if operator == "AND" else " OR "
     clause = "(" + joiner.join(token_parts) + ")"
     return clause, binds
+
+
+def build_fts_where_from_intent(intent: Dict[str, Any], bind_prefix: str = "fts") -> Tuple[Optional[str], Dict[str, Any]]:
+    """Compatibility wrapper for callers expecting the legacy API name."""
+
+    return _build_fts_where_from_intent(intent, bind_prefix=bind_prefix)
+
+
+# Backwards compatibility alias
+build_fts_where_legacy = build_fts_where_from_intent
 
 
 def apply_order_by(sql: str, col: str, desc: bool) -> str:
@@ -233,7 +360,7 @@ def build_sql(intent: Dict[str, Any], settings, *, table: str = "Contract") -> T
         binds["date_end"] = exp_dates["end"]
         where_parts.append("REQUEST_DATE BETWEEN :date_start AND :date_end")
 
-    fts_clause, fts_binds = build_fts_where(it)
+    fts_clause, fts_binds = _build_fts_where_from_intent(it)
     if fts_clause:
         where_parts.append(fts_clause)
         binds.update(fts_binds)
