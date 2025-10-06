@@ -1,9 +1,16 @@
 from __future__ import annotations
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 from datetime import date
 
-from apps.dw.fts_utils import build_boolean_fts_where, resolve_fts_columns
+from apps.dw.eq_parser import build_eq_where_and_binds, parse_eq_filters_from_text
+from apps.dw.fts_fallback import build_fts_like_where_and_binds
+from apps.dw.fts_utils import (
+    DEFAULT_CONTRACT_FTS_COLUMNS,
+    build_boolean_fts_where,
+    resolve_fts_columns,
+)
+from apps.dw.settings_defaults import DEFAULT_EXPLICIT_FILTER_COLUMNS
 
 from .contract_common import GROSS_SQL, OVERLAP_PRED, explain_window
 
@@ -43,6 +50,106 @@ def _get_fts_columns(settings: Any) -> List[str]:
             normalized.append(upper)
     return normalized
 
+
+def _resolve_explicit_filter_columns(settings: Any) -> List[str]:
+    """Return allow-list of columns for inline equality filters."""
+
+    candidates: List[str] = []
+    sources = []
+    if settings is not None:
+        sources.append(getattr(settings, "get_json", None))
+        sources.append(getattr(settings, "get", None))
+    for getter in sources:
+        if callable(getter):
+            try:
+                value = getter("DW_EXPLICIT_FILTER_COLUMNS", [])
+            except TypeError:
+                value = getter("DW_EXPLICIT_FILTER_COLUMNS")
+            if isinstance(value, list):
+                candidates = [str(item).strip() for item in value if str(item or "").strip()]
+                break
+    if not candidates and isinstance(settings, dict):
+        raw = settings.get("DW_EXPLICIT_FILTER_COLUMNS")
+        if isinstance(raw, list):
+            candidates = [str(item).strip() for item in raw if str(item or "").strip()]
+    if not candidates:
+        candidates = list(DEFAULT_EXPLICIT_FILTER_COLUMNS)
+    return candidates
+
+
+def _resolve_fallback_fts_columns(
+    settings: Any, override: Optional[List[str]] = None
+) -> List[str]:
+    """Resolve FTS columns for LIKE fallback with sane defaults."""
+
+    def _normalize(values: Iterable[Any]) -> List[str]:
+        seen: set[str] = set()
+        normalized: List[str] = []
+        for val in values or []:
+            if val is None:
+                continue
+            text = str(val).strip()
+            if not text:
+                continue
+            if text.startswith('"') and text.endswith('"'):
+                text = text[1:-1]
+            upper = text.upper()
+            if upper in seen:
+                continue
+            seen.add(upper)
+            normalized.append(upper)
+        return normalized
+
+    if override:
+        normalized = _normalize(override)
+        if normalized:
+            return normalized
+
+    if isinstance(settings, dict):
+        cfg = settings.get("DW_FTS_COLUMNS")
+        if isinstance(cfg, dict):
+            for key in ("Contract", "CONTRACT", "contract", "*"):
+                cols = cfg.get(key)
+                if isinstance(cols, list) and cols:
+                    normalized = _normalize(cols)
+                    if normalized:
+                        return normalized
+
+    columns = _get_fts_columns(settings)
+    if columns:
+        return columns
+    return list(DEFAULT_CONTRACT_FTS_COLUMNS)
+
+
+def _clean_token(token: str) -> str:
+    text = str(token or "").strip().strip(",.;")
+    text = re.sub(r"\b(?:and|or)\b$", "", text, flags=re.IGNORECASE).strip(",.; ")
+    return text
+
+
+def _derive_token_groups(text: str) -> Tuple[List[List[str]], str]:
+    """Derive token groups (AND within group, OR between groups) from text."""
+
+    if not text:
+        return [], "OR"
+    match = re.search(r"\b(?:where\s+)?has\s+(.+)$", text, flags=re.IGNORECASE)
+    if not match:
+        return [], "OR"
+    tail = match.group(1)
+    if not tail:
+        return [], "OR"
+    tail = tail.replace("،", ",")
+    # Prefer explicit OR groups; fall back to AND if present.
+    if re.search(r"\s+or\s+", tail, flags=re.IGNORECASE):
+        parts = re.split(r"\s+or\s+", tail, flags=re.IGNORECASE)
+        groups = [[_clean_token(part)] for part in parts if _clean_token(part)]
+        return groups, "OR"
+    if re.search(r"\s+and\s+", tail, flags=re.IGNORECASE):
+        parts = re.split(r"\s+and\s+", tail, flags=re.IGNORECASE)
+        tokens = [_clean_token(part) for part in parts if _clean_token(part)]
+        return ([tokens] if tokens else []), "AND"
+    part = _clean_token(tail)
+    return ([[part]] if part else []), "OR"
 
 # allow common aliases -> real columns
 _COLUMN_ALIASES = {
@@ -200,13 +307,45 @@ def _apply_fts_if_requested(
     settings: Any,
     where_clauses: List[str],
     binds: Dict[str, Any],
+    *,
+    fts_columns_override: Optional[List[str]] = None,
 ) -> Tuple[bool, Dict[str, Any]]:
-    """Append FTS clause when requested and return FTS metadata."""
+    """Append LIKE-based FTS fallback when tokens and columns are available."""
 
-    clause, meta = _build_fts_clause(question, payload, settings, binds)
-    if clause:
-        where_clauses.append(clause)
-    return bool(clause), meta
+    token_groups, joiner = _derive_token_groups(question)
+    columns = _resolve_fallback_fts_columns(settings, fts_columns_override)
+    tokens_flat: List[str] = [tok for group in token_groups for tok in group]
+
+    meta: Dict[str, Any] = {
+        "enabled": False,
+        "tokens": tokens_flat,
+        "columns": columns,
+        "binds": [],
+        "mode": "fallback" if token_groups else None,
+        "join": joiner,
+        "error": None,
+    }
+
+    if not token_groups:
+        if payload.get("full_text_search"):
+            meta["error"] = "no_terms"
+        return False, meta
+
+    where_sql, like_binds = build_fts_like_where_and_binds(
+        token_groups, columns, operator_between_groups=joiner
+    )
+    if not where_sql:
+        meta["error"] = "no_columns" if columns else "no_terms"
+        return False, meta
+
+    where_clauses.append(where_sql)
+    binds.update(like_binds)
+    meta.update({
+        "enabled": True,
+        "binds": list(like_binds.keys()),
+        "error": None,
+    })
+    return True, meta
 
 
 def _apply_eq_filters_from_text(
@@ -214,43 +353,20 @@ def _apply_eq_filters_from_text(
     settings: Any,
     where_clauses: List[str],
     binds: Dict[str, Any],
-) -> bool:
-    """
-    Parse simple 'column = value' expressions from free text using DW_EXPLICIT_FILTER_COLUMNS.
-    Also supports aliases like 'departments' -> OWNER_DEPARTMENT.
-    """
+) -> Tuple[bool, str, List[Dict[str, Any]]]:
+    """Parse and apply inline equality filters, returning cleaned text."""
 
-    import re
+    allowed = _resolve_explicit_filter_columns(settings)
+    cleaned, filters = parse_eq_filters_from_text(question or "", allowed)
+    if not filters:
+        return False, cleaned, []
 
-    allowed_raw: List[str] = []
-    if settings is not None:
-        getter = getattr(settings, "get_json", None)
-        if callable(getter):
-            allowed_raw = getter("DW_EXPLICIT_FILTER_COLUMNS", []) or []
-        elif isinstance(settings, dict):
-            allowed_raw = settings.get("DW_EXPLICIT_FILTER_COLUMNS", []) or []
-    allowed = [str(c).upper() for c in allowed_raw if isinstance(c, str) and c.strip()]
-    if not allowed:
-        return False
-
-    q = question or ""
-    # find patterns: <word(s)> = <value> ; accept quotes or not
-    matches = re.findall(r"(\b[ A-Za-z_]+?)\s*=\s*[\"']?([^\"']+)[\"']?", q)
-    applied = False
-    for raw_col, raw_val in matches:
-        col = _alias_column(raw_col)
-        if col == "STAKEHOLDER*":
-            # treat as multi-slot equality (rare), but here we prefer 'has' pattern; skip
-            continue
-
-        if col not in allowed:
-            continue
-
-        bind_name = f"eq_{len(binds)}"
-        binds[bind_name] = raw_val.strip()
-        where_clauses.append(f"UPPER(TRIM({col})) = UPPER(TRIM(:{bind_name}))")
-        applied = True
-    return applied
+    where_sql, eq_binds = build_eq_where_and_binds(filters)
+    if where_sql:
+        where_clauses.append(where_sql)
+        binds.update(eq_binds)
+        return True, cleaned, filters
+    return False, cleaned, []
 
 
 def _apply_stakeholder_has(
@@ -290,6 +406,8 @@ def _build_text_filter_sql(
     question: str,
     payload: Dict[str, Any],
     settings: Any,
+    *,
+    fts_columns_override: Optional[List[str]] = None,
 ) -> Tuple[str, Dict[str, Any], Dict[str, Any], str, bool]:
     """Attempt to build simple Contract SQL using text-driven filters."""
 
@@ -297,16 +415,28 @@ def _build_text_filter_sql(
     binds: Dict[str, Any] = {}
 
     stakeholder_applied, stakeholder_terms = _apply_stakeholder_has(question, where_clauses, binds)
-    eq_applied = _apply_eq_filters_from_text(question, settings, where_clauses, binds)
+    eq_applied, cleaned_q, eq_filters = _apply_eq_filters_from_text(
+        question, settings, where_clauses, binds
+    )
     fts_applied, fts_meta = _apply_fts_if_requested(
-        question, payload, settings, where_clauses, binds
+        cleaned_q or question,
+        payload,
+        settings,
+        where_clauses,
+        binds,
+        fts_columns_override=fts_columns_override,
     )
 
     applied = stakeholder_applied or eq_applied or fts_applied
     if not applied:
         return "", {}, {}, "", False
 
-    sql = 'SELECT * FROM "Contract"\nWHERE ' + "\n  AND ".join(where_clauses) + "\nORDER BY REQUEST_DATE DESC"
+    sql_lines = ['SELECT * FROM "Contract"']
+    if where_clauses:
+        sql_lines.append("WHERE " + "\n  AND ".join(where_clauses))
+    sql = "\n".join(sql_lines)
+    if " order by " not in sql.lower():
+        sql += "\nORDER BY REQUEST_DATE DESC"
     explain_bits: List[str] = []
     if stakeholder_applied:
         explain_bits.append("Matched stakeholder terms across stakeholder slots.")
@@ -332,8 +462,11 @@ def _build_text_filter_sql(
         "text_filters": True,
     }
     meta["fts"] = fts_meta if isinstance(fts_meta, dict) else {"enabled": bool(fts_applied)}
+    if eq_applied:
+        meta["eq_filters"] = eq_filters
     if stakeholder_applied:
         meta["stakeholder_terms"] = stakeholder_terms
+    meta["binds"] = {k: binds[k] for k in binds}
 
     return sql, binds, meta, explain, True
 
@@ -445,7 +578,7 @@ def plan_contract_query(
     payload = payload or {}
 
     text_sql, text_binds, text_meta, text_explain, text_applied = _build_text_filter_sql(
-        q or "", payload, settings
+        q or "", payload, settings, fts_columns_override=fts_columns
     )
     if text_applied:
         return text_sql, text_binds, text_meta, text_explain
