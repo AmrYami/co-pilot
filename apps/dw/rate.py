@@ -8,6 +8,9 @@ from .settings import get_setting
 from .sql_builder import build_measure_sql, quote_ident, strip_double_order_by
 from .learn_store import LearningStore, ExampleRecord, PatchRecord
 from .utils import safe_upper
+from .fts_like import build_fts_like_where
+from .eq_filters import build_eq_where
+from .settings_defaults import DEFAULT_EXPLICIT_FILTER_COLUMNS
 
 rate_bp = Blueprint("rate", __name__)
 
@@ -134,55 +137,6 @@ def _resolve_group_by_col(raw_col: str) -> str | None:
     return None
 
 
-def _build_eq_where(eq_filters: list[dict], binds: dict) -> list[str]:
-    where = []
-    for i, f in enumerate(eq_filters):
-        col = f.get("col")
-        val = f.get("val")
-        ci = bool(f.get("ci"))
-        tr = bool(f.get("trim"))
-        if not col or val is None:
-            continue
-        bind_name = f"eq_{i}"
-        binds[bind_name] = val
-        col_sql = quote_ident(col)
-        left = col_sql
-        right = f":{bind_name}"
-        if tr:
-            left = f"TRIM({left})"
-            right = f"TRIM(:{bind_name})"
-        if ci:
-            left = f"UPPER({left})"
-            right = f"UPPER({right})"
-        where.append(f"{left} = {right}")
-    return where
-
-
-def _build_fts_where(
-    tokens: list[str],
-    fts_cols: list[str],
-    op: str,
-    binds: dict,
-    bind_offset: int = 0,
-) -> list[str]:
-    groups = []
-    for idx, tok in enumerate(tokens):
-        t = tok.strip()
-        if not t:
-            continue
-        bname = f"fts_{idx + bind_offset}"
-        binds[bname] = f"%{t}%"
-        ors = []
-        for c in fts_cols:
-            ors.append(f"UPPER(NVL({quote_ident(c)},'')) LIKE UPPER(:{bname})")
-        groups.append("(" + " OR ".join(ors) + ")")
-    if not groups:
-        return []
-    if (op or "OR").upper() == "AND":
-        return ["(" + " AND ".join(groups) + ")"]
-    return ["(" + " OR ".join(groups) + ")"]
-
-
 @rate_bp.route("/dw/rate", methods=["POST"])
 def rate():
     payload = request.get_json(force=True, silent=True) or {}
@@ -199,21 +153,23 @@ def rate():
     order_by: str | None = None
     sort_desc: bool | None = None
 
-    fts_enabled = False
-    fts_cols_dbg = []
-    if hints_intent.get("full_text_search") and hints_intent.get("fts_tokens"):
-        fts_cols = _select_rate_fts_columns()
-        fts_cols_dbg = fts_cols[:]
-        where_parts += _build_fts_where(
-            hints_intent["fts_tokens"],
-            fts_cols,
-            hints_intent.get("fts_operator", "OR"),
-            binds,
-        )
-        fts_enabled = True
+    fts_tokens = hints_intent.get("fts_tokens") or []
+    fts_operator = hints_intent.get("fts_operator") or "OR"
+    raw_fts_columns = _select_rate_fts_columns()
+    fts_columns = [quote_ident(col) for col in raw_fts_columns]
+    fts_where, fts_binds = build_fts_like_where(fts_tokens, fts_columns, operator=fts_operator)
+    fts_enabled = bool(fts_where)
+    if fts_where:
+        where_parts.append(fts_where)
+        binds.update(fts_binds)
 
-    if hints_intent.get("eq_filters"):
-        where_parts += _build_eq_where(hints_intent["eq_filters"], binds)
+    allowed_eq_columns = get_setting("DW_EXPLICIT_FILTER_COLUMNS", scope="namespace") or DEFAULT_EXPLICIT_FILTER_COLUMNS
+    eq_where, eq_binds, eq_applied = build_eq_where(hints_intent.get("eq_filters") or [], allowed_eq_columns)
+    if eq_where:
+        where_parts.append(f"({eq_where})" if " AND " in eq_where else eq_where)
+        binds.update(eq_binds)
+    else:
+        eq_applied = []
 
     group_by_raw = hints_intent.get("group_by")
     group_by = _resolve_group_by_col(group_by_raw) if group_by_raw else None
@@ -265,10 +221,15 @@ def rate():
     debug = {
         "fts": {
             "enabled": bool(fts_enabled),
-            "tokens": hints_intent.get("fts_tokens") if fts_enabled else None,
-            "columns": fts_cols_dbg if fts_enabled else None,
-            "binds": list(binds.keys()) if fts_enabled else None,
+            "mode": "like" if fts_enabled else None,
+            "tokens": fts_tokens or None,
+            "columns": raw_fts_columns if fts_enabled else None,
+            "binds": list(fts_binds.keys()) if fts_enabled else None,
             "error": None,
+        },
+        "eq": {
+            "applied": eq_applied,
+            "binds": list(eq_binds.keys()),
         },
         "intent": {
             "agg": None if not group_by else ("count" if gross_flag is not True else "sum"),
@@ -321,7 +282,7 @@ def rate():
                 "fts": debug["fts"],
                 "rate_hints": {
                     "comment_present": bool(comment),
-                    "eq_filters": len(hints_intent.get("eq_filters") or []),
+                    "eq_filters": len(eq_applied),
                     "group_by": [group_by] if group_by else None,
                     "order_by_applied": True,
                     "where_applied": bool(where_parts),
