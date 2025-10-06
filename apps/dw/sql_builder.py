@@ -8,6 +8,29 @@ from dateutil.relativedelta import relativedelta
 LOGGER = logging.getLogger("dw.sql_builder")
 
 
+def build_measure_sql() -> str:
+    return (
+        "NVL(CONTRACT_VALUE_NET_OF_VAT,0) + CASE WHEN NVL(VAT,0) BETWEEN 0 AND 1 "
+        "THEN NVL(CONTRACT_VALUE_NET_OF_VAT,0) * NVL(VAT,0) ELSE NVL(VAT,0) END"
+    )
+
+
+def quote_ident(name: str) -> str:
+    if not name:
+        return name
+    n = name.strip()
+    if n.startswith('"') and n.endswith('"'):
+        return n
+    return '"' + n.upper() + '"'
+
+
+def strip_double_order_by(sql: str) -> str:
+    parts = sql.split("\nORDER BY ")
+    if len(parts) <= 2:
+        return sql
+    return parts[0] + "\nORDER BY " + parts[1]
+
+
 # Helper to read optional strict overlap from Settings
 def _bool_env(v) -> bool:
     if v is None:
