@@ -222,6 +222,81 @@ def parse_rate_comment_strict(comment: Optional[str]) -> StrictRateHints:
     return hints
 
 
+EQ_CMD = re.compile(r"(?i)\beq\s*:\s*([A-Z0-9_ ]+)\s*=\s*(.+?)(?:;|$)")
+FTS_CMD = re.compile(r"(?i)\bfts\s*:\s*(.+?)(?:;|$)")
+GB_CMD = re.compile(r"(?i)\bgroup_by\s*:\s*([A-Z0-9_, ]+)(?:;|$)")
+ORD_CMD = re.compile(r"(?i)\border_by\s*:\s*([A-Z0-9_ ]+?)(?:\s+(asc|desc))?(?:;|$)")
+GROSS_CMD = re.compile(r"(?i)\bgross\s*:\s*(true|false)(?:;|$)")
+FLAGS = re.compile(r"\((?P<flags>[^)]*)\)$")
+
+
+def _parse_flags(val: str) -> Tuple[str, bool, bool]:
+    value = val.strip()
+    ci = False
+    trim = False
+    match = FLAGS.search(value)
+    if match:
+        raw_flags = match.group("flags") or ""
+        for flag in (frag.strip().lower() for frag in raw_flags.split(",") if frag.strip()):
+            if flag == "ci" or flag == "case_insensitive":
+                ci = True
+            elif flag == "trim":
+                trim = True
+        value = value[: match.start()].strip()
+    return value, ci, trim
+
+
+def apply_rate_comment(intent: Dict[str, Any], comment: str) -> Dict[str, Any]:
+    """Apply /dw/rate micro-language patches to an intent dictionary."""
+
+    if not isinstance(intent, dict):
+        intent = {}
+    out = dict(intent)
+
+    eq_filters: List[Dict[str, Any]] = list(out.get("eq_filters") or [])
+
+    for match in EQ_CMD.finditer(comment or ""):
+        col = (match.group(1) or "").strip()
+        val_raw = (match.group(2) or "").strip()
+        value, ci, trim = _parse_flags(val_raw)
+        if col and value:
+            eq_filters.append({"col": col, "val": value, "ci": ci, "trim": trim})
+
+    out["eq_filters"] = eq_filters
+
+    fts_match = FTS_CMD.search(comment or "")
+    if fts_match:
+        expr = (fts_match.group(1) or "").strip()
+        tokens = [tok.strip() for tok in expr.split("|") if tok.strip()]
+        if tokens:
+            from apps.dw.fts import build_like_fts_where
+
+            where, binds = build_like_fts_where(
+                out.get("schema_key", "Contract"),
+                [[tok] for tok in tokens],
+                bind_prefix="fts",
+            )
+            out["fts"] = {"enabled": bool(where), "where": where, "binds": binds}
+            out["full_text_search"] = True
+
+    gb_match = GB_CMD.search(comment or "")
+    if gb_match:
+        cols = [c.strip().upper() for c in (gb_match.group(1) or "").split(",") if c.strip()]
+        out["group_by"] = cols or None
+
+    ord_match = ORD_CMD.search(comment or "")
+    if ord_match:
+        out["sort_by"] = (ord_match.group(1) or "").strip().upper()
+        direction = (ord_match.group(2) or "DESC").strip().lower()
+        out["sort_desc"] = direction != "asc"
+
+    gross_match = GROSS_CMD.search(comment or "")
+    if gross_match:
+        out["gross"] = gross_match.group(1).strip().lower() == "true"
+
+    return out
+
+
 def merge_rate_comment_hints(
     intent: "NLIntent",
     hints: StrictRateHints,

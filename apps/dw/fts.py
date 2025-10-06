@@ -137,4 +137,99 @@ def _settings_get(settings: Any, key: str, default: Any = None) -> Any:
     return default
 
 
-__all__ = ["extract_fts_tokens", "build_fts_where"]
+try:  # pragma: no cover - optional dependency in some deployments
+    from apps.dw.settings_util import get_setting as _get_setting
+except Exception:  # pragma: no cover - fall back to a safe stub
+    def _get_setting(*args, **kwargs):
+        return {}
+
+
+STOP_WORDS = {"the", "a", "an", "of", "for", "to", "in", "on", "at", "by", "and", "or"}
+
+
+def _split_or_and(text: str) -> List[List[str]]:
+    """Split text into OR groups that contain AND-constrained tokens."""
+
+    groups: List[List[str]] = []
+    for or_part in re.split(r"(?i)\bor\b", text):
+        tokens = [seg.strip() for seg in re.split(r"(?i)\band\b", or_part)]
+        tokens = [tok for tok in tokens if tok and tok.lower() not in STOP_WORDS]
+        if tokens:
+            groups.append(tokens)
+    return groups
+
+
+def build_fts_tokens(q: str) -> List[List[str]]:
+    """Normalize question text into OR-of-AND token groups for FTS."""
+
+    text = re.sub(r"\s+", " ", q or "").strip()
+    if not text:
+        return []
+    return _split_or_and(text)
+
+
+def get_fts_columns(schema_key: str) -> List[str]:
+    """Return configured FTS columns for ``schema_key`` with sane fallbacks."""
+
+    raw = _get_setting("DW_FTS_COLUMNS", scope="namespace", namespace="dw::common") or {}
+    cols = raw.get(schema_key) or raw.get(schema_key.upper()) or raw.get("*") or []
+    seen: set[str] = set()
+    result: List[str] = []
+    for col in cols:
+        if not isinstance(col, str):
+            continue
+        normalized = col.strip().upper()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        result.append(normalized)
+    if not result:
+        result = ["CONTRACT_SUBJECT", "CONTRACT_PURPOSE"]
+    return result
+
+
+def build_like_fts_where(
+    schema_key: str,
+    groups: List[List[str]],
+    *,
+    bind_prefix: str = "fts",
+) -> Tuple[str, Dict[str, str]]:
+    """Construct a LIKE-based WHERE clause for FTS token groups."""
+
+    columns = get_fts_columns(schema_key)
+    if not columns or not groups:
+        return "", {}
+
+    binds: Dict[str, str] = {}
+    or_clauses: List[str] = []
+    bind_i = 0
+
+    for and_tokens in groups:
+        and_clauses: List[str] = []
+        for token in and_tokens:
+            if not token:
+                continue
+            bind_name = f"{bind_prefix}_{bind_i}"
+            bind_i += 1
+            binds[bind_name] = f"%{token}%"
+            per_token = " OR ".join(
+                f"UPPER(NVL({col},'')) LIKE UPPER(:{bind_name})" for col in columns
+            )
+            and_clauses.append(f"({per_token})")
+        if and_clauses:
+            or_clauses.append("(" + " AND ".join(and_clauses) + ")")
+
+    if not or_clauses:
+        return "", {}
+
+    where_sql = "(" + " OR ".join(or_clauses) + ")"
+    return where_sql, binds
+
+
+__all__ = [
+    "extract_fts_tokens",
+    "build_fts_where",
+    "build_fts_tokens",
+    "get_fts_columns",
+    "build_like_fts_where",
+]

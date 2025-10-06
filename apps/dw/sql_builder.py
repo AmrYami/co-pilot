@@ -15,6 +15,74 @@ def build_measure_sql() -> str:
     )
 
 
+GROSS_EXPR = (
+    "NVL(CONTRACT_VALUE_NET_OF_VAT,0) + CASE WHEN NVL(VAT,0) BETWEEN 0 AND 1 "
+    "THEN NVL(CONTRACT_VALUE_NET_OF_VAT,0) * NVL(VAT,0) ELSE NVL(VAT,0) END"
+)
+
+
+def _merge_where(parts):
+    parts = [part for part in parts if part]
+    if not parts:
+        return ""
+    return "WHERE " + " AND ".join(f"({part})" for part in parts)
+
+
+def build_contract_sql(intent: Dict[str, Any]) -> Tuple[str, Dict[str, str]]:
+    """Lightweight SQL builder used by the simplified DW blueprint."""
+
+    selects = "*"
+    table = '"Contract"'
+    binds: Dict[str, str] = {}
+    where_parts: List[str] = []
+
+    fts_info = intent.get("fts") or {}
+    if fts_info.get("enabled") and fts_info.get("where"):
+        where_parts.append(str(fts_info.get("where")))
+        binds.update({k: v for k, v in (fts_info.get("binds") or {}).items()})
+
+    eq_info = intent.get("eq") or {}
+    if eq_info.get("where"):
+        where_parts.append(str(eq_info.get("where")))
+        binds.update({k: v for k, v in (eq_info.get("binds") or {}).items()})
+
+    group_by = intent.get("group_by") or []
+    gross = intent.get("gross")
+
+    order_col = (intent.get("sort_by") or "REQUEST_DATE").upper()
+    order_dir = "DESC" if intent.get("sort_desc", True) else "ASC"
+
+    where_sql = _merge_where(where_parts)
+    if where_sql:
+        where_sql = where_sql + "\n"
+
+    if group_by:
+        gb_list = [str(col).upper().replace(" ", "_") for col in group_by if str(col).strip()]
+        gb_sql = ", ".join(gb_list)
+        if gross:
+            selects = f"{gb_sql} AS GROUP_KEY, SUM({GROSS_EXPR}) AS MEASURE, COUNT(*) AS CNT"
+            order_col = "MEASURE"
+        else:
+            selects = f"{gb_sql} AS GROUP_KEY, COUNT(*) AS CNT"
+            order_col = "CNT"
+        sql = (
+            f"SELECT {selects}\n"
+            f"FROM {table}\n"
+            f"{where_sql}"
+            f"GROUP BY {gb_sql}\n"
+            f"ORDER BY {order_col} {order_dir}"
+        )
+        return sql, binds
+
+    sql = (
+        f"SELECT {selects}\n"
+        f"FROM {table}\n"
+        f"{where_sql}"
+        f"ORDER BY {order_col} {order_dir}"
+    )
+    return sql, binds
+
+
 def quote_ident(name: str) -> str:
     if not name:
         return name
