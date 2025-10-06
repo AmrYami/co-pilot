@@ -1,45 +1,8 @@
-import pathlib
 import sys
 import types
+from pathlib import Path
 
-sys.path.append(str(pathlib.Path(__file__).resolve().parents[1]))
-
-if "pydantic" not in sys.modules:  # pragma: no cover - lightweight stub for tests
-    pydantic_stub = types.ModuleType("pydantic")
-
-    class _BaseModel:  # pragma: no cover - simple stand-in
-        pass
-
-    def _Field(*args, **kwargs):  # pragma: no cover
-        return None
-
-    pydantic_stub.BaseModel = _BaseModel
-    pydantic_stub.Field = _Field
-    sys.modules["pydantic"] = pydantic_stub
-
-if "word2number" not in sys.modules:  # pragma: no cover
-    w2n_module = types.ModuleType("word2number")
-
-    class _W2N:  # pragma: no cover
-        @staticmethod
-        def word_to_num(text):
-            raise ValueError("stub")
-
-    w2n_module.w2n = _W2N()
-    sys.modules["word2number"] = w2n_module
-
-if "dateutil" not in sys.modules:  # pragma: no cover
-    dateutil_module = types.ModuleType("dateutil")
-    relativedelta_module = types.ModuleType("dateutil.relativedelta")
-
-    class _Relativedelta:  # pragma: no cover
-        def __init__(self, **kwargs):
-            self.kwargs = kwargs
-
-    relativedelta_module.relativedelta = _Relativedelta
-    dateutil_module.relativedelta = relativedelta_module
-    sys.modules["dateutil"] = dateutil_module
-    sys.modules["dateutil.relativedelta"] = relativedelta_module
+sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 import pytest
 
@@ -74,13 +37,10 @@ except ModuleNotFoundError:  # pragma: no cover - optional dependency
     flask_stub.Flask = None  # type: ignore
     sys.modules.setdefault("flask", flask_stub)
 
-from apps.dw.nlp import extract_equalities_first
-from apps.dw.fts import build_fts_tokens, build_like_fts_where
 from apps.dw import filters as filters_mod
-from apps.dw.filters import eq_filters_to_where, request_type_synonyms
-from apps.dw.intent import derive_intent
-from apps.dw.rate_grammar import apply_rate_comment
-from apps.dw.sql_builder import build_contract_sql
+from apps.dw.eq_parser import extract_eq_filters_from_natural_text
+from apps.dw.fts_like import build_fts_where
+from apps.dw.rate_grammar import parse_rate_comment
 from apps.dw.routes import bp as dw_blueprint
 
 
@@ -90,96 +50,92 @@ def _patch_settings(monkeypatch):
         if key == "DW_FTS_COLUMNS":
             return {"Contract": ["CONTRACT_SUBJECT", "ENTITY"]}
         if key == "DW_EXPLICIT_FILTER_COLUMNS":
-            return ["ENTITY", "REQUEST_TYPE"]
+            return ["ENTITY", "REQUEST_TYPE", "REPRESENTATIVE_EMAIL"]
         if key == "DW_ENUM_SYNONYMS":
             return {
                 "Contract.REQUEST_TYPE": {
-                    "home care": {"equals": ["HOME CARE", "HOME HEALTH"]}
+                    "renewal": {
+                        "equals": ["RENEWAL"],
+                        "prefix": ["RENEW"],
+                        "contains": ["REN"],
+                    }
                 }
             }
         return default
 
     monkeypatch.setattr(filters_mod, "get_setting", fake_get_setting)
-    monkeypatch.setattr("apps.dw.fts._get_setting", lambda *args, **kwargs: fake_get_setting("DW_FTS_COLUMNS"))
+    monkeypatch.setattr("apps.dw.routes._get_setting", fake_get_setting)
     yield
 
 
-def test_extract_equalities_first():
-    cleaned, pairs = extract_equalities_first('Entity = "DSFH" and home care services')
-    assert pairs == [("Entity", "DSFH")]
-    assert "DSFH" not in cleaned
-    assert "home care" in cleaned.lower()
+def test_extract_eq_filters_from_natural_text():
+    cols = ["ENTITY", "REQUEST_TYPE", "REPRESENTATIVE_EMAIL"]
+    pairs = extract_eq_filters_from_natural_text(
+        "Show contracts where entity = DSFH and request type equals Renewal",
+        cols,
+    )
+    assert ("ENTITY", "DSFH") in pairs
+    assert any(col == "REQUEST_TYPE" and val.lower() == "renewal" for col, val in pairs)
 
 
-def test_build_like_fts_where(monkeypatch):
-    groups = build_fts_tokens("home care or hospital and urgent")
-    assert groups == [["home care"], ["hospital", "urgent"]]
-
-    where_sql, binds = build_like_fts_where("Contract", groups, bind_prefix="b")
-    assert "UPPER(NVL(CONTRACT_SUBJECT,''))" in where_sql
-    assert binds == {"b_0": "%home care%", "b_1": "%hospital%", "b_2": "%urgent%"}
+def test_build_fts_where_groups():
+    groups = [["it"], ["home care"]]
+    sql, binds = build_fts_where(groups, ["CONTRACT_SUBJECT", "ENTITY"], "OR")
+    assert "UPPER(NVL(CONTRACT_SUBJECT,''))" in sql
+    assert binds == {"fts_0": "%it%", "fts_1": "%home care%"}
 
 
-def test_eq_filters_to_where_and_synonyms():
-    filters = [
-        {"col": "entity", "val": "DSFH", "ci": True, "trim": True},
-        {"col": "REQUEST_TYPE", "val": "home care", "ci": True, "trim": True},
-    ]
-    where_sql, binds = eq_filters_to_where(filters)
-    assert "UPPER(TRIM(ENTITY))" in where_sql
-    assert "eq_0" in binds and binds["eq_0"] == "DSFH"
-
-    synonyms = request_type_synonyms(["home care", "other"])
-    assert synonyms == ["HOME CARE", "HOME HEALTH", "OTHER"]
-
-
-def test_derive_intent_and_sql_builder():
-    payload = {"question": 'Entity = "DSFH" has home care', "full_text_search": True}
-    intent = derive_intent(payload)
-    assert intent["eq_filters"] == [{"col": "Entity", "val": "DSFH", "ci": True, "trim": True}]
-    assert intent["fts"]["enabled"]
-    sql, binds = build_contract_sql(intent)
-    assert "FROM \"Contract\"" in sql
-    assert ":eq_0" in sql
-    assert binds["eq_0"] == "DSFH"
+def test_parse_rate_comment_with_flags():
+    comment = "fts: it | home care; eq: ENTITY = DSFH (ci, trim); order_by: REQUEST_DATE asc; group_by: REQUEST_TYPE; gross: true"
+    hints = parse_rate_comment(comment)
+    assert hints["fts_tokens"] == ["it", "home care"]
+    assert hints["eq_filters"][0]["ci"] is True
+    assert hints["eq_filters"][0]["trim"] is True
+    assert hints["group_by"] == ["REQUEST_TYPE"]
+    assert hints["sort_by"] == "REQUEST_DATE"
+    assert hints["sort_desc"] is False
+    assert hints["gross"] is True
 
 
-def test_apply_rate_comment(monkeypatch):
-    base_intent = {"schema_key": "Contract", "eq_filters": []}
-    comment = "eq: ENTITY = DSFH (ci, trim); fts: urgent | care; group_by: REQUEST_TYPE; gross: true; order_by: REQUEST_DATE asc"
-    patched = apply_rate_comment(base_intent, comment)
-    assert patched["eq_filters"][-1]["val"] == "DSFH"
-    assert patched["fts"]["enabled"]
-    assert patched["group_by"] == ["REQUEST_TYPE"]
-    assert patched["gross"] is True
-    assert patched["sort_desc"] is False
-
-    sql, binds = build_contract_sql(patched)
-    assert "GROUP BY REQUEST_TYPE" in sql
-    assert "SUM(" in sql
-    assert "ORDER BY MEASURE ASC" in sql
-    assert binds
-
-
-def test_routes_endpoints(monkeypatch):
-    if Flask is None:
-        pytest.skip("Flask is required for route tests")
-
+@pytest.mark.skipif(Flask is None, reason="Flask is required for route tests")
+def test_answer_endpoint_combines_fts_and_eq(monkeypatch):
     monkeypatch.setattr("apps.dw.routes.fetch_rows", lambda sql, binds: [{"sql": sql, "binds": binds}])
 
     app = Flask(__name__)
     app.register_blueprint(dw_blueprint)
 
     client = app.test_client()
-
-    resp = client.post("/dw/answer", json={"question": "Entity = DSFH", "full_text_search": True})
+    payload = {
+        "question": "list all contracts has it or home care and entity = DSFH",
+        "full_text_search": True,
+    }
+    resp = client.post("/dw/answer", json=payload)
     data = resp.get_json()
+
     assert resp.status_code == 200
     assert data["ok"] is True
-    assert data["rows"][0]["binds"]["eq_0"] == "DSFH"
+    assert "UPPER(TRIM(ENTITY)) = UPPER(TRIM(:eq_0))" in data["sql"]
+    assert "LIKE UPPER(:fts_0)" in data["sql"]
+    assert data["debug"]["fts"]["enabled"] is True
+    assert data["rows"][0]["binds"]["eq_0"].upper() == "DSFH"
 
-    resp = client.post("/dw/rate", json={"comment": "eq: ENTITY = DSFH"})
+
+@pytest.mark.skipif(Flask is None, reason="Flask is required for route tests")
+def test_rate_endpoint_uses_rate_comment(monkeypatch):
+    monkeypatch.setattr("apps.dw.routes.fetch_rows", lambda sql, binds: [{"sql": sql, "binds": binds}])
+
+    app = Flask(__name__)
+    app.register_blueprint(dw_blueprint)
+
+    client = app.test_client()
+    resp = client.post(
+        "/dw/rate",
+        json={"comment": "fts: it | home care; eq: ENTITY = DSFH; order_by: REQUEST_DATE desc"},
+    )
     data = resp.get_json()
+
     assert resp.status_code == 200
     assert data["ok"] is True
+    assert "UPPER(TRIM(ENTITY)) = UPPER(TRIM(:eq_0))" in data["sql"]
+    assert "LIKE UPPER(:fts_0)" in data["sql"]
     assert data["debug"]["validation"]["ok"] is True
