@@ -54,6 +54,8 @@ except Exception:  # pragma: no cover - fallback for tests
 from core.inquiries import create_or_update_inquiry
 
 from apps.dw.rate_grammar import parse_rate_comment_strict
+from apps.dw.fts_builder import build_fts_where as build_like_fts_where
+from apps.dw.eq_parser import extract_eq_filters_from_text, strip_eq_from_text
 from apps.dw.rate_hints import (
     append_where,
     apply_rate_hints,
@@ -810,6 +812,27 @@ def _get_settings():
     return getattr(pipeline, "settings", None)
 
 
+def _get_namespace_setting(settings_obj: Any, namespace: str, key: str, default: Any = None) -> Any:
+    """Fetch a namespaced setting using ``get_json``/``get`` fallbacks."""
+
+    if settings_obj is None:
+        return default
+
+    for attr in ("get_json", "get"):
+        getter = getattr(settings_obj, attr, None)
+        if not callable(getter):
+            continue
+        try:
+            value = getter(key, scope="namespace", namespace=namespace)
+        except TypeError:
+            value = getter(key)
+        except Exception:
+            continue
+        if value is not None:
+            return value
+    return default
+
+
 def _extract_fts_map(settings_obj: Any, namespace: str) -> Dict[str, Any]:
     if settings_obj is None:
         return {}
@@ -975,6 +998,160 @@ def _log_inquiry(
         return None
 
 
+def _attempt_like_eq_fallback(
+    *,
+    question: str,
+    namespace: str,
+    table_name: str,
+    settings: Any,
+    fts_columns: List[str],
+    allowed_columns: List[str],
+    full_text_search: bool,
+    payload: Dict[str, Any],
+    prefixes: Sequence[str],
+    auth_email: Optional[str],
+    t0: float,
+    online_hints_applied: int,
+    online_intent: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    if not full_text_search:
+        return None
+
+    engine_value = _get_namespace_setting(settings, namespace, "DW_FTS_ENGINE", "like")
+    fts_engine = str(engine_value or "like").lower()
+    if fts_engine != "like":
+        return None
+
+    columns = [str(col).strip() for col in (fts_columns or []) if str(col).strip()]
+    if not columns:
+        return None
+
+    explicit_columns = allowed_columns or []
+    eq_filters = extract_eq_filters_from_text(question, explicit_columns)
+    cleaned_question = strip_eq_from_text(question, explicit_columns)
+    token_source = re.sub(r"\s+", " ", cleaned_question or question or "").strip()
+
+    def _clean_token(fragment: str) -> str:
+        text = re.sub(r"\s+", " ", fragment or "").strip()
+        if not text:
+            return ""
+        match = re.search(r"\bhas\b(.*)", text, flags=re.IGNORECASE)
+        if match and match.group(1).strip():
+            text = match.group(1).strip()
+        else:
+            text = re.sub(r"^(list|show|display|find|get|fetch)\s+", "", text, flags=re.IGNORECASE)
+            text = re.sub(r"^(all\s+)?contracts?\s*", "", text, flags=re.IGNORECASE)
+        return text.strip(" ,.")
+
+    tokens_groups: List[List[str]] = []
+    operator_between_groups = "OR"
+    parts: List[str] = []
+    if re.search(r"\band\b", token_source, flags=re.IGNORECASE):
+        parts = re.split(r"\band\b", token_source, flags=re.IGNORECASE)
+        operator_between_groups = "AND"
+    elif re.search(r"\bor\b", token_source, flags=re.IGNORECASE):
+        parts = re.split(r"\bor\b", token_source, flags=re.IGNORECASE)
+        operator_between_groups = "OR"
+    elif token_source:
+        parts = [token_source]
+
+    for part in parts:
+        token = _clean_token(part)
+        if token:
+            tokens_groups.append([token])
+
+    binds: Dict[str, Any] = {}
+    where_terms: List[str] = []
+
+    if tokens_groups:
+        fts_sql, binds = build_like_fts_where(tokens_groups, columns, operator_between_groups, binds)
+        if fts_sql:
+            where_terms.append(fts_sql)
+
+    for idx, eq in enumerate(eq_filters):
+        column = str(eq.get("col") or "").strip()
+        value = eq.get("val")
+        if not column or value is None:
+            continue
+        bind_name = f"eq_{idx}"
+        binds[bind_name] = value
+        left = column
+        right = f":{bind_name}"
+        if eq.get("trim", True):
+            left = f"TRIM({left})"
+            right = f"TRIM({right})"
+        if eq.get("ci", True):
+            left = f"UPPER({left})"
+            right = f"UPPER({right})"
+        where_terms.append(f"{left} = {right}")
+
+    if not where_terms:
+        return None
+
+    base_sql = f'SELECT * FROM "{table_name}"'
+    sql = base_sql + " WHERE " + " AND ".join(where_terms)
+    sql = _append_order_by(sql, "REQUEST_DATE", descending=True)
+
+    sanitized_patch = {
+        key: value
+        for key, value in online_intent.items()
+        if key not in {"fts_tokens", "fts_columns", "fts_operator", "fts_op", "full_text_search"}
+    }
+    online_meta: Dict[str, Any] = {}
+    if sanitized_patch:
+        sql, binds, online_meta = _apply_online_rate_hints(sql, binds, sanitized_patch)
+
+    binds = _coerce_bind_dates(binds)
+    rows, cols, exec_meta = _execute_oracle(sql, binds)
+
+    inquiry_id = _log_inquiry(
+        question,
+        auth_email,
+        status="answered",
+        rows=len(rows),
+        prefixes=prefixes,
+        payload=payload,
+    )
+
+    duration_ms = int((time.time() - t0) * 1000)
+    meta = {
+        "strategy": "fts_like_fallback",
+        "binds": _json_safe_binds(binds),
+        **exec_meta,
+        "duration_ms": duration_ms,
+        "online_learning": {"hints": online_hints_applied, **online_meta},
+        "fts": {
+            "enabled": bool(tokens_groups),
+            "columns": columns,
+            "tokens": tokens_groups,
+            "operator": operator_between_groups,
+            "binds": [key for key in binds if str(key).startswith("fts_")],
+            "error": None,
+        },
+    }
+    if eq_filters:
+        meta["eq_filters"] = eq_filters
+
+    response = {
+        "ok": True,
+        "inquiry_id": inquiry_id,
+        "rows": rows,
+        "columns": cols,
+        "sql": sql,
+        "meta": meta,
+        "debug": {
+            "fts": meta["fts"],
+            "like_fallback": {
+                "tokens": tokens_groups,
+                "operator": operator_between_groups,
+                "eq_filters": eq_filters,
+            },
+            "online_learning": meta.get("online_learning"),
+        },
+    }
+    return response
+
+
 @dw_bp.post("/answer")
 def answer():
     t0 = time.time()
@@ -1012,12 +1189,18 @@ def answer():
 
     namespace = (payload.get("namespace") or "dw::common").strip() or "dw::common"
     table_name = _resolve_contract_table(settings, namespace)
+    initial_getter = getattr(settings, "get_json", None) or getattr(settings, "get", None)
+    allowed_columns_initial = load_explicit_filter_columns(
+        initial_getter,
+        namespace,
+        DEFAULT_EXPLICIT_FILTER_COLUMNS,
+    )
+    fts_map_initial = _extract_fts_map(settings, namespace)
+    fts_columns_initial = _resolve_fts_columns_from_map(fts_map_initial, table_name)
     if full_text_search:
-        fts_map_direct = _extract_fts_map(settings, namespace)
-        fts_columns_direct = _resolve_fts_columns_from_map(fts_map_direct, table_name)
         direct_groups, direct_mode = extract_fts_terms(question, force=False)
-        if direct_mode == "explicit" and direct_groups and fts_columns_direct:
-            direct_where, direct_binds = build_fts_where_groups(direct_groups, fts_columns_direct)
+        if direct_mode == "explicit" and direct_groups and fts_columns_initial:
+            direct_where, direct_binds = build_fts_where_groups(direct_groups, fts_columns_initial)
             if direct_where:
                 direct_sql = f'SELECT * FROM "{table_name}"\nWHERE {direct_where}'
             else:
@@ -1057,7 +1240,7 @@ def answer():
                     "enabled": True,
                     "mode": direct_mode,
                     "tokens": direct_groups,
-                    "columns": fts_columns_direct,
+                    "columns": fts_columns_initial,
                     "binds": list(binds.keys()),
                     "error": None,
                 },
@@ -1122,6 +1305,24 @@ def answer():
         if response["meta"].get("online_learning", {}).get("fts"):
             response["meta"]["fts"] = response["meta"]["online_learning"]["fts"]
         return jsonify(response)
+
+    like_response = _attempt_like_eq_fallback(
+        question=question,
+        namespace=namespace,
+        table_name=table_name,
+        settings=settings,
+        fts_columns=fts_columns_initial,
+        allowed_columns=allowed_columns_initial,
+        full_text_search=full_text_search,
+        payload=payload,
+        prefixes=prefixes,
+        auth_email=auth_email,
+        t0=t0,
+        online_hints_applied=online_hints_applied,
+        online_intent=online_intent,
+    )
+    if like_response is not None:
+        return jsonify(like_response)
 
     namespace = "dw::common"
 
