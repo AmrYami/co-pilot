@@ -32,6 +32,78 @@ class RateHints:
     top_n: Optional[int] = None
 
 
+_BASIC_EQ_RE = re.compile(r"\b(?:eq|filter)\s*:\s*([A-Z0-9_ ]+)\s*=\s*(.+?)(?:;|$)", re.IGNORECASE)
+_BASIC_FTS_RE = re.compile(r"\bfts\s*:\s*(.+?)(?:;|$)", re.IGNORECASE)
+_BASIC_GBY_RE = re.compile(r"\bgroup_by\s*:\s*([A-Z0-9_, ]+)", re.IGNORECASE)
+_BASIC_OBY_RE = re.compile(r"\border_by\s*:\s*([A-Z0-9_]+)(?:\s+(asc|desc))?", re.IGNORECASE)
+_BASIC_FLAGS_RE = re.compile(r"\(([^)]*)\)")
+
+
+def _parse_basic_flags(raw_val: str) -> Tuple[str, bool, bool]:
+    value = (raw_val or "").strip()
+    ci = False
+    trim = False
+    match = _BASIC_FLAGS_RE.search(value)
+    if match:
+        raw_flags = match.group(1) or ""
+        flags = [frag.strip().lower() for frag in raw_flags.split(",") if frag.strip()]
+        ci = any(flag in {"ci", "case_insensitive"} for flag in flags)
+        trim = "trim" in flags
+        value = _BASIC_FLAGS_RE.sub("", value).strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+        value = value[1:-1]
+    return value, ci, trim
+
+
+def parse_rate_comment(comment: str) -> Dict[str, Any]:
+    """Parse a free-form /dw/rate comment into structured filter hints."""
+
+    hints: Dict[str, Any] = {
+        "eq_filters": [],
+        "fts_tokens": [],
+        "fts_operator": "OR",
+        "group_by": None,
+        "sort_by": None,
+        "sort_desc": None,
+    }
+    if not comment:
+        return hints
+
+    fts_match = _BASIC_FTS_RE.search(comment)
+    if fts_match:
+        raw_tokens = fts_match.group(1)
+        tokens = [tok.strip() for tok in raw_tokens.split("|") if tok.strip()]
+        hints["fts_tokens"] = tokens
+
+    for col_raw, val_raw in _BASIC_EQ_RE.findall(comment or ""):
+        col = col_raw.strip().upper().replace(" ", "_")
+        value, ci, trim = _parse_basic_flags(val_raw)
+        if not col or value == "":
+            continue
+        hints["eq_filters"].append({
+            "col": col,
+            "val": value,
+            "ci": ci,
+            "trim": trim,
+            "op": "eq",
+        })
+
+    gby_match = _BASIC_GBY_RE.search(comment)
+    if gby_match:
+        cols = [frag.strip().upper().replace(" ", "_") for frag in gby_match.group(1).split(",") if frag.strip()]
+        hints["group_by"] = cols or None
+
+    oby_match = _BASIC_OBY_RE.search(comment)
+    if oby_match:
+        hints["sort_by"] = (oby_match.group(1) or "").strip().upper().replace(" ", "_") or None
+        direction = (oby_match.group(2) or "DESC").strip().lower()
+        hints["sort_desc"] = direction != "asc"
+
+    return hints
+
+
+
+
 _flags_re = re.compile(r"\(([^)]*)\)\s*$")
 
 
@@ -81,7 +153,7 @@ def _clean_value_literal(val: str) -> str:
     return val.strip().strip('"').strip("'")
 
 
-def parse_rate_comment(comment: str) -> RateHints:
+def parse_rate_comment_legacy(comment: str) -> RateHints:
     """
     Very small grammar:
       filter: COL = 'value' (ci, trim);
@@ -141,6 +213,9 @@ def parse_rate_comment(comment: str) -> RateHints:
             except ValueError:
                 pass
     return hints
+
+
+parse_rate_comment_rate_hints = parse_rate_comment_legacy
 
 
 _EQ_RE = re.compile(
