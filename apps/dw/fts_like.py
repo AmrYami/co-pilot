@@ -1,47 +1,57 @@
 from __future__ import annotations
 
-from typing import Dict, List, Tuple
+from typing import Dict, List, Sequence, Tuple
+
+LIKE_WRAP = "UPPER(NVL({col},'')) LIKE UPPER(:{b})"
 
 
-def _normalize_token(tok: str) -> str:
-    """Trim whitespace and strip surrounding quotes from a token."""
-    tok = (tok or "").strip()
-    if (tok.startswith("'") and tok.endswith("'")) or (
-        tok.startswith("\"") and tok.endswith("\"")
-    ):
-        tok = tok[1:-1].strip()
-    return tok
-
-
-def _like_group(columns: List[str], bind_name: str) -> str:
-    """Build an OR group of LIKE clauses across the provided columns."""
-    ors: List[str] = []
+def _group_sql_for_token(token_bind: str, columns: Sequence[str]) -> str:
+    ors = []
     for col in columns:
-        ors.append(f"UPPER(NVL({col},'')) LIKE UPPER(:{bind_name})")
+        ors.append(LIKE_WRAP.format(col=col, b=token_bind))
     return "(" + " OR ".join(ors) + ")"
 
 
+def build_fts_where(
+    tokens_groups: List[List[str]],
+    columns: Sequence[str],
+    op_between_groups: str = "OR",
+    bind_prefix: str = "fts",
+) -> Tuple[str, Dict[str, str]]:
+    if not tokens_groups or not columns:
+        return "", {}
+
+    sql_groups: List[str] = []
+    binds: Dict[str, str] = {}
+    idx = 0
+    for group in tokens_groups:
+        ors = []
+        for tok in group:
+            token = (tok or "").strip()
+            if not token:
+                continue
+            bind_name = f"{bind_prefix}_{idx}"
+            binds[bind_name] = f"%{token}%"
+            ors.append(_group_sql_for_token(bind_name, columns))
+            idx += 1
+        if not ors:
+            continue
+        if len(ors) == 1:
+            sql_groups.append(ors[0])
+        else:
+            sql_groups.append("(" + " OR ".join(ors) + ")")
+
+    if not sql_groups:
+        return "", {}
+
+    joiner = " AND " if (op_between_groups or "OR").upper() == "AND" else " OR "
+    return "(" + joiner.join(sql_groups) + ")", binds
+
+
 def build_fts_like_where(
-    tokens: List[str],
-    columns: List[str],
+    columns: Sequence[str],
+    tokens: Sequence[str],
     operator: str = "OR",
 ) -> Tuple[str, Dict[str, str]]:
-    """Return a LIKE-based WHERE fragment and binds for FTS tokens."""
-    tokens = [t for t in (tokens or []) if str(t or "").strip()]
-    if not tokens or not columns:
-        return "", {}
-
-    groups: List[str] = []
-    binds: Dict[str, str] = {}
-    for idx, raw_token in enumerate(tokens):
-        token = _normalize_token(raw_token)
-        if not token:
-            continue
-        bind_name = f"fts_{idx}"
-        binds[bind_name] = f"%{token}%"
-        groups.append(_like_group(columns, bind_name))
-
-    if not groups:
-        return "", {}
-    glue = " AND " if (operator or "").upper() == "AND" else " OR "
-    return "(" + glue.join(groups) + ")", binds
+    token_groups = [[tok] for tok in tokens or []]
+    return build_fts_where(token_groups, columns, operator)

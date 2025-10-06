@@ -9,7 +9,9 @@ __all__ = [
     "parse_eq_filters_from_text",
     "build_eq_where_and_binds",
     "extract_eq_filters_from_text",
+    "extract_eq_filters_from_natural_text",
     "normalize_column",
+    "normalize_name",
     "parse_rate_comment",
     "strip_eq_from_text",
 ]
@@ -22,6 +24,11 @@ _EQ_RE = re.compile(
     ['\"]?(?P<val>[^'\"]+)['\"]?
     """,
     re.IGNORECASE | re.VERBOSE,
+)
+
+_EQ_PAT = re.compile(
+    r"(?:(?<=^)|(?<=\s)|(?<=,)|(?<=;))(?P<col>[A-Za-z0-9_ ]{1,64})\s*(?:=|==|equals|is)\s*['\"]?(?P<val>[^'\",]+?)['\"]?(?=\s|$)",
+    re.IGNORECASE,
 )
 
 # Column synonyms supported for quick mapping from display names.
@@ -56,6 +63,10 @@ def _canon(value: str | None) -> str:
     return re.sub(r"[\s\-]+", "_", cleaned).upper()
 
 
+def normalize_name(s: str) -> str:
+    return re.sub(r"\s+", "_", (s or "").strip()).upper()
+
+
 def _normalize_explicit_columns(columns: Iterable[str]) -> Dict[str, str]:
     mapping: Dict[str, str] = {}
     for col in columns or []:
@@ -86,6 +97,36 @@ def _map_to_real_column(raw: str, explicit: Dict[str, str]) -> str:
             return explicit[alias_key]
         return alias_target
     return canonical if canonical in explicit else ""
+
+
+def extract_eq_filters_from_natural_text(
+    text: str,
+    explicit_columns: Iterable[str],
+) -> List[Tuple[str, str]]:
+    pairs: List[Tuple[str, str]] = []
+    allowed = {
+        normalize_name(col): re.sub(r"\s+", "_", str(col).strip().upper())
+        for col in (explicit_columns or [])
+        if col
+    }
+    if not allowed or not text:
+        return pairs
+
+    for match in _EQ_PAT.finditer(text or ""):
+        raw_col = match.group("col") or ""
+        col_key = normalize_name(raw_col)
+        if col_key not in allowed:
+            for candidate in allowed:
+                if candidate in col_key:
+                    col_key = candidate
+                    break
+            else:
+                continue
+        value = (match.group("val") or "").strip()
+        if not value:
+            continue
+        pairs.append((allowed[col_key], value))
+    return pairs
 
 
 def parse_eq_filters_from_text(

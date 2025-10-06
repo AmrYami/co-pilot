@@ -32,27 +32,28 @@ class RateHints:
     top_n: Optional[int] = None
 
 
-_BASIC_EQ_RE = re.compile(r"\b(?:eq|filter)\s*:\s*([A-Z0-9_ ]+)\s*=\s*(.+?)(?:;|$)", re.IGNORECASE)
-_BASIC_FTS_RE = re.compile(r"\bfts\s*:\s*(.+?)(?:;|$)", re.IGNORECASE)
-_BASIC_GBY_RE = re.compile(r"\bgroup_by\s*:\s*([A-Z0-9_, ]+)", re.IGNORECASE)
-_BASIC_OBY_RE = re.compile(r"\border_by\s*:\s*([A-Z0-9_]+)(?:\s+(asc|desc))?", re.IGNORECASE)
-_BASIC_FLAGS_RE = re.compile(r"\(([^)]*)\)")
+_BASIC_EQ_RE = re.compile(r"\beq\s*:\s*([A-Za-z0-9_ ]+?)\s*=\s*([^;]+)", re.IGNORECASE)
+_BASIC_FTS_RE = re.compile(r"\bfts\s*:\s*([^;]+)", re.IGNORECASE)
+_BASIC_GBY_RE = re.compile(r"\bgroup_by\s*:\s*([A-Za-z0-9_, ]+)", re.IGNORECASE)
+_BASIC_OBY_RE = re.compile(r"\border_by\s*:\s*([A-Za-z0-9_]+)(?:\s+(asc|desc))?", re.IGNORECASE)
+_BASIC_GROSS_RE = re.compile(r"\bgross\s*:\s*(true|false)", re.IGNORECASE)
+_FLAG_RE = re.compile(r"\(([^)]*)\)\s*$")
 
 
 def _parse_basic_flags(raw_val: str) -> Tuple[str, bool, bool]:
     value = (raw_val or "").strip()
     ci = False
     trim = False
-    match = _BASIC_FLAGS_RE.search(value)
+    match = _FLAG_RE.search(value)
     if match:
         raw_flags = match.group(1) or ""
         flags = [frag.strip().lower() for frag in raw_flags.split(",") if frag.strip()]
         ci = any(flag in {"ci", "case_insensitive"} for flag in flags)
         trim = "trim" in flags
-        value = _BASIC_FLAGS_RE.sub("", value).strip()
+        value = _FLAG_RE.sub("", value).strip()
     if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
         value = value[1:-1]
-    return value, ci, trim
+    return value.strip(), ci, trim
 
 
 def parse_rate_comment(comment: str) -> Dict[str, Any]:
@@ -65,6 +66,7 @@ def parse_rate_comment(comment: str) -> Dict[str, Any]:
         "group_by": None,
         "sort_by": None,
         "sort_desc": None,
+        "gross": None,
     }
     if not comment:
         return hints
@@ -76,12 +78,12 @@ def parse_rate_comment(comment: str) -> Dict[str, Any]:
         hints["fts_tokens"] = tokens
 
     for col_raw, val_raw in _BASIC_EQ_RE.findall(comment or ""):
-        col = col_raw.strip().upper().replace(" ", "_")
+        column = (col_raw or "").strip().upper().replace(" ", "_")
         value, ci, trim = _parse_basic_flags(val_raw)
-        if not col or value == "":
+        if not column or not value:
             continue
         hints["eq_filters"].append({
-            "col": col,
+            "col": column,
             "val": value,
             "ci": ci,
             "trim": trim,
@@ -98,6 +100,10 @@ def parse_rate_comment(comment: str) -> Dict[str, Any]:
         hints["sort_by"] = (oby_match.group(1) or "").strip().upper().replace(" ", "_") or None
         direction = (oby_match.group(2) or "DESC").strip().lower()
         hints["sort_desc"] = direction != "asc"
+
+    gross_match = _BASIC_GROSS_RE.search(comment)
+    if gross_match:
+        hints["gross"] = (gross_match.group(1) or "").strip().lower() == "true"
 
     return hints
 
