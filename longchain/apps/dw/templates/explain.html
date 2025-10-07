@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>DW Explain</title>
+    <style>
+      body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 24px; color: #1f2937; }
+      .card { border: 1px solid #e5e7eb; border-radius: 8px; padding: 16px; margin-bottom: 16px; background: #fff; }
+      h1 { font-size: 20px; margin-bottom: 12px; }
+      h2 { font-size: 16px; margin: 16px 0 8px; }
+      pre { background: #f9fafb; border: 1px solid #e5e7eb; padding: 12px; border-radius: 6px; overflow: auto; }
+      code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+      .kv { display: grid; grid-template-columns: 220px 1fr; gap: 8px 16px; }
+      .muted { color: #6b7280; }
+      .badge { display: inline-block; padding: 2px 8px; border: 1px solid #d1d5db; border-radius: 999px; font-size: 12px; margin-right: 6px; background: #f9fafb; }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h1>Explain — Interpretation</h1>
+      <p>{{ explain_text }}</p>
+    </div>
+
+    <div class="card">
+      <h2>Summary</h2>
+      <div class="kv">
+        <div class="muted">Order By</div><div>{{ explain_struct.order_by.column }} {{ "DESC" if explain_struct.order_by.desc else "ASC" }}</div>
+        <div class="muted">Group By</div><div>{{ explain_struct.group_by or "—" }}</div>
+        <div class="muted">Gross</div><div>{{ "enabled" if explain_struct.gross.enabled else "disabled" }}</div>
+        <div class="muted">FTS</div>
+        <div>
+          {% if explain_struct.fts.enabled %}
+            <span class="badge">{{ explain_struct.fts.operator }}</span>
+            {% for t in explain_struct.fts.tokens %}<span class="badge">{{ t }}</span>{% endfor %}
+          {% else %}disabled{% endif %}
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>SQL</h2>
+      <pre><code>{{ sql }}</code></pre>
+    </div>
+
+    <div class="card">
+      <h2>Binds</h2>
+      <pre><code>{{ binds|tojson(indent=2) }}</code></pre>
+    </div>
+
+    <div class="card">
+      <h2>Debug (raw)</h2>
+      <pre><code>{{ debug|tojson(indent=2) }}</code></pre>
+    </div>
+  </body>
+</html>

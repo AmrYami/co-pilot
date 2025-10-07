@@ -11,7 +11,7 @@ from flask import Blueprint, jsonify, render_template, request
 
 from . import settings as dw_settings
 from .examples import retrieve_examples_for_question, save_example_if_positive
-from .explain import build_user_explain
+from .explain import build_explain, build_user_explain
 from .fts import build_fts_where
 from .rules import choose_canary
 from .settings import Settings
@@ -281,6 +281,14 @@ def answer() -> Any:
         "rows": [],
     }
 
+    try:
+        explain_text, explain_struct = build_explain(response)
+        response["explain"] = explain_text
+        response.setdefault("debug", {}).setdefault("explain_struct", explain_struct)
+    except Exception:
+        # Never block the response because of explain formatting.
+        pass
+
     snapshot = {
         "inquiry_id": inquiry_id,
         "question": question,
@@ -294,6 +302,25 @@ def answer() -> Any:
     save_answer_snapshot(inquiry_id, snapshot)
 
     return jsonify(response)
+
+
+@dw_bp.post("/admin/explain")
+def admin_explain() -> Any:
+    """Render a lightweight HTML view of the explain payload."""
+
+    payload = request.get_json(force=True) or {}
+    text, struct = build_explain(payload)
+    debug = payload.get("debug", {}) or {}
+    sql = payload.get("sql", "") or ""
+    binds = (payload.get("meta") or {}).get("binds") or {}
+    return render_template(
+        "explain.html",
+        explain_text=text,
+        explain_struct=struct,
+        sql=sql,
+        debug=debug,
+        binds=binds,
+    )
 
 
 @dw_bp.post("/rate")
@@ -400,6 +427,7 @@ __all__ = [
     "answer",
     "rate",
     "explain_view",
+    "admin_explain",
     "save_answer_snapshot",
     "load_answer_snapshot",
 ]
