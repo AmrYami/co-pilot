@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DW Explain</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 24px; line-height: 1.5; }
+    .card { border: 1px solid #ddd; border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+    .k { color:#666; font-weight:600; }
+    pre { background: #f7f7f7; padding: 12px; border-radius: 6px; overflow:auto; }
+    code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }
+    h1 { font-size: 20px; margin: 0 0 12px; }
+    .pill { display:inline-block; padding:2px 8px; border-radius:999px; background:#eee; margin-right:6px; font-size:12px; }
+  </style>
+</head>
+<body>
+  <h1>Answer Explanation</h1>
+  <div class="card">
+    <div><span class="k">Inquiry ID:</span> {{ data.inquiry_id }}</div>
+    <div><span class="k">Question:</span> {{ data.question }}</div>
+    <div><span class="k">Date Column:</span> {{ data.intent.date_column }}</div>
+    <div><span class="k">Group By:</span> {{ data.intent.group_by or 'None' }}</div>
+    <div><span class="k">Order By:</span> {{ data.intent.sort_by or 'None' }} {{ 'DESC' if data.intent.sort_desc else 'ASC' if data.intent.sort_by else '' }}</div>
+    <div><span class="k">Gross:</span> {{ 'Yes' if data.meta.gross or (data.intent.measure_sql and 'VAT' in data.intent.measure_sql|upper) else 'No' }}</div>
+  </div>
+
+  <div class="card">
+    <div><span class="k">Equality Filters:</span></div>
+    {% if data.intent.eq_filters %}
+      <ul>
+        {% for f in data.intent.eq_filters %}
+          <li><code>{{ f.col }}</code> = <code>{{ f.val }}</code> (ci={{ 'true' if f.ci else 'false' }}, trim={{ 'true' if f.trim else 'false' }})</li>
+        {% endfor %}
+      </ul>
+    {% else %}
+      <div>None</div>
+    {% endif %}
+  </div>
+
+  <div class="card">
+    <div><span class="k">Full Text Search:</span></div>
+    {% if data.fts and data.fts.enabled %}
+      <div>Engine: <span class="pill">{{ data.fts.engine or 'like' }}</span> Operator: <span class="pill">{{ data.intent.fts_operator or 'OR' }}</span></div>
+      <div>Columns ({{ data.fts.columns|length }}):</div>
+      <pre><code>{{ data.fts.columns|join(', ') }}</code></pre>
+      <div>Tokens:</div>
+      <pre><code>{{ data.intent.fts_tokens }}</code></pre>
+    {% else %}
+      <div>Disabled</div>
+    {% endif %}
+  </div>
+
+  <div class="card">
+    <div><span class="k">Final SQL:</span></div>
+    <pre><code>{{ data.sql }}</code></pre>
+  </div>
+  <div class="card">
+    <div><span class="k">Rationale:</span></div>
+    <div>{{ data.user_explain }}</div>
+  </div>
+</body>
+</html>

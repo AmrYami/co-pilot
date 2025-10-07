@@ -407,6 +407,7 @@ class GoldenCase:
     expect_agg: Optional[str] = None       # e.g. "count", "sum"
     expect_top_n: Optional[int] = None
     expect_binds: List[str] = field(default_factory=list)
+    explain_contains: List[str] = field(default_factory=list)
     assertions: Dict[str, Any] = field(default_factory=dict)
     assert_all_of: List[str] = field(default_factory=list)
     assert_any_of: List[str] = field(default_factory=list)
@@ -617,6 +618,9 @@ def _hydrate_case(raw: Dict[str, Any]) -> GoldenCase:
         expect_agg = raw.get("expect_agg"),
         expect_top_n = raw.get("expect_top_n"),
         expect_binds = _ensure_str_list(raw.get("expect_binds")),
+        explain_contains = _ensure_str_list(
+            raw.get("explain_contains") or expect.get("explain_contains")
+        ),
         assertions = raw.get("assertions") or {},
         assert_all_of = _ensure_str_list(raw.get("assert_all_of")) + assert_contains,
         assert_any_of = _ensure_str_list(raw.get("assert_any_of")),
@@ -654,6 +658,13 @@ def _check_expectations(case: GoldenCase, resp: Dict[str, Any]) -> Tuple[bool, L
         if missing_binds:
             ok = False
             reasons.append(f"Missing expected bind keys: {missing_binds}")
+
+    if case.explain_contains:
+        explain_text = str(meta.get("user_explain") or meta.get("explain") or "")
+        for frag in case.explain_contains:
+            if frag and frag not in explain_text:
+                ok = False
+                reasons.append(f"Explain missing fragment: {frag}")
 
     # 2) group by
     if case.expect_group_by:

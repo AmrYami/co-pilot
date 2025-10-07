@@ -24,6 +24,10 @@ cases:
       - "LIKE UPPER(:fts_0)"
       - "LIKE UPPER(:fts_1)"
       - "ORDER BY REQUEST_DATE DESC"
+    expect_not_contains:
+      - "Fallback listing"
+    explain_contains:
+      - "FTS("
 
   - id: patch_fts_and_tokens
     question: "list all contracts has it and home care"
