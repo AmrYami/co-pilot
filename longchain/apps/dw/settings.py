@@ -7,7 +7,7 @@ Falls back safely when the central settings service is unavailable.
 """
 
 from __future__ import annotations
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 import os
 import json
 import logging
@@ -17,6 +17,86 @@ log = logging.getLogger(__name__)
 # Local cache to avoid repeated round-trips
 _SETTINGS_CACHE: Dict[str, Any] = {}
 _NAMESPACE = "dw::common"
+
+
+class Settings:
+    """Minimal settings facade used by the lightweight longchain DW app.
+
+    The real DocuWare service talks to a central settings database. For the
+    purposes of the longchain test harness we only need a predictable accessor
+    that supports ``get``/``get_bool``/``get_int`` calls. Values can come from
+    three sources (in order):
+
+    1. Overrides passed at construction time (useful for tests).
+    2. Environment variables (``{namespace}.{key}`` or plain ``key``).
+    3. Provided default.
+
+    The implementation intentionally keeps the surface tiny to avoid pulling in
+    heavyweight database dependencies when the module is imported during unit
+    tests.
+    """
+
+    def __init__(self, *, namespace: str = _NAMESPACE, values: Optional[Dict[str, Any]] = None) -> None:
+        self.namespace = namespace
+        self._values: Dict[str, Any] = dict(values or {})
+
+    # ------------------------------------------------------------------
+    def _env_key(self, key: str) -> str:
+        return f"{self.namespace}.{key}" if self.namespace else key
+
+    # ------------------------------------------------------------------
+    def get(self, key: str, default: Any = None, *, scope: str = "namespace", namespace: Optional[str] = None) -> Any:
+        if namespace and namespace != self.namespace:
+            # naive multi-namespace support – construct a scoped helper on the fly
+            scoped = Settings(namespace=namespace, values=self._values)
+            return scoped.get(key, default, scope=scope)
+
+        if scope not in {"namespace", None}:  # pragma: no cover - defensive
+            return default
+
+        if key in self._values:
+            return self._values[key]
+
+        env_override = os.getenv(self._env_key(key))
+        if env_override is not None:
+            return env_override
+
+        env_plain = os.getenv(key)
+        if env_plain is not None:
+            return env_plain
+
+        return default
+
+    # ------------------------------------------------------------------
+    def get_bool(self, key: str, default: Optional[bool] = None, **kwargs: Any) -> Optional[bool]:
+        value = self.get(key, default=default, **kwargs)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered in {"1", "true", "t", "yes", "y", "on"}:
+                return True
+            if lowered in {"0", "false", "f", "no", "n", "off"}:
+                return False
+        if value is None:
+            return default
+        return bool(value)
+
+    # ------------------------------------------------------------------
+    def get_int(self, key: str, default: Optional[int] = None, **kwargs: Any) -> Optional[int]:
+        value = self.get(key, default=default, **kwargs)
+        if value is None:
+            return default
+        if isinstance(value, int):
+            return value
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    # ------------------------------------------------------------------
+    def update(self, **items: Any) -> None:
+        self._values.update(items)
 
 # --- Internal helpers ---------------------------------------------------------
 
