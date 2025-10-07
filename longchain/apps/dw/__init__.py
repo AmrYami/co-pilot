@@ -8,6 +8,7 @@ from .app import (
     save_answer_snapshot,
     load_answer_snapshot,
 )
+from .admin_ui import dw_admin_ui
 
 __all__ = [
     "dw_bp",
@@ -16,4 +17,5 @@ __all__ = [
     "explain_view",
     "save_answer_snapshot",
     "load_answer_snapshot",
+    "dw_admin_ui",
 ]

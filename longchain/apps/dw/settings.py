@@ -12,11 +12,20 @@ import os
 import json
 import logging
 
+try:  # pragma: no cover - optional dependency during tests
+    from sqlalchemy import create_engine, text
+except Exception:  # pragma: no cover - allow running without SQLAlchemy
+    create_engine = None  # type: ignore[assignment]
+
+    def text(sql: str):  # type: ignore
+        return sql
+
 log = logging.getLogger(__name__)
 
 # Local cache to avoid repeated round-trips
 _SETTINGS_CACHE: Dict[str, Any] = {}
 _NAMESPACE = "dw::common"
+_DW_SETTINGS_NAMESPACE = _NAMESPACE
 
 
 class Settings:
@@ -268,3 +277,80 @@ def get_enum_synonyms() -> Dict[str, Any]:
     if not isinstance(m, dict):
         return {}
     return m
+
+
+class DWSettings:
+    """Lightweight DB-backed settings facade for DW helpers."""
+
+    def __init__(self, url: Optional[str] = None) -> None:
+        self.mem_url = url or os.getenv("MEMORY_DB_URL")
+        self._cache: Dict[str, Any] = {}
+        self._engine = create_engine(self.mem_url) if (self.mem_url and create_engine) else None
+
+    # ------------------------------------------------------------------
+    def _fetch_all(self) -> Dict[str, Any]:
+        if self._cache:
+            return self._cache
+        if not self._engine:
+            return {}
+        try:
+            with self._engine.begin() as conn:
+                rows = (
+                    conn.execute(
+                        text(
+                            "SELECT key, value, value_type FROM settings WHERE namespace=:ns"
+                        ),
+                        {"ns": _DW_SETTINGS_NAMESPACE},
+                    )
+                    .mappings()
+                    .all()
+                )
+        except Exception:
+            return {}
+
+        data: Dict[str, Any] = {}
+        for row in rows:
+            val: Any = row.get("value")
+            vtype = row.get("value_type")
+            if vtype == "json" and isinstance(val, str):
+                try:
+                    val = json.loads(val)
+                except Exception:
+                    pass
+            data[str(row.get("key"))] = val
+        self._cache = data
+        return self._cache
+
+    # ------------------------------------------------------------------
+    def get(self, key: str, default: Any = None) -> Any:
+        return self._fetch_all().get(key, default)
+
+    # ------------------------------------------------------------------
+    def fts_engine(self) -> str:
+        value = (self.get("DW_FTS_ENGINE", "like") or "like").strip().lower()
+        if value not in {"like", "oracle-text"}:
+            value = "like"
+        return value
+
+    # ------------------------------------------------------------------
+    def fts_columns(self, table: str = "Contract") -> List[str]:
+        conf = self.get("DW_FTS_COLUMNS", {}) or {}
+        if not isinstance(conf, dict):
+            return []
+        if table in conf and isinstance(conf[table], list):
+            return list(conf[table])
+        if "*" in conf and isinstance(conf["*"], list):
+            return list(conf["*"])
+        return []
+
+    # ------------------------------------------------------------------
+    def explicit_eq_columns(self) -> List[str]:
+        data = self.get("DW_EXPLICIT_FILTER_COLUMNS", []) or []
+        if not isinstance(data, list):
+            return []
+        return [str(item) for item in data if str(item).strip()]
+
+    # ------------------------------------------------------------------
+    def enum_synonyms(self) -> Dict[str, Any]:
+        mapping = self.get("DW_ENUM_SYNONYMS", {}) or {}
+        return mapping if isinstance(mapping, dict) else {}

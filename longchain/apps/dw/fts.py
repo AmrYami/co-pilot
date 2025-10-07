@@ -1,113 +1,156 @@
-# longchain/apps/dw/fts.py
-# -*- coding: utf-8 -*-
-"""
-Full-text search (FTS) planner for DW.
-Builds safe, engine-aware WHERE clauses from natural-language tokens.
-
-Engine:
-- like          -> uses UPPER(NVL(col,'')) LIKE UPPER(:bind)
-- oracle-text   -> uses CONTAINS(col, :bind) > 0   (requires Oracle Text)
-
-AND / OR:
-- If the question contains explicit 'and' between phrases, groups are ANDed.
-- If it contains 'or' (or no explicit connector), groups are ORed by default.
-
-Stop-words:
-- Very small set to ignore irrelevant tokens.
-"""
-
+"""Full-text search helpers for the lightweight DW blueprint."""
 from __future__ import annotations
-from typing import List, Tuple, Dict, Any, Optional
+
 import re
-import logging
+from typing import Dict, List, Optional, Tuple
 
-from . import settings as dw_settings
+from .settings import DWSettings, get_fts_columns, get_fts_engine
+from .sql_utils import like_expr
 
-log = logging.getLogger(__name__)
+Token = str
+TokenGroup = List[Token]
+FTSInput = List[TokenGroup]
 
 _STOP_WORDS = {
-    "the", "a", "an", "of", "in", "on", "at", "for", "to", "by", "with",
-    "has", "have", "where", "all", "list", "show", "and", "or",
+    "the",
+    "a",
+    "an",
+    "of",
+    "in",
+    "on",
+    "at",
+    "for",
+    "to",
+    "by",
+    "with",
+    "has",
+    "have",
+    "where",
+    "all",
+    "list",
+    "show",
+    "and",
+    "or",
 }
 
-_TOKEN_SPLIT_RE = re.compile(r"[,\u060C;؛]+|\\band\\b|\\bor\\b", re.IGNORECASE)
-_AND_RE = re.compile(r"\\band\\b", re.IGNORECASE)
-_OR_RE  = re.compile(r"\\bor\\b", re.IGNORECASE)
-_WS_RE  = re.compile(r"\\s+")
+_EQ_FILTER_RE = re.compile(
+    r"[A-Za-z0-9_\"\.]+\s*=\s*(?:'[^']*'|\"[^\"]*\"|[A-Za-z0-9_./-]+)",
+    re.IGNORECASE,
+)
+_AND_SPLIT_RE = re.compile(r"(?i)\band\b")
+_OR_SPLIT_RE = re.compile(r"(?i)\bor\b")
+_PUNCT_SPLIT_RE = re.compile(r"[,\u060C;؛]+")
+_WS_RE = re.compile(r"\s+")
 
-def _normalize_tok(s: str) -> str:
-    return _WS_RE.sub(" ", (s or "").strip().lower())
+_dw_settings = DWSettings()
 
-def _is_meaningful(tok: str) -> bool:
-    if not tok:
-        return False
-    if tok in _STOP_WORDS:
-        return False
-    # token should have at least one alnum
-    return any(ch.isalnum() for ch in tok)
 
-def tokenize_fts_query(question: str) -> Tuple[List[List[str]], str]:
-    """
-    Split the question into token groups and decide the top-level operator.
-    Returns (groups, operator) where operator is "AND" or "OR".
+def _normalize(text: str) -> str:
+    return _WS_RE.sub(" ", (text or "").strip()).lower()
 
-    Examples:
-      "has it or home care"  -> groups: [["it"], ["home care"]], op="OR"
-      "has it and home care" -> groups: [["it"], ["home care"]], op="AND"
-      "it"                   -> groups: [["it"]], op="OR"
-    """
-    q = (question or "").strip()
-    if not q:
-        return [], "OR"
 
-    # Decide operator: explicit 'and' takes precedence, otherwise 'or', else OR
-    op = "OR"
-    has_and = bool(_AND_RE.search(q))
-    has_or  = bool(_OR_RE.search(q))
-    if has_and and not has_or:
-        op = "AND"
-    elif has_or and not has_and:
-        op = "OR"
-    elif has_and and has_or:
-        # Mixed case: prefer AND if 'and' appears between non-empty chunks
-        op = "AND"
+def _strip_eq_sections(text: str) -> str:
+    return _EQ_FILTER_RE.sub(" ", text or "")
 
-    # Split by 'and'/'or'/punctuation, but then reconstruct groups respectfully
-    raw_chunks = [c for c in _TOKEN_SPLIT_RE.split(q) if c is not None]
-    # Remove empty and normalize
-    norm_chunks = [_normalize_tok(c) for c in raw_chunks]
-    norm_chunks = [c for c in norm_chunks if _is_meaningful(c)]
 
-    # If nothing left, return empty
-    if not norm_chunks:
-        return [], op
+def _keywordize(chunk: str) -> List[str]:
+    words = [w for w in _WS_RE.split(chunk) if w]
+    keywords: List[str] = []
+    current: List[str] = []
+    for word in words:
+        lowered = word.lower()
+        if lowered in _STOP_WORDS:
+            if current:
+                keywords.append(" ".join(current))
+                current = []
+            continue
+        current.append(lowered)
+    if current:
+        keywords.append(" ".join(current))
+    return keywords
 
-    # Simple grouping: each chunk is its own group
-    groups = [[c] for c in norm_chunks]
-    return groups, op
 
-def _escape_like(token: str) -> str:
-    # Escape % and _ for LIKE. You can also add ESCAPE clause if needed.
-    return token.replace("%", "\\%").replace("_", "\\_")
+def _extract_group_tokens(part: str) -> List[str]:
+    part = _normalize(part)
+    if not part:
+        return []
+    # Remove punctuation and collapse whitespace again after normalization.
+    part = _PUNCT_SPLIT_RE.sub(" ", part)
+    part = _normalize(part)
 
-def _like_clause(col: str, bind: str) -> str:
-    return f"UPPER(NVL({col},'')) LIKE UPPER(:{bind})"
+    raw_tokens = [_normalize(tok) for tok in _OR_SPLIT_RE.split(part) if _normalize(tok)]
+    tokens: List[str] = []
+    for raw in raw_tokens:
+        keywords = _keywordize(raw)
+        if keywords:
+            tokens.extend(keywords)
+        else:
+            if raw and raw not in _STOP_WORDS:
+                tokens.append(raw)
+    # Deduplicate while preserving order
+    seen = set()
+    result = []
+    for token in tokens:
+        if token and token not in seen:
+            seen.add(token)
+            result.append(token)
+    return result
 
-def _contains_clause(col: str, bind: str) -> str:
-    return f"CONTAINS({col}, :{bind}) > 0"
+
+def parse_tokens(raw_tokens: List[str]) -> FTSInput:
+    """Parse caller-provided *raw_tokens* into AND/OR groups."""
+
+    if not raw_tokens:
+        return []
+    text = " ".join(token for token in raw_tokens if token)
+    text = _strip_eq_sections(text)
+    text = _PUNCT_SPLIT_RE.sub(" ", text)
+    text = _normalize(text)
+    if not text:
+        return []
+
+    parts = [seg for seg in _AND_SPLIT_RE.split(text) if seg]
+    if len(parts) > 1:
+        groups: FTSInput = []
+        for seg in parts:
+            tokens = _extract_group_tokens(seg)
+            if tokens:
+                groups.append(tokens)
+        return groups
+
+    tokens = _extract_group_tokens(text)
+    if not tokens:
+        return []
+    if len(tokens) == 1:
+        keywords = _keywordize(tokens[0])
+        if len(keywords) > 1:
+            return [[tok] for tok in keywords]
+    return [[tok] for tok in tokens]
+
+
+def _resolve_columns(table: str) -> List[str]:
+    cols = _dw_settings.fts_columns(table)
+    if cols:
+        return cols
+    return get_fts_columns(table)
+
+
+def _resolve_engine(default: str = "like") -> str:
+    engine = _dw_settings.fts_engine()
+    if engine:
+        return engine
+    return get_fts_engine(default)
+
 
 def build_fts_where(
     table: str,
     question: str,
     force_operator: Optional[str] = None,
 ) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
-    """
-    Build FTS WHERE SQL fragment + binds + debug.
-    Returns (where_sql, binds, debug)
-    """
-    # 1) Read settings
-    engine = dw_settings.get_fts_engine("like")
-    columns = dw_settings.get_fts_columns(table or "Contract")
+    """Build a WHERE fragment for FTS using configured columns."""
+
+    engine = _resolve_engine("like")
+    columns = _resolve_columns(table or "Contract")
 
     debug: Dict[str, Any] = {
         "enabled": False,
@@ -123,64 +166,70 @@ def build_fts_where(
         debug["error"] = "no_columns"
         return "", {}, debug
 
-    # 2) Tokenize
-    groups, default_op = tokenize_fts_query(question)
+    groups = parse_tokens([question])
     if not groups:
         debug["error"] = "no_tokens"
         return "", {}, debug
 
-    op = (force_operator or default_op or "OR").upper()
+    lower_question = (question or "").lower()
+    if force_operator:
+        op = force_operator.strip().upper()
+    elif " and " in lower_question:
+        op = "AND"
+    else:
+        op = "OR"
     if op not in {"AND", "OR"}:
         op = "OR"
 
-    # 3) Build SQL depending on engine
     binds: Dict[str, Any] = {}
-    clauses: List[str] = []
+    group_sqls: List[str] = []
     bind_idx = 0
+    debug_tokens: List[str] = []
 
-    try:
-        for g in groups:
-            # g is a list of tokens; combine inner columns by OR for each token
-            # (token matches if it appears in any column)
-            g_clauses: List[str] = []
-            for tok in g:
-                bind_name = f"fts_{bind_idx}"
-                bind_idx += 1
-                debug["tokens"].append(tok)
-                if engine == "like":
-                    val = f"%{_escape_like(tok)}%"
-                    binds[bind_name] = val
-                    col_ors = [ _like_clause(c, bind_name) for c in columns ]
-                elif engine == "oracle-text":
-                    # For Oracle Text we can use the token as-is (or wrap with double quotes)
-                    binds[bind_name] = tok
-                    col_ors = [ _contains_clause(c, bind_name) for c in columns ]
-                else:
-                    # Unknown engine -> fallback to like safely
-                    val = f"%{_escape_like(tok)}%"
-                    binds[bind_name] = val
-                    col_ors = [ _like_clause(c, bind_name) for c in columns ]
-                g_clauses.append("( " + " OR ".join(col_ors) + " )")
-
-            # Token group itself is an AND of its tokens (e.g. ["home", "care"] inside one chunk)
-            if len(g_clauses) == 1:
-                clauses.append(g_clauses[0])
+    for group in groups:
+        per_token_clauses: List[str] = []
+        for token in group:
+            token = token.strip()
+            if not token:
+                continue
+            bind_name = f"fts_{bind_idx}"
+            bind_idx += 1
+            debug_tokens.append(token)
+            if engine == "oracle-text":
+                binds[bind_name] = token
+                col_exprs = [f"CONTAINS({col}, :{bind_name}) > 0" for col in columns]
             else:
-                clauses.append("( " + " AND ".join(g_clauses) + " )")
+                binds[bind_name] = f"%{token}%"
+                col_exprs = [like_expr(col, bind_name, oracle=True) for col in columns]
+            per_token_clauses.append("( " + " OR ".join(col_exprs) + " )")
+        if per_token_clauses:
+            if len(per_token_clauses) == 1:
+                group_sqls.append(per_token_clauses[0])
+            else:
+                group_sqls.append("( " + " OR ".join(per_token_clauses) + " )")
 
-        # Top-level combine groups by op
-        if len(clauses) == 1:
-            where_sql = clauses[0]
-        else:
-            glue = f" {op} "
-            where_sql = "( " + glue.join(clauses) + " )"
-
-        debug["enabled"] = True
-        debug["operator"] = op
-        debug["binds"] = {k: v for k, v in binds.items()}
-        return where_sql, binds, debug
-
-    except Exception as ex:
-        log.exception("Failed to build FTS WHERE: %s", ex)
-        debug["error"] = "exception"
+    if not group_sqls:
+        debug["error"] = "no_tokens"
         return "", {}, debug
+
+    if len(group_sqls) == 1:
+        where_sql = group_sqls[0]
+    else:
+        glue = f" {op} "
+        where_sql = glue.join(f"( {clause} )" if not clause.strip().startswith("(") else clause for clause in group_sqls)
+
+    debug["enabled"] = True
+    debug["operator"] = op
+    debug["binds"] = dict(binds)
+    debug["tokens"] = debug_tokens
+
+    return where_sql, binds, debug
+
+
+__all__ = [
+    "Token",
+    "TokenGroup",
+    "FTSInput",
+    "parse_tokens",
+    "build_fts_where",
+]

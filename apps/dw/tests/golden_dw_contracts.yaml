@@ -895,3 +895,64 @@ cases:
   assert_sql_contains:
     - "ORDER BY TOTAL_GROSS ASC"
     - "FETCH FIRST 5 ROWS ONLY"
+
+# --- Equality + Synonyms: REQUEST TYPE = Renewal
+- name: request_type_renewal
+  request:
+    question: "Show contracts where REQUEST TYPE = Renewal"
+    full_text_search: false
+  expect:
+    ok: true
+    asserts:
+      sql_contains:
+        - 'FROM "Contract"'
+        - 'WHERE'
+        - 'REQUEST_TYPE'
+        - 'ORDER BY REQUEST_DATE DESC'
+      not_contains:
+        - 'Fallback listing ordered'
+      debug_flags:
+        contract_planner: true
+
+# --- FTS OR: it | home care + equality on ENTITY
+- name: fts_or_with_entity
+  request:
+    question: "list all contracts has it or home care and ENTITY = DSFH"
+    full_text_search: true
+  expect:
+    ok: true
+    asserts:
+      sql_contains:
+        - 'LIKE UPPER(:fts_0)'
+        - 'LIKE UPPER(:fts_1)'
+        - 'UPPER(TRIM(ENTITY))'
+        - 'ORDER BY REQUEST_DATE DESC'
+      debug_fts_enabled: true
+
+# --- Group-By by status for specific ENTITY_NO with gross measure
+- name: group_by_status_entityno
+  request:
+    question: "For ENTITY_NO = 'E-123', total and count by CONTRACT_STATUS."
+    full_text_search: false
+  expect:
+    ok: true
+    asserts:
+      sql_contains:
+        - 'GROUP BY CONTRACT_STATUS'
+        - 'COUNT(*)'
+        - 'NVL(CONTRACT_VALUE_NET_OF_VAT,0)'
+        - 'ORDER BY'
+      not_contains: ['Fallback listing ordered']
+
+# --- Bottom N / Lowest direction
+- name: bottom5_gross_last_month
+  request:
+    question: "bottom 5 by gross last month"
+  expect:
+    ok: true
+    asserts:
+      sql_contains:
+        - 'ORDER BY'
+        - 'ASC'
+        - 'FETCH FIRST 5 ROWS'
+
