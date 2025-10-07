@@ -1,0 +1,45 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>DW Rules & Patches</title>
+    <style>
+      body { font-family: system-ui, Arial, sans-serif; margin: 24px; }
+      table { border-collapse: collapse; width: 100%; }
+      th, td { border: 1px solid #ddd; padding: 8px; font-size: 14px; vertical-align: top; }
+      th { background: #f7f7f7; }
+      pre { margin: 0; white-space: pre-wrap; word-break: break-word; }
+      .actions form { display: inline-block; margin-right: 8px; }
+    </style>
+  </head>
+  <body>
+    <h2>DW Patches (proposed)</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>ID</th>
+          <th>Inquiry</th>
+          <th>Status</th>
+          <th>Created</th>
+          <th>Patch</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for p in patches %}
+        <tr>
+          <td>{{ p.id }}</td>
+          <td>{{ p.inquiry_id }}</td>
+          <td>{{ p.status }}</td>
+          <td>{{ p.created_at }}</td>
+          <td><pre>{{ p.patch_json }}</pre></td>
+          <td class="actions">
+            <form method="post" action="{{ url_for('admin_rules.approve', pid=p.id) }}"><button>Approve</button></form>
+            <form method="post" action="{{ url_for('admin_rules.reject', pid=p.id) }}"><button>Reject</button></form>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </body>
+</html>

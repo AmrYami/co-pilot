@@ -1493,3 +1493,14 @@ def answer():
 
 def create_dw_blueprint(*args, **kwargs):
     return dw_bp
+
+# ensure FTS engine check and default
+from apps.dw.settings import get_setting
+
+def fts_engine():
+    eng = (get_setting("DW_FTS_ENGINE", scope="namespace") or "like")
+    try:
+        eng = eng.lower()
+    except Exception:
+        eng = "like"
+    return "like" if eng not in ("like", "oracle-text") else eng
