@@ -1,0 +1,67 @@
+# Golden tests for Explain/FTS/Order/Group By cosmetics
+
+- name: "fts_or_contracts_it_or_homecare"
+  request:
+    endpoint: /dw/answer
+    body:
+      prefixes: []
+      question: "list all contracts has it or home care"
+      auth_email: "amr.yami1@gmail.com"
+      full_text_search: true
+  expect:
+    must_contain:
+      - "LIKE UPPER(:fts_0)"
+      - "LIKE UPPER(:fts_1)"
+      - "ORDER BY REQUEST_DATE DESC"
+    must_not_contain:
+      - "SELECT * FROM \"Contract\"\nORDER BY REQUEST_DATE DESC\nORDER BY REQUEST_DATE DESC"
+    require_order_by: "REQUEST_DATE"
+    require_order_dir: "DESC"
+    require_explain_contains:
+      - "Full‑text search"
+      - "Ordered by REQUEST_DATE DESC"
+
+- name: "eq_request_type_synonyms"
+  request:
+    endpoint: /dw/answer
+    body:
+      prefixes: []
+      question: "Show contracts where REQUEST TYPE = Renewal"
+      auth_email: "amr.yami1@gmail.com"
+  expect:
+    must_contain:
+      - "REQUEST_TYPE"
+      - "ORDER BY REQUEST_DATE DESC"
+    require_order_by: "REQUEST_DATE"
+    require_order_dir: "DESC"
+    require_explain_contains:
+      - "Applied equality filters"
+
+- name: "group_by_department_oul"
+  request:
+    endpoint: /dw/answer
+    body:
+      prefixes: []
+      question: "Total gross per DEPARTMENT_OUL"
+      auth_email: "amr.yami1@gmail.com"
+  expect:
+    must_contain:
+      - "GROUP BY DEPARTMENT_OUL"
+    require_group_by: "DEPARTMENT_OUL"
+    require_explain_contains:
+      - "Grouped by: DEPARTMENT_OUL"
+
+- name: "lowest_direction_check"
+  request:
+    endpoint: /dw/answer
+    body:
+      prefixes: []
+      question: "show lowest contracts by value"
+      auth_email: "amr.yami1@gmail.com"
+  expect:
+    must_contain:
+      - "ORDER BY"
+      - "ASC"
+    require_order_dir: "ASC"
+    require_explain_contains:
+      - "Ordered by"
