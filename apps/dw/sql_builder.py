@@ -18,6 +18,7 @@ except Exception:  # pragma: no cover - fallback used in tests
 
 from apps.dw.fts_utils import DEFAULT_CONTRACT_FTS_COLUMNS
 from apps.dw.settings_defaults import DEFAULT_EXPLICIT_FILTER_COLUMNS
+from apps.dw.settings import get_setting as _rate_get_setting
 
 
 def _wrap_ci_trim(col_expr: str, bind_name: str, ci: bool, trim: bool) -> str:
@@ -658,3 +659,151 @@ def _ensure_single_order_by(sql: str) -> str:
             continue
         kept.append(line)
     return "\n".join(kept)
+
+
+GROSS_EXPR_RATE = "NVL(CONTRACT_VALUE_NET_OF_VAT,0) + CASE WHEN NVL(VAT,0) BETWEEN 0 AND 1 THEN NVL(CONTRACT_VALUE_NET_OF_VAT,0) * NVL(VAT,0) ELSE NVL(VAT,0) END"
+
+
+def _rate_build_fts_where(fts: Dict[str, Any], binds: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+    engine = (_rate_get_setting("DW_FTS_ENGINE", scope="namespace") or "like")
+    try:
+        engine = engine.lower()
+    except Exception:
+        engine = "like"
+    if not fts or not fts.get("enabled") or engine != "like":
+        return "", binds
+    columns: List[str] = fts.get("columns") or []
+    groups: List[List[str]] = fts.get("tokens") or []
+    operator = fts.get("operator", "OR")
+    clauses: List[str] = []
+    for g in groups:
+        g_clauses: List[str] = []
+        for tok in g:
+            idx = len([k for k in binds.keys() if k.startswith("fts_")])
+            bname = f"fts_{idx}"
+            binds[bname] = f"%{tok}%"
+            col_clauses = [f"UPPER(NVL({c},'')) LIKE UPPER(:{bname})" for c in columns]
+            g_clauses.append("(" + " OR ".join(col_clauses) + ")")
+        if g_clauses:
+            group_expr = "(" + (" AND ".join(g_clauses) if len(g_clauses) > 1 else g_clauses[0]) + ")"
+            clauses.append(group_expr)
+    if not clauses:
+        return "", binds
+    joiner = " OR " if (operator or "OR").upper() == "OR" else " AND "
+    return "(" + joiner.join(clauses) + ")", binds
+
+
+def _rate_build_eq_where(eq_filters: List[Dict[str, Any]], enum_syn: Dict[str, Any], binds: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+    if not eq_filters:
+        return "", binds
+    parts: List[str] = []
+    for ef in eq_filters:
+        col = ef.get("col")
+        val = ef.get("val")
+        ci = bool(ef.get("ci", True))
+        tr = bool(ef.get("trim", True))
+        if not col:
+            continue
+        col_sql = str(col)
+        if str(col).upper() == "REQUEST_TYPE" and enum_syn:
+            equals: List[str] = []
+            prefix: List[str] = []
+            contains: List[str] = []
+            for cfg in enum_syn.values():
+                equals += cfg.get("equals", [])
+                prefix += cfg.get("prefix", [])
+                contains += cfg.get("contains", [])
+            equals = list({e.upper().strip(): e for e in equals}.keys())
+            prefix = [p.upper().strip() for p in prefix]
+            contains = [c.upper().strip() for c in contains]
+            sub: List[str] = []
+            if equals:
+                eq_list = equals + [str(val).upper()]
+                eq_binds: List[str] = []
+                for v in eq_list:
+                    idx = len([k for k in binds.keys() if k.startswith(f"eq_{col}_")])
+                    bname = f"eq_{col}_{idx}"
+                    binds[bname] = v
+                    eq_binds.append(f":{bname}")
+                target = "UPPER(TRIM({}))".format(col_sql) if tr else col_sql
+                if ci:
+                    target = f"UPPER({target})"
+                sub.append(f"{target} IN (" + ",".join(eq_binds) + ")")
+            for pf in prefix:
+                idx = len([k for k in binds.keys() if k.startswith(f"pf_{col}_")])
+                bname = f"pf_{col}_{idx}"
+                binds[bname] = f"{pf}%"
+                target = "TRIM({})".format(col_sql) if tr else col_sql
+                target = f"UPPER({target})" if ci else target
+                sub.append(f"{target} LIKE :{bname}")
+            for ct in contains:
+                idx = len([k for k in binds.keys() if k.startswith(f"ct_{col}_")])
+                bname = f"ct_{col}_{idx}"
+                binds[bname] = f"%{ct}%"
+                target = "TRIM({})".format(col_sql) if tr else col_sql
+                target = f"UPPER({target})" if ci else target
+                sub.append(f"{target} LIKE :{bname}")
+            if sub:
+                parts.append("(" + " OR ".join(sub) + ")")
+            continue
+        idx = len([k for k in binds.keys() if k.startswith(f"eq_{col}_")])
+        bname = f"eq_{col}_{idx}"
+        binds[bname] = val
+        lhs = col_sql
+        rhs = f":{bname}"
+        if tr:
+            lhs = f"TRIM({lhs})"
+            rhs = f"TRIM({rhs})"
+        if ci:
+            lhs = f"UPPER({lhs})"
+            rhs = f"UPPER({rhs})"
+        parts.append(f"{lhs} = {rhs}")
+    return ("(" + " AND ".join(parts) + ")" if parts else ""), binds
+
+
+def _rate_build_group_select(group_by: Optional[str], use_gross: bool) -> Tuple[str, str, str]:
+    if not group_by:
+        return "SELECT *", "", ""
+    alias = "TOTAL_GROSS" if use_gross else "CNT"
+    measure = GROSS_EXPR_RATE if use_gross else "COUNT(*)"
+    select = f"SELECT {group_by} AS GROUP_KEY, {measure} AS {alias}"
+    group_clause = f" GROUP BY {group_by}"
+    return select, group_clause, alias
+
+
+def _rate_build_order_by(sort_by: Optional[str], sort_desc: bool) -> str:
+    if not sort_by:
+        return " ORDER BY REQUEST_DATE DESC"
+    direction = "DESC" if sort_desc else "ASC"
+    return f" ORDER BY {sort_by} {direction}"
+
+
+def _rate_build_fetch(top_n: Any) -> str:
+    try:
+        n = int(top_n) if top_n is not None else None
+    except Exception:
+        n = None
+    return f" FETCH FIRST {n} ROWS ONLY" if n else ""
+
+
+def build_rate_sql(intent: Dict[str, Any], enum_syn: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+    binds: Dict[str, Any] = {}
+    select, group_clause, alias = _rate_build_group_select(intent.get("group_by"), bool(intent.get("gross")))
+    where_parts: List[str] = []
+    eq_clause, binds = _rate_build_eq_where(intent.get("eq_filters") or [], enum_syn, binds)
+    if eq_clause:
+        where_parts.append(eq_clause)
+    fts_clause, binds = _rate_build_fts_where(intent.get("fts") or {}, binds)
+    if fts_clause:
+        where_parts.append(fts_clause)
+    where_sql = " WHERE " + " AND ".join(where_parts) if where_parts else ""
+    sort_by = intent.get("sort_by")
+    sort_desc = bool(intent.get("sort_desc"))
+    if intent.get("group_by") and not sort_by:
+        sort_by = alias
+        sort_desc = True
+    order_sql = _rate_build_order_by(sort_by or "REQUEST_DATE", sort_desc if sort_by else True)
+    fetch_sql = _rate_build_fetch(intent.get("top_n"))
+    sql = f"{select} FROM \"Contract\"{where_sql}{group_clause}{order_sql}{fetch_sql}"
+    return sql, binds
+

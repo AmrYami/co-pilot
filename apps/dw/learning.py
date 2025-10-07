@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, Optional
+import re
+from typing import Any, Dict, Optional, List
 
 from sqlalchemy import text
+import sqlalchemy as sa
 
+from apps.dw.settings import get_setting
 
 _DDL_STATEMENTS = (
     """
@@ -33,7 +36,16 @@ _DDL_STATEMENTS = (
       rating INT NOT NULL,
       comment TEXT,
       patch_payload JSONB,
-      status TEXT NOT NULL DEFAULT 'pending'
+      status TEXT NOT NULL DEFAULT 'proposed'
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS dw_feedback (
+      id SERIAL PRIMARY KEY,
+      inquiry_id BIGINT,
+      rating INT,
+      comment TEXT,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW()
     )
     """,
 )
@@ -219,5 +231,92 @@ __all__ = [
     "load_rules_for_question",
     "save_patch",
     "save_positive_rule",
+    "record_feedback",
+    "to_patch_from_comment",
 ]
+
+
+
+_ENGINE: Optional[sa.Engine] = None
+
+
+def _engine() -> Optional[sa.Engine]:
+    global _ENGINE
+    if _ENGINE is None:
+        url = get_setting("MEMORY_DB_URL", scope="global")
+        if not url:
+            return None
+        _ENGINE = sa.create_engine(url, pool_pre_ping=True, future=True)
+        _ensure_tables(_ENGINE)
+    return _ENGINE
+
+
+def record_feedback(inquiry_id: int, rating: int, comment: str) -> None:
+    eng = _engine()
+    if not eng:
+        return
+    with eng.begin() as cx:
+        cx.execute(
+            text("INSERT INTO dw_feedback(inquiry_id, rating, comment) VALUES(:iid, :rating, :comment)"),
+            {"iid": inquiry_id, "rating": int(rating) if rating is not None else None, "comment": comment},
+        )
+
+
+_RE_EQ = re.compile(r"\beq:\s*([A-Za-z0-9_ ]+)\s*=\s*([^\;]+)", re.I)
+_RE_FTS = re.compile(r"\bfts:\s*([^\;]+)", re.I)
+_RE_GB = re.compile(r"\bgroup_by:\s*([A-Za-z0-9_ ]+)", re.I)
+_RE_GROSS = re.compile(r"\bgross:\s*(true|false)\b", re.I)
+_RE_ORDER = re.compile(r"\border_by:\s*([A-Za-z0-9_ ]+)\s*(asc|desc)?", re.I)
+_RE_TOP = re.compile(r"\btop\s+(\d+)\b", re.I)
+_RE_BOTTOM = re.compile(r"\bbottom\s+(\d+)\b", re.I)
+
+
+def to_patch_from_comment(comment: str) -> Dict[str, Any]:
+    c = comment or ""
+    eq_filters: List[Dict[str, Any]] = []
+    for m in _RE_EQ.finditer(c):
+        col = m.group(1).strip().replace(" ", "_").upper()
+        val = m.group(2).strip().strip("'\"")
+        eq_filters.append({"col": col, "val": val, "ci": True, "trim": True})
+    fts_tokens: Optional[List[str]] = None
+    m = _RE_FTS.search(c)
+    if m:
+        raw = m.group(1)
+        parts = [p.strip() for p in raw.split("|") if p.strip()]
+        if parts:
+            fts_tokens = parts
+    gb = None
+    m = _RE_GB.search(c)
+    if m:
+        gb = m.group(1).strip().replace(" ", "_").upper()
+    gross = None
+    m = _RE_GROSS.search(c)
+    if m:
+        gross = (m.group(1).lower() == "true")
+    sort_by = None
+    sort_desc = True
+    m = _RE_ORDER.search(c)
+    if m:
+        sort_by = m.group(1).strip().upper()
+        if m.group(2):
+            sort_desc = (m.group(2).lower() == "desc")
+    top_n = None
+    m = _RE_TOP.search(c)
+    if m:
+        top_n = int(m.group(1))
+        sort_desc = False
+    m = _RE_BOTTOM.search(c)
+    if m:
+        top_n = int(m.group(1))
+        sort_desc = True
+    return {
+        "eq_filters": eq_filters,
+        "fts_tokens": fts_tokens,
+        "fts_operator": "OR",
+        "group_by": gb,
+        "gross": gross,
+        "sort_by": sort_by,
+        "sort_desc": sort_desc,
+        "top_n": top_n,
+    }
 

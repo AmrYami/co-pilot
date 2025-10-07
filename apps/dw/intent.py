@@ -1,6 +1,6 @@
 from __future__ import annotations
 import re
-from typing import Optional, List, Dict, Any, TYPE_CHECKING, Iterable
+from typing import Optional, List, Dict, Any, TYPE_CHECKING, Iterable, Tuple
 
 from apps.dw.filters import eq_filters_to_where
 from apps.dw.fts import build_like_fts_where, build_fts_tokens
@@ -9,6 +9,7 @@ from apps.dw.nlp.parse import extract_equalities_first, normalize_question
 from apps.dw.tables import for_namespace
 from apps.dw.tables.base import TableSpec
 from apps.dw.tables.contract import ContractSpec
+from apps.dw.settings import get_setting
 from pydantic import BaseModel, Field
 from word2number import w2n
 from dateutil.relativedelta import relativedelta
@@ -613,4 +614,172 @@ def derive_intent(payload: Dict[str, Any]) -> Dict[str, Any]:
         "gross": None,
     }
 
+    return intent
+
+
+# ------------------------------
+# Intent utilities (FTS / EQ / GROUP BY / TOP/BOTTOM)
+# ------------------------------
+
+_EQ_PATTERNS = [
+    r"(?P<col>[\w\s\._]+?)\s*(?:=|==|is|equals)\s*[\"“”'`](?P<val_quoted>[^\"“”'`]+)[\"“”'`]",  # with quotes
+    r"(?P<col>[\w\s\._]+?)\s*(?:=|==|is|equals)\s*(?P<val>[^,;]+)"                                   # without quotes
+]
+
+_TOP_PAT = re.compile(r"\btop\s+(?P<n>\d+)\b", re.I)
+_BOTTOM_PAT = re.compile(r"\bbottom\s+(?P<n>\d+)\b", re.I)
+_LOWEST_PAT = re.compile(r"\blowest|cheapest|smallest\b", re.I)
+_HIGHEST_PAT = re.compile(r"\bhighest|top|biggest|largest\b", re.I)
+
+
+def _normalize_space_v2(s: str) -> str:
+    return re.sub(r"\s+", " ", s or "").strip()
+
+
+def _load_lists_v2() -> Tuple[List[str], Dict[str, Any], Dict[str, List[str]]]:
+    """Load settings once per request-path."""
+    eq_cols = get_setting("DW_EXPLICIT_FILTER_COLUMNS", scope="namespace") or []
+    fts_map = get_setting("DW_FTS_COLUMNS", scope="namespace") or {}
+    fts_cols = fts_map.get("Contract", fts_map.get("*", []))
+    enum_syn = (get_setting("DW_ENUM_SYNONYMS", scope="namespace") or {}).get("Contract.REQUEST_TYPE", {})
+    return fts_cols or [], enum_syn, eq_cols
+
+
+def parse_eq_filters(question: str) -> List[Dict[str, Any]]:
+    """Extract generic equality filters from natural text for columns from DW_EXPLICIT_FILTER_COLUMNS."""
+    _, _, eq_cols = _load_lists_v2()
+    eq_cols_lc = {str(c).lower(): c for c in eq_cols}
+    found: List[Dict[str, Any]] = []
+    q = question or ""
+    for pat in _EQ_PATTERNS:
+        for m in re.finditer(pat, q, flags=re.I):
+            raw_col = _normalize_space_v2(m.group("col"))
+            if not raw_col:
+                continue
+            col_key = raw_col.lower()
+            col_norm = col_key.replace(" ", "_")
+            target_col = eq_cols_lc.get(col_key) or eq_cols_lc.get(col_norm)
+            if not target_col:
+                col_key2 = col_key.split(".")[-1]
+                col_norm2 = col_key2.replace(" ", "_")
+                target_col = eq_cols_lc.get(col_key2) or eq_cols_lc.get(col_norm2)
+            if not target_col:
+                continue
+            val = m.groupdict().get("val_quoted") or m.groupdict().get("val")
+            if not val:
+                continue
+            val = _normalize_space_v2(val)
+            val = re.sub(r"\)\s*$", "", val)
+            found.append({"col": target_col, "val": val, "ci": True, "trim": True})
+    return found
+
+
+def parse_fts(question: str, full_text_search: bool) -> Dict[str, Any]:
+    """Detect FTS tokens and operator (AND/OR), excluding eq parts."""
+    fts_cols, _, _ = _load_lists_v2()
+    if not full_text_search:
+        return {"enabled": False}
+    scrubbed = question or ""
+    for pat in _EQ_PATTERNS:
+        scrubbed = re.sub(pat, " ", scrubbed, flags=re.I)
+    s = _normalize_space_v2(scrubbed.lower())
+    if not s:
+        return {"enabled": False}
+    groups: List[List[str]] = []
+    if " and " in s:
+        operator = "AND"
+        parts = [p.strip() for p in s.split(" and ") if p.strip()]
+        for p in parts:
+            groups.append([p])
+    else:
+        operator = "OR"
+        parts = [p.strip() for p in s.split(" or ") if p.strip()]
+        if len(parts) <= 1:
+            parts = [s]
+        for p in parts:
+            groups.append([p])
+    cleaned_groups: List[List[str]] = []
+    for g in groups:
+        cg: List[str] = []
+        for tok in g:
+            tok = tok.strip()
+            if len(tok) < 2:
+                continue
+            if tok in {"show", "list", "contracts", "where", "has", "with", "all", "and", "or"}:
+                continue
+            cg.append(tok)
+        if cg:
+            cleaned_groups.append(cg)
+    if not cleaned_groups:
+        return {"enabled": False}
+    return {
+        "enabled": True,
+        "operator": operator,
+        "tokens": cleaned_groups,
+        "columns": fts_cols,
+    }
+
+
+def parse_top_bottom(question: str) -> Dict[str, Any]:
+    s = question or ""
+    top = bottom = asc = desc = False
+    n = None
+    m = _TOP_PAT.search(s)
+    if m:
+        top = True
+        n = int(m.group("n"))
+    m = _BOTTOM_PAT.search(s)
+    if m:
+        bottom = True
+        n = int(m.group("n"))
+    if _LOWEST_PAT.search(s):
+        asc = True
+    if _HIGHEST_PAT.search(s):
+        desc = True
+    if bottom or asc:
+        direction = "ASC"
+    elif top or desc:
+        direction = "DESC"
+    else:
+        direction = None
+    return {"top_n": n, "direction": direction}
+
+
+def parse_group_by(question: str) -> Optional[str]:
+    s = (question or "").lower()
+    grp = None
+    m = re.search(r"group by\s+([a-z0-9_ ]+)", s)
+    if m:
+        grp = m.group(1).strip().replace(" ", "_").upper()
+    else:
+        m = re.search(r"\bper\s+([a-z0-9_ ]+)", s)
+        if m:
+            grp = m.group(1).strip().replace(" ", "_").upper()
+    if grp in {"DEPARTMENT_OUL", "ENTITY_NO", "OWNER_DEPARTMENT", "CONTRACT_STATUS", "REQUEST_TYPE"}:
+        return grp
+    return None
+
+
+def detect_sort(question: str) -> Tuple[str, bool]:
+    return ("REQUEST_DATE", True)
+
+
+def enrich_intent_from_question(q: str, full_text_search: bool) -> Dict[str, Any]:
+    intent = {
+        "eq_filters": parse_eq_filters(q),
+        "fts": parse_fts(q, full_text_search),
+        "group_by": parse_group_by(q),
+        "sort_by": None,
+        "sort_desc": None,
+        "top_n": None,
+        "gross": None,
+    }
+    tb = parse_top_bottom(q)
+    if tb["direction"]:
+        intent["sort_by"] = "TOTAL_GROSS"
+        intent["sort_desc"] = (tb["direction"] == "DESC")
+        intent["top_n"] = tb["top_n"]
+    if intent["sort_by"] is None:
+        sb, sd = detect_sort(q)
+        intent["sort_by"], intent["sort_desc"] = sb, sd
     return intent
