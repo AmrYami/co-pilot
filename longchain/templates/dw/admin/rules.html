@@ -1,0 +1,19 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>DW Admin – Rules</title>
+<style>body{font-family:sans-serif} table{border-collapse:collapse;width:100%} th,td{border:1px solid #ddd;padding:6px} th{background:#f2f2f2}</style>
+</head><body>
+<h2>Rules</h2>
+<table>
+  <thead><tr><th>ID</th><th>Name</th><th>Status</th><th>%</th><th>Version</th><th>Pattern</th><th>Payload</th><th>Updated</th></tr></thead>
+  <tbody>
+  {% for r in rows %}
+    <tr>
+      <td>{{r.id}}</td><td>{{r.name}}</td><td>{{r.status}}</td><td>{{r.rollout_pct}}</td><td>{{r.version}}</td>
+      <td><pre style="white-space:pre-wrap">{{r.pattern}}</pre></td>
+      <td><pre style="white-space:pre-wrap">{{r.payload}}</pre></td>
+      <td>{{r.updated_at}}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</body></html>

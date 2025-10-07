@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import copy
 import itertools
+import json
+import os
 import re
 import threading
 import time
@@ -15,6 +17,8 @@ from .explain import build_explain, build_user_explain
 from .fts import build_fts_where
 from .rules import choose_canary
 from .settings import Settings
+from .sql_utils import enforce_single_order_by
+from .learning.rules import RulesEngine
 
 
 SETTINGS = Settings()
@@ -24,6 +28,8 @@ dw_bp = Blueprint("dw", __name__)
 _INQUIRY_COUNTER = itertools.count(1)
 _SNAPSHOT_LOCK = threading.Lock()
 _SNAPSHOTS: Dict[int, Dict[str, Any]] = {}
+_DEFAULT_NAMESPACE = "dw::common"
+_RULES_ENGINE: Optional[RulesEngine] = None
 
 _EQ_PATTERN = re.compile(r"(?P<col>[A-Za-z0-9_\"\. ]+)\s*=\s*(?P<val>'[^']*'|\"[^\"]*\"|[A-Za-z0-9_./-]+)", re.IGNORECASE)
 
@@ -78,6 +84,133 @@ def _build_eq_sql(eq_filters: List[Dict[str, Any]]) -> Tuple[List[str], Dict[str
     return sql_parts, binds
 
 
+def _get_rules_engine() -> Optional[RulesEngine]:
+    global _RULES_ENGINE
+    if _RULES_ENGINE is not None:
+        return _RULES_ENGINE
+    url = os.getenv("MEMORY_DB_URL")
+    if not url:
+        _RULES_ENGINE = None
+        return _RULES_ENGINE
+    try:
+        _RULES_ENGINE = RulesEngine(url)
+    except Exception:
+        _RULES_ENGINE = None
+    return _RULES_ENGINE
+
+
+def _ensure_rule_dict(value: Any) -> Dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            data = json.loads(value)
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            return {}
+    return {}
+
+
+def _matches_rule(pattern: Dict[str, Any], question: str, intent: Dict[str, Any]) -> bool:
+    if not pattern:
+        return True
+    question_text = (question or "").lower()
+    contains = pattern.get("contains")
+    if isinstance(contains, str) and contains.strip():
+        if contains.strip().lower() not in question_text:
+            return False
+    for key, expected in pattern.items():
+        if key == "contains":
+            continue
+        if intent.get(key) != expected:
+            return False
+    return True
+
+
+def _apply_rules(
+    namespace: str,
+    question: str,
+    intent: Dict[str, Any],
+) -> Tuple[
+    List[Dict[str, Any]],
+    List[str],
+    Optional[str],
+    Optional[bool],
+    List[Dict[str, Any]],
+    Optional[List[str]],
+]:
+    engine = _get_rules_engine()
+    if not engine:
+        return [], [], None, None, [], None
+    try:
+        candidates = engine.find_applicable(namespace, intent)
+    except Exception:
+        return [], [], None, None, [], None
+
+    matching: List[Dict[str, Any]] = []
+    shadow_matches: List[Dict[str, Any]] = []
+    for rule in candidates:
+        pattern = _ensure_rule_dict(rule.get("pattern"))
+        if not _matches_rule(pattern, question, intent):
+            continue
+        status = (rule.get("status") or "").lower()
+        if status == "shadow":
+            shadow_matches.append(
+                {
+                    "id": rule.get("id"),
+                    "name": rule.get("name"),
+                    "status": rule.get("status"),
+                }
+            )
+            continue
+        rule = dict(rule)
+        rule["pattern"] = pattern
+        rule["payload"] = _ensure_rule_dict(rule.get("payload"))
+        matching.append(rule)
+
+    selected = engine.select_to_apply(matching)
+    applied_info: List[Dict[str, Any]] = []
+    extra_where: List[str] = []
+    sort_by_override: Optional[str] = None
+    sort_desc_override: Optional[bool] = None
+    group_by_override: Optional[List[str]] = None
+
+    for rule in selected:
+        payload = _ensure_rule_dict(rule.get("payload"))
+        applied_info.append(
+            {
+                "id": rule.get("id"),
+                "name": rule.get("name"),
+                "status": rule.get("status"),
+                "payload": payload,
+            }
+        )
+
+        where_clause = payload.get("where")
+        if isinstance(where_clause, str) and where_clause.strip():
+            extra_where.append(where_clause.strip())
+        elif isinstance(where_clause, list):
+            extra_where.extend(
+                [str(item).strip() for item in where_clause if str(item).strip()]
+            )
+
+        group_by_val = payload.get("group_by")
+        if isinstance(group_by_val, list) and group_by_val:
+            group_by_override = [str(item).strip() for item in group_by_val if str(item).strip()]
+
+        order_val = payload.get("order_by") or payload.get("sort_by")
+        if isinstance(order_val, str) and order_val.strip():
+            sort_by_override = order_val.strip()
+
+        if "order_desc" in payload:
+            sort_desc_override = bool(payload.get("order_desc"))
+        if "sort_desc" in payload:
+            sort_desc_override = bool(payload.get("sort_desc"))
+
+    return applied_info, extra_where, sort_by_override, sort_desc_override, shadow_matches, group_by_override
+
+
 def _default_fts_debug(columns: Optional[List[str]] = None) -> Dict[str, Any]:
     return {
         "enabled": False,
@@ -119,12 +252,44 @@ def _plan_query(
     fts_override: Optional[Dict[str, Any]] = None,
     sort_by: Optional[str] = None,
     sort_desc: bool = True,
+    namespace: str = _DEFAULT_NAMESPACE,
 ) -> Dict[str, Any]:
     eq_filters = list(eq_filters or [])
     default_date_col = dw_settings.get_date_column("REQUEST_DATE")
     sort_column = (sort_by or default_date_col).strip() or "REQUEST_DATE"
+    sort_direction = bool(sort_desc)
 
-    fts_sql, fts_binds, fts_debug = _prepare_fts(question, full_text_search=full_text_search, override=fts_override)
+    intent: Dict[str, Any] = {
+        "question": question,
+        "eq_filters": eq_filters,
+        "group_by": None,
+        "sort_by": sort_column,
+        "sort_desc": sort_direction,
+        "measure_sql": None,
+        "date_column": default_date_col,
+    }
+
+    applied_rules, rule_where, sort_override, desc_override, shadow_rules, group_override = _apply_rules(
+        namespace, question, intent
+    )
+
+    if sort_override:
+        sort_column = _normalize_col(sort_override)
+        intent["sort_by"] = sort_column
+    if desc_override is not None:
+        sort_direction = bool(desc_override)
+        intent["sort_desc"] = sort_direction
+    if group_override:
+        intent["group_by"] = group_override
+
+    fts_sql, fts_binds, fts_debug = _prepare_fts(
+        question, full_text_search=full_text_search, override=fts_override
+    )
+    intent["fts_tokens"] = list(fts_debug.get("tokens") or [])
+    intent["fts_operator"] = fts_debug.get("operator") or (
+        "OR" if fts_debug.get("enabled") else None
+    )
+
     eq_sqls, eq_binds = _build_eq_sql(eq_filters)
 
     where_parts: List[str] = []
@@ -132,6 +297,8 @@ def _plan_query(
         where_parts.append(fts_sql)
     if eq_sqls:
         where_parts.append("(" + " AND ".join(eq_sqls) + ")")
+    if rule_where:
+        where_parts.extend([clause for clause in rule_where if clause])
 
     binds: Dict[str, Any] = {}
     binds.update(fts_binds)
@@ -143,36 +310,35 @@ def _plan_query(
     ]
     if where_parts:
         sql_lines.append("WHERE " + " AND ".join(where_parts))
-    direction = "DESC" if sort_desc else "ASC"
+    direction = "DESC" if sort_direction else "ASC"
     sql_lines.append(f"ORDER BY {sort_column} {direction}")
-    sql = "\n".join(sql_lines)
+    sql = enforce_single_order_by("\n".join(sql_lines))
 
-    intent = {
-        "question": question,
-        "eq_filters": eq_filters,
-        "group_by": None,
-        "sort_by": sort_column,
-        "sort_desc": sort_desc,
-        "measure_sql": None,
-        "date_column": default_date_col,
-        "fts_tokens": list(fts_debug.get("tokens") or []),
-        "fts_operator": fts_debug.get("operator") or ("OR" if fts_debug.get("enabled") else None),
-    }
-
-    meta = {
+    meta: Dict[str, Any] = {
         "binds": binds,
         "fts": fts_debug,
         "eq_filters": eq_filters,
         "sort_by": sort_column,
-        "sort_desc": sort_desc,
+        "sort_desc": sort_direction,
         "gross": False,
         "clarifier_intent": intent,
+        "namespace": namespace,
     }
+
+    if applied_rules or shadow_rules:
+        meta["rules"] = {
+            "applied": applied_rules,
+            "shadow": shadow_rules,
+        }
+    if rule_where:
+        meta["rule_where"] = rule_where
 
     debug = {
         "intent": intent,
         "fts": fts_debug,
     }
+    if "rules" in meta:
+        debug["rules"] = meta["rules"]
 
     return {
         "sql": sql,
@@ -244,23 +410,29 @@ def answer() -> Any:
     payload = request.get_json(force=True) or {}
     question = payload.get("question", "")
     full_text_search = bool(payload.get("full_text_search"))
+    namespace = payload.get("namespace") or _DEFAULT_NAMESPACE
 
     eq_filters = _parse_eq_filters(question)
     plan = _plan_query(
         question,
         eq_filters=eq_filters,
         full_text_search=full_text_search,
+        namespace=namespace,
     )
 
     inquiry_id = _next_inquiry_id()
     plan["meta"]["canary"] = choose_canary(inquiry_id)
+    plan["meta"].setdefault("namespace", namespace)
 
-    examples = retrieve_examples_for_question(question)
+    examples = retrieve_examples_for_question(question, namespace=namespace)
     if examples:
         plan["meta"]["examples_used"] = [
             {"q": row.get("q"), "score": row.get("score")}
             for row in examples[:3]
         ]
+        example_sqls = [row.get("sql") for row in examples if row.get("sql")]
+        if example_sqls:
+            plan["intent"]["examples_sql"] = example_sqls
 
     explain_payload = {
         "intent": plan["intent"],
@@ -349,6 +521,14 @@ def rate() -> Any:
             "text": hints.get("fts_text"),
         }
 
+    meta_snapshot = snapshot.get("meta") or {}
+    namespace = (
+        hints.get("namespace")
+        or meta_snapshot.get("namespace")
+        or payload.get("namespace")
+        or _DEFAULT_NAMESPACE
+    )
+
     plan = _plan_query(
         snapshot.get("question", ""),
         eq_filters=eq_filters,
@@ -356,6 +536,7 @@ def rate() -> Any:
         fts_override=fts_override,
         sort_by=sort_by,
         sort_desc=bool(sort_desc),
+        namespace=namespace,
     )
 
     plan["meta"]["source"] = "rate"
@@ -376,6 +557,7 @@ def rate() -> Any:
             question=snapshot.get("question", ""),
             sql=final_sql,
             rating=payload.get("rating"),
+            namespace=namespace,
         )
     except Exception:
         pass

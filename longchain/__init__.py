@@ -8,6 +8,7 @@ except Exception:  # pragma: no cover
     Flask = None  # type: ignore[assignment]
 else:
     from longchain.apps.dw.app import dw_bp
+    from longchain.apps.dw.admin_ui import dw_admin_ui
 
 
 def create_app():  # pragma: no cover - exercised via tests
@@ -15,6 +16,8 @@ def create_app():  # pragma: no cover - exercised via tests
         raise RuntimeError("Flask is required to create the longchain app")
     app = Flask(__name__, template_folder="templates")
     app.register_blueprint(dw_bp, url_prefix="/dw")
+    if dw_admin_ui is not None:
+        app.register_blueprint(dw_admin_ui)
     return app
 
 
