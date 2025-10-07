@@ -54,8 +54,9 @@ except Exception:  # pragma: no cover - fallback for tests
 from core.inquiries import create_or_update_inquiry
 
 from apps.dw.rate_grammar import parse_rate_comment_strict
-from apps.dw.fts_builder import build_fts_where as build_like_fts_where
-from apps.dw.eq_parser import extract_eq_filters_from_text, strip_eq_from_text
+from apps.dw.lib.eq_ops import build_eq_where as build_eq_where_v2, parse_eq_from_text
+from apps.dw.lib.fts_ops import build_fts_where as build_fts_where_v2, detect_fts_groups
+from apps.dw.lib.sql_utils import direction_from_words, merge_where as merge_where_v2, order_by_safe
 from apps.dw.rate_hints import (
     append_where,
     apply_rate_hints,
@@ -1014,83 +1015,65 @@ def _attempt_like_eq_fallback(
     online_hints_applied: int,
     online_intent: Dict[str, Any],
 ) -> Optional[Dict[str, Any]]:
-    if not full_text_search:
-        return None
+    question_text = question or ""
+    lowered = question_text.lower()
+    implied_fts = bool(
+        re.search(r"\bhas\b", lowered)
+        or re.search(r"\bcontain", lowered)
+        or re.search(r"\binclude", lowered)
+    )
+
+    columns = [str(col).strip().upper() for col in (fts_columns or []) if str(col).strip()]
+    allowed = [str(col).strip().upper() for col in (allowed_columns or []) if str(col).strip()]
 
     engine_value = _get_namespace_setting(settings, namespace, "DW_FTS_ENGINE", "like")
-    fts_engine = str(engine_value or "like").lower()
-    if fts_engine != "like":
-        return None
+    synonyms_setting = _get_namespace_setting(settings, namespace, "DW_ENUM_SYNONYMS", {})
+    settings_bundle: Dict[str, Any] = {
+        "DW_FTS_COLUMNS": {"value": {"Contract": columns}},
+        "DW_FTS_ENGINE": {"value": str(engine_value or "like")},
+        "DW_EXPLICIT_FILTER_COLUMNS": {"value": allowed},
+    }
+    if synonyms_setting:
+        settings_bundle["DW_ENUM_SYNONYMS"] = {"value": synonyms_setting}
 
-    columns = [str(col).strip() for col in (fts_columns or []) if str(col).strip()]
-    if not columns:
-        return None
-
-    explicit_columns = allowed_columns or []
-    eq_filters = extract_eq_filters_from_text(question, explicit_columns)
-    cleaned_question = strip_eq_from_text(question, explicit_columns)
-    token_source = re.sub(r"\s+", " ", cleaned_question or question or "").strip()
-
-    def _clean_token(fragment: str) -> str:
-        text = re.sub(r"\s+", " ", fragment or "").strip()
-        if not text:
-            return ""
-        match = re.search(r"\bhas\b(.*)", text, flags=re.IGNORECASE)
-        if match and match.group(1).strip():
-            text = match.group(1).strip()
-        else:
-            text = re.sub(r"^(list|show|display|find|get|fetch)\s+", "", text, flags=re.IGNORECASE)
-            text = re.sub(r"^(all\s+)?contracts?\s*", "", text, flags=re.IGNORECASE)
-        return text.strip(" ,.")
+    eq_filters_v2 = parse_eq_from_text(question_text, settings_bundle)
 
     tokens_groups: List[List[str]] = []
     operator_between_groups = "OR"
-    parts: List[str] = []
-    if re.search(r"\band\b", token_source, flags=re.IGNORECASE):
-        parts = re.split(r"\band\b", token_source, flags=re.IGNORECASE)
-        operator_between_groups = "AND"
-    elif re.search(r"\bor\b", token_source, flags=re.IGNORECASE):
-        parts = re.split(r"\bor\b", token_source, flags=re.IGNORECASE)
-        operator_between_groups = "OR"
-    elif token_source:
-        parts = [token_source]
+    if full_text_search or implied_fts:
+        tokens_groups, operator_between_groups = detect_fts_groups(question_text)
 
-    for part in parts:
-        token = _clean_token(part)
-        if token:
-            tokens_groups.append([token])
-
-    binds: Dict[str, Any] = {}
-    where_terms: List[str] = []
-
-    if tokens_groups:
-        fts_sql, binds = build_like_fts_where(tokens_groups, columns, operator_between_groups, binds)
-        if fts_sql:
-            where_terms.append(fts_sql)
-
-    for idx, eq in enumerate(eq_filters):
-        column = str(eq.get("col") or "").strip()
-        value = eq.get("val")
-        if not column or value is None:
-            continue
-        bind_name = f"eq_{idx}"
-        binds[bind_name] = value
-        left = column
-        right = f":{bind_name}"
-        if eq.get("trim", True):
-            left = f"TRIM({left})"
-            right = f"TRIM({right})"
-        if eq.get("ci", True):
-            left = f"UPPER({left})"
-            right = f"UPPER({right})"
-        where_terms.append(f"{left} = {right}")
-
-    if not where_terms:
+    if not tokens_groups and not eq_filters_v2:
         return None
 
+    fts_sql = ""
+    fts_binds: Dict[str, Any] = {}
+    fts_debug: Dict[str, Any] = {"enabled": False, "error": None, "columns": columns, "groups": []}
+    if tokens_groups:
+        fts_sql, fts_binds, fts_debug = build_fts_where_v2(settings_bundle, tokens_groups, operator_between_groups)
+        fts_debug.setdefault("groups", tokens_groups)
+        fts_debug["operator"] = operator_between_groups
+    else:
+        fts_debug["operator"] = operator_between_groups
+
+    eq_sql = ""
+    eq_binds: Dict[str, Any] = {}
+    if eq_filters_v2:
+        eq_sql, eq_binds = build_eq_where_v2(eq_filters_v2, settings_bundle, bind_prefix="eq")
+
+    if not fts_sql and not eq_sql:
+        return None
+
+    where_sql = merge_where_v2([fts_sql, eq_sql])
+
+    binds: Dict[str, Any] = {}
+    binds.update(fts_binds)
+    binds.update(eq_binds)
+
     base_sql = f'SELECT * FROM "{table_name}"'
-    sql = base_sql + " WHERE " + " AND ".join(where_terms)
-    sql = _append_order_by(sql, "REQUEST_DATE", descending=True)
+    sql = base_sql + ("\n" + where_sql if where_sql else "")
+    order_dir = direction_from_words(question_text, "DESC")
+    sql = order_by_safe(sql, f"ORDER BY REQUEST_DATE {order_dir}")
 
     sanitized_patch = {
         key: value
@@ -1114,23 +1097,16 @@ def _attempt_like_eq_fallback(
     )
 
     duration_ms = int((time.time() - t0) * 1000)
-    meta = {
+    meta: Dict[str, Any] = {
         "strategy": "fts_like_fallback",
         "binds": _json_safe_binds(binds),
         **exec_meta,
         "duration_ms": duration_ms,
         "online_learning": {"hints": online_hints_applied, **online_meta},
-        "fts": {
-            "enabled": bool(tokens_groups),
-            "columns": columns,
-            "tokens": tokens_groups,
-            "operator": operator_between_groups,
-            "binds": [key for key in binds if str(key).startswith("fts_")],
-            "error": None,
-        },
+        "fts": fts_debug,
     }
-    if eq_filters:
-        meta["eq_filters"] = eq_filters
+    if eq_filters_v2:
+        meta["eq_filters"] = eq_filters_v2
 
     response = {
         "ok": True,
@@ -1144,7 +1120,7 @@ def _attempt_like_eq_fallback(
             "like_fallback": {
                 "tokens": tokens_groups,
                 "operator": operator_between_groups,
-                "eq_filters": eq_filters,
+                "eq_filters": eq_filters_v2,
             },
             "online_learning": meta.get("online_learning"),
         },
