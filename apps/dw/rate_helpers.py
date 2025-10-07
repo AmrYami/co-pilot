@@ -64,6 +64,7 @@ def parse_rate_comment(comment: str) -> Dict:
     result = {
         "fts_tokens": [],
         "fts_operator": "OR",
+        "fts_reason": None,
         "eq_filters": [],  # list of {col, val, ci, trim, op}
         "order_by": None,  # {col, dir}
         "group_by": [],
@@ -77,10 +78,26 @@ def parse_rate_comment(comment: str) -> Dict:
     # fts:
     m = FTS_RE.search(text)
     if m:
-        body = m.group("body")
-        parts = [t.strip() for t in re.split(r"\|", body) if t.strip()]
-        result["fts_tokens"] = [p.strip(" '\"") for p in parts if p.strip(" '\"")]
-        result["fts_operator"] = "OR"
+        body = (m.group("body") or "").strip()
+        # Decide operator: explicit 'and' wins when no explicit '|'
+        if "|" in body:
+            tokens_raw = [frag.strip() for frag in body.split("|")]
+            result["fts_operator"] = "OR"
+            result["fts_reason"] = "OR because '|' separator detected"
+        elif re.search(r"\band\b", body, flags=re.IGNORECASE):
+            tokens_raw = [frag.strip() for frag in re.split(r"\band\b", body, flags=re.IGNORECASE)]
+            result["fts_operator"] = "AND"
+            result["fts_reason"] = "AND because keyword 'and' was present"
+        else:
+            tokens_raw = [frag.strip() for frag in body.split("|")]
+            result["fts_operator"] = "OR"
+            result["fts_reason"] = "OR default"
+        cleaned = []
+        for raw_tok in tokens_raw:
+            token = raw_tok.strip(" '\"")
+            if token:
+                cleaned.append(token)
+        result["fts_tokens"] = cleaned
 
     # eq:
     for em in EQ_RE.finditer(text):
