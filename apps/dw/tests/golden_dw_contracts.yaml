@@ -159,6 +159,24 @@ cases:
       order: { metric: measure, dir: desc }
       group_by: ["OWNER_DEPARTMENT"]
 
+  - id: highest_department_gross_last_quarter
+    question: "Owner department with the highest gross last quarter"
+    expect_contains:
+      - "GROUP BY OWNER_DEPARTMENT"
+      - "TOTAL_GROSS"
+      - "ORDER BY TOTAL_GROSS DESC"
+    assertions:
+      order: { metric: measure, dir: desc }
+      group_by: ["OWNER_DEPARTMENT"]
+
+  - id: bottom_contracts_by_gross
+    question: "bottom contracts by gross last month"
+    expect_contains:
+      - "ORDER BY NVL(CONTRACT_VALUE_NET_OF_VAT,0) + CASE WHEN"
+      - " ASC"
+      - "FROM \"Contract\""
+    notes: "Direction hints without explicit N should default to ascending order."
+
   - id: count_by_status_all_time
     question: "Count of contracts by status (all time)"
     expect:
