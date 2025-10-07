@@ -4,6 +4,9 @@ import re
 from datetime import date
 from dateutil.relativedelta import relativedelta
 
+from apps.dw.patchlib.settings_util import get_fts_engine, get_fts_columns
+from apps.dw.patchlib.fts_builder import build_like_fts
+
 
 LOGGER = logging.getLogger("dw.sql_builder")
 
@@ -75,7 +78,7 @@ def build_eq_where(
     return predicates
 
 
-def build_fts_where(
+def build_fts_where_legacy(
     tokens: Sequence[str],
     binds: Dict[str, Any],
     operator: str = "OR",
@@ -125,11 +128,98 @@ def build_fts_where(
     return "(" + joiner.join(groups) + ")"
 
 
+build_fts_where_with_binds = build_fts_where_legacy
+
+
 def build_measure_sql() -> str:
     return (
         "NVL(CONTRACT_VALUE_NET_OF_VAT,0) + CASE WHEN NVL(VAT,0) BETWEEN 0 AND 1 "
         "THEN NVL(CONTRACT_VALUE_NET_OF_VAT,0) * NVL(VAT,0) ELSE NVL(VAT,0) END"
     )
+
+
+def build_eq_where_from_pairs(eq_pairs: List[Dict], synonyms: Dict) -> Tuple[str, Dict[str, Any]]:
+    """
+    Build CASE-insensitive, TRIM-aware equality WHERE.
+    Special-case REQUEST_TYPE with DW_ENUM_SYNONYMS.
+    """
+
+    clauses: List[str] = []
+    binds: Dict[str, Any] = {}
+    bidx = 0
+    for e in eq_pairs or []:
+        col = str(e.get("col", "")).upper()
+        val = e.get("val")
+        if not col:
+            continue
+        if col == "REQUEST_TYPE":
+            syn = (synonyms or {}).get("Contract.REQUEST_TYPE") or {}
+            or_parts: List[str] = []
+
+            equals_vals: List[str] = []
+            for cat in syn.values():
+                equals_vals += [v for v in cat.get("equals", []) if v]
+            if equals_vals:
+                eq_bind_names: List[str] = []
+                for v in list(dict.fromkeys(equals_vals)):
+                    bn = f"eq_{bidx}"; bidx += 1
+                    binds[bn] = v
+                    eq_bind_names.append(bn)
+                or_parts.append(
+                    "(UPPER(TRIM(REQUEST_TYPE)) IN ("
+                    + ", ".join([f"UPPER(TRIM(:{bn}))" for bn in eq_bind_names])
+                    + "))"
+                )
+
+            prefixes: List[str] = []
+            for cat in syn.values():
+                prefixes += [v for v in cat.get("prefix", []) if v]
+            for p in list(dict.fromkeys(prefixes)):
+                bn = f"eq_{bidx}"; bidx += 1
+                binds[bn] = f"{p}%"
+                or_parts.append("UPPER(TRIM(REQUEST_TYPE)) LIKE UPPER(TRIM(:{}))".format(bn))
+
+            contains: List[str] = []
+            for cat in syn.values():
+                contains += [v for v in cat.get("contains", []) if v]
+            for c in list(dict.fromkeys(contains)):
+                bn = f"eq_{bidx}"; bidx += 1
+                binds[bn] = f"%{c}%"
+                or_parts.append("UPPER(TRIM(REQUEST_TYPE)) LIKE UPPER(TRIM(:{}))".format(bn))
+
+            if or_parts:
+                clauses.append("(" + " OR ".join(or_parts) + ")")
+            else:
+                bn = f"eq_{bidx}"; bidx += 1
+                binds[bn] = val
+                clauses.append("UPPER(TRIM(REQUEST_TYPE)) = UPPER(TRIM(:{}))".format(bn))
+        else:
+            bn = f"eq_{bidx}"; bidx += 1
+            binds[bn] = val
+            clauses.append(f"UPPER(TRIM({col})) = UPPER(TRIM(:{bn}))")
+
+    where_sql = " AND ".join(clauses) if clauses else ""
+    return where_sql, binds
+
+
+def build_fts_where(tokens: Sequence[str], mode: str = "OR") -> Tuple[str, Dict[str, Any]]:
+    eng = get_fts_engine()
+    columns = [c for c in get_fts_columns("Contract") if c]
+    if not columns:
+        return "", {}
+
+    toks = [t for t in (tokens or []) if t]
+    if not toks:
+        return "", {}
+
+    if (mode or "OR").upper() == "AND":
+        groups = [[t] for t in toks]
+    else:
+        groups = [toks]
+
+    if eng == "like":
+        return build_like_fts(columns, groups)
+    return build_like_fts(columns, groups)
 
 
 GROSS_EXPR = (

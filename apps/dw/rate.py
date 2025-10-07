@@ -1,10 +1,22 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 from typing import Dict, List, Sequence
 
 from flask import Blueprint, request, jsonify
 
+from apps.dw.patchlib.order_utils import (
+    detect_order_direction as _patch_detect_order_direction,
+    detect_top_n as _patch_detect_top_n,
+)
+from apps.dw.patchlib.rate_parser import parse_rate_comment as parse_rate_comment_patch
+from apps.dw.patchlib.settings_util import (
+    get_explicit_filter_columns as _patch_get_explicit_filter_columns,
+    get_enum_synonyms as _patch_get_enum_synonyms,
+    get_fts_columns as _patch_get_fts_columns,
+)
+from apps.dw.sql_builder import build_eq_where_from_pairs, build_fts_where as build_fts_where_patch
 from .settings import get_setting
 from .sql_builder import build_measure_sql, quote_ident, strip_double_order_by
 from .learn_store import LearningStore, ExampleRecord, PatchRecord
@@ -18,6 +30,7 @@ from .rate_helpers import (
 )
 
 rate_bp = Blueprint("rate", __name__)
+LOGGER = logging.getLogger("dw.rate")
 
 # ---------------------------
 # Rate Comment Parsing
@@ -41,6 +54,140 @@ def rate():
     inquiry_id = payload.get("inquiry_id")
     rating = payload.get("rating")
     comment = payload.get("comment") or ""
+
+    patch_hints = parse_rate_comment_patch(comment)
+    patch_has_directives = any(
+        [
+            patch_hints.get("fts"),
+            patch_hints.get("eq"),
+            patch_hints.get("group_by"),
+            patch_hints.get("gross") is not None,
+            patch_hints.get("order_by"),
+            _patch_detect_top_n(comment),
+        ]
+    )
+
+    if patch_has_directives:
+        try:
+            explicit_cols = _patch_get_explicit_filter_columns() or []
+            allowed = {
+                str(col).strip().upper().replace(" ", "_")
+                for col in explicit_cols
+                if isinstance(col, str) and col.strip()
+            }
+
+            eq_pairs: List[Dict] = []
+            for pair in patch_hints.get("eq") or []:
+                col = str(pair.get("col") or "").upper()
+                if not col:
+                    continue
+                if allowed and col not in allowed:
+                    continue
+                eq_pairs.append(pair)
+
+            fts_info = patch_hints.get("fts") or {}
+            fts_tokens = fts_info.get("tokens") or []
+            fts_mode = fts_info.get("mode") or "OR"
+            fts_sql, fts_binds = build_fts_where_patch(fts_tokens, fts_mode)
+
+            eq_sql, eq_binds = build_eq_where_from_pairs(eq_pairs, _patch_get_enum_synonyms())
+
+            where_parts_patch = [part for part in (fts_sql, eq_sql) if part]
+            where_sql = (" WHERE " + " AND ".join(where_parts_patch)) if where_parts_patch else ""
+
+            group_by_col = patch_hints.get("group_by")
+            gross_flag = patch_hints.get("gross")
+            measure_expr = (
+                "NVL(CONTRACT_VALUE_NET_OF_VAT,0) + CASE WHEN NVL(VAT,0) BETWEEN 0 AND 1 "
+                "THEN NVL(CONTRACT_VALUE_NET_OF_VAT,0)*NVL(VAT,0) ELSE NVL(VAT,0) END"
+            )
+
+            if group_by_col:
+                select_sql = f"SELECT {group_by_col} AS GROUP_KEY"
+                default_order_col = "CNT"
+                if gross_flag is True:
+                    select_sql += f", SUM({measure_expr}) AS TOTAL_GROSS"
+                    default_order_col = "TOTAL_GROSS"
+                select_sql += ", COUNT(*) AS CNT"
+                final_sql = (
+                    f"{select_sql}\n"
+                    f"FROM \"Contract\"{where_sql}\n"
+                    f"GROUP BY {group_by_col}"
+                )
+            else:
+                final_sql = f'SELECT *\nFROM "Contract"{where_sql}'
+                default_order_col = "REQUEST_DATE"
+
+            order_hint = patch_hints.get("order_by")
+            if order_hint:
+                order_col = order_hint.get("col") or default_order_col
+                order_dir = (order_hint.get("dir") or "DESC").upper()
+            else:
+                order_col = default_order_col
+                order_dir = _patch_detect_order_direction(comment, default_desc=True)
+
+            if not order_col:
+                order_col = "REQUEST_DATE"
+            if not order_dir:
+                order_dir = "DESC"
+
+            final_sql += f"\nORDER BY {order_col} {order_dir}"
+
+            top_n = _patch_detect_top_n(comment)
+            if top_n:
+                final_sql += f"\nFETCH FIRST {top_n} ROWS ONLY"
+
+            binds: Dict[str, object] = {}
+            binds.update(fts_binds)
+            binds.update(eq_binds)
+
+            debug_fts = {
+                "enabled": bool(fts_tokens),
+                "mode": (fts_mode or "OR").upper(),
+                "tokens": fts_tokens,
+                "columns": _patch_get_fts_columns("Contract"),
+                "binds": list(fts_binds.keys()),
+                "error": None,
+            }
+            debug_eq = {
+                "pairs": eq_pairs,
+                "binds": list(eq_binds.keys()),
+            }
+            debug_payload = {
+                "fts": debug_fts,
+                "eq": debug_eq,
+                "validation": {
+                    "ok": True,
+                    "errors": [],
+                    "binds": list(binds.keys()),
+                    "bind_names": list(binds.keys()),
+                },
+                "rate_patch": True,
+            }
+
+            response_payload = {
+                "ok": True,
+                "inquiry_id": inquiry_id,
+                "sql": final_sql,
+                "meta": {
+                    "attempt_no": 2,
+                    "binds": binds,
+                    "clarifier_intent": {
+                        "fts": fts_tokens,
+                        "eq": eq_pairs,
+                        "group_by": group_by_col,
+                        "gross": gross_flag,
+                    },
+                    "fts": debug_fts,
+                },
+                "debug": debug_payload,
+                "rows": [],
+                "retry": True,
+            }
+
+            return jsonify(response_payload)
+        except Exception:  # pragma: no cover - defensive fallback
+            LOGGER.exception("[dw/rate] patch handler failed; using legacy pipeline")
 
     hints_intent = parse_rate_comment(comment)
 
