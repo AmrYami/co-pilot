@@ -63,6 +63,7 @@ def parse_rate_comment(comment: str) -> Dict[str, Any]:
         "eq_filters": [],
         "fts_tokens": [],
         "fts_operator": "OR",
+        "fts_reason": None,
         "group_by": None,
         "sort_by": None,
         "sort_desc": None,
@@ -73,8 +74,20 @@ def parse_rate_comment(comment: str) -> Dict[str, Any]:
 
     fts_match = _BASIC_FTS_RE.search(comment)
     if fts_match:
-        raw_tokens = fts_match.group(1)
-        tokens = [tok.strip() for tok in raw_tokens.split("|") if tok.strip()]
+        raw_tokens = (fts_match.group(1) or "").strip()
+        if "|" in raw_tokens:
+            parts = [frag.strip() for frag in raw_tokens.split("|")]
+            hints["fts_operator"] = "OR"
+            hints["fts_reason"] = "OR because '|' separator detected"
+        elif re.search(r"\band\b", raw_tokens, flags=re.IGNORECASE):
+            parts = [frag.strip() for frag in re.split(r"\band\b", raw_tokens, flags=re.IGNORECASE)]
+            hints["fts_operator"] = "AND"
+            hints["fts_reason"] = "AND because keyword 'and' was present"
+        else:
+            parts = [frag.strip() for frag in raw_tokens.split("|")]
+            hints["fts_operator"] = "OR"
+            hints["fts_reason"] = "OR default"
+        tokens = [tok.strip(" '\"") for tok in parts if tok.strip(" '\"")]
         hints["fts_tokens"] = tokens
 
     for col_raw, val_raw in _BASIC_EQ_RE.findall(comment or ""):

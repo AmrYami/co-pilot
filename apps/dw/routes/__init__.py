@@ -222,20 +222,23 @@ def _split_tokens(segment: str) -> List[str]:
     return tokens
 
 
-def _extract_fts_groups(question: str, explicit_cols: List[str]) -> Tuple[List[List[str]], str]:
+def _extract_fts_groups(question: str, explicit_cols: List[str]) -> Tuple[List[List[str]], str, str]:
     if not question:
-        return [], "OR"
+        return [], "OR", "OR default"
     without_eq = strip_eq_from_text(question, explicit_cols)
     segment = _after_marker(without_eq)
     lower_segment = segment.lower()
     operator = "OR"
+    reason = "OR default"
     if " and " in lower_segment:
         operator = "AND"
+        reason = "AND because keyword 'and' was detected"
     elif " or " in lower_segment:
         operator = "OR"
+        reason = "OR because keyword 'or' was detected"
     tokens = _split_tokens(segment)
     groups = [[tok] for tok in tokens if tok]
-    return groups, operator
+    return groups, operator, reason
 
 
 def _flatten(groups: List[List[str]]) -> List[str]:
@@ -269,16 +272,12 @@ def answer() -> Any:
         eq_sqls.append(sql_piece)
         eq_binds.update(binds)
 
-    token_groups, token_operator = _extract_fts_groups(question, explicit_cols)
+    token_groups, token_operator, token_reason = _extract_fts_groups(question, explicit_cols)
     should_enable_fts = full_text_flag or bool(token_groups)
     fts_sql = ""
     fts_binds: Dict[str, Any] = {}
-    fts_error: str | None = None
 
-    engine_raw = settings.get("DW_FTS_ENGINE")
     engine = settings.get_fts_engine()
-    if isinstance(engine_raw, str) and engine_raw.strip().lower() not in {"like", "oracle-text"}:
-        fts_error = "no_engine -> use LIKE"
 
     if should_enable_fts and fts_columns:
         groups = token_groups
@@ -298,22 +297,33 @@ def answer() -> Any:
     rows = fetch_rows(final_sql, binds)
 
     flat_tokens = _flatten(token_groups) if token_groups else []
+    fts_reason = token_reason if (fts_sql or flat_tokens) else None
+    eq_applied = [{"col": col, "val": val} for col, val in eq_pairs]
+    explain_parts: List[str] = []
+    if fts_sql:
+        cols_list = ", ".join(str(col) for col in fts_columns) or "(no columns configured)"
+        explain_parts.append(
+            f"FTS tokens joined with {token_operator} ({token_reason}). Columns: {cols_list}."
+        )
+    if eq_applied:
+        cols = ", ".join(item["col"] for item in eq_applied)
+        explain_parts.append(f"Equality filters applied on {cols}.")
     debug = {
         "fts": {
             "enabled": bool(fts_sql),
             "tokens": flat_tokens if fts_sql else None,
             "columns": fts_columns if fts_sql else None,
             "binds": list(fts_binds.keys()) if fts_binds else None,
-            "error": fts_error,
+            "engine": engine,
+            "reason": fts_reason,
         },
         "intent": {
             "full_text_search": bool(fts_sql),
             "fts_tokens": flat_tokens,
             "fts_operator": token_operator if fts_sql else None,
-            "eq_filters": [
-                {"col": col, "val": val} for col, val in eq_pairs
-            ],
+            "eq_filters": eq_applied,
         },
+        "explain": explain_parts,
     }
 
     meta = {
@@ -324,6 +334,8 @@ def answer() -> Any:
             "mode": "explicit" if fts_sql else None,
             "columns": fts_columns if fts_sql else [],
             "binds": list(fts_binds.keys()) if fts_binds else [],
+            "engine": engine,
+            "operator": token_operator if fts_sql else None,
         },
     }
 
@@ -350,14 +362,14 @@ def rate() -> Any:
 
     fts_sql = ""
     fts_binds: Dict[str, Any] = {}
-    fts_error: str | None = None
-    engine_raw = settings.get("DW_FTS_ENGINE")
-    if isinstance(engine_raw, str) and engine_raw.strip().lower() not in {"like", "oracle-text"}:
-        fts_error = "no_engine -> use LIKE"
+    engine = settings.get_fts_engine()
 
     tokens = hints.get("fts_tokens") or []
+    operator = hints.get("fts_operator") or "OR"
+    hint_reason = hints.get("fts_reason")
     if tokens and fts_columns:
-        fts_sql, fts_binds = build_fts_where([[tok] for tok in tokens], fts_columns, "OR")
+        token_groups = [[tok] for tok in tokens]
+        fts_sql, fts_binds = build_fts_where(token_groups, fts_columns, operator)
 
     eq_sqls: List[str] = []
     eq_binds: Dict[str, Any] = {}
@@ -402,20 +414,35 @@ def rate() -> Any:
 
     rows = fetch_rows(final_sql, binds)
 
+    eq_applied = hints.get("eq_filters") or []
+    explain_parts: List[str] = []
+    if fts_sql:
+        cols_list = ", ".join(str(col) for col in fts_columns) or "(no columns configured)"
+        reason = hint_reason or ("AND default" if operator == "AND" else "OR default")
+        explain_parts.append(
+            f"FTS tokens joined with {operator} ({reason}). Columns: {cols_list}."
+        )
+    if eq_applied:
+        cols = ", ".join(str(item.get("col")) for item in eq_applied if item.get("col"))
+        if cols:
+            explain_parts.append(f"Equality filters applied on {cols}.")
+
     debug = {
         "fts": {
             "enabled": bool(fts_sql),
             "tokens": tokens or None,
             "columns": fts_columns if fts_sql else None,
-            "binds": fts_binds if fts_binds else None,
-            "error": fts_error,
+            "binds": list(fts_binds.keys()) if fts_binds else None,
+            "engine": engine,
+            "operator": operator if tokens else None,
+            "reason": hint_reason if fts_sql else None,
         },
         "intent": {
             "full_text_search": bool(tokens),
             "fts_tokens": tokens or None,
             "fts_columns": fts_columns if fts_sql else [],
-            "fts_operator": "OR" if tokens else None,
-            "eq_filters": hints.get("eq_filters") or [],
+            "fts_operator": operator if tokens else None,
+            "eq_filters": eq_applied,
             "group_by": group_cols or None,
             "sort_by": order_col,
             "sort_desc": sort_desc,
@@ -430,13 +457,20 @@ def rate() -> Any:
             "comment_present": bool(comment),
             "where_applied": bool(where_sql),
             "order_by_applied": True,
-            "eq_filters": len(hints.get("eq_filters") or []),
+            "eq_filters": len(eq_applied),
         },
+        "explain": explain_parts,
     }
 
     meta = {
         "attempt_no": 2,
         "binds": binds,
+        "fts": {
+            "enabled": bool(fts_sql),
+            "engine": engine,
+            "operator": operator if tokens else None,
+            "columns": fts_columns if fts_sql else [],
+        },
     }
 
     response = {

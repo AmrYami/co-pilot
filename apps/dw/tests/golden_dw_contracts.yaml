@@ -167,6 +167,27 @@ cases:
       - 'LIKE'
       - 'ORDER BY REQUEST_DATE DESC'
 
+  - id: fts_like_tokens_or
+    question: "list all contracts has it or home care"
+    expect:
+      sql_like:
+        - 'LIKE UPPER(:fts_0)'
+        - 'LIKE UPPER(:fts_1)'
+        - 'ORDER BY REQUEST_DATE DESC'
+      must_not:
+        - 'Fallback listing ordered'
+
+  - id: eq_multiple_filters_email
+    question: "list all contracts has it or home care and ENTITY = DSFH and REPRESENTATIVE_EMAIL = samer@procare-sa.com"
+    expect:
+      sql_like:
+        - 'LIKE UPPER(:fts_0)'
+        - 'UPPER(TRIM(ENTITY)) = UPPER(TRIM(:eq_0))'
+        - 'UPPER(TRIM(REPRESENTATIVE_EMAIL)) = UPPER(TRIM(:eq_1))'
+        - 'ORDER BY REQUEST_DATE DESC'
+      must_not:
+        - 'Fallback listing ordered'
+
   - id: distinct_entity_counts
     question: "List distinct ENTITY values and their contract counts."
     expect:

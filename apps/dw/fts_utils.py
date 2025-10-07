@@ -12,6 +12,7 @@ DEFAULT_CONTRACT_FTS_COLUMNS = [
     "LEGAL_NAME_OF_THE_COMPANY",
     "ENTITY",
     "ENTITY_NO",
+    "REPRESENTATIVE_EMAIL",
 ]
 
 AND_RE = re.compile(r"\band\b", flags=re.IGNORECASE)

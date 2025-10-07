@@ -32,7 +32,7 @@ def order_by_safe(existing_sql: str, order_clause: str) -> str:
 
 def direction_from_words(question: str, fallback: str = "DESC") -> str:
     q = (question or "").lower()
-    if any(w in q for w in ["lowest", "bottom", "smallest", "cheapest"]):
+    if any(w in q for w in ["lowest", "bottom", "smallest", "cheapest", "اقل", "أقل"]):
         return "ASC"
     if any(w in q for w in ["highest", "top", "biggest", "largest"]):
         return "DESC"
