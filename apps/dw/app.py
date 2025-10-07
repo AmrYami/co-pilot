@@ -71,6 +71,17 @@ from apps.mem.kv import get_settings_for_namespace
 from apps.dw.online_learning import load_recent_hints
 from apps.dw.learning import load_rules_for_question
 from apps.dw.builder import _where_from_eq_filters
+from apps.dw.learning_store import (
+    DWExample,
+    DWPatch,
+    DWRule,
+    SessionLocal,
+    get_similar_examples,
+    init_db,
+    list_metrics_summary,
+    record_run,
+)
+from apps.dw.explain import build_explain
 from .contracts.fts import extract_fts_terms, build_fts_where_groups
 from .contracts.filters import parse_explicit_filters
 from .contracts.contract_planner import plan_contract_query
@@ -80,7 +91,59 @@ LOGGER = logging.getLogger("dw.app")
 
 
 dw_bp = Blueprint("dw", __name__)
+init_db()
 dw_bp.register_blueprint(rate_bp, url_prefix="")
+
+
+def _ns() -> str:
+    return "dw::common"
+
+
+def _respond(payload: Dict[str, Any], response: Dict[str, Any]):
+    if not isinstance(response, dict):
+        return jsonify(response)
+
+    meta = response.get("meta")
+    if not isinstance(meta, dict):
+        meta = {}
+        response["meta"] = meta
+
+    try:
+        response["explain"] = build_explain(meta)
+    except Exception:
+        pass
+
+    try:
+        rows_field = response.get("rows")
+        if isinstance(rows_field, list):
+            rows_count = len(rows_field)
+        else:
+            rows_count = int(meta.get("rows") or rows_field or 0)
+    except Exception:
+        rows_count = 0
+
+    try:
+        duration = int(meta.get("duration_ms") or 0)
+    except Exception:
+        duration = 0
+
+    try:
+        record_run(
+            namespace=_ns(),
+            user_email=payload.get("auth_email"),
+            question=payload.get("question"),
+            sql=str(response.get("sql") or ""),
+            ok=bool(response.get("ok")),
+            duration_ms=duration,
+            rows=rows_count,
+            strategy=str(meta.get("strategy") or ""),
+            explain=str(response.get("explain") or ""),
+            meta=meta,
+        )
+    except Exception:
+        pass
+
+    return jsonify(response)
 
 
 def _ensure_engine():
@@ -1233,7 +1296,7 @@ def answer():
                     "online_learning": meta.get("online_learning"),
                 },
             }
-            return jsonify(response)
+            return _respond(payload, response)
 
     contract_sql, contract_binds, contract_meta = _plan_contract_sql(
         question,
@@ -1280,7 +1343,7 @@ def answer():
         }
         if response["meta"].get("online_learning", {}).get("fts"):
             response["meta"]["fts"] = response["meta"]["online_learning"]["fts"]
-        return jsonify(response)
+        return _respond(payload, response)
 
     like_response = _attempt_like_eq_fallback(
         question=question,
@@ -1298,7 +1361,7 @@ def answer():
         online_intent=online_intent,
     )
     if like_response is not None:
-        return jsonify(like_response)
+        return _respond(payload, like_response)
 
     namespace = "dw::common"
 
@@ -1412,7 +1475,7 @@ def answer():
                 },
             },
         }
-        return jsonify(response)
+        return _respond(payload, response)
 
     planner_settings = {"DW_FTS_COLUMNS": fts_map} if isinstance(fts_map, dict) else {}
     sql, binds, meta, explain = plan_contract_query(
@@ -1488,11 +1551,128 @@ def answer():
             "hints": online_hints_applied,
             **({} if not online_meta else online_meta),
         }
-    return jsonify(response)
+    return _respond(payload, response)
 
 
 def create_dw_blueprint(*args, **kwargs):
     return dw_bp
+
+# --- Admin JSON endpoints (MVP) ---
+
+
+@dw_bp.route("/admin/dw/metrics", methods=["GET"])
+def dw_metrics():
+    try:
+        return jsonify({"ok": True, "metrics_24h": list_metrics_summary(24)})
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@dw_bp.route("/admin/dw/examples", methods=["GET"])
+def dw_examples():
+    namespace = request.args.get("namespace") or _ns()
+    question = request.args.get("question")
+    if question:
+        matches = get_similar_examples(namespace, question, limit=10)
+        data = [
+            {
+                "id": match.id,
+                "q": match.raw_question,
+                "sql": match.sql,
+                "tags": match.tags,
+                "created_at": match.created_at.isoformat() if match.created_at else None,
+                "success_count": match.success_count,
+            }
+            for match in matches
+        ]
+        return jsonify({"ok": True, "examples": data, "mode": "similar"})
+
+    with SessionLocal() as session:
+        rows = (
+            session.query(DWExample)
+            .filter_by(namespace=namespace)
+            .order_by(DWExample.id.desc())
+            .limit(200)
+            .all()
+        )
+        data = [
+            {
+                "id": row.id,
+                "q": row.raw_question,
+                "sql": row.sql,
+                "tags": row.tags,
+                "created_at": row.created_at.isoformat() if row.created_at else None,
+                "success_count": row.success_count,
+            }
+            for row in rows
+        ]
+    return jsonify({"ok": True, "examples": data, "mode": "recent"})
+
+
+@dw_bp.route("/admin/dw/patches", methods=["GET"])
+def dw_patches():
+    namespace = request.args.get("namespace") or _ns()
+    with SessionLocal() as session:
+        rows = (
+            session.query(DWPatch)
+            .filter_by(namespace=namespace)
+            .order_by(DWPatch.id.desc())
+            .limit(200)
+            .all()
+        )
+        data = [
+            {
+                "id": row.id,
+                "status": row.status,
+                "comment": row.comment,
+                "patch_intent": row.patch_intent,
+                "created_at": row.created_at.isoformat() if row.created_at else None,
+                "applied_now": row.applied_now,
+                "user_email": row.user_email,
+                "inquiry_id": row.inquiry_id,
+            }
+            for row in rows
+        ]
+    return jsonify({"ok": True, "patches": data})
+
+
+@dw_bp.route("/admin/dw/rules", methods=["GET", "POST"])
+def dw_rules():
+    with SessionLocal() as session:
+        if request.method == "POST":
+            payload = request.get_json(force=True) or {}
+            rule_id = int(payload.get("id") or 0)
+            action = (payload.get("action") or "").lower()
+            rule = session.query(DWRule).filter_by(id=rule_id).first()
+            if not rule:
+                return jsonify({"ok": False, "error": "rule_not_found"}), 404
+            if action in {"approve", "activate"}:
+                rule.status = "active"
+                rule.approved_at = datetime.utcnow()
+            elif action in {"disable", "reject"}:
+                rule.status = "disabled"
+            elif action == "canary":
+                rule.status = "canary"
+                if payload.get("canary_percent") is not None:
+                    try:
+                        rule.canary_percent = int(payload.get("canary_percent"))
+                    except Exception:
+                        pass
+            session.commit()
+
+        rows = session.query(DWRule).order_by(DWRule.id.desc()).limit(200).all()
+        data = [
+            {
+                "id": row.id,
+                "name": row.name,
+                "status": row.status,
+                "version": row.version,
+                "canary_percent": row.canary_percent,
+                "created_at": row.created_at.isoformat() if row.created_at else None,
+            }
+            for row in rows
+        ]
+    return jsonify({"ok": True, "rules": data})
 
 # ensure FTS engine check and default
 from apps.dw.settings import get_setting

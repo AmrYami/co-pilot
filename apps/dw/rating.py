@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 from typing import Any, Dict, List, Optional, Sequence
 
 try:  # pragma: no cover - allow unit tests without Flask dependency
@@ -50,6 +52,43 @@ from .sql_builders import GROSS_EXPR, group_by_sql, select_all_sql
 from .settings_defaults import DEFAULT_EXPLICIT_FILTER_COLUMNS
 from .fts_utils import DEFAULT_CONTRACT_FTS_COLUMNS
 from .learn.store import save_feedback
+from apps.dw.learning_store import record_example, record_patch
+
+
+def _default_namespace(ns: Optional[str]) -> str:
+    text = (ns or "").strip()
+    return text or "dw::common"
+
+
+def _hash_pct(seed: str) -> int:
+    digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()
+    return int(digest[:8], 16) % 100
+
+
+def _should_apply_canary(user_email: Optional[str], question: Optional[str], percent: int) -> bool:
+    pct = max(0, min(100, percent))
+    key = f"{user_email or ''}|{question or ''}"
+    return _hash_pct(key) < pct
+
+
+def _build_example_tags(hints: Dict[str, Any]) -> List[str]:
+    tags: List[str] = []
+    if not isinstance(hints, dict):
+        return tags
+    if hints.get("fts_tokens") or hints.get("fts_token_groups"):
+        tags.append("fts")
+    for entry in hints.get("eq_filters") or []:
+        if isinstance(entry, dict):
+            col = entry.get("col") or entry.get("column")
+            if col:
+                tags.append(f"eq:{col}")
+    group_by = hints.get("group_by")
+    if group_by:
+        tags.append(f"group:{group_by}")
+    sort_by = hints.get("sort_by") or hints.get("order_by")
+    if sort_by:
+        tags.append(f"order:{sort_by}")
+    return tags
 from apps.dw.lib.eq_ops import build_eq_where as build_eq_where_v2
 from apps.dw.lib.fts_ops import build_fts_where as build_fts_where_v2
 from apps.dw.lib.rate_ops import parse_rate_comment as parse_rate_comment_v2
@@ -126,6 +165,8 @@ def rate():
     app = current_app
     engine = app.config["MEM_ENGINE"]
     data = request.get_json(force=True) or {}
+    user_email_raw = data.get("auth_email") or data.get("user_email")
+    user_email = (user_email_raw or "").strip() or None
     inquiry_id = int(data.get("inquiry_id") or 0)
     rating = int(data.get("rating") or 0)
     feedback = (data.get("feedback") or "").strip() or None
@@ -285,6 +326,7 @@ def rate():
     inquiry_namespace = inquiry_row[0] if inquiry_row else None
     default_namespace = getattr(pipeline_obj, "namespace", None)
     effective_namespace = inquiry_namespace or default_namespace
+    namespace_value = _default_namespace(effective_namespace)
     settings_obj = app.config.get("SETTINGS") if app else None
     fts_columns = _resolve_fts_columns(settings_obj, effective_namespace)
     eq_allowed = _resolve_eq_columns(settings_obj, effective_namespace)
@@ -563,16 +605,52 @@ def rate():
 
     question_text = inquiry_row[1] if inquiry_row and len(inquiry_row) >= 2 else None
 
-    if rating >= 4 and question_text and intent_snapshot:
-        try:
-            save_positive_rule(engine, question_text, intent_snapshot)
-        except Exception:
-            pass
+    if rating >= 4 and question_text:
+        if intent_snapshot:
+            try:
+                save_positive_rule(engine, question_text, intent_snapshot)
+            except Exception:
+                pass
+        if rate_sql:
+            try:
+                tags = _build_example_tags(structured_hints_v2 or structured_hints or {})
+                record_example(
+                    namespace_value,
+                    user_email,
+                    question_text,
+                    rate_sql,
+                    tags=tags,
+                    rating=rating,
+                )
+            except Exception:
+                pass
 
     if rating <= 2 and comment and question_text and hints_dict:
         store_rate_hints(question_text, hints_dict)
         try:
             save_patch(engine, inquiry_id, question_text, rating, comment, hints_dict)
+        except Exception:
+            pass
+        try:
+            canary_percent = int(os.getenv("DW_CANARY_DEFAULT_PERCENT", "15"))
+        except Exception:
+            canary_percent = 15
+        applied_now_flag = bool(rate_sql) and _should_apply_canary(user_email, question_text, canary_percent)
+        try:
+            patch_payload = {
+                "structured": structured_hints_v2,
+                "legacy": hints_dict,
+            }
+            record_patch(
+                namespace_value,
+                user_email,
+                inquiry_id,
+                rating,
+                comment,
+                patch_payload,
+                status="shadow",
+                applied_now=applied_now_flag,
+            )
         except Exception:
             pass
 

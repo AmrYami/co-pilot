@@ -1,40 +1,81 @@
-from typing import Dict, Any
+from __future__ import annotations
+"""
+Human-friendly explain builder for DW responses.
+Keeps a consistent, terse style with all the useful knobs.
+"""
+from typing import Any, Dict, List
 
 
-def explain_interpretation(intent: Dict[str, Any], binds: Dict[str, Any], table: str = "Contract") -> str:
-    parts = []
-    q = (intent.get("notes") or {}).get("q", "")
-    date_col = intent.get("date_column") or "OVERLAP"
-    exp = intent.get("explicit_dates") or {}
-    gb = intent.get("group_by")
-    agg = intent.get("agg")
-    top_n = intent.get("top_n")
-    measure = intent.get("measure_sql") or "NVL(CONTRACT_VALUE_NET_OF_VAT,0)"
-    fts = intent.get("full_text_search")
-    tokens = intent.get("fts_tokens") or []
-
-    if exp:
-        parts.append(f"Interpreting time window as {exp.get('start')} → {exp.get('end')}.")
-    if date_col == "OVERLAP":
-        parts.append("Treating “contracts” as active by overlap (START_DATE ≤ end AND END_DATE ≥ start).")
-    elif date_col == "REQUEST_DATE":
-        parts.append("Using REQUEST_DATE because the question mentions “requested”.")
-    elif date_col == "END_DATE" and intent.get("expire"):
-        parts.append(f"Using END_DATE for expiry in next {intent['expire']} days.")
-    if gb:
-        parts.append(f"Grouping by {gb}.")
-    if agg == "count":
-        parts.append("Returning counts.")
-    elif measure:
-        parts.append(f"Measuring by {('GROSS' if 'VAT' in measure and ' + ' in measure else 'NET')} contract value.")
-    if top_n:
-        parts.append(f"Limiting to Top {top_n} by sort.")
-    if fts:
-        parts.append(f"Full‑text search enabled across configured columns (tokens: {', '.join(tokens)})")
-    return " ".join(parts) or "Default interpretation applied."
+def _fmt_tokens(tokens: Any) -> str:
+    if not tokens:
+        return "[]"
+    if isinstance(tokens, list) and tokens and isinstance(tokens[0], list):
+        return " | ".join(" & ".join(group) for group in tokens)
+    if isinstance(tokens, (list, tuple, set)):
+        return " | ".join(str(token) for token in tokens)
+    return str(tokens)
 
 
-def build_explanation(*, intent: Dict[str, Any], binds: Dict[str, Any], fts_meta: Dict[str, Any], table: str,
-                       cols_selected: Any, strategy: str, default_date_basis: str) -> str:
-    # Legacy shim for existing callers; delegate to explain_interpretation.
-    return explain_interpretation(intent, binds, table=table)
+def build_explain(meta: Dict[str, Any]) -> str:
+    """Compose a compact explanation string from meta payload."""
+
+    parts: List[str] = []
+    meta = meta or {}
+
+    fts_meta = meta.get("fts") or meta.get("FTS") or {}
+    if isinstance(fts_meta, dict) and fts_meta.get("enabled"):
+        operator = "AND" if fts_meta.get("operator") == "AND" else "OR"
+        tokens = _fmt_tokens(fts_meta.get("tokens"))
+        columns = fts_meta.get("columns") or []
+        parts.append(f"FTS={operator} on {len(columns)} cols; tokens=({tokens})")
+
+    eq_filters = meta.get("eq_filters") or meta.get("intent", {}).get("eq_filters") or []
+    filter_lines: List[str] = []
+    for entry in eq_filters or []:
+        if not isinstance(entry, dict):
+            continue
+        column = entry.get("col") or entry.get("column")
+        value = entry.get("val") or entry.get("value")
+        if not column:
+            continue
+        flags: List[str] = []
+        if entry.get("ci"):
+            flags.append("ci")
+        if entry.get("trim"):
+            flags.append("trim")
+        extra = f" ({','.join(flags)})" if flags else ""
+        filter_lines.append(f"{column} = {value}{extra}")
+    if filter_lines:
+        parts.append("Filters: " + "; ".join(filter_lines))
+
+    group_by = meta.get("group_by") or meta.get("intent", {}).get("group_by")
+    if group_by:
+        parts.append(f"Group by: {group_by}")
+
+    gross_flag = meta.get("gross")
+    if gross_flag is None:
+        gross_flag = meta.get("intent", {}).get("gross")
+    if gross_flag is not None:
+        parts.append("Measure: GROSS" if gross_flag else "Measure: NET")
+
+    date_start = meta.get("date_start") or meta.get("binds", {}).get("date_start")
+    date_end = meta.get("date_end") or meta.get("binds", {}).get("date_end")
+    if date_start or date_end:
+        parts.append(f"Window: {date_start}..{date_end}")
+
+    sort_by = meta.get("sort_by") or meta.get("intent", {}).get("sort_by")
+    sort_desc = meta.get("sort_desc")
+    if sort_desc is None:
+        sort_desc = meta.get("intent", {}).get("sort_desc")
+    if sort_by:
+        direction = "DESC" if sort_desc else "ASC"
+        parts.append(f"Order by: {sort_by} {direction}")
+
+    strategy = meta.get("strategy")
+    if strategy:
+        parts.append(f"Strategy: {strategy}")
+
+    if not parts:
+        return "Plan constructed."
+    return " | ".join(parts)
+
