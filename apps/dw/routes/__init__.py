@@ -10,10 +10,14 @@ from flask import Blueprint, jsonify, request
 from apps.dw.db import fetch_rows
 from apps.dw.fts_like import build_fts_where
 from apps.dw.eq_parser import extract_eq_filters_from_natural_text, strip_eq_from_text
-from apps.dw.rate_grammar import parse_rate_comment
 from apps.dw.settings_access import DWSettings
 from apps.dw.settings_defaults import DEFAULT_EXPLICIT_FILTER_COLUMNS
 from apps.dw.fts_utils import DEFAULT_CONTRACT_FTS_COLUMNS
+from apps.dw.sqlbuilder import (
+    build_sql_from_intent,
+    direction_from_words,
+    parse_rate_comment as parse_rate_comment_v2,
+)
 
 try:  # pragma: no cover - lightweight fallback for tests without settings backend
     from apps.dw.settings_util import get_setting as _get_setting
@@ -23,11 +27,6 @@ except Exception:  # pragma: no cover
 
 bp = Blueprint("dw", __name__)
 
-_GROSS_EXPR = (
-    "NVL(CONTRACT_VALUE_NET_OF_VAT,0) + CASE WHEN NVL(VAT,0) BETWEEN 0 AND 1 "
-    "THEN NVL(CONTRACT_VALUE_NET_OF_VAT,0) * NVL(VAT,0) ELSE NVL(VAT,0) END"
-)
-
 
 def _settings_dict() -> Dict[str, Any]:
     keys = [
@@ -35,6 +34,7 @@ def _settings_dict() -> Dict[str, Any]:
         "DW_FTS_COLUMNS",
         "DW_EXPLICIT_FILTER_COLUMNS",
         "DW_ENUM_SYNONYMS",
+        "DW_CONTRACT_TABLE",
     ]
     cfg: Dict[str, Any] = {}
     for key in keys:
@@ -357,96 +357,87 @@ def rate() -> Any:
 
     settings = _load_dw_settings()
     fts_columns = _fts_columns_from_settings(settings)
+    raw_settings = dict(settings.ns)
 
-    hints = parse_rate_comment(comment)
-
-    fts_sql = ""
-    fts_binds: Dict[str, Any] = {}
-    engine = settings.get_fts_engine()
-
+    hints = parse_rate_comment_v2(comment)
     tokens = hints.get("fts_tokens") or []
-    operator = hints.get("fts_operator") or "OR"
-    hint_reason = hints.get("fts_reason")
-    if tokens and fts_columns:
-        token_groups = [[tok] for tok in tokens]
-        fts_sql, fts_binds = build_fts_where(token_groups, fts_columns, operator)
+    operator = (hints.get("fts_operator") or "OR").upper()
+    group_col = hints.get("group_by")
+    group_cols = [group_col] if group_col else []
+    gross_flag = hints.get("gross")
+    sort_by_hint = hints.get("sort_by")
+    sort_desc_hint = hints.get("sort_desc")
+    top_n = hints.get("top_n")
+    direction_hint = hints.get("direction_hint")
 
-    eq_sqls: List[str] = []
-    eq_binds: Dict[str, Any] = {}
-    for idx, eq in enumerate(hints.get("eq_filters") or []):
-        col = str(eq.get("col") or "").upper()
-        val = str(eq.get("val") or "")
-        sql_piece, binds = _eq_sql(col, val, idx, _apply_eq_synonyms_if_needed(settings, col, val))
-        eq_sqls.append(sql_piece)
-        eq_binds.update(binds)
+    contract_table = raw_settings.get("DW_CONTRACT_TABLE") or "Contract"
 
-    where_sql, binds = _compose_where(fts_sql, fts_binds, eq_sqls, eq_binds)
+    builder_fts: Dict[str, List[str]] = {}
+    raw_fts = raw_settings.get("DW_FTS_COLUMNS")
+    if isinstance(raw_fts, dict):
+        for key, value in raw_fts.items():
+            if isinstance(value, list):
+                builder_fts[str(key)] = list(value)
+    if fts_columns:
+        builder_fts.setdefault(contract_table, fts_columns)
+        builder_fts.setdefault(contract_table.upper(), fts_columns)
 
-    group_cols = hints.get("group_by") or []
-    sort_by = hints.get("sort_by") or ("CNT" if group_cols else "REQUEST_DATE")
-    sort_desc = hints.get("sort_desc")
-    if sort_desc is None:
-        sort_desc = True
+    explicit_cols = settings.get_explicit_eq_columns() or DEFAULT_EXPLICIT_FILTER_COLUMNS
+    if not explicit_cols:
+        explicit_cols = DEFAULT_EXPLICIT_FILTER_COLUMNS
 
-    if group_cols:
-        group_sql = "GROUP BY " + ", ".join(group_cols)
-        if hints.get("gross"):
-            select_sql = f"{group_cols[0]} AS GROUP_KEY, SUM({_GROSS_EXPR}) AS TOTAL_GROSS, COUNT(*) AS CNT"
-            order_col = sort_by or "TOTAL_GROSS"
-        else:
-            select_sql = f"{group_cols[0]} AS GROUP_KEY, COUNT(*) AS CNT"
-            order_col = sort_by or "CNT"
-        order_sql = f"ORDER BY {order_col} {'DESC' if sort_desc else 'ASC'}"
-        parts = [f"SELECT {select_sql}", 'FROM "Contract"']
-        if where_sql:
-            parts.append(where_sql)
-        parts.append(group_sql)
-        parts.append(order_sql)
-        final_sql = "\n".join(part for part in parts if part)
-    else:
-        order_col = sort_by or "REQUEST_DATE"
-        order_sql = f"ORDER BY {order_col} {'DESC' if sort_desc else 'ASC'}"
-        parts = ['SELECT *', 'FROM "Contract"']
-        if where_sql:
-            parts.append(where_sql)
-        parts.append(order_sql)
-        final_sql = "\n".join(part for part in parts if part)
+    builder_settings = {
+        "DW_FTS_COLUMNS": builder_fts,
+        "DW_EXPLICIT_FILTER_COLUMNS": explicit_cols,
+        "DW_FTS_ENGINE": settings.get_fts_engine(),
+        "DW_CONTRACT_TABLE": contract_table,
+    }
 
+    intent = {
+        "date_column": "OVERLAP",
+        "fts_tokens": tokens,
+        "fts_operator": operator,
+        "full_text_search": bool(tokens),
+        "eq_filters": hints.get("eq_filters") or [],
+        "group_by": group_col,
+        "gross": gross_flag,
+        "sort_by": sort_by_hint,
+        "sort_desc": sort_desc_hint,
+        "top_n": top_n,
+        "direction_hint": direction_hint,
+        "wants_all_columns": True,
+    }
+
+    final_sql, binds, builder_dbg = build_sql_from_intent(intent, builder_settings, table=contract_table)
     rows = fetch_rows(final_sql, binds)
 
-    eq_applied = hints.get("eq_filters") or []
-    explain_parts: List[str] = []
-    if fts_sql:
-        cols_list = ", ".join(str(col) for col in fts_columns) or "(no columns configured)"
-        reason = hint_reason or ("AND default" if operator == "AND" else "OR default")
-        explain_parts.append(
-            f"FTS tokens joined with {operator} ({reason}). Columns: {cols_list}."
-        )
-    if eq_applied:
-        cols = ", ".join(str(item.get("col")) for item in eq_applied if item.get("col"))
-        if cols:
-            explain_parts.append(f"Equality filters applied on {cols}.")
+    sort_desc_effective = sort_desc_hint
+    if direction_hint is not None and sort_desc_effective is None:
+        sort_desc_effective, _ = direction_from_words([direction_hint])
+    if sort_desc_effective is None:
+        sort_desc_effective = True
+
+    if group_cols:
+        order_col = sort_by_hint or ("TOTAL_GROSS" if gross_flag else "CNT")
+    else:
+        order_col = sort_by_hint or "REQUEST_DATE"
+
+    fts_bind_names = [name for name in binds if name.startswith("fts_")]
+
+    intent_debug = dict(intent)
+    intent_debug["sort_by_effective"] = order_col
+    intent_debug["sort_desc_effective"] = sort_desc_effective
 
     debug = {
         "fts": {
-            "enabled": bool(fts_sql),
+            "enabled": bool(tokens),
             "tokens": tokens or None,
-            "columns": fts_columns if fts_sql else None,
-            "binds": list(fts_binds.keys()) if fts_binds else None,
-            "engine": engine,
+            "columns": fts_columns if tokens else None,
+            "binds": fts_bind_names or None,
+            "engine": builder_settings.get("DW_FTS_ENGINE"),
             "operator": operator if tokens else None,
-            "reason": hint_reason if fts_sql else None,
         },
-        "intent": {
-            "full_text_search": bool(tokens),
-            "fts_tokens": tokens or None,
-            "fts_columns": fts_columns if fts_sql else [],
-            "fts_operator": operator if tokens else None,
-            "eq_filters": eq_applied,
-            "group_by": group_cols or None,
-            "sort_by": order_col,
-            "sort_desc": sort_desc,
-        },
+        "intent": intent_debug,
         "validation": {
             "ok": True,
             "bind_names": list(binds.keys()),
@@ -455,22 +446,23 @@ def rate() -> Any:
         },
         "rate_hints": {
             "comment_present": bool(comment),
-            "where_applied": bool(where_sql),
+            "where_applied": bool(tokens or intent["eq_filters"]),
             "order_by_applied": True,
-            "eq_filters": len(eq_applied),
+            "eq_filters": len(intent["eq_filters"]),
         },
-        "explain": explain_parts,
+        "builder_notes": builder_dbg.get("notes"),
     }
 
     meta = {
         "attempt_no": 2,
         "binds": binds,
         "fts": {
-            "enabled": bool(fts_sql),
-            "engine": engine,
+            "enabled": bool(tokens),
+            "engine": builder_settings.get("DW_FTS_ENGINE"),
             "operator": operator if tokens else None,
-            "columns": fts_columns if fts_sql else [],
+            "columns": fts_columns if tokens else [],
         },
+        "clarifier_intent": intent_debug,
     }
 
     response = {
@@ -480,6 +472,7 @@ def rate() -> Any:
         "debug": debug,
         "meta": meta,
         "rows": rows,
+        "retry": True,
     }
     return jsonify(response)
 
