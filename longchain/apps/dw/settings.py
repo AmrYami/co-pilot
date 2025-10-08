@@ -12,6 +12,21 @@ import os
 import json
 import logging
 
+__all__ = [
+    "get_namespace",
+    "get_setting",
+    "get_json_setting",
+    "get_string_setting",
+    "get_int_setting",
+    "get_bool_setting",
+    "get_json",
+    "get_int",
+    "get_bool",
+    "clear_cache",
+    "Settings",
+    "DWSettings",
+]
+
 try:  # pragma: no cover - optional dependency during tests
     from sqlalchemy import create_engine, text
 except Exception:  # pragma: no cover - allow running without SQLAlchemy
@@ -22,10 +37,20 @@ except Exception:  # pragma: no cover - allow running without SQLAlchemy
 
 log = logging.getLogger(__name__)
 
-# Local cache to avoid repeated round-trips
-_SETTINGS_CACHE: Dict[str, Any] = {}
-_NAMESPACE = "dw::common"
-_DW_SETTINGS_NAMESPACE = _NAMESPACE
+# Local cache to avoid repeated round-trips (per-namespace payloads)
+_SETTINGS_CACHE: Dict[str, Dict[str, Any]] = {}
+_DEFAULT_NAMESPACE = "dw::common"
+_ENV_NAMESPACE_KEY = "DW_NAMESPACE"
+
+
+def get_namespace() -> str:
+    """Return the active DW namespace."""
+
+    namespace = os.getenv(_ENV_NAMESPACE_KEY, _DEFAULT_NAMESPACE)
+    return namespace or _DEFAULT_NAMESPACE
+
+
+_NAMESPACE = get_namespace()
 
 
 class Settings:
@@ -136,68 +161,128 @@ def _try_import_settings_getter():
 
 _GET_SETTING_FN = _try_import_settings_getter()
 
-def _get_raw(key: str, default: Any = None) -> Any:
+def _get_namespace_cache(namespace: str) -> Dict[str, Any]:
+    if namespace not in _SETTINGS_CACHE:
+        _SETTINGS_CACHE[namespace] = {}
+    return _SETTINGS_CACHE[namespace]
+
+
+def _get_raw(key: str, default: Any = None, *, namespace: Optional[str] = None) -> Any:
     """
     Read a setting from the central settings service (if exposed),
     otherwise use cache/env/default.
     """
-    cache_key = f"{_NAMESPACE}:{key}"
-    if cache_key in _SETTINGS_CACHE:
-        return _SETTINGS_CACHE[cache_key]
 
-    val = None
+    ns = namespace or get_namespace()
+    cache = _get_namespace_cache(ns)
+    if key in cache:
+        return cache[key]
+
+    val: Any = None
 
     # 1) Preferred: central settings getter (DB-backed)
     if _GET_SETTING_FN:
         try:
-            # Many central getters accept (key, default=None, scope=None/namespace)
-            # We try to pass namespace via kwargs; fallback to positional if needed.
             try:
-                val = _GET_SETTING_FN(key, default=default, scope="namespace")
+                val = _GET_SETTING_FN(key, default=default, scope="namespace", namespace=ns)
             except TypeError:
-                # Older signature
-                val = _GET_SETTING_FN(key, default)
+                try:
+                    val = _GET_SETTING_FN(key, default=default, namespace=ns)
+                except TypeError:
+                    try:
+                        val = _GET_SETTING_FN(key, default=default, scope="namespace")
+                    except TypeError:
+                        val = _GET_SETTING_FN(key, default)
         except Exception as ex:
             log.warning("Settings getter failed for %s: %s", key, ex)
 
     # 2) Environment override (rarely used but handy in dev)
     if val is None:
-        env_key = f"{_NAMESPACE}.{key}"
+        env_key = f"{ns}.{key}"
         if env_key in os.environ:
             val = os.environ.get(env_key)
 
-    # 3) Fallback to default
-    if val is None:
-        val = default
+    if val is None and key in os.environ:
+        val = os.environ.get(key)
 
-    _SETTINGS_CACHE[cache_key] = val
+    # 3) Fallback to default (with guardrails for critical keys)
+    if val is None:
+        if key == "DW_FTS_ENGINE":
+            val = "like" if default is None else default or "like"
+        else:
+            val = default
+
+    cache[key] = val
     return val
 
-def clear_cache():
-    _SETTINGS_CACHE.clear()
+
+def clear_cache(namespace: Optional[str] = None) -> None:
+    if namespace is None:
+        _SETTINGS_CACHE.clear()
+    else:
+        _SETTINGS_CACHE.pop(namespace, None)
 
 # --- Typed readers ------------------------------------------------------------
 
-def get_setting(key: str, default: Any = None) -> Any:
-    return _get_raw(key, default)
+def _resolve_scope_namespace(namespace: Optional[str], scope: Optional[str]) -> Optional[str]:
+    if namespace:
+        return namespace
+    if scope in {None, "namespace"}:
+        return get_namespace()
+    return namespace
 
-def get_bool(key: str, default: bool = False) -> bool:
-    val = _get_raw(key, default)
+
+def get_setting(
+    key: str,
+    default: Any = None,
+    *,
+    namespace: Optional[str] = None,
+    scope: Optional[str] = None,
+) -> Any:
+    ns = _resolve_scope_namespace(namespace, scope)
+    return _get_raw(key, default, namespace=ns)
+
+
+def get_bool_setting(
+    key: str,
+    default: bool = False,
+    *,
+    namespace: Optional[str] = None,
+    scope: Optional[str] = None,
+) -> bool:
+    ns = _resolve_scope_namespace(namespace, scope)
+    val = _get_raw(key, default, namespace=ns)
     if isinstance(val, bool):
         return val
     if isinstance(val, str):
         return val.strip().lower() in {"1", "true", "yes", "y", "on"}
     return bool(val)
 
-def get_int(key: str, default: int = 0) -> int:
-    val = _get_raw(key, default)
+
+def get_int_setting(
+    key: str,
+    default: int = 0,
+    *,
+    namespace: Optional[str] = None,
+    scope: Optional[str] = None,
+) -> int:
+    ns = _resolve_scope_namespace(namespace, scope)
+    val = _get_raw(key, default, namespace=ns)
     try:
         return int(val)
     except Exception:
         return default
 
-def get_json(key: str, default: Any = None) -> Any:
-    val = _get_raw(key, default)
+
+def get_json_setting(
+    key: str,
+    default: Any = None,
+    *,
+    namespace: Optional[str] = None,
+    scope: Optional[str] = None,
+) -> Any:
+    ns = _resolve_scope_namespace(namespace, scope)
+    val = _get_raw(key, default, namespace=ns)
     if val is None:
         return default
     if isinstance(val, (dict, list)):
@@ -210,6 +295,34 @@ def get_json(key: str, default: Any = None) -> Any:
             # but the underlying getter returns stringified JSON. We try best-effort.
             pass
     return val
+
+
+def get_string_setting(
+    key: str,
+    default: str = "",
+    *,
+    namespace: Optional[str] = None,
+    scope: Optional[str] = None,
+) -> str:
+    ns = _resolve_scope_namespace(namespace, scope)
+    val = _get_raw(key, default, namespace=ns)
+    if val is None:
+        return default
+    return str(val)
+
+
+# Backwards compatibility helpers ------------------------------------------------
+
+def get_bool(key: str, default: bool = False, **kwargs: Any) -> bool:
+    return get_bool_setting(key, default=default, **kwargs)
+
+
+def get_int(key: str, default: int = 0, **kwargs: Any) -> int:
+    return get_int_setting(key, default=default, **kwargs)
+
+
+def get_json(key: str, default: Any = None, **kwargs: Any) -> Any:
+    return get_json_setting(key, default=default, **kwargs)
 
 # --- DW-specific helpers ------------------------------------------------------
 
@@ -286,6 +399,7 @@ class DWSettings:
         self.mem_url = url or os.getenv("MEMORY_DB_URL")
         self._cache: Dict[str, Any] = {}
         self._engine = create_engine(self.mem_url) if (self.mem_url and create_engine) else None
+        self.namespace = get_namespace()
 
     # ------------------------------------------------------------------
     def _fetch_all(self) -> Dict[str, Any]:
@@ -300,7 +414,7 @@ class DWSettings:
                         text(
                             "SELECT key, value, value_type FROM settings WHERE namespace=:ns"
                         ),
-                        {"ns": _DW_SETTINGS_NAMESPACE},
+                        {"ns": self.namespace},
                     )
                     .mappings()
                     .all()
