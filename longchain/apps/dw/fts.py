@@ -4,7 +4,7 @@ from __future__ import annotations
 import re
 from typing import Dict, List, Optional, Tuple
 
-from .settings import DWSettings, get_fts_columns, get_fts_engine
+from .settings import DWSettings, get_fts_columns, get_fts_engine, get_setting
 from .sql_utils import like_expr
 
 Token = str
@@ -135,11 +135,22 @@ def _resolve_columns(table: str) -> List[str]:
     return get_fts_columns(table)
 
 
+def _resolve_fts_engine() -> str:
+    engine = (get_setting("DW_FTS_ENGINE", "like") or "like").strip().lower()
+    if engine not in ("like", "oracle-text"):
+        engine = "like"
+    return engine
+
+
 def _resolve_engine(default: str = "like") -> str:
     engine = _dw_settings.fts_engine()
     if engine:
         return engine
-    return get_fts_engine(default)
+    # Fall back to module-level helpers (includes env/default handling)
+    fallback = get_fts_engine(default)
+    if fallback:
+        return fallback
+    return _resolve_fts_engine()
 
 
 def build_fts_where(
@@ -162,8 +173,10 @@ def build_fts_where(
         "error": None,
     }
 
-    if not columns:
-        debug["error"] = "no_columns"
+    enabled = bool(columns) and engine in ("like", "oracle-text")
+    debug["enabled"] = enabled
+    if not enabled:
+        debug["error"] = "no_engine" if engine not in ("like", "oracle-text") else "no_columns"
         return "", {}, debug
 
     groups = parse_tokens([question])
