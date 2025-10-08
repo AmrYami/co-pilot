@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from typing import Any, Iterable, List
 
+from core.settings import Settings
+
 
 def get_namespace_json(db: Any, key: str, default: Any) -> Any:
     """Return a JSON-like configuration value for the given key.
@@ -119,4 +121,22 @@ def get_short_token_allow(db: Any) -> List[str]:
     return [str(item).strip().upper() for item in allow if isinstance(item, str) and item.strip()]
 
 
-__all__ = ["get_namespace_json", "get_fts_columns", "get_short_token_allow"]
+# --- Backwards-compatibility shim ---
+def get_setting(key, default=None, scope=None, as_type=None):
+    """
+    Backwards-compatible accessor used by legacy modules.
+    Reads from the DB-backed settings (admin/settings/bulk) via get_namespace_json().
+    - Ignores `scope` and `as_type` to maintain compatibility.
+    - Returns the raw `value` already typed (bool/int/str/json), since our admin
+      settings are stored with proper JSON types.
+    """
+
+    try:
+        settings = Settings()
+        return get_namespace_json(settings, key, default)
+    except Exception:
+        # Fail safe: never crash the app because of settings lookup
+        return default
+
+
+__all__ = ["get_namespace_json", "get_fts_columns", "get_short_token_allow", "get_setting"]
