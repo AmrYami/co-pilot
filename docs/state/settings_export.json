@@ -1,0 +1,4 @@
+{
+  "error": "'Engine' object has no attribute 'execute'",
+  "sql": "\n        SELECT key, value, value_type, scope\n        FROM mem_settings\n        WHERE namespace='dw::common'\n        ORDER BY key\n    "
+}
