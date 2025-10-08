@@ -1,3 +1,4 @@
+#!/usr/bin/env markdown
 # البنية المعمارية (Architecture)
 
 ## بنية المستودع (مختصر)
@@ -27,6 +28,6 @@ scripts/
 8. **Rate**: `/dw/rate` يطبّق تعليق المستخدم فورًا (fts/eq/group/order/top-bottom).
 
 ## ما هو `apps/dw/...`؟
-- **settings.py**: مصدر الحقيقة للإعدادات من DB.
+- **settings.py**: مصدر الحقيقة للإعدادات من DB (namespace `dw::common`).
 - **fts.py**: يبني WHERE للبحث النصّي حسب الإعدادات.
 - **explain.py**: يبني rationale نظيف للمستخدم + صفحة HTML `/dw/admin/explain`.

@@ -1,3 +1,4 @@
+#!/usr/bin/env markdown
 # Welcome to co-pilot (DW SQL Copilot)
 
 **TL;DR**
@@ -7,7 +8,7 @@
 - `/dw/answer` builds SQL; `/dw/rate` applies instant fixes (`fts:`, `eq:`, `group_by:`, `order_by:`).
 - Golden tests must pass before merging.
 
-**How to continue here**
+**How to continue**
 1. Read `docs/00-Project-Overview.md` then `01-Architecture.md`.
 2. Export state: `python scripts/export_context.py --out docs/state`
 3. Run `/admin/run_golden` and fix any failing asserts.

@@ -1,3 +1,4 @@
+#!/usr/bin/env markdown
 # الاختبارات و Golden
 
 ## تشغيل

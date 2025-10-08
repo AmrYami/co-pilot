@@ -1,3 +1,4 @@
+#!/usr/bin/env yaml
 # condensed golden tests for explain/fts/order/group-by
 - name: "fts_or_it_homecare"
   request:

@@ -1,3 +1,4 @@
+#!/usr/bin/env markdown
 # co-pilot — نظرة عامة (Overview)
 
 هذا المشروع عبارة عن **DW SQL Copilot** يحوّل الأسئلة الطبيعية إلى SQL على جدول العقود (DocuWare).

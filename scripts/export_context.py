@@ -6,7 +6,7 @@ Usage:
   MEMORY_DB_URL=postgresql+psycopg2://... python scripts/export_context.py --out docs/state
 """
 from __future__ import annotations
-import os, json, argparse, sys
+import os, json, argparse
 from sqlalchemy import create_engine, text
 
 def table_exists(engine, name: str) -> bool:
@@ -24,6 +24,7 @@ def dump(engine, sql: str, params=None):
         return {"error": str(e), "sql": sql}
 
 def main():
+    import sys
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="docs/state", help="Output directory")
     args = ap.parse_args()
@@ -34,6 +35,7 @@ def main():
         for f in ("settings_export.json","examples_export.json","rules_export.json","patches_export.json","runs_metrics_24h.json"):
             with open(os.path.join(args.out, f), "w") as fp:
                 json.dump({"warning":"MEMORY_DB_URL not set"}, fp, indent=2)
+        print("MEMORY_DB_URL not set; wrote placeholders to", args.out)
         return 0
 
     eng = create_engine(url, pool_pre_ping=True, future=True)

@@ -1,3 +1,4 @@
+#!/usr/bin/env markdown
 # Glossary (قاموس مختصر)
 
 - **FTS**: Full-Text Search (LIKE/Oracle-Text).
