@@ -1,3 +1,4 @@
+#!/usr/bin/env markdown
 # سنابشوت الإعدادات (Settings Snapshot)
 
 الإعدادات تُدار من `/admin/settings/bulk` (namespace: `dw::common`).  

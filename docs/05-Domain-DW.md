@@ -1,3 +1,4 @@
+#!/usr/bin/env markdown
 # نطاق DocuWare (DW)
 
 ## جدول Contract (أمثلة لأعمدة رئيسية)
@@ -10,6 +11,8 @@
 - CONTRACT_STAKEHOLDER_1..8
 - REPRESENTATIVE_EMAIL, LEGAL_NAME_OF_THE_COMPANY
 - CONTRACT_SUBJECT, CONTRACT_PURPOSE
+
+> **Schema reference**: راجع `schema.sql` في جذر المشروع (إن وُجد) أو المسار الذي رفعته.
 
 ## Gross measure (افتراضي):
 ```sql

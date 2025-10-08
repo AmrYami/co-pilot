@@ -1,3 +1,4 @@
+#!/usr/bin/env markdown
 # حالة المشروع الحالية (Current State)
 
 | بند | الحالة |

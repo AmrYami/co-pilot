@@ -1,3 +1,4 @@
+#!/usr/bin/env markdown
 # ADR-0003: Rate-Driven Learning
 
 **Decision**: `/dw/rate` يطبق تصحيح فوري (patch-in-place) ويسجل أمثلة ≥4 نجوم للتعلّم.  

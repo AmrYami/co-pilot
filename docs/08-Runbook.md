@@ -1,3 +1,4 @@
+#!/usr/bin/env markdown
 # دليل التشغيل (Runbook)
 
 ## متطلبات
@@ -5,12 +6,8 @@
 - Oracle client (oracledb)
 - PostgreSQL (MEMORY_DB_URL) للتعلّم/الإدارة
 
-## .env (مثال مختصر)
-```
-MEMORY_DB_URL=postgresql+psycopg2://postgres:***@localhost/copilot_mem_dev
-APP_DB_URL=oracle+oracledb://user:pass@localhost:1521/?service_name=FREEPDB1
-DW_FTS_ENGINE=like
-```
+## .env
+ضع ملف `.env` الخاص بك في جذر المشروع (الذي رفعته) — أو استخدم المتغيرات بيئيًا.
 
 ## Populate settings
 استخدم `/admin/settings/bulk` بالقيم الموجودة في `docs/03-Settings-Snapshot.md`.
