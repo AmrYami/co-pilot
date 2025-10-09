@@ -9,6 +9,8 @@ from apps.dw.fts_utils import build_boolean_fts_where, resolve_fts_columns
 from apps.dw.settings import get_fts_columns, get_short_token_allow
 from apps.dw.settings_util import get_fts_columns_for
 
+from apps.dw.common.eq_aliases import get_eq_alias_map
+
 from .columns_map import COLUMN_SYNONYMS, STAKEHOLDER_COLUMNS
 from .fts import normalize_terms, parse_fts_terms_from_question
 
@@ -151,10 +153,16 @@ def apply_equality_aliases(
     if not text:
         return applied
 
+    alias_map = get_eq_alias_map()
+
     dept_match = re.search(r"\bDEPARTMENTS?\s*=\s*['\"]?([^'\"\n]+)['\"]?", text, flags=re.IGNORECASE)
     if dept_match:
         value = dept_match.group(1).strip()
-        columns = COLUMN_SYNONYMS.get("DEPARTMENTS", ["OWNER_DEPARTMENT"])
+        columns = (
+            alias_map.get("DEPARTMENTS")
+            or alias_map.get("DEPARTMENT")
+            or COLUMN_SYNONYMS.get("DEPARTMENTS", ["OWNER_DEPARTMENT"])
+        )
         bind_name = "eq_dept_0"
         binds[bind_name] = value
         clause = "(" + " OR ".join(
@@ -170,7 +178,11 @@ def apply_equality_aliases(
         raw_parts = re.split(r"\s*(?:OR|,|/)\s*", tail, flags=re.IGNORECASE)
         terms = [part.strip(" ' \"") for part in raw_parts if part.strip(" ' \"")]
         terms = terms[:10]
-        cols = COLUMN_SYNONYMS.get("STAKEHOLDER", STAKEHOLDER_COLUMNS)
+        cols = (
+            alias_map.get("STAKEHOLDERS")
+            or alias_map.get("STAKEHOLDER")
+            or COLUMN_SYNONYMS.get("STAKEHOLDER", STAKEHOLDER_COLUMNS)
+        )
         ors: List[str] = []
         for idx, term in enumerate(terms):
             bind = f"eq_stk_{idx}"

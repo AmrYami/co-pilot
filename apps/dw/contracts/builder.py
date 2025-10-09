@@ -1,14 +1,13 @@
 from __future__ import annotations
 import re
 from datetime import date, datetime
-from typing import Dict, Tuple, Optional, List
+from typing import Dict, Tuple, Optional, List, Iterable
 
 from apps.dw.aliases import resolve_column_alias
-from apps.dw.contracts.text_filters import (
-    extract_eq_filters,
-    build_eq_where,
-)
+from apps.dw.common.eq_aliases import get_eq_alias_map, resolve_eq_targets
+from apps.dw.contracts.text_filters import extract_eq_filters
 from apps.dw.fts_utils import resolve_fts_columns
+from apps.dw.settings_defaults import DEFAULT_EXPLICIT_FILTER_COLUMNS
 from .planner_contracts import apply_equality_aliases, apply_full_text_search
 
 from .filters import try_parse_simple_equals
@@ -175,6 +174,151 @@ def _get_fts_columns(settings: dict | None, override: Optional[List[str]] = None
     return _normalize_columns(resolved)
 
 
+def _get_explicit_eq_columns(settings: dict | None) -> List[str]:
+    """Return the configured DW_EXPLICIT_FILTER_COLUMNS list or fallback default."""
+
+    if isinstance(settings, dict):
+        raw = settings.get("DW_EXPLICIT_FILTER_COLUMNS")
+        if isinstance(raw, list) and raw:
+            return list(raw)
+
+    for attr in ("get", "get_json"):
+        getter = getattr(settings, attr, None)
+        if callable(getter):
+            try:
+                value = getter("DW_EXPLICIT_FILTER_COLUMNS")
+            except TypeError:
+                try:
+                    value = getter("DW_EXPLICIT_FILTER_COLUMNS", None)
+                except TypeError:
+                    continue
+            if isinstance(value, list) and value:
+                return list(value)
+
+    mapping = _as_settings_dict(settings)
+    if mapping:
+        candidate = mapping.get("DW_EXPLICIT_FILTER_COLUMNS")
+        if isinstance(candidate, list) and candidate:
+            return list(candidate)
+
+    return list(DEFAULT_EXPLICIT_FILTER_COLUMNS)
+
+
+def _normalize_allowed_columns(columns: Iterable[str]) -> set[str]:
+    allowed: set[str] = set()
+    for col in columns or []:
+        if not isinstance(col, str):
+            continue
+        cleaned = col.strip()
+        if not cleaned:
+            continue
+        if cleaned.startswith('"') and cleaned.endswith('"'):
+            key = cleaned.strip('"').upper()
+        else:
+            key = cleaned.replace(" ", "_").replace("-", "_").upper()
+        allowed.add(key)
+    return allowed
+
+
+def _select_allowed_columns(columns: Iterable[str], allowed: set[str]) -> List[str]:
+    selected: List[str] = []
+    seen: set[str] = set()
+    for col in columns or []:
+        if not isinstance(col, str):
+            continue
+        text = col.strip()
+        if not text:
+            continue
+        if text.startswith('"') and text.endswith('"'):
+            key = text.strip('"').upper()
+        else:
+            key = text.replace(" ", "_").replace("-", "_").upper()
+        if key not in allowed or key in seen:
+            continue
+        seen.add(key)
+        selected.append(text)
+    return selected
+
+
+def _expand_columns_for_entry(entry: Dict, alias_map: Dict[str, List[str]], allowed: set[str]) -> List[str]:
+    tokens: List[str] = []
+    raw_token = entry.get("raw_col")
+    col_token = entry.get("col")
+    if isinstance(raw_token, str) and raw_token:
+        tokens.append(raw_token)
+    if isinstance(col_token, str) and col_token and col_token not in tokens:
+        tokens.append(col_token)
+
+    for token in tokens:
+        expanded = resolve_eq_targets(token, mapping=alias_map)
+        filtered = _select_allowed_columns(expanded, allowed)
+        if filtered:
+            return filtered
+
+    return _select_allowed_columns([col_token], allowed)
+
+
+def _comparison_expr(column: str, bind_name: str, *, ci: bool, trim: bool) -> str:
+    placeholder = f":{bind_name}"
+    if ci and trim:
+        return f"UPPER(TRIM({column})) = UPPER(TRIM({placeholder}))"
+    if ci:
+        return f"UPPER({column}) = UPPER({placeholder})"
+    if trim:
+        return f"TRIM({column}) = TRIM({placeholder})"
+    return f"{column} = {placeholder}"
+
+
+def _build_eq_clause(columns: List[str], bind_name: str, *, ci: bool, trim: bool) -> str:
+    comparisons = [
+        _comparison_expr(column, bind_name, ci=ci, trim=trim)
+        for column in columns
+        if column
+    ]
+    if not comparisons:
+        return ""
+    if len(comparisons) == 1:
+        return comparisons[0]
+    return "(" + " OR ".join(comparisons) + ")"
+
+
+def _build_eq_clauses(
+    eq_filters: List[Dict],
+    binds: Dict[str, object],
+    *,
+    alias_map: Dict[str, List[str]],
+    allowed: set[str],
+) -> Tuple[List[str], Dict[str, object]]:
+    clauses: List[str] = []
+    new_binds: Dict[str, object] = {}
+    existing = {
+        str(key)
+        for key in binds.keys()
+        if isinstance(key, str)
+    }
+    next_index = 0
+    for entry in eq_filters:
+        columns = _expand_columns_for_entry(entry, alias_map, allowed)
+        if not columns:
+            continue
+        while f"eq_{next_index}" in existing:
+            next_index += 1
+        bind_name = f"eq_{next_index}"
+        existing.add(bind_name)
+        next_index += 1
+        clause = _build_eq_clause(
+            columns,
+            bind_name,
+            ci=bool(entry.get("ci", True)),
+            trim=bool(entry.get("trim", True)),
+        )
+        if not clause:
+            continue
+        clauses.append(clause)
+        new_binds[bind_name] = entry.get("val")
+    return clauses, new_binds
+
+
 def build_contract_sql(
     *,
     question: str,
@@ -224,9 +368,17 @@ def build_contract_sql(
             filtered.append(entry)
 
         if filtered:
-            eq_sql, binds = build_eq_where(filtered, binds, bind_prefix="eq")
-            if eq_sql:
-                base_where.append(eq_sql)
+            alias_map = get_eq_alias_map(settings)
+            allowed = _normalize_allowed_columns(_get_explicit_eq_columns(settings))
+            clauses, new_binds = _build_eq_clauses(
+                filtered,
+                binds,
+                alias_map=alias_map,
+                allowed=allowed,
+            )
+            if clauses:
+                base_where.append(" AND ".join(clauses))
+                binds.update(new_binds)
 
     fts_debug: Dict[str, object] = {}
     skip_fts = bool(alias_result.get("stakeholder"))
