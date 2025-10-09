@@ -7,19 +7,33 @@ Usage:
 """
 from __future__ import annotations
 import os, json, argparse
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, text, inspect
+try:
+    # Optional: load .env if available
+    from dotenv import load_dotenv  # type: ignore
+    load_dotenv()
+except Exception:
+    pass
 
-def table_exists(engine, name: str) -> bool:
+def table_exists(engine, name: str, schema: str | None = None) -> bool:
+    """
+    SQLAlchemy 2.0-safe table existence check.
+    Try name as-is, lower, and upper to be robust to case/quoting.
+    """
     try:
-        q = text("SELECT 1 FROM information_schema.tables WHERE table_name=:t")
-        return bool(engine.execute(q, {"t": name}).fetchall())
+        insp = inspect(engine)
+        for cand in (name, name.lower(), name.upper()):
+            if insp.has_table(cand, schema=schema):
+                return True
+        return False
     except Exception:
         return False
 
 def dump(engine, sql: str, params=None):
     try:
-        rows = engine.execute(text(sql), params or {}).mappings().all()
-        return [dict(r) for r in rows]
+        with engine.connect() as conn:
+            rows = conn.execute(text(sql), params or {}).mappings().all()
+            return [dict(r) for r in rows]
     except Exception as e:
         return {"error": str(e), "sql": sql}
 
@@ -30,7 +44,7 @@ def main():
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
 
-    url = os.getenv("MEMORY_DB_URL")
+    url = os.getenv("MEMORY_DB_URL", "postgresql+psycopg2://postgres:123456789@localhost/copilot_mem_dev")
     if not url:
         for f in ("settings_export.json","examples_export.json","rules_export.json","patches_export.json","runs_metrics_24h.json"):
             with open(os.path.join(args.out, f), "w") as fp:
@@ -38,7 +52,7 @@ def main():
         print("MEMORY_DB_URL not set; wrote placeholders to", args.out)
         return 0
 
-    eng = create_engine(url, pool_pre_ping=True, future=True)
+    eng = create_engine(url, pool_pre_ping=True)
 
     # settings
     settings = dump(eng, """
