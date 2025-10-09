@@ -22,3 +22,11 @@ group_by: COL1, COL2
 order_by: COL asc|desc
 top:  N by COL   # or bottom: N by COL
 ```
+
+---
+
+## Structure quick guide
+- **core/**: project-agnostic reusable building blocks (settings infra, DB/session, logging, sql utils, validators, generic explain/rate). No domain-specific code here.  
+- **apps/<app>/**: app/domain-specific logic (e.g., `apps/dw` for DocuWare).  
+- **Table-scoped**: put each table logic under its own module (e.g., `apps/dw/contracts/*`).  
+  Keep imports one-way (`apps/*` can import `core/`, not vice versa). No hardcoded settings—read from DB always.
