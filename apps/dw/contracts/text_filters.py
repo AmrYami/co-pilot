@@ -56,15 +56,18 @@ def extract_eq_filters(question: str) -> List[Dict]:
     """
     out: List[Dict] = []
     for col_h, val in _EQ_RE.findall(question or ""):
+        raw_name = (col_h or "").strip()
+        raw_key = re.sub(r"[\s\-]+", "_", raw_name.replace('"', "")).upper()
         norm = normalize_column_name(col_h)
         if not norm:
             # try raw uppercase (user may have written exact DB column)
-            raw = col_h.strip().upper().replace(" ", "_").replace("-", "_")
+            raw = raw_key
             norm = raw if re.match(r"^[A-Z0-9_]+$", raw) else None
         if not norm:
             continue
         out.append({
             "col": norm,
+            "raw_col": raw_key or norm,
             "val": val.strip(),
             "ci": True,   # case-insensitive by default
             "trim": True, # trim by default

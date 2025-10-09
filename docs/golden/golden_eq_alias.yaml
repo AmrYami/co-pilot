@@ -1,0 +1,32 @@
+cases:
+  - name: eq_alias_department_expands_to_9_cols
+    request:
+      question: "department = AL FARABI"
+      full_text_search: false
+    require_order_by: REQUEST_DATE
+    must_contain:
+      - "UPPER(TRIM(DEPARTMENT_1)) = UPPER(TRIM(:eq_0))"
+      - "OR UPPER(TRIM(DEPARTMENT_8)) = UPPER(TRIM(:eq_0))"
+      - "OR UPPER(TRIM(OWNER_DEPARTMENT)) = UPPER(TRIM(:eq_0))"
+    must_not_contain:
+      - "CONTRACT_STAKEHOLDER_1"
+
+  - name: eq_alias_stakeholder_expands_to_8_cols
+    request:
+      question: "stakeholders = John Doe"
+      full_text_search: false
+    must_contain:
+      - "UPPER(TRIM(CONTRACT_STAKEHOLDER_1)) = UPPER(TRIM(:eq_0))"
+      - "OR UPPER(TRIM(CONTRACT_STAKEHOLDER_8)) = UPPER(TRIM(:eq_0))"
+
+  - name: eq_specific_column_does_not_expand
+    request:
+      question: "DEPARTMENT_3 = AL FARABI and OWNER_DEPARTMENT = AL FARABI"
+      full_text_search: false
+    must_contain:
+      - "UPPER(TRIM(DEPARTMENT_3)) = UPPER(TRIM(:eq_0))"
+      - "UPPER(TRIM(OWNER_DEPARTMENT)) = UPPER(TRIM(:eq_1))"
+    must_not_contain:
+      - "DEPARTMENT_1"
+      - "DEPARTMENT_2"
+      - "DEPARTMENT_4"
