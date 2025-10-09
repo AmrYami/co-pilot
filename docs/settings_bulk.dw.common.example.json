@@ -1,0 +1,179 @@
+{
+  "namespace": "dw::common",
+  "updated_by": "docs",
+  "settings": [
+    { "key": "DW_OVERLAP_STRICT", "scope": "namespace", "value_type": "int", "value": 1 },
+    {
+      "key": "DW_EXPLICIT_FILTER_COLUMNS",
+      "scope": "namespace",
+      "value_type": "json",
+      "value": [
+        "CONTRACT_SUBJECT",
+        "CONTRACT_PURPOSE",
+        "OWNER_DEPARTMENT",
+        "DEPARTMENT_OUL",
+        "CONTRACT_OWNER",
+        "CONTRACT_STAKEHOLDER_1",
+        "CONTRACT_STAKEHOLDER_2",
+        "LEGAL_NAME_OF_THE_COMPANY",
+        "ENTITY",
+        "ENTITY_NO",
+        "REQUEST_TYPE",
+        "CONTRACT_STATUS",
+        "REQUESTER",
+        "CONTRACT_ID",
+        "REPRESENTATIVE_EMAIL"
+      ]
+    },
+    {
+      "key": "DW_FTS_COLUMNS",
+      "scope": "namespace",
+      "value_type": "json",
+      "value": {
+        "Contract": [
+          "CONTRACT_SUBJECT",
+          "CONTRACT_PURPOSE",
+          "OWNER_DEPARTMENT",
+          "DEPARTMENT_OUL",
+          "CONTRACT_OWNER",
+          "CONTRACT_STAKEHOLDER_1",
+          "CONTRACT_STAKEHOLDER_2",
+          "LEGAL_NAME_OF_THE_COMPANY",
+          "ENTITY",
+          "ENTITY_NO",
+          "REQUEST_TYPE",
+          "CONTRACT_STATUS",
+          "REQUESTER",
+          "CONTRACT_ID",
+          "REPRESENTATIVE_EMAIL"
+        ],
+        "*": [
+          "CONTRACT_SUBJECT",
+          "CONTRACT_PURPOSE",
+          "OWNER_DEPARTMENT",
+          "DEPARTMENT_OUL",
+          "CONTRACT_OWNER",
+          "CONTRACT_STAKEHOLDER_1",
+          "CONTRACT_STAKEHOLDER_2",
+          "LEGAL_NAME_OF_THE_COMPANY",
+          "ENTITY",
+          "ENTITY_NO",
+          "REPRESENTATIVE_EMAIL"
+        ]
+      }
+    },
+    {
+      "key": "DW_ENUM_SYNONYMS",
+      "scope": "namespace",
+      "value_type": "json",
+      "value": {
+        "Contract.REQUEST_TYPE": {
+          "renewal": {
+            "equals": ["Renewal", "Renew", "Renew Contract", "Renewed", "extension"],
+            "prefix": ["Renew", "Extens"],
+            "contains": []
+          },
+          "addendum": {
+            "equals": ["Addendum", "Amendment", "Appendix"],
+            "prefix": ["Amend", "Append"],
+            "contains": []
+          },
+          "new": {
+            "equals": ["New Contract", "New"],
+            "prefix": ["New", "Create"],
+            "contains": []
+          },
+          "termination": {
+            "equals": ["Termination", "Cancellation"],
+            "prefix": ["Termin", "Cancel", "Close"],
+            "contains": []
+          },
+          "null": {
+            "equals": ["NULL", "N/A", "NA", "-"],
+            "prefix": [],
+            "contains": []
+          }
+        }
+      }
+    },
+    { "key": "DW_FTS_ENGINE", "scope": "namespace", "value_type": "string", "value": "like" },
+
+    { "key": "ACTIVE_APP", "scope": "namespace", "value": "dw" },
+    { "key": "APP_DB_URL", "scope": "namespace", "value": "oracle+oracledb://docuware:***@localhost:1521/?service_name=FREEPDB1" },
+    { "key": "RESEARCH_MODE", "scope": "namespace", "value": true },
+    { "key": "RESEARCHER_CLASS", "scope": "global", "value": "apps.dw.research.DWResearcher" },
+
+    { "key": "DW_SELECT_ALL_DEFAULT", "scope": "namespace", "value": true },
+
+    { "key": "ADMIN_EMAILS", "scope": "global", "value": ["amr.yami1@gmail.com", "dev@example.com"] },
+    { "key": "ADMINS_CAN_CLARIFY_IMMEDIATE", "scope": "namespace", "value": ["amr.yami1@gmail.com", "dev@example.com"] },
+
+    { "key": "CLARIFIER_MODEL_BACKEND", "scope": "global", "value_type": "string", "value": "hf-4bit" },
+
+    { "key": "SMTP_HOST", "scope": "global", "value": "smtp.gmail.com" },
+    { "key": "SMTP_SECURITY", "scope": "global", "value": "ssl" },
+    { "key": "SMTP_PORT", "scope": "global", "value_type": "int", "value": 587 },
+    { "key": "SMTP_USER", "scope": "global", "value": "amr.yami1.business@gmail.com" },
+    { "key": "SMTP_PASSWORD", "scope": "global", "value": "CHANGE_ME", "is_secret": true },
+    { "key": "SMTP_FROM", "scope": "global", "value": "Copilot" },
+
+    { "key": "AUTO_ESCALATE_ON_CLARIFICATION", "scope": "global", "value": true },
+    { "key": "AUTO_NOTIFY_ON_FAILED_DERIVATION", "scope": "global", "value": true },
+    { "key": "ENDUSER_CAN_CLARIFY", "scope": "global", "value": true },
+
+    { "key": "MAX_CLARIFICATION_ROUNDS", "scope": "namespace", "value_type": "int", "value": 5 },
+    { "key": "EMPTY_RESULT_AUTORETRY", "scope": "namespace", "value_type": "bool", "value": true },
+    { "key": "EMPTY_RESULT_AUTORETRY_DAYS", "scope": "namespace", "value_type": "int", "value": 365 },
+    { "key": "SNIPPETS_AUTOSAVE", "scope": "namespace", "value_type": "bool", "value": true },
+
+    { "key": "AUTH_EMAIL", "value": "amr.yami1@gmail.com" },
+    { "key": "ALERTS_ENABLED", "value": true },
+    { "key": "VALIDATE_WITH_EXPLAIN_ONLY", "scope": "global", "value": false },
+    { "key": "ALERTS_EMAILS", "scope": "global", "value": ["amr.yami1@gmail.com","dev@example.com"] },
+    { "key": "LEARNING_MODE", "scope": "global", "value": true },
+    { "key": "ASK_MODE", "scope": "global", "value": "metric_first" },
+
+    { "key": "MEMORY_DB_URL", "scope": "global", "value": "postgresql+psycopg2://postgres:***@localhost/copilot_mem_dev" },
+
+    {
+      "key": "RESEARCH_POLICY",
+      "scope": "namespace",
+      "value_type": "json",
+      "value": { "frontaccounting_bk": true, "rms2": false, "membership": true }
+    },
+
+    {
+      "key": "DB_CONNECTIONS",
+      "scope": "namespace",
+      "value_type": "json",
+      "value": [
+        {
+          "name": "docuware",
+          "url": "oracle+oracledb://docuware:***@localhost:1521/?service_name=FREEPDB1",
+          "role": "oltp"
+        }
+      ]
+    },
+    { "key": "DEFAULT_DATASOURCE", "scope": "namespace", "value_type": "string", "value": "docuware" },
+
+    { "key": "SETTINGS_ADMIN_KEY_HASH", "scope": "global", "value": "CHANGE_THIS_HASH", "is_secret": true, "value_type": "string" },
+
+    { "key": "DW_CONTRACT_TABLE", "scope": "namespace", "value": "Contract" },
+    { "key": "DW_DATE_COLUMN", "scope": "namespace", "value": "REQUEST_DATE" },
+    { "key": "DW_STAKEHOLDER_SLOTS", "scope": "namespace", "value_type": "int", "value": 8 },
+    { "key": "DW_USE_LLM", "scope": "namespace", "value_type": "bool", "value": true },
+
+    {
+      "key": "FA_CATEGORY_MAP",
+      "scope": "global",
+      "value": {
+        "sales invoice": { "table": "debtor_trans", "types": [10] },
+        "credit note":   { "table": "debtor_trans", "types": [11] },
+        "customer receipt": { "table": "debtor_trans", "types": [12] },
+        "supplier invoice": { "table": "supp_trans", "types": [2] },
+        "supplier payment": { "table": "supp_trans", "types": [6] },
+        "fund transfer": { "table": "bank_trans", "types": [3] }
+      }
+    }
+  ]
+}

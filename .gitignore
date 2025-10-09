@@ -1,0 +1,7 @@
+Python caches
+pycache/
+*.pyc
+*.pyo
+
+# local settings payload (secrets)
+docs/*local.json
