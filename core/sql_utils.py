@@ -66,20 +66,41 @@ def normalize_order_by(sort_by: Optional[str], sort_desc: Optional[bool]) -> str
     if not sort_by:
         return "ORDER BY REQUEST_DATE DESC"
 
-    token = str(sort_by or "").strip()
     direction = "DESC" if sort_desc else "ASC"
-    upper = token.upper()
-    if upper.endswith("_DESC"):
-        token = upper[:-5]
-        direction = "DESC"
-    elif upper.endswith("_ASC"):
-        token = upper[:-4]
-        direction = "ASC"
-    else:
-        token = upper
 
-    column = token.strip() or "REQUEST_DATE"
-    return f"ORDER BY {column} {direction}"
+    if isinstance(sort_by, (list, tuple)):
+        tokens = [str(part).strip() for part in sort_by if str(part or "").strip()]
+        token = tokens[0] if tokens else ""
+    else:
+        token = str(sort_by or "").strip()
+
+    if not token:
+        return "ORDER BY REQUEST_DATE DESC"
+
+    match = re.match(r"^(?P<col>.+?)\s+(?P<dir>ASC|DESC)$", token, flags=re.IGNORECASE)
+    if match:
+        column = match.group("col").strip()
+        direction = match.group("dir").upper()
+    else:
+        upper = token.upper()
+        if upper.endswith("_DESC"):
+            column = token[:-5].strip()
+            direction = "DESC"
+        elif upper.endswith("_ASC"):
+            column = token[:-4].strip()
+            direction = "ASC"
+        else:
+            column = token
+
+    if column.startswith('"') and column.endswith('"') and len(column) >= 2:
+        normalized_column = column
+    else:
+        normalized_column = column.upper()
+
+    if not normalized_column:
+        normalized_column = "REQUEST_DATE"
+
+    return f"ORDER BY {normalized_column} {direction}"
 
 
 def extract_bind_names(sql: str) -> list[str]:
