@@ -1,0 +1,47 @@
+cases:
+  - id: eq_alias_department_expands_to_9_cols
+    question: "department = AL FARABI"
+    full_text_search: false
+    allow_zero_rows: true
+    require_order_by: REQUEST_DATE
+    require_order_dir: DESC
+    must_contain:
+      - "UPPER(TRIM(DEPARTMENT_1))"
+      - "OR UPPER(TRIM(DEPARTMENT_8))"
+      - "OR UPPER(TRIM(OWNER_DEPARTMENT))"
+    must_not_contain:
+      - " UPPER(TRIM(DEPARTMENT)) = "
+      - " UPPER(TRIM(STAKEHOLDER)) = "
+
+  - id: eq_alias_stakeholder_expands_to_8_cols
+    question: "stakeholders = John Doe"
+    full_text_search: false
+    allow_zero_rows: true
+    must_contain:
+      - "UPPER(TRIM(CONTRACT_STAKEHOLDER_1))"
+      - "OR UPPER(TRIM(CONTRACT_STAKEHOLDER_8))"
+    must_not_contain:
+      - " UPPER(TRIM(STAKEHOLDER)) = "
+
+  - id: eq_specific_column_no_expand
+    question: "DEPARTMENT_3 = AL FARABI and OWNER_DEPARTMENT = AL FARABI"
+    full_text_search: false
+    allow_zero_rows: true
+    must_contain:
+      - "UPPER(TRIM(DEPARTMENT_3))"
+      - "UPPER(TRIM(OWNER_DEPARTMENT))"
+    must_not_contain:
+      - "DEPARTMENT_1"
+      - "DEPARTMENT_2"
+      - "DEPARTMENT_4"
+
+  - id: order_by_is_column_plus_direction_not_literal_suffix
+    question: "department = X"
+    full_text_search: false
+    allow_zero_rows: true
+    require_order_by: REQUEST_DATE
+    require_order_dir: DESC
+    must_contain:
+      - "ORDER BY REQUEST_DATE DESC"
+    must_not_contain:
+      - "ORDER BY REQUEST_DATE_DESC"

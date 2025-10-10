@@ -39,6 +39,8 @@ def _run_case(client, case: dict[str, Any]) -> dict[str, Any]:
         "question": case["question"],
         "auth_email": "dev@example.com",
     }
+    if "full_text_search" in case:
+        payload["full_text_search"] = bool(case.get("full_text_search"))
     t0 = time.time()
     rv = client.post("/dw/answer", json=payload)
     ms = int((time.time() - t0) * 1000)
@@ -53,6 +55,11 @@ def _run_case(client, case: dict[str, Any]) -> dict[str, Any]:
         if frag not in sql:
             errs.append(f"missing fragment: {frag}")
 
+    # Must NOT contain checks
+    for frag in case.get("must_not_contain", []):
+        if frag in sql:
+            errs.append(f"forbidden fragment present: {frag}")
+
     # Compile check
     if case.get("compile_oracle"):
         good, msg = _compile_oracle(sql)
@@ -65,6 +72,17 @@ def _run_case(client, case: dict[str, Any]) -> dict[str, Any]:
             errs.append(f"rows<{case['expect_min_rows']} (got {len(rows)})")
     if not case.get("allow_zero_rows", False) and len(rows) == 0:
         errs.append("rows==0 not allowed")
+
+    order_col = case.get("require_order_by")
+    if order_col:
+        if "ORDER BY" not in sql.upper():
+            errs.append("missing ORDER BY clause")
+        elif order_col.upper() not in sql.upper():
+            errs.append(f"ORDER BY missing column: {order_col}")
+
+    order_dir = case.get("require_order_dir")
+    if order_dir and order_dir.upper() not in sql.upper():
+        errs.append(f"ORDER BY missing direction: {order_dir}")
 
     return {
         "id": case["id"],
