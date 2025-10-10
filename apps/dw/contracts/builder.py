@@ -512,6 +512,10 @@ def build_contract_sql(
     allowed_eq_columns = _normalize_allowed_columns(_get_explicit_eq_columns(settings_map))
     if not allowed_eq_columns:
         allowed_eq_columns = _normalize_allowed_columns(DEFAULT_EXPLICIT_FILTER_COLUMNS)
+    for alias in ("DEPARTMENT", "DEPARTMENTS", "STAKEHOLDER", "STAKEHOLDERS"):
+        allowed_eq_columns.update(
+            _normalize_allowed_columns(resolve_eq_targets(alias))
+        )
 
     fts_columns_cfg = _get_fts_columns(settings_map, override=fts_columns_override)
 

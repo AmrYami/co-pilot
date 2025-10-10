@@ -48,6 +48,7 @@ def _run_case(client, case: dict[str, Any]) -> dict[str, Any]:
     sql = _normalize_sql(data.get("sql", ""))
     ok = data.get("ok", False)
     rows = data.get("rows") or []
+    debug_blob = json.dumps(data.get("debug", {}), sort_keys=True)
     errs: list[str] = []
 
     # Must contain checks
@@ -59,6 +60,14 @@ def _run_case(client, case: dict[str, Any]) -> dict[str, Any]:
     for frag in case.get("must_not_contain", []):
         if frag in sql:
             errs.append(f"forbidden fragment present: {frag}")
+
+    for frag in case.get("debug_must_contain", []):
+        if frag not in debug_blob:
+            errs.append(f"missing debug fragment: {frag}")
+
+    for frag in case.get("debug_must_not_contain", []):
+        if frag in debug_blob:
+            errs.append(f"forbidden debug fragment present: {frag}")
 
     # Compile check
     if case.get("compile_oracle"):
