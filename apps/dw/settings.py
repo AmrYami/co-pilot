@@ -1,9 +1,92 @@
 """Utilities for reading DW namespace settings with safe defaults."""
 from __future__ import annotations
 
-from typing import Any, Iterable, List
+import json
+import logging
+import os
+from functools import lru_cache
+from typing import Any, Dict, Iterable, List
+
+try:
+    from sqlalchemy import create_engine, text
+except Exception:  # pragma: no cover - optional dependency at runtime
+    create_engine = None
+    text = None
 
 from core.settings import Settings
+
+_NAMESPACE = "dw::common"
+
+
+def _coerce(value: Any, value_type: str) -> Any:
+    value_type_norm = (value_type or "").lower()
+    if value_type_norm == "json":
+        if isinstance(value, (dict, list)):
+            return value
+        try:
+            return json.loads(value)
+        except Exception:
+            return {}
+    if value_type_norm == "int":
+        try:
+            return int(value)
+        except Exception:
+            return 0
+    if value_type_norm == "bool":
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() in {"1", "true", "t", "yes", "y"}
+    return value
+
+
+@lru_cache(maxsize=1)
+def get_settings() -> Dict[str, Any]:
+    """Load dw::common settings from the memory DB with a file fallback."""
+
+    settings_map: Dict[str, Any] = {}
+    db_url = os.getenv("MEMORY_DB_URL", "").strip()
+    rows = []
+
+    if db_url and create_engine and text:
+        try:
+            engine = create_engine(db_url, pool_pre_ping=True, future=True)
+            with engine.begin() as conn:
+                rows = (
+                    conn.execute(
+                        text(
+                            """
+                            SELECT key, value, value_type, scope
+                            FROM mem_settings
+                            WHERE namespace = :ns
+                            ORDER BY key
+                            """
+                        ),
+                        {"ns": _NAMESPACE},
+                    )
+                    .mappings()
+                    .all()
+                )
+        except Exception as exc:  # pragma: no cover - defensive fallback
+            logging.warning("get_settings(): DB load failed: %s", exc)
+
+    if not rows:
+        snapshot_path = os.path.join(os.getcwd(), "docs", "state", "settings_export.json")
+        try:
+            with open(snapshot_path, "r", encoding="utf-8") as handler:
+                snapshot = json.load(handler)
+                if isinstance(snapshot, list):
+                    rows = snapshot
+        except Exception:
+            rows = []
+
+    for row in rows:
+        key = row.get("key") if isinstance(row, dict) else None
+        if not key:
+            continue
+        settings_map[key] = _coerce(row.get("value"), row.get("value_type"))
+
+    settings_map.setdefault("DW_FTS_ENGINE", "like")
+    return settings_map
 
 
 def get_namespace_json(db: Any, key: str, default: Any) -> Any:
@@ -139,4 +222,10 @@ def get_setting(key, default=None, scope=None, as_type=None):
         return default
 
 
-__all__ = ["get_namespace_json", "get_fts_columns", "get_short_token_allow", "get_setting"]
+__all__ = [
+    "get_settings",
+    "get_namespace_json",
+    "get_fts_columns",
+    "get_short_token_allow",
+    "get_setting",
+]
