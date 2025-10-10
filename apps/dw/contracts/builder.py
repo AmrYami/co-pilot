@@ -246,10 +246,13 @@ def _expand_columns_for_entry(entry: Dict, allowed: set[str]) -> List[str]:
     tokens: List[str] = []
     raw_token = entry.get("raw_col")
     col_token = entry.get("col")
+    column_token = entry.get("column")
     if isinstance(raw_token, str) and raw_token:
         tokens.append(raw_token)
     if isinstance(col_token, str) and col_token and col_token not in tokens:
         tokens.append(col_token)
+    if isinstance(column_token, str) and column_token and column_token not in tokens:
+        tokens.append(column_token)
 
     for token in tokens:
         expanded = resolve_eq_targets(token)
@@ -298,13 +301,41 @@ def _build_eq_clauses(
         op = str(entry.get("op") or "eq").lower()
         if op not in {"eq", "like"}:
             op = "eq"
-        ci = bool(entry.get("ci", True))
-        trim = bool(entry.get("trim", True))
-        values = entry.get("values") or []
+        flags = entry.get("flags") if isinstance(entry.get("flags"), dict) else {}
+
+        def _resolve_flag(name: str, default: bool) -> bool:
+            raw = entry.get(name)
+            if raw is None and isinstance(flags, dict):
+                raw = flags.get(name)
+            if raw is None:
+                return default
+            if isinstance(raw, str):
+                lowered = raw.strip().lower()
+                if lowered in {"0", "false", "no", "off"}:
+                    return False
+                if lowered in {"1", "true", "yes", "on"}:
+                    return True
+            return bool(raw)
+
+        ci = _resolve_flag("ci", True)
+        trim = _resolve_flag("trim", True)
+
+        raw_values = entry.get("values")
+        values: List[object] = []
+        if isinstance(raw_values, (list, tuple, set)):
+            values = list(raw_values)
+        elif raw_values not in (None, ""):
+            values = [raw_values]
         if not values:
-            fallback = entry.get("val")
-            if fallback not in (None, ""):
-                values = [fallback]
+            single_value = None
+            if "value" in entry:
+                single_value = entry.get("value")
+            elif "val" in entry:
+                single_value = entry.get("val")
+            if isinstance(single_value, (list, tuple, set)):
+                values = list(single_value)
+            elif single_value not in (None, ""):
+                values = [single_value]
         if not values:
             continue
         processed: List[object] = []

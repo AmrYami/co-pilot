@@ -253,17 +253,71 @@ def _respond(payload: Dict[str, Any], response: Dict[str, Any]):
         if not isinstance(fts_debug, dict):
             fts_debug = {}
             debug_section["fts"] = fts_debug
-        engine_value = fts_debug.get("engine") or fts_engine()
+
+        engine_value: Optional[str] = None
+        raw_engine: Any = None
+        try:
+            settings_obj = get_settings()
+        except Exception:  # pragma: no cover - defensive fallback
+            settings_obj = None
+        if isinstance(settings_obj, dict):
+            raw_engine = settings_obj.get("DW_FTS_ENGINE")
+        else:
+            getter = getattr(settings_obj, "get", None)
+            if callable(getter):
+                try:
+                    raw_engine = getter("DW_FTS_ENGINE")
+                except TypeError:
+                    raw_engine = getter("DW_FTS_ENGINE", None)
+                except Exception:  # pragma: no cover - defensive fallback
+                    raw_engine = None
+            else:
+                raw_engine = None
+        if raw_engine:
+            try:
+                engine_value = str(raw_engine).strip() or None
+            except Exception:  # pragma: no cover - defensive fallback
+                engine_value = None
+        if not engine_value:
+            engine_value = fts_engine()
         if engine_value:
             fts_debug["engine"] = engine_value
-        if fts_debug.get("engine") == "like" and fts_debug.get("error") == "no_engine":
-            fts_debug.pop("error", None)
+        fts_debug.pop("error", None)
+
+        intent_tokens: List[str] = []
+        intent_section = debug_section.get("intent")
+        if isinstance(intent_section, dict):
+            raw_tokens: Any = intent_section.get("fts_tokens")
+            if not raw_tokens:
+                fts_section = intent_section.get("fts")
+                if isinstance(fts_section, dict):
+                    raw_tokens = fts_section.get("tokens")
+            if isinstance(raw_tokens, (list, tuple, set)):
+                intent_tokens = [
+                    str(token).strip()
+                    for token in raw_tokens
+                    if str(token or "").strip()
+                ]
+            elif isinstance(raw_tokens, str) and raw_tokens.strip():
+                intent_tokens = [raw_tokens.strip()]
         try:
             question_text = _extract_question_for_debug(payload if isinstance(payload, dict) else {}, response)
             fts_columns = _extract_fts_columns_for_debug(response)
             plan = build_boolean_debug(question_text, fts_columns)
-            debug_section["boolean_groups"] = plan.get("blocks", [])
-            debug_section["boolean_groups_text"] = plan.get("summary", "")
+            blocks = plan.get("blocks", [])
+            summary_text = plan.get("summary", "") or ""
+            debug_section["boolean_groups"] = blocks
+            debug_section["boolean_groups_text"] = summary_text
+            if blocks and isinstance(blocks[0], dict):
+                first_block = blocks[0]
+                block_fts = first_block.get("fts") if isinstance(first_block.get("fts"), list) else []
+                if not block_fts and intent_tokens:
+                    first_block["fts"] = intent_tokens
+                    fts_text = "FTS(" + " OR ".join(intent_tokens) + ")"
+                    if summary_text.startswith("(") and len(summary_text) > 1:
+                        debug_section["boolean_groups_text"] = "(" + f"{fts_text} AND " + summary_text[1:]
+                    else:
+                        debug_section["boolean_groups_text"] = f"({fts_text})"
         except Exception as exc:  # pragma: no cover - debug best-effort
             debug_section["boolean_groups_error"] = str(exc)
 
@@ -1806,7 +1860,7 @@ def dw_rules():
     return jsonify({"ok": True, "rules": data})
 
 # ensure FTS engine check and default
-from apps.dw.settings import get_setting
+from apps.dw.settings import get_setting, get_settings
 
 def fts_engine():
     eng = (get_setting("DW_FTS_ENGINE", scope="namespace") or "like")

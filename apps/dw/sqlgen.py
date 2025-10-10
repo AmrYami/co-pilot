@@ -1,6 +1,9 @@
 from __future__ import annotations
 import os
 from typing import Tuple, Dict, Any, List, Optional
+
+from apps.dw.contracts.builder import normalize_order_by
+
 from .intent import DWIntent
 
 
@@ -72,7 +75,7 @@ def build_sql(intent: DWIntent, strict_overlap: Optional[bool] = None) -> Tuple[
     if intent.group_by:
         sql.append(f"GROUP BY {intent.group_by}")
     if intent.sort_by:
-        sql.append(f"ORDER BY {intent.sort_by} {'DESC' if intent.sort_desc else 'ASC'}")
+        sql.append(normalize_order_by(intent.sort_by, intent.sort_desc))
     if intent.top_n:
         binds["top_n"] = intent.top_n
         sql.append("FETCH FIRST :top_n ROWS ONLY")
