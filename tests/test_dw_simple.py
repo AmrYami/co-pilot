@@ -41,6 +41,7 @@ from apps.dw import filters as filters_mod
 from apps.dw.eq_parser import extract_eq_filters_from_natural_text
 from apps.dw.fts_like import build_fts_where
 from apps.dw.rate_grammar import parse_rate_comment
+from apps.dw.sqlbuilder import build_eq_where, parse_rate_comment as parse_rate_comment_sqlbuilder
 from apps.dw.routes import bp as dw_blueprint
 
 
@@ -139,3 +140,25 @@ def test_rate_endpoint_uses_rate_comment(monkeypatch):
     assert "UPPER(TRIM(ENTITY)) = UPPER(TRIM(:eq_0))" in data["sql"]
     assert "LIKE UPPER(:fts_0)" in data["sql"]
     assert data["debug"]["validation"]["ok"] is True
+
+
+def test_sqlbuilder_parse_rate_comment_groups_values():
+    comment = "eq: entity = DSFH or Farabi; eq: entity = ACME"
+    hints = parse_rate_comment_sqlbuilder(comment)
+
+    entity_filters = [f for f in hints["eq_filters"] if f.get("col") == "ENTITY"]
+    assert len(entity_filters) == 1
+    entity_filter = entity_filters[0]
+    assert entity_filter["values"] == ["DSFH", "Farabi", "ACME"]
+    assert entity_filter["val"] == "DSFH"
+    assert entity_filter["op"] == "eq"
+
+
+def test_sqlbuilder_build_eq_where_or_values():
+    filters = [
+        {"col": "ENTITY", "values": ["DSFH", "FARABI"], "ci": True, "trim": True, "op": "eq"}
+    ]
+    where, binds = build_eq_where(filters, ["ENTITY"])
+
+    assert "OR" in where
+    assert binds == {"eq_0": "DSFH", "eq_1": "FARABI"}

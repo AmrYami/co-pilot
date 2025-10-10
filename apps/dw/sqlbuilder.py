@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import re
 
+from apps.dw.common.eq_aliases import resolve_eq_targets
 from core.nlu.schema import NLIntent
 
 
@@ -158,6 +159,132 @@ def _norm(s: str) -> str:
     return (s or "").strip()
 
 
+_SEGMENT_SPLIT_RE = re.compile(r"[\n;]+")
+
+
+def _split_segments(comment: str) -> List[List[str]]:
+    if not comment:
+        return []
+    fragments = [frag.strip() for frag in _SEGMENT_SPLIT_RE.split(comment) if frag.strip()]
+    blocks: List[List[str]] = []
+    current: List[str] = []
+    for frag in fragments:
+        if frag.lower() == "or":
+            if current:
+                blocks.append(current)
+                current = []
+            continue
+        current.append(frag)
+    if current:
+        blocks.append(current)
+    return blocks or [[]]
+
+
+def _split_or_values(text: str) -> List[str]:
+    tokens: List[str] = []
+    for part in re.split(r"\s+or\s+|\s*\|\s*|,", text or "", flags=re.IGNORECASE):
+        cleaned = part.strip().strip("\"'")
+        if cleaned:
+            tokens.append(cleaned)
+    return tokens
+
+
+def _parse_flag_blob(blob: str) -> Tuple[bool, bool]:
+    ci = True
+    trim = True
+    if not blob:
+        return ci, trim
+    for raw in blob.split(","):
+        token = raw.strip().lower()
+        if not token:
+            continue
+        if token in {"ci", "case_insensitive"}:
+            ci = True
+        elif token in {"no_ci", "case_sensitive", "exact"}:
+            ci = False
+        elif token == "trim":
+            trim = True
+        elif token in {"no_trim", "raw"}:
+            trim = False
+    return ci, trim
+
+
+def _add_eq_filter(
+    eq_filters: List[Dict[str, Any]],
+    column: str,
+    values: List[str],
+    *,
+    op: str = "eq",
+    ci: bool = True,
+    trim: bool = True,
+) -> None:
+    if not column or not values:
+        return
+    norm_col = column.strip().upper()
+    key = (norm_col, op, ci, trim)
+    for existing in eq_filters:
+        existing_key = (
+            str(existing.get("col") or "").upper(),
+            str(existing.get("op") or "eq"),
+            bool(existing.get("ci", True)),
+            bool(existing.get("trim", True)),
+        )
+        if existing_key == key:
+            seen: set[str] = set()
+            merged: List[str] = []
+            for value in (existing.get("values") or []) + values:
+                if value is None:
+                    continue
+                text = value.strip() if isinstance(value, str) else str(value)
+                if not text or text in seen:
+                    continue
+                seen.add(text)
+                merged.append(text)
+            if merged:
+                existing["values"] = merged
+                existing["val"] = merged[0]
+            return
+    cleaned: List[str] = []
+    seen_values: set[str] = set()
+    for value in values:
+        if value is None:
+            continue
+        text = value.strip() if isinstance(value, str) else str(value)
+        if not text or text in seen_values:
+            continue
+        seen_values.add(text)
+        cleaned.append(text)
+    if not cleaned:
+        return
+    eq_filters.append(
+        {
+            "col": norm_col,
+            "values": cleaned,
+            "val": cleaned[0],
+            "op": op,
+            "ci": ci,
+            "trim": trim,
+        }
+    )
+
+
+def _parse_fts_segment(value: str) -> Tuple[List[str], str]:
+    body = value or ""
+    if "&" in body and "|" not in body and not re.search(r"\bor\b", body, flags=re.IGNORECASE):
+        tokens = [frag.strip().strip("\"'") for frag in body.split("&")]
+        operator = "AND"
+    elif re.search(r"\band\b", body, flags=re.IGNORECASE) and not re.search(
+        r"\bor\b", body, flags=re.IGNORECASE
+    ):
+        tokens = [frag.strip().strip("\"'") for frag in re.split(r"\band\b", body, flags=re.IGNORECASE)]
+        operator = "AND"
+    else:
+        tokens = [frag.strip().strip("\"'") for frag in _split_or_values(body)]
+        operator = "OR"
+    cleaned = [tok for tok in tokens if tok]
+    return cleaned, operator
+
+
 def parse_rate_comment(comment: str) -> Dict[str, Any]:
     """Parse a /dw/rate comment into structured hints."""
 
@@ -175,70 +302,73 @@ def parse_rate_comment(comment: str) -> Dict[str, Any]:
     if not comment:
         return hints
 
-    text = comment.strip()
-
-    fts_and = re.search(r"fts\s*\(\s*and\s*\)\s*:\s*([^;]+)", text, flags=re.I)
-    fts_or = re.search(r"fts\s*:\s*([^;]+)", text, flags=re.I)
-    if fts_and:
-        tokens = re.split(r"[&]", fts_and.group(1))
-        hints["fts_tokens"] = [t.strip() for t in tokens if t.strip()]
-        hints["fts_operator"] = "AND"
-    elif fts_or:
-        tokens = re.split(r"[|]", fts_or.group(1))
-        hints["fts_tokens"] = [t.strip() for t in tokens if t.strip()]
-        hints["fts_operator"] = "OR"
-
-    for m in re.finditer(r"eq\s*:\s*([A-Za-z0-9_]+)\s*=\s*([^;]+)", text, flags=re.I):
-        col = _norm(m.group(1).upper())
-        val_raw = _norm(m.group(2))
-        val = val_raw
-        ci = True
-        trim = True
-        flag_m = re.search(r"\(([^)]+)\)$", val_raw)
-        if flag_m:
-            val = _norm(val_raw[: flag_m.start()])
-            flags = {f.strip().lower() for f in flag_m.group(1).split(",")}
-            if {"cs", "case_sensitive", "no_ci", "exact"} & flags:
-                ci = False
-            if {"raw", "no_trim"} & flags:
-                trim = False
-            if {"ci", "case_insensitive"} & flags:
+    for block in _split_segments(comment):
+        for segment in block:
+            if ":" not in segment:
+                continue
+            key, value = segment.split(":", 1)
+            directive = key.strip().lower()
+            payload = value.strip()
+            if directive == "fts":
+                tokens, operator = _parse_fts_segment(payload)
+                if tokens:
+                    hints["fts_tokens"] = tokens
+                    hints["fts_operator"] = operator
+                continue
+            if directive in {"eq", "has", "have", "contains"}:
+                if "=" not in payload:
+                    continue
+                col_raw, rhs = payload.split("=", 1)
+                column = col_raw.strip()
+                flag_match = re.search(r"\(([^)]*)\)\s*$", rhs)
                 ci = True
-            if "trim" in flags:
                 trim = True
-        if (len(val) >= 2) and ((val[0] in "\"'") and (val[-1] == val[0])):
-            val = val[1:-1]
-        hints["eq_filters"].append({"col": col, "val": val, "ci": ci, "trim": trim})
+                if flag_match:
+                    ci, trim = _parse_flag_blob(flag_match.group(1))
+                    rhs = rhs[: flag_match.start()].rstrip()
+                op = "like" if directive in {"has", "have", "contains"} else "eq"
+                values = _split_or_values(rhs)
+                _add_eq_filter(hints["eq_filters"], column, values, op=op, ci=ci, trim=trim)
+                continue
+            if directive == "group_by":
+                hints["group_by"] = _norm(payload.upper())
+                continue
+            if directive == "order_by":
+                match = re.match(r"(.+?)\s+(asc|desc)$", payload, flags=re.IGNORECASE)
+                if match:
+                    hints["sort_by"] = _norm(match.group(1).upper())
+                    hints["sort_desc"] = match.group(2).lower() == "desc"
+                else:
+                    hints["sort_by"] = _norm(payload.upper())
+                continue
+            if directive == "gross":
+                lowered = payload.lower()
+                if lowered in {"true", "false"}:
+                    hints["gross"] = lowered == "true"
+                continue
+            if directive == "top_n":
+                try:
+                    hints["top_n"] = int(payload)
+                except ValueError:
+                    pass
 
-    m = re.search(r"group_by\s*:\s*([A-Za-z0-9_]+)", text, flags=re.I)
-    if m:
-        hints["group_by"] = _norm(m.group(1).upper())
-
-    m = re.search(r"gross\s*:\s*(true|false)", text, flags=re.I)
-    if m:
-        hints["gross"] = m.group(1).lower() == "true"
-
-    m = re.search(r"order_by\s*:\s*([A-Za-z0-9_]+)\s*(asc|desc)?", text, flags=re.I)
-    if m:
-        hints["sort_by"] = _norm(m.group(1).upper())
-        hints["sort_desc"] = (m.group(2) or "DESC").strip().lower() == "desc"
-
-    m = re.search(
+    text = comment.strip()
+    match = re.search(
         r"\b(top|bottom|lowest|highest|smallest|largest|cheapest|min|max)\s+(\d+)\b",
         text,
-        flags=re.I,
+        flags=re.IGNORECASE,
     )
-    if m:
-        hints["direction_hint"] = m.group(1).lower()
-        hints["top_n"] = int(m.group(2))
+    if match:
+        hints["direction_hint"] = match.group(1).lower()
+        hints["top_n"] = int(match.group(2))
     else:
-        m2 = re.search(
+        match2 = re.search(
             r"\b(top|bottom|lowest|highest|smallest|largest|cheapest|min|max)\b",
             text,
-            flags=re.I,
+            flags=re.IGNORECASE,
         )
-        if m2:
-            hints["direction_hint"] = m2.group(1).lower()
+        if match2:
+            hints["direction_hint"] = match2.group(1).lower()
 
     return hints
 
@@ -273,48 +403,69 @@ def build_eq_where(
 ) -> Tuple[str, Dict[str, Any]]:
     parts: List[str] = []
     binds: Dict[str, Any] = {}
-    idx = 0
     allow = {c.upper() for c in (allowed_columns or [])}
-    for f in eq_filters or []:
-        col = _norm(str(f.get("col") or "").upper())
-        if not col or (allow and col not in allow):
+
+    grouped: Dict[Tuple[str, str, bool, bool], List[Any]] = {}
+    for entry in eq_filters or []:
+        column = _norm(str(entry.get("col") or "").upper())
+        if not column:
             continue
-        op = str(f.get("op") or "eq").lower()
-        val = f.get("val", "")
-        ci = bool(f.get("ci", True))
-        trim = bool(f.get("trim", True))
-        bname = f"eq_{idx}"
-        left_expr = col
-        if trim:
-            left_expr = f"TRIM({left_expr})"
-        if op == "like":
-            pattern = val
-            if isinstance(pattern, str) and pattern and not pattern.startswith("%") and not pattern.endswith("%"):
-                pattern = f"%{pattern}%"
-            binds[bname] = pattern
-            right_expr = f":{bname}"
-            if trim:
-                right_expr = f"TRIM({right_expr})"
-            if ci:
-                parts.append(f"UPPER({left_expr}) LIKE UPPER({right_expr})")
-            else:
-                parts.append(f"{left_expr} LIKE {right_expr}")
-            idx += 1
+        op = str(entry.get("op") or "eq").lower()
+        if op not in {"eq", "like"}:
+            op = "eq"
+        ci = bool(entry.get("ci", True))
+        trim = bool(entry.get("trim", True))
+        values = entry.get("values") or []
+        if not values:
+            fallback = entry.get("val")
+            if fallback not in (None, ""):
+                values = [fallback]
+        cleaned: List[Any] = []
+        seen: set[Any] = set()
+        for value in values:
+            if value is None:
+                continue
+            candidate = value
+            if isinstance(candidate, str):
+                candidate = candidate.strip()
+            if candidate == "":
+                continue
+            key = candidate.lower() if (ci and isinstance(candidate, str)) else candidate
+            if key in seen:
+                continue
+            seen.add(key)
+            if op == "like" and isinstance(candidate, str) and not (candidate.startswith("%") or candidate.endswith("%")):
+                candidate = f"%{candidate}%"
+            cleaned.append(candidate)
+        if not cleaned:
             continue
-        if ci:
-            left_cmp = f"UPPER({left_expr})"
-        else:
-            left_cmp = left_expr
-        right_expr = f":{bname}"
-        if trim:
-            right_expr = f"TRIM({right_expr})"
-        if ci:
-            right_cmp = f"UPPER({right_expr})"
-        else:
-            right_cmp = right_expr
-        parts.append(f"{left_cmp} = {right_cmp}")
-        binds[bname] = val
-        idx += 1
+        grouped.setdefault((column, op, ci, trim), []).extend(cleaned)
+
+    bind_index = 0
+    for (column, op, ci, trim), values in grouped.items():
+        targets = resolve_eq_targets(column) or [column]
+        resolved = [col for col in targets if not allow or col.upper() in allow]
+        if not resolved:
+            continue
+        ors: List[str] = []
+        for value in values:
+            bind_name = f"eq_{bind_index}"
+            bind_index += 1
+            binds[bind_name] = value
+            for target in resolved:
+                left = target
+                right = f":{bind_name}"
+                if trim:
+                    left = f"TRIM({left})"
+                    right = f"TRIM({right})"
+                if ci:
+                    left = f"UPPER({left})"
+                    right = f"UPPER({right})"
+                operator = "LIKE" if op == "like" else "="
+                ors.append(f"{left} {operator} {right}")
+        if ors:
+            parts.append("(" + " OR ".join(ors) + ")")
+
     where = ("(" + " AND ".join(parts) + ")") if parts else ""
     return where, binds
 
