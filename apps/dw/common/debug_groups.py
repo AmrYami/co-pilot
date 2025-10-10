@@ -77,12 +77,12 @@ def build_boolean_debug(question: str, fts_columns: List[str] | None = None) -> 
     for index, group in enumerate(groups):
         block_id = ascii_uppercase[index] if index < len(ascii_uppercase) else f"#{index + 1}"
         fts_tokens = list(group.fts_tokens)
-        fts_text = f"FTS({_human_join(fts_tokens)})" if fts_tokens else ""
+        fts_text = f"FTS({' OR '.join(fts_tokens)})" if fts_tokens else ""
 
         field_entries: List[Dict[str, Any]] = []
         field_parts: List[str] = []
         for column, values, op in group.field_terms:
-            expanded = resolve_eq_targets(column)
+            expanded = resolve_eq_targets(column)  # يعتمد على DB settings / fallbacks
             entry = {
                 "field": column,
                 "op": "eq" if op == "eq" else "like",
