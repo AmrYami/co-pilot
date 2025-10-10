@@ -719,13 +719,10 @@ def _rate_build_eq_where(eq_filters: List[Dict[str, Any]], enum_syn: Dict[str, A
 
     for ef in eq_filters:
         col = ef.get("col")
+        val = ef.get("val") if "val" in ef else ef.get("value")
         values_raw: List[Any] = []
         if isinstance(ef.get("values"), (list, tuple, set)):
             values_raw = list(ef.get("values"))
-        elif "val" in ef:
-            values_raw = [ef.get("val")]
-        elif "value" in ef:
-            values_raw = [ef.get("value")]
         ci = bool(ef.get("ci", True))
         tr = bool(ef.get("trim", True))
         if not col:
@@ -739,26 +736,63 @@ def _rate_build_eq_where(eq_filters: List[Dict[str, Any]], enum_syn: Dict[str, A
             prefix: List[str] = []
             contains: List[str] = []
             for cfg in enum_syn.values():
-                equals += cfg.get("equals", [])
-                prefix += cfg.get("prefix", [])
-                contains += cfg.get("contains", [])
-            equals = list({e.upper().strip(): e for e in equals}.keys())
-            prefix = [p.upper().strip() for p in prefix]
-            contains = [c.upper().strip() for c in contains]
+                equals += [v for v in cfg.get("equals", []) if v]
+                prefix += [v for v in cfg.get("prefix", []) if v]
+                contains += [v for v in cfg.get("contains", []) if v]
             sub: List[str] = []
-            if equals or values_raw:
-                eq_values = equals + [str(v).strip().upper() for v in values_raw if v not in (None, "")]
-                eq_values = list(dict.fromkeys(eq_values))
+            if equals or values_raw or (val not in (None, "")):
+                all_eq: List[str] = []
+                if equals:
+                    all_eq += [str(e) for e in equals]
+                if val not in (None, ""):
+                    all_eq.append(str(val))
+                if values_raw:
+                    all_eq += [str(v) for v in values_raw if v not in (None, "")]
+                norm: List[str] = []
+                seen: set[str] = set()
+                for s in all_eq:
+                    trimmed = s.strip()
+                    if not trimmed:
+                        continue
+                    key = trimmed.upper() if ci else trimmed
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    norm.append(trimmed.upper() if ci else trimmed)
                 bind_names: List[str] = []
-                for value in eq_values:
+                for eqv in norm:
                     idx = len([k for k in binds.keys() if k.startswith(f"eq_{col}_")])
-                    name = f"eq_{col}_{idx}"
-                    binds[name] = value
-                    bind_names.append(name)
-                target = _wrap(col_token, ci=ci, trim=tr)
-                placeholders = [f":{name}" for name in bind_names]
-                if placeholders:
-                    sub.append(f"{target} IN (" + ",".join(placeholders) + ")")
+                    bn = f"eq_{col}_{idx}"
+                    binds[bn] = _normalize_bind(eqv, ci=ci, trim=tr)
+                    bind_names.append(bn)
+                if bind_names:
+                    placeholders = ",".join(f":{bn}" for bn in bind_names)
+                    sub.append(f"{_wrap(col_token, ci=ci, trim=tr)} IN ({placeholders})")
+            prefix_norm: List[str] = []
+            prefix_seen: set[str] = set()
+            for pf in prefix:
+                text = str(pf).strip()
+                if not text:
+                    continue
+                key = text.upper() if ci else text
+                if key in prefix_seen:
+                    continue
+                prefix_seen.add(key)
+                prefix_norm.append(text.upper() if ci else text)
+            prefix = prefix_norm
+            contains_norm: List[str] = []
+            contains_seen: set[str] = set()
+            for ct in contains:
+                text = str(ct).strip()
+                if not text:
+                    continue
+                key = text.upper() if ci else text
+                if key in contains_seen:
+                    continue
+                contains_seen.add(key)
+                contains_norm.append(text.upper() if ci else text)
+            contains = contains_norm
+
             for pf in prefix:
                 idx = len([k for k in binds.keys() if k.startswith(f"pf_{col}_")])
                 bname = f"pf_{col}_{idx}"
@@ -775,20 +809,27 @@ def _rate_build_eq_where(eq_filters: List[Dict[str, Any]], enum_syn: Dict[str, A
                 parts.append("(" + " OR ".join(sub) + ")")
             continue
 
-        if not values_raw:
+        all_values: List[Any] = []
+        if val not in (None, ""):
+            all_values.append(val)
+        all_values.extend(values_raw)
+        if not all_values:
             continue
         deduped: List[Any] = []
         seen_keys: set[Any] = set()
-        for value in values_raw:
+        for value in all_values:
             if value in (None, ""):
                 continue
-            key = value
-            if isinstance(value, str):
-                key = value.strip().upper() if ci else value.strip()
+            normalized_value: Any = value.strip() if isinstance(value, str) else value
+            key = (
+                normalized_value.upper()
+                if ci and isinstance(normalized_value, str)
+                else normalized_value
+            )
             if key in seen_keys:
                 continue
             seen_keys.add(key)
-            deduped.append(value)
+            deduped.append(normalized_value)
         if not deduped:
             continue
 
