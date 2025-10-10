@@ -9,6 +9,11 @@ try:  # pragma: no cover - optional import available in production
 except Exception:  # pragma: no cover - fall back to lazy loader
     get_settings_for_namespace = None  # type: ignore
 
+try:  # pragma: no cover - imported lazily in tests
+    from apps.dw.settings import get_setting  # type: ignore
+except Exception:  # pragma: no cover - optional fallback
+    get_setting = None  # type: ignore
+
 _SETTING_KEY = "DW_EQ_ALIAS_COLUMNS"
 _NAMESPACE = "dw::common"
 
@@ -106,15 +111,26 @@ def _coerce_alias_map(source: Any | None) -> Dict[str, List[str]]:
 
 @lru_cache(maxsize=4)
 def _load_global_alias_map() -> Dict[str, List[str]]:
-    if get_settings_for_namespace is None:  # pragma: no cover - fallback for tests
-        return {}
-    try:
-        settings = get_settings_for_namespace(_NAMESPACE)
-    except Exception:  # pragma: no cover - settings backend issues
-        return {}
-    if not isinstance(settings, MutableMapping):
-        return {}
-    return _coerce_alias_map(settings)
+    if get_settings_for_namespace is not None:  # pragma: no cover - fallback for tests
+        try:
+            settings = get_settings_for_namespace(_NAMESPACE)
+        except Exception:  # pragma: no cover - settings backend issues
+            settings = None
+        if isinstance(settings, MutableMapping):
+            mapped = _coerce_alias_map(settings)
+            if mapped:
+                return mapped
+
+    if get_setting is not None:  # pragma: no cover - loaded dynamically
+        try:
+            raw = get_setting(_SETTING_KEY, default={})
+        except Exception:
+            raw = {}
+        mapped = _coerce_alias_map({_SETTING_KEY: raw})
+        if mapped:
+            return mapped
+
+    return {}
 
 
 def get_eq_alias_map(settings: Any | None = None) -> Dict[str, List[str]]:
