@@ -1547,6 +1547,13 @@ def answer():
             "binds": meta_fts.get("binds") if isinstance(meta_fts, dict) else None,
             "error": meta_fts.get("error") if isinstance(meta_fts, dict) else None,
         }
+        fts_debug = response["debug"].get("fts")
+        if isinstance(fts_debug, dict):
+            engine_value = fts_engine()
+            if engine_value:
+                fts_debug["engine"] = engine_value
+            if engine_value == "like" and fts_debug.get("error") == "no_engine":
+                fts_debug.pop("error", None)
         response["debug"]["online_learning"] = {
             "hints": online_hints_applied,
             **({} if not online_meta else online_meta),
