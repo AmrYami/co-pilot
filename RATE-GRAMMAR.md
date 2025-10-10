@@ -45,6 +45,43 @@ The natural-language question is analysed into OR-groups:
   ```
   Produces two groups joined by OR with the expected LIKE/`=` combinations.
 
+## Debug view (what you’ll see)
+When you submit a rate, the response contains a friendly breakdown:
+
+**boolean_groups_text**
+```
+(FTS(it OR home care) AND ENTITY = (DSFH) AND REPRESENTATIVE_EMAIL = (samer@procare-sa.com))
+ OR
+(STAKEHOLDER = (Amr Taher A Maghrabi) AND DEPARTMENT = (AL FARABI))
+```
+
+**boolean_groups** (JSON)
+```json
+{
+  "blocks": [
+    {
+      "id": "A",
+      "fts": ["it", "home care"],
+      "fts_columns_count": 28,
+      "fields": [
+        {"field":"ENTITY","op":"eq","values":["DSFH"],"expanded_columns":["ENTITY"]},
+        {"field":"REPRESENTATIVE_EMAIL","op":"eq","values":["samer@procare-sa.com"],"expanded_columns":["REPRESENTATIVE_EMAIL"]}
+      ]
+    },
+    {
+      "id": "B",
+      "fts": [],
+      "fts_columns_count": 28,
+      "fields": [
+        {"field":"STAKEHOLDER","op":"eq","values":["Amr Taher A Maghrabi"],"expanded_columns":["CONTRACT_STAKEHOLDER_1","...","CONTRACT_STAKEHOLDER_8"]},
+        {"field":"DEPARTMENT","op":"eq","values":["AL FARABI"],"expanded_columns":["DEPARTMENT_1","...","DEPARTMENT_8","OWNER_DEPARTMENT"]}
+      ]
+    }
+  ]
+}
+```
+The FTS engine is displayed as `debug.fts.engine = "like"` when using LIKE.
+
 ## ORDER BY
 
 * `order_by:` accepts `COLUMN asc|desc`. If the direction is omitted we default

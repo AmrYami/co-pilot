@@ -57,6 +57,7 @@ from apps.dw.rate_grammar import parse_rate_comment_strict
 from apps.dw.lib.eq_ops import build_eq_where as build_eq_where_v2, parse_eq_from_text
 from apps.dw.lib.fts_ops import build_fts_where as build_fts_where_v2, detect_fts_groups
 from apps.dw.lib.sql_utils import direction_from_words, merge_where as merge_where_v2, order_by_safe
+from apps.dw.common.debug_groups import build_boolean_debug
 from apps.dw.rate_hints import (
     append_where,
     apply_rate_hints,
@@ -97,6 +98,109 @@ dw_bp.register_blueprint(rate_bp, url_prefix="")
 
 def _ns() -> str:
     return "dw::common"
+
+
+def _coerce_debug_columns(value: Any) -> List[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, (set, tuple)):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, dict):
+        collected: List[str] = []
+        for candidate in value.values():
+            collected.extend(_coerce_debug_columns(candidate))
+        return collected
+    if isinstance(value, str):
+        return [part.strip() for part in value.split(",") if part.strip()]
+    return []
+
+
+def _first_non_empty_text(values: List[Any]) -> str:
+    for value in values:
+        if isinstance(value, str):
+            text = value.strip()
+            if text:
+                return text
+        elif isinstance(value, (list, tuple)):
+            nested = _first_non_empty_text(list(value))
+            if nested:
+                return nested
+    return ""
+
+
+def _extract_question_for_debug(payload: Dict[str, Any], response: Dict[str, Any]) -> str:
+    candidates: List[Any] = []
+    debug_section = response.get("debug")
+    if isinstance(debug_section, dict):
+        intent_section = debug_section.get("intent")
+        if isinstance(intent_section, dict):
+            candidates.extend(
+                [
+                    intent_section.get("question"),
+                    intent_section.get("raw_question"),
+                ]
+            )
+            notes_section = intent_section.get("notes")
+            if isinstance(notes_section, dict):
+                candidates.extend(
+                    [
+                        notes_section.get("q"),
+                        notes_section.get("question"),
+                        notes_section.get("raw_question"),
+                    ]
+                )
+    meta_section = response.get("meta")
+    if isinstance(meta_section, dict):
+        candidates.extend([meta_section.get("question"), meta_section.get("raw_question")])
+        clarifier = meta_section.get("clarifier_intent")
+        if isinstance(clarifier, dict):
+            candidates.extend(
+                [
+                    clarifier.get("question"),
+                    clarifier.get("raw_question"),
+                ]
+            )
+            clarifier_notes = clarifier.get("notes")
+            if isinstance(clarifier_notes, dict):
+                candidates.extend(
+                    [
+                        clarifier_notes.get("q"),
+                        clarifier_notes.get("question"),
+                    ]
+                )
+    if isinstance(payload, dict):
+        candidates.extend([payload.get("question"), payload.get("q")])
+    return _first_non_empty_text(candidates)
+
+
+def _extract_fts_columns_for_debug(response: Dict[str, Any]) -> List[str]:
+    candidates: List[Any] = []
+    debug_section = response.get("debug")
+    if isinstance(debug_section, dict):
+        fts_section = debug_section.get("fts")
+        if isinstance(fts_section, dict):
+            candidates.append(fts_section.get("columns"))
+        intent_section = debug_section.get("intent")
+        if isinstance(intent_section, dict):
+            intent_fts = intent_section.get("fts")
+            if isinstance(intent_fts, dict):
+                candidates.append(intent_fts.get("columns"))
+    meta_section = response.get("meta")
+    if isinstance(meta_section, dict):
+        meta_fts = meta_section.get("fts")
+        if isinstance(meta_fts, dict):
+            candidates.append(meta_fts.get("columns"))
+        clarifier = meta_section.get("clarifier_intent")
+        if isinstance(clarifier, dict):
+            candidates.append(clarifier.get("fts_columns"))
+            clarifier_fts = clarifier.get("fts")
+            if isinstance(clarifier_fts, dict):
+                candidates.append(clarifier_fts.get("columns"))
+    for candidate in candidates:
+        columns = _coerce_debug_columns(candidate)
+        if columns:
+            return columns
+    return []
 
 
 def _respond(payload: Dict[str, Any], response: Dict[str, Any]):
@@ -142,6 +246,26 @@ def _respond(payload: Dict[str, Any], response: Dict[str, Any]):
         )
     except Exception:
         pass
+
+    debug_section = response.setdefault("debug", {}) if isinstance(response, dict) else {}
+    if isinstance(debug_section, dict):
+        fts_debug = debug_section.get("fts")
+        if not isinstance(fts_debug, dict):
+            fts_debug = {}
+            debug_section["fts"] = fts_debug
+        engine_value = fts_debug.get("engine") or fts_engine()
+        if engine_value:
+            fts_debug["engine"] = engine_value
+        if fts_debug.get("engine") == "like" and fts_debug.get("error") == "no_engine":
+            fts_debug.pop("error", None)
+        try:
+            question_text = _extract_question_for_debug(payload if isinstance(payload, dict) else {}, response)
+            fts_columns = _extract_fts_columns_for_debug(response)
+            plan = build_boolean_debug(question_text, fts_columns)
+            debug_section["boolean_groups"] = plan.get("blocks", [])
+            debug_section["boolean_groups_text"] = plan.get("summary", "")
+        except Exception as exc:  # pragma: no cover - debug best-effort
+            debug_section["boolean_groups_error"] = str(exc)
 
     return jsonify(response)
 
