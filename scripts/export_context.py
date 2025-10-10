@@ -8,7 +8,7 @@ Usage:
 from __future__ import annotations
 import os, json, argparse
 from typing import Optional, Iterable, Set
-from sqlalchemy import create_engine, text, inspect
+from sqlalchemy import create_engine, text
 try:
     # Optional: load .env if present
     from dotenv import load_dotenv  # type: ignore
@@ -24,28 +24,32 @@ def _pick(cols: Iterable[str], *candidates: str) -> Optional[str]:
     return None
 
 def table_exists(engine, name: str, schema: str | None = None) -> bool:
-    """SQLAlchemy 2.0-safe, robust to case differences."""
+    """Check existence via information_schema for compatibility."""
     try:
-        insp = inspect(engine)
-        for cand in (name, name.lower(), name.upper()):
-            if insp.has_table(cand, schema=schema):
-                return True
-        return False
+        with engine.connect() as conn:
+            clauses = ["lower(table_name)=lower(:t)"]
+            params = {"t": name}
+            if schema:
+                clauses.append("lower(table_schema)=lower(:s)")
+                params["s"] = schema
+            sql = f"SELECT 1 FROM information_schema.tables WHERE {' AND '.join(clauses)}"
+            return bool(conn.execute(text(sql), params).fetchone())
     except Exception:
         return False
 
 def table_columns(engine, name: str, schema: str | None = None) -> Set[str]:
     try:
-        insp = inspect(engine)
-        # try various casings
-        for cand in (name, name.lower(), name.upper()):
-            try:
-                return {c["name"] for c in insp.get_columns(cand, schema=schema)}
-            except Exception:
-                continue
+        with engine.connect() as conn:
+            clauses = ["lower(table_name)=lower(:t)"]
+            params = {"t": name}
+            if schema:
+                clauses.append("lower(table_schema)=lower(:s)")
+                params["s"] = schema
+            sql = f"SELECT column_name FROM information_schema.columns WHERE {' AND '.join(clauses)}"
+            rows = conn.execute(text(sql), params).fetchall()
+            return {r[0] for r in rows}
     except Exception:
-        pass
-    return set()
+        return set()
 
 def dump(engine, sql: str, params=None):
     try:
