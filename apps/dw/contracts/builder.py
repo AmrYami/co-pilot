@@ -9,6 +9,7 @@ from apps.dw.common.bool_groups import infer_boolean_groups, Group
 from apps.dw.contracts.text_filters import extract_eq_filters
 from apps.dw.fts_utils import resolve_fts_columns
 from apps.dw.settings import get_settings
+from core.sql_utils import normalize_order_by
 from apps.dw.settings_defaults import DEFAULT_EXPLICIT_FILTER_COLUMNS
 from .planner_contracts import apply_equality_aliases, apply_full_text_search
 
@@ -389,29 +390,6 @@ def _build_eq_clauses(
         else:
             clauses.append("(" + " OR ".join(ors) + ")")
     return clauses, new_binds
-
-
-def normalize_order_by(sort_by: Optional[str], sort_desc: Optional[bool]) -> str:
-    """
-    Normalize ORDER BY tokens like 'REQUEST_DATE_DESC' into a column plus
-    direction. Defaults to DW_DATE_COLUMN when the token is missing.
-    """
-    settings = get_settings() or {}
-    raw = (sort_by or "").strip()
-    direction = "DESC" if sort_desc else "ASC"
-    upper = raw.upper()
-    if upper.endswith("_DESC"):
-        raw = raw[: -5]
-        direction = "DESC"
-    elif upper.endswith("_ASC"):
-        raw = raw[: -4]
-        direction = "ASC"
-    column = raw.strip()
-    if not column:
-        column = str(settings.get("DW_DATE_COLUMN", "REQUEST_DATE")).strip()
-    if not column:
-        column = "REQUEST_DATE"
-    return f"ORDER BY {column} {direction}"
 
 
 def _like_or_eq_expr(column: str, bind: str, use_like: bool, *, ci: bool = True, trim: bool = True) -> str:

@@ -60,6 +60,28 @@ _ALL_COL_HINTS = [
 ]
 
 
+def normalize_order_by(sort_by: Optional[str], sort_desc: Optional[bool]) -> str:
+    """Return a normalized ORDER BY clause for optional sort tokens."""
+
+    if not sort_by:
+        return "ORDER BY REQUEST_DATE DESC"
+
+    token = str(sort_by or "").strip()
+    direction = "DESC" if sort_desc else "ASC"
+    upper = token.upper()
+    if upper.endswith("_DESC"):
+        token = upper[:-5]
+        direction = "DESC"
+    elif upper.endswith("_ASC"):
+        token = upper[:-4]
+        direction = "ASC"
+    else:
+        token = upper
+
+    column = token.strip() or "REQUEST_DATE"
+    return f"ORDER BY {column} {direction}"
+
+
 def extract_bind_names(sql: str) -> list[str]:
     """Return a sorted list of distinct bind names (Oracle style :name)."""
 

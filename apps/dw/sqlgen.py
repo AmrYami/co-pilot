@@ -2,7 +2,7 @@ from __future__ import annotations
 import os
 from typing import Tuple, Dict, Any, List, Optional
 
-from apps.dw.contracts.builder import normalize_order_by
+from core.sql_utils import normalize_order_by
 
 from .intent import DWIntent
 
