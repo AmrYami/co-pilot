@@ -53,7 +53,7 @@ def _normalize(text: str) -> str:
 
 _FIELD_PATTERN = re.compile(
     rf"\b(?P<col>{_COL_PATTERN})\b\s*(?P<op>=|has|have|contains)\s*"
-    rf"(?P<body>.*?)(?=(?:\s+(?:and|or)\s+(?:{_JOIN_PATTERN}))|$)",
+    rf"(?P<body>.*?)(?=(?:\s+(?:and|or)\s+(?:{_JOIN_PATTERN}))|;|$)",
     re.IGNORECASE,
 )
 
@@ -88,7 +88,7 @@ def parse_question_into_terms(question: str) -> List[Term]:
 
     # Generic "has <fts tokens>" without a specific column
     generic_pattern = re.compile(
-        rf"\bhas\s+(?P<body>.*?)(?=(?:\s+(?:and|or)\s+(?:{_JOIN_PATTERN}))|$)",
+        rf"\bhas\s+(?P<body>.*?)(?=(?:\s+(?:and|or)\s+(?:{_JOIN_PATTERN}))|;|$)",
         re.IGNORECASE,
     )
     occupied: List[Tuple[int, int]] = [(t.start, t.end) for t in terms]

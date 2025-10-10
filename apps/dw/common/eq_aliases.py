@@ -1,7 +1,11 @@
 # English-only comments.
 from typing import Dict, List
 
-from apps.dw.settings import get_settings  # DB-backed (dw::common)
+try:  # pragma: no cover - defensive fallback when settings backend is unavailable
+    from apps.dw.settings import get_settings  # DB-backed (dw::common)
+except ModuleNotFoundError:  # pragma: no cover
+    def get_settings():
+        return {}
 
 
 def resolve_eq_targets(column_token: str) -> List[str]:

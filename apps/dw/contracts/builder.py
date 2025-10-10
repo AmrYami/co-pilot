@@ -260,20 +260,11 @@ def _expand_columns_for_entry(entry: Dict, allowed: set[str]) -> List[str]:
     return _select_allowed_columns([col_token], allowed)
 
 
-def _comparison_expr(column: str, bind_name: str, *, ci: bool, trim: bool) -> str:
-    placeholder = f":{bind_name}"
-    if ci and trim:
-        return f"UPPER(TRIM({column})) = UPPER(TRIM({placeholder}))"
-    if ci:
-        return f"UPPER({column}) = UPPER({placeholder})"
-    if trim:
-        return f"TRIM({column}) = TRIM({placeholder})"
-    return f"{column} = {placeholder}"
-
-
-def _build_eq_clause(columns: List[str], bind_name: str, *, ci: bool, trim: bool) -> str:
+def _build_eq_clause(
+    columns: List[str], bind_name: str, *, ci: bool, trim: bool, op: str = "eq"
+) -> str:
     comparisons = [
-        _comparison_expr(column, bind_name, ci=ci, trim=trim)
+        _like_or_eq_expr(column, bind_name, op == "like", ci=ci, trim=trim)
         for column in columns
         if column
     ]
@@ -298,25 +289,74 @@ def _build_eq_clauses(
         if isinstance(key, str)
     }
     next_index = 0
+
+    buckets: Dict[Tuple[Tuple[str, ...], str, bool, bool], List[object]] = {}
     for entry in eq_filters:
-        columns = _expand_columns_for_entry(entry, allowed)
+        columns = tuple(_expand_columns_for_entry(entry, allowed))
         if not columns:
             continue
-        while f"eq_{next_index}" in existing:
-            next_index += 1
-        bind_name = f"eq_{next_index}"
-        existing.add(bind_name)
-        next_index += 1
-        clause = _build_eq_clause(
-            columns,
-            bind_name,
-            ci=bool(entry.get("ci", True)),
-            trim=bool(entry.get("trim", True)),
-        )
-        if not clause:
+        op = str(entry.get("op") or "eq").lower()
+        if op not in {"eq", "like"}:
+            op = "eq"
+        ci = bool(entry.get("ci", True))
+        trim = bool(entry.get("trim", True))
+        values = entry.get("values") or []
+        if not values:
+            fallback = entry.get("val")
+            if fallback not in (None, ""):
+                values = [fallback]
+        if not values:
             continue
-        clauses.append(clause)
-        new_binds[bind_name] = entry.get("val")
+        processed: List[object] = []
+        seen: set[object] = set()
+        for value in values:
+            if value is None:
+                continue
+            candidate: object = value
+            if isinstance(candidate, str):
+                candidate = candidate.strip()
+            if candidate == "":
+                continue
+            key = candidate.lower() if (ci and isinstance(candidate, str)) else candidate
+            if key in seen:
+                continue
+            seen.add(key)
+            if op == "like" and isinstance(candidate, str) and not (
+                candidate.startswith("%") or candidate.endswith("%")
+            ):
+                candidate = f"%{candidate}%"
+            processed.append(candidate)
+        if not processed:
+            continue
+        buckets.setdefault((columns, op, ci, trim), []).extend(processed)
+
+    for (columns, op, ci, trim), values in buckets.items():
+        deduped: List[object] = []
+        seen_keys: set[object] = set()
+        for value in values:
+            key = value.lower() if (ci and isinstance(value, str)) else value
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            deduped.append(value)
+        ors: List[str] = []
+        for value in deduped:
+            while f"eq_{next_index}" in existing:
+                next_index += 1
+            bind_name = f"eq_{next_index}"
+            existing.add(bind_name)
+            next_index += 1
+            clause = _build_eq_clause(list(columns), bind_name, ci=ci, trim=trim, op=op)
+            if not clause:
+                continue
+            ors.append(clause)
+            new_binds[bind_name] = value
+        if not ors:
+            continue
+        if len(ors) == 1:
+            clauses.append(ors[0])
+        else:
+            clauses.append("(" + " OR ".join(ors) + ")")
     return clauses, new_binds
 
 
