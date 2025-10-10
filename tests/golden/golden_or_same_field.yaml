@@ -1,0 +1,10 @@
+cases:
+  - id: or_inside_same_field_is_or_not_and
+    question: "ENTITY = DSFH and ENTITY = Farabi"
+    full_text_search: false
+    allow_zero_rows: true
+    must_contain:
+      - " (UPPER(TRIM(ENTITY)) = "
+      - " OR UPPER(TRIM(ENTITY)) = "
+    must_not_contain:
+      - " AND UPPER(TRIM(ENTITY)) = "

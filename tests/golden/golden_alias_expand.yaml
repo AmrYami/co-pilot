@@ -1,0 +1,11 @@
+cases:
+  - id: dept_and_stakeholder_expand
+    question: "department = A or B and stakeholder = X or Y"
+    full_text_search: false
+    allow_zero_rows: true
+    must_contain:
+      - "CONTRACT_STAKEHOLDER_1"
+      - "CONTRACT_STAKEHOLDER_8"
+      - "DEPARTMENT_1"
+      - "DEPARTMENT_8"
+      - "OWNER_DEPARTMENT"
