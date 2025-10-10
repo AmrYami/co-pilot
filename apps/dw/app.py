@@ -1665,7 +1665,8 @@ def answer():
         fts_columns=fts_columns,
     )
 
-    LOGGER.info("[dw] final_sql: %s", {"size": len(sql), "sql": sql})
+    final_sql = sql
+    LOGGER.info(json.dumps({"final_sql": {"size": len(final_sql.split()), "sql": final_sql}}))
     sql, binds, online_meta = _apply_online_rate_hints(sql, binds or {}, online_intent)
     binds = _coerce_bind_dates(binds or {})
     rows, cols, exec_meta = _execute_oracle(sql, binds)
@@ -1717,22 +1718,29 @@ def answer():
         },
     }
     if isinstance(response.get("debug"), dict):
+        error_value = meta_fts.get("error") if isinstance(meta_fts, dict) else None
         response["debug"]["fts"] = {
             "enabled": bool(meta_fts.get("enabled")) if isinstance(meta_fts, dict) else False,
             "mode": meta_fts.get("mode") if isinstance(meta_fts, dict) else None,
             "tokens": meta_fts.get("tokens") if isinstance(meta_fts, dict) else [],
             "columns": meta_fts.get("columns") if isinstance(meta_fts, dict) else [],
             "binds": meta_fts.get("binds") if isinstance(meta_fts, dict) else None,
-            "error": meta_fts.get("error") if isinstance(meta_fts, dict) else None,
         }
-        fts_debug = response["debug"].get("fts")
-        if isinstance(fts_debug, dict):
-            engine_value = fts_engine()
-            if engine_value:
-                fts_debug["engine"] = engine_value
-            if engine_value == "like" and fts_debug.get("error") == "no_engine":
-                fts_debug.pop("error", None)
-        response["debug"]["online_learning"] = {
+        if error_value and error_value != "no_engine":
+            response["debug"]["fts"]["error"] = error_value
+        debug_section = response["debug"]
+        fts_debug = debug_section.setdefault("fts", {})
+        settings_obj = get_settings()
+        if hasattr(settings_obj, "get"):
+            try:
+                fts_debug["engine"] = settings_obj.get("DW_FTS_ENGINE", "like")
+            except TypeError:
+                fts_debug["engine"] = settings_obj.get("DW_FTS_ENGINE") or "like"
+        else:
+            fts_debug["engine"] = "like"
+        if fts_debug.get("error") == "no_engine":
+            fts_debug.pop("error", None)
+        debug_section["online_learning"] = {
             "hints": online_hints_applied,
             **({} if not online_meta else online_meta),
         }
