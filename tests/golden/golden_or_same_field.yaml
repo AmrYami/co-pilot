@@ -8,3 +8,16 @@ cases:
       - " OR UPPER(TRIM(ENTITY)) = "
     must_not_contain:
       - " AND UPPER(TRIM(ENTITY)) = "
+  - id: or_inside_same_field
+    question: "ENTITY has DSFH or Farabi and department = A or B and stakeholder = X or Y"
+    full_text_search: false
+    allow_zero_rows: true
+    must_contain:
+      - " OR UPPER(TRIM(ENTITY)) "
+      - "CONTRACT_STAKEHOLDER_1"
+      - "CONTRACT_STAKEHOLDER_8"
+      - "DEPARTMENT_1"
+      - "DEPARTMENT_8"
+      - "OWNER_DEPARTMENT"
+    must_not_contain:
+      - " AND UPPER(TRIM(ENTITY)) "

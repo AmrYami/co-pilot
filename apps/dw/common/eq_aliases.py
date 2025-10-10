@@ -64,7 +64,11 @@ def resolve_eq_targets(column_token: str) -> List[str]:
         if any(col.upper() == "OWNER_DEPARTMENT" for col in columns):
             if "OWNER_DEPARTMENT" not in seen:
                 expanded.append("OWNER_DEPARTMENT")
-        return expanded or [key]
+                seen.add("OWNER_DEPARTMENT")
+        if not expanded:
+            expanded.extend([f"DEPARTMENT_{i}" for i in range(1, 9)])
+            expanded.append("OWNER_DEPARTMENT")
+        return _dedupe(expanded) or [key]
 
     if key in {"STAKEHOLDER", "STAKEHOLDERS"}:
         slots_raw = _fetch(settings, "DW_STAKEHOLDER_SLOTS", 8)

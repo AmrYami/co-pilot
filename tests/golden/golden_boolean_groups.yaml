@@ -40,3 +40,10 @@ cases:
       - "UPPER(TRIM(ENTITY)) LIKE UPPER(TRIM(:eq_bg_"
       - "CONTRACT_STAKEHOLDER_1"
       - "CONTRACT_STAKEHOLDER_8"
+
+  - id: fts_shown_in_debug_text
+    question: "list all contracts has it or home care"
+    full_text_search: true
+    allow_zero_rows: true
+    debug_must_contain:
+      - "FTS(it OR home care)"
