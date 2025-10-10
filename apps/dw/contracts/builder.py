@@ -470,20 +470,13 @@ def build_group_clause(
             column_clauses: List[str] = []
             for col in columns:
                 comparisons = [
-                    _like_or_eq_expr(col, name, True)
-                    for name in bind_names
+                    _like_or_eq_expr(col, bn, True)
+                    for bn in bind_names
                 ]
                 if not comparisons:
                     continue
-                if len(comparisons) == 1:
-                    column_clauses.append(comparisons[0])
-                else:
-                    column_clauses.append("(" + " OR ".join(comparisons) + ")")
-            if not column_clauses:
-                continue
-            if len(column_clauses) == 1:
-                subclauses.append(column_clauses[0])
-            else:
+                column_clauses.append("(" + " OR ".join(comparisons) + ")")
+            if column_clauses:
                 subclauses.append("(" + " OR ".join(column_clauses) + ")")
             continue
 
