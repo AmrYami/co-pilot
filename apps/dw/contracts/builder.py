@@ -5,6 +5,7 @@ from typing import Dict, Tuple, Optional, List, Iterable
 
 from apps.dw.aliases import resolve_column_alias
 from apps.dw.common.eq_aliases import resolve_eq_targets
+from apps.dw.common.bool_groups import infer_boolean_groups, Group
 from apps.dw.contracts.text_filters import extract_eq_filters
 from apps.dw.fts_utils import resolve_fts_columns
 from apps.dw.settings import get_settings
@@ -342,6 +343,99 @@ def normalize_order_by(sort_by: Optional[str], sort_desc: Optional[bool]) -> str
     return f"ORDER BY {column} {direction}"
 
 
+def _like_or_eq_expr(column: str, bind: str, use_like: bool, *, ci: bool = True, trim: bool = True) -> str:
+    """Return a normalized comparison (LIKE or =) for the given column/bind."""
+
+    def _normalize(expr: str) -> str:
+        value = expr
+        if trim:
+            value = f"TRIM({value})"
+        if ci:
+            value = f"UPPER({value})"
+        return value
+
+    op = "LIKE" if use_like else "="
+    return f"{_normalize(column)} {op} {_normalize(f':{bind}')}"
+
+
+def build_group_clause(
+    group: Group,
+    *,
+    fts_columns: List[str],
+    allowed_columns: set[str],
+    binds_accum: List[Tuple[str, str]],
+) -> str:
+    """Translate a boolean group into SQL with bind placeholders."""
+
+    subclauses: List[str] = []
+
+    if fts_columns and group.fts_tokens:
+        fts_fragments: List[str] = []
+        for token in group.fts_tokens:
+            bind_name = f"fts_bg_{len(binds_accum)}"
+            binds_accum.append((bind_name, f"%{token}%"))
+            ors = [f"UPPER(NVL({col},'')) LIKE UPPER(:{bind_name})" for col in fts_columns]
+            if ors:
+                fts_fragments.append("(" + " OR ".join(ors) + ")")
+        if fts_fragments:
+            subclauses.append("(" + " OR ".join(fts_fragments) + ")")
+
+    for column, values, op in group.field_terms:
+        if not column or not values:
+            continue
+        resolved = resolve_eq_targets(column) or [column]
+        columns = [col for col in resolved if col and col.strip().upper() in allowed_columns]
+        if not columns:
+            continue
+        unique_values = [*dict.fromkeys(values)]
+        if not unique_values:
+            continue
+        ors: List[str] = []
+        for value in unique_values:
+            bind_name = f"eq_bg_{len(binds_accum)}"
+            binds_accum.append((bind_name, f"%{value}%" if op == "like" else value))
+            for col in columns:
+                ors.append(_like_or_eq_expr(col, bind_name, op == "like"))
+        if ors:
+            subclauses.append("(" + " OR ".join(ors) + ")")
+
+    if not subclauses:
+        return ""
+    return "(" + " AND ".join(subclauses) + ")"
+
+
+def build_boolean_where_from_question(
+    question: str,
+    *,
+    fts_columns: List[str],
+    allowed_columns: set[str],
+) -> Tuple[str, Dict[str, str]]:
+    """Infer boolean groups from the question and render a SQL WHERE clause."""
+
+    groups = infer_boolean_groups(question)
+    if not groups:
+        return "", {}
+
+    binds_accum: List[Tuple[str, str]] = []
+    clauses: List[str] = []
+    for group in groups:
+        clause = build_group_clause(
+            group,
+            fts_columns=fts_columns,
+            allowed_columns=allowed_columns,
+            binds_accum=binds_accum,
+        )
+        if clause:
+            clauses.append(clause)
+
+    if not clauses:
+        return "", {}
+
+    where_sql = " OR ".join(clauses)
+    binds = {name: value for name, value in binds_accum}
+    return where_sql, binds
+
+
 def build_contract_sql(
     *,
     question: str,
@@ -364,6 +458,45 @@ def build_contract_sql(
     Returns updated (where_list, binds)
     """
     q = (question or "").strip()
+
+    settings_map = _as_settings_dict(settings)
+    allowed_eq_columns = _normalize_allowed_columns(_get_explicit_eq_columns(settings_map))
+    if not allowed_eq_columns:
+        allowed_eq_columns = _normalize_allowed_columns(DEFAULT_EXPLICIT_FILTER_COLUMNS)
+
+    fts_columns_cfg = _get_fts_columns(settings_map, override=fts_columns_override)
+
+    boolean_groups = infer_boolean_groups(q)
+    has_boolean_tokens = bool(re.search(r"\b(or|has|have)\b", q, flags=re.IGNORECASE))
+    boolean_override = False
+    if boolean_groups and has_boolean_tokens:
+        use_fts_columns = fts_columns_cfg if bool(request_flags.get("full_text_search")) else []
+        bool_where, bool_binds = build_boolean_where_from_question(
+            q,
+            fts_columns=use_fts_columns,
+            allowed_columns=allowed_eq_columns,
+        )
+        if bool_where:
+            base_where.append(bool_where)
+            binds.update(bool_binds)
+            boolean_override = True
+            if notes is not None:
+                notes.setdefault(
+                    "boolean_groups",
+                    [
+                        {
+                            "fts": group.fts_tokens,
+                            "fields": [
+                                {"column": col, "values": vals, "op": op}
+                                for col, vals, op in group.field_terms
+                            ],
+                        }
+                        for group in boolean_groups
+                    ],
+                )
+
+    if boolean_override:
+        return base_where, binds
 
     alias_debug: Dict[str, object] = {}
     alias_result = apply_equality_aliases(q, base_where, binds, alias_debug)
@@ -391,11 +524,10 @@ def build_contract_sql(
             filtered.append(entry)
 
         if filtered:
-            allowed = _normalize_allowed_columns(_get_explicit_eq_columns(settings))
             clauses, new_binds = _build_eq_clauses(
                 filtered,
                 binds,
-                allowed=allowed,
+                allowed=allowed_eq_columns,
             )
             if clauses:
                 base_where.append(" AND ".join(clauses))
@@ -412,12 +544,11 @@ def build_contract_sql(
             base_where,
             binds,
             fts_debug,
-            columns_override=fts_columns_override,
+            columns_override=fts_columns_override or fts_columns_cfg,
         )
         if notes is not None and fts_debug.get("fts"):
             notes.setdefault("fts", fts_debug["fts"])
 
-    
     return base_where, binds
 
 
