@@ -38,6 +38,8 @@ except Exception:  # pragma: no cover
     def text(sql: str):  # type: ignore
         return sql
 
+from apps.dw.common.debug_groups import build_boolean_debug
+
 from .attempts import run_attempt
 from .online_learning import store_rate_hints
 from .rate_feedback import (
@@ -577,6 +579,7 @@ def rate():
             pass
 
     def _augment_response(payload: Dict[str, Any]) -> Dict[str, Any]:
+        debug_section = payload.setdefault("debug", {})
         if rate_sql:
             payload["sql"] = rate_sql
             meta = payload.setdefault("meta", {})
@@ -588,7 +591,6 @@ def rate():
                 meta["clarifier_intent"] = intent_debug
             payload.setdefault("rows", [])
             payload["retry"] = payload.get("retry") or True
-            debug_section = payload.setdefault("debug", {})
             for key, value in rate_debug.items():
                 if value is None:
                     continue
@@ -600,7 +602,28 @@ def rate():
                 else:
                     debug_section[key] = value
         elif hints_debug:
-            payload.setdefault("debug", {})["rate_hints"] = hints_debug
+            debug_section["rate_hints"] = hints_debug
+
+        fts_section = debug_section.get("fts")
+        if not isinstance(fts_section, dict):
+            fts_section = {}
+            debug_section["fts"] = fts_section
+        engine_value = str(engine_setting or "like").lower()
+        if engine_value == "like":
+            fts_section["engine"] = "like"
+            if fts_section.get("error") == "no_engine":
+                fts_section.pop("error", None)
+        elif engine_value:
+            fts_section.setdefault("engine", engine_value)
+
+        try:
+            base_question = comment or (inquiry_row[1] if inquiry_row and len(inquiry_row) >= 2 else None) or ""
+            plan = build_boolean_debug(base_question, fts_columns)
+            debug_section["boolean_groups"] = plan.get("blocks", [])
+            debug_section["boolean_groups_text"] = plan.get("summary", "")
+        except Exception as exc:  # pragma: no cover - debug best-effort
+            debug_section["boolean_groups_error"] = str(exc)
+
         return payload
 
     question_text = inquiry_row[1] if inquiry_row and len(inquiry_row) >= 2 else None
