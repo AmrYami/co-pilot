@@ -1,5 +1,5 @@
 # English-only comments.
-from typing import Dict, List
+from typing import Dict, Iterable, List
 
 try:  # pragma: no cover - defensive fallback when settings backend is unavailable
     from apps.dw.settings import get_settings  # DB-backed (dw::common)
@@ -20,6 +20,21 @@ def _fetch(settings: Dict | object, key: str, default=None):
     return default
 
 
+def _dedupe(values: Iterable[str]) -> List[str]:
+    seen: set[str] = set()
+    result: List[str] = []
+    for raw in values:
+        text = str(raw or "").strip()
+        if not text:
+            continue
+        key = text.upper()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(text)
+    return result
+
+
 def resolve_eq_targets(column_token: str) -> List[str]:
     """Expand equality aliases based on DW settings with smart fallbacks."""
 
@@ -32,16 +47,23 @@ def resolve_eq_targets(column_token: str) -> List[str]:
     if isinstance(aliases, dict) and key in aliases:
         values = aliases[key]
         if isinstance(values, (list, tuple, set)):
-            return [str(v).strip() for v in values if str(v or "").strip()]
+            return _dedupe(values)
         if isinstance(values, str) and values.strip():
             return [values.strip()]
 
     if key in {"DEPARTMENT", "DEPARTMENTS"}:
         explicit = _fetch(settings, "DW_EXPLICIT_FILTER_COLUMNS", []) or []
         columns = [str(c).strip() for c in explicit if str(c or "").strip()]
-        expanded = [c for c in columns if c.upper().startswith("DEPARTMENT_")]
-        if any(c.upper() == "OWNER_DEPARTMENT" for c in columns):
-            expanded.append("OWNER_DEPARTMENT")
+        expanded: List[str] = []
+        seen: set[str] = set()
+        for col in columns:
+            upper = col.upper()
+            if upper.startswith("DEPARTMENT_") and upper not in seen:
+                expanded.append(upper)
+                seen.add(upper)
+        if any(col.upper() == "OWNER_DEPARTMENT" for col in columns):
+            if "OWNER_DEPARTMENT" not in seen:
+                expanded.append("OWNER_DEPARTMENT")
         return expanded or [key]
 
     if key in {"STAKEHOLDER", "STAKEHOLDERS"}:
