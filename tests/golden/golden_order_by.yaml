@@ -4,5 +4,7 @@ cases:
     full_text_search: false
     allow_zero_rows: true
     require_order_by: REQUEST_DATE
+    must_contain:
+      - "ORDER BY REQUEST_DATE DESC"
     must_not_contain:
       - "REQUEST_DATE_DESC DESC"
