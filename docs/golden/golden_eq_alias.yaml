@@ -7,6 +7,9 @@
     - "UPPER(TRIM(DEPARTMENT_1))"
     - "OR UPPER(TRIM(DEPARTMENT_8))"
     - "OR UPPER(TRIM(OWNER_DEPARTMENT))"
+  must_not_contain:
+    - " UPPER(TRIM(DEPARTMENT)) = "
+    - " UPPER(TRIM(STAKEHOLDER)) = "
 
 - name: eq_alias_stakeholder_expands_to_8_cols
   request:
@@ -15,6 +18,8 @@
   must_contain:
     - "UPPER(TRIM(CONTRACT_STAKEHOLDER_1))"
     - "OR UPPER(TRIM(CONTRACT_STAKEHOLDER_8))"
+  must_not_contain:
+    - " UPPER(TRIM(STAKEHOLDER)) = "
 
 - name: eq_specific_column_no_expand
   request:
@@ -27,3 +32,12 @@
     - "DEPARTMENT_1"
     - "DEPARTMENT_2"
     - "DEPARTMENT_4"
+
+- name: order_by_is_column_plus_direction_not_literal_suffix
+  request:
+    question: "department = X"
+    full_text_search: false
+  must_contain:
+    - "ORDER BY REQUEST_DATE DESC"
+  must_not_contain:
+    - "ORDER BY REQUEST_DATE_DESC"

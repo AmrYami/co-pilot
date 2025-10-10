@@ -7,6 +7,7 @@ from apps.dw.aliases import resolve_column_alias
 from apps.dw.common.eq_aliases import resolve_eq_targets
 from apps.dw.contracts.text_filters import extract_eq_filters
 from apps.dw.fts_utils import resolve_fts_columns
+from apps.dw.settings import get_settings
 from apps.dw.settings_defaults import DEFAULT_EXPLICIT_FILTER_COLUMNS
 from .planner_contracts import apply_equality_aliases, apply_full_text_search
 
@@ -316,6 +317,29 @@ def _build_eq_clauses(
         clauses.append(clause)
         new_binds[bind_name] = entry.get("val")
     return clauses, new_binds
+
+
+def normalize_order_by(sort_by: Optional[str], sort_desc: Optional[bool]) -> str:
+    """
+    Normalize ORDER BY tokens like 'REQUEST_DATE_DESC' into a column plus
+    direction. Defaults to DW_DATE_COLUMN when the token is missing.
+    """
+    settings = get_settings() or {}
+    raw = (sort_by or "").strip()
+    direction = "DESC" if sort_desc else "ASC"
+    upper = raw.upper()
+    if upper.endswith("_DESC"):
+        raw = raw[: -5]
+        direction = "DESC"
+    elif upper.endswith("_ASC"):
+        raw = raw[: -4]
+        direction = "ASC"
+    column = raw.strip()
+    if not column:
+        column = str(settings.get("DW_DATE_COLUMN", "REQUEST_DATE")).strip()
+    if not column:
+        column = "REQUEST_DATE"
+    return f"ORDER BY {column} {direction}"
 
 
 def build_contract_sql(
@@ -989,7 +1013,7 @@ def build_contracts_sql(
         return sql, binds
 
     if order_by:
-        q_parts.append(f"ORDER BY {order_by} {'DESC' if desc else 'ASC'}")
+        q_parts.append(normalize_order_by(order_by, desc))
     elif fallback_order_clause:
         q_parts.append(f"ORDER BY {fallback_order_clause}")
 
