@@ -14,6 +14,8 @@ class Term:
     column: str | None
     values: List[str]
     op: Op = "eq"
+    start: int = -1
+    end: int = -1
 
 
 @dataclass
@@ -30,15 +32,18 @@ _COL_TOKENS = [
     "DEPARTMENT",
     "DEPARTMENTS",
 ]
+_COL_PATTERN = "|".join(re.escape(col) for col in _COL_TOKENS)
+_JOIN_PATTERN = _COL_PATTERN + "|has|have|contains"
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+_OR_SPLIT_RE = re.compile(r"\s+or\s+|\s*\|\s*|,", re.IGNORECASE)
 
 
 def _split_or_list(text: str) -> List[str]:
     tokens: List[str] = []
-    for part in re.split(r"\s+or\s+|,", text, flags=re.IGNORECASE):
-        cleaned = part.strip()
+    for part in _OR_SPLIT_RE.split(text or ""):
+        cleaned = part.strip(" \t\n\r\f\v\"'“”’`“”")
         if cleaned:
-            tokens.append(cleaned)
+            tokens.append(re.sub(r"\s+", " ", cleaned))
     return tokens
 
 
@@ -46,73 +51,116 @@ def _normalize(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "").strip())
 
 
+_FIELD_PATTERN = re.compile(
+    rf"\b(?P<col>{_COL_PATTERN})\b\s*(?P<op>=|has|have|contains)\s*"
+    rf"(?P<body>.*?)(?=(?:\s+(?:and|or)\s+(?:{_JOIN_PATTERN}))|$)",
+    re.IGNORECASE,
+)
+
+
 def parse_question_into_terms(question: str) -> List[Term]:
     """Extract heuristic terms from the natural-language question."""
 
-    text = " " + _normalize(question) + " "
+    text = _normalize(question)
+    if not text:
+        return []
+
     terms: List[Term] = []
 
-    for col in _COL_TOKENS:
-        pattern = rf"{col}\s+(?:has|have)\s+(.*?)(?=\s+(?:and|or)\s+|$)"
-        for match in re.finditer(pattern, text, flags=re.IGNORECASE):
-            values = _split_or_list(match.group(1))
-            if values:
-                terms.append(Term(kind="field", column=col.upper(), values=values, op="like"))
+    for match in _FIELD_PATTERN.finditer(text):
+        column = match.group("col").upper().replace(" ", "_")
+        op_token = match.group("op").lower()
+        body = match.group("body") or ""
+        values = _split_or_list(body)
+        if not values:
+            continue
+        op: Op = "like" if op_token in {"has", "have", "contains"} else "eq"
+        terms.append(
+            Term(
+                kind="field",
+                column=column,
+                values=values,
+                op=op,
+                start=match.start(),
+                end=match.end(),
+            )
+        )
 
-    for col in _COL_TOKENS:
-        pattern = rf"{col}\s*=\s*(.*?)(?=\s+(?:and|or)\s+|$)"
-        for match in re.finditer(pattern, text, flags=re.IGNORECASE):
-            values = _split_or_list(match.group(1))
-            if values:
-                terms.append(Term(kind="field", column=col.upper(), values=values, op="eq"))
+    # Generic "has <fts tokens>" without a specific column
+    generic_pattern = re.compile(
+        rf"\bhas\s+(?P<body>.*?)(?=(?:\s+(?:and|or)\s+(?:{_JOIN_PATTERN}))|$)",
+        re.IGNORECASE,
+    )
+    occupied: List[Tuple[int, int]] = [(t.start, t.end) for t in terms]
+    for match in generic_pattern.finditer(text):
+        span = (match.start(), match.end())
+        if any(span[0] >= s and span[1] <= e for s, e in occupied):
+            continue
+        # Avoid capturing cases like "ENTITY has" that are already field terms
+        prefix = text[: match.start()].rstrip()
+        if re.search(rf"\b({_COL_PATTERN})\s*$", prefix, re.IGNORECASE):
+            continue
+        values = _split_or_list(match.group("body") or "")
+        if not values:
+            continue
+        terms.append(
+            Term(
+                kind="fts",
+                column=None,
+                values=values,
+                op="eq",
+                start=match.start(),
+                end=match.end(),
+            )
+        )
 
-    for match in re.finditer(r"has\s+(.*?)(?=\s+(?:and|or)\s+|$)", text, flags=re.IGNORECASE):
-        values = _split_or_list(match.group(1))
-        if values:
-            terms.append(Term(kind="fts", column=None, values=values, op="eq"))
-
-    has_rep_email = any((t.column or "").upper() == "REPRESENTATIVE_EMAIL" for t in terms if t.kind == "field")
+    # If representative email is present, augment with any email addresses in the text
+    has_rep_email = any(
+        term.kind == "field" and (term.column or "").upper() == "REPRESENTATIVE_EMAIL"
+        for term in terms
+    )
     if has_rep_email:
         emails = _EMAIL_RE.findall(text)
         if emails:
             explicit = {
                 value.lower()
-                for t in terms
-                if t.kind == "field" and (t.column or "").upper() == "REPRESENTATIVE_EMAIL"
-                for value in t.values
+                for term in terms
+                if term.kind == "field" and (term.column or "").upper() == "REPRESENTATIVE_EMAIL"
+                for value in term.values
             }
             extra = [email for email in emails if email.lower() not in explicit]
             if extra:
-                terms.append(Term(kind="field", column="REPRESENTATIVE_EMAIL", values=extra, op="eq"))
+                last_span = max((term.end for term in terms if term.end >= 0), default=len(text))
+                terms.append(
+                    Term(
+                        kind="field",
+                        column="REPRESENTATIVE_EMAIL",
+                        values=extra,
+                        op="eq",
+                        start=last_span,
+                        end=last_span,
+                    )
+                )
 
-    def _position(term: Term) -> int:
-        indexes: List[int] = []
-        for value in term.values:
-            match = re.search(re.escape(value), text, flags=re.IGNORECASE)
-            if match:
-                indexes.append(match.start())
-        return min(indexes) if indexes else len(text)
-
-    terms.sort(key=_position)
+    terms.sort(key=lambda term: term.start if term.start >= 0 else len(text))
     return terms
 
 
 def group_by_boolean_ops(question: str, terms: List[Term]) -> List[Group]:
     """Group terms into AND/OR buckets based on connectors in the question."""
 
-    parts = re.split(r"(and|or)", _normalize(question), flags=re.IGNORECASE)
-    segments: List[Tuple[str, str]] = []
-    for index in range(0, len(parts), 2):
-        segment = parts[index].strip()
-        op = parts[index + 1].strip().lower() if index + 1 < len(parts) else ""
-        if segment:
-            segments.append((segment, op))
+    if not terms:
+        return []
 
-    iterator = iter(terms)
-    current: List[Term] = []
+    text = _normalize(question)
+    if not text:
+        return []
+
+    ordered = sorted(terms, key=lambda term: term.start if term.start >= 0 else len(text))
     groups: List[Group] = []
+    current: List[Term] = []
 
-    def _flush() -> None:
+    def flush() -> None:
         nonlocal current
         if not current:
             return
@@ -129,36 +177,24 @@ def group_by_boolean_ops(question: str, terms: List[Term]) -> List[Group]:
             for (column, op), values in field_map.items()
             if column
         ]
-        groups.append(Group(fts_tokens=fts_tokens, field_terms=field_terms))
+        groups.append(Group(fts_tokens=list(dict.fromkeys(fts_tokens)), field_terms=field_terms))
         current = []
 
-    for segment, op in segments:
-        try:
-            term = next(iterator)
-        except StopIteration:
-            continue
+    for index, term in enumerate(ordered):
         current.append(term)
-        if op == "and":
+        next_term = ordered[index + 1] if index + 1 < len(ordered) else None
+        if not next_term:
+            flush()
+            break
+        span_text = text[term.end : next_term.start]
+        if re.search(r"\band\b", span_text, re.IGNORECASE):
             continue
-        if op == "or":
-            try:
-                idx = terms.index(term)
-                next_term = terms[idx + 1]
-            except (ValueError, IndexError):
-                next_term = None
-            if (
-                next_term
-                and term.kind == next_term.kind
-                and (term.column or "").upper() == (next_term.column or "").upper()
-            ):
-                continue
-            _flush()
-    _flush()
+        if re.search(r"\bor\b", span_text, re.IGNORECASE):
+            flush()
+
     return groups
 
 
 def infer_boolean_groups(question: str) -> List[Group]:
     terms = parse_question_into_terms(question)
-    if not terms:
-        return []
     return group_by_boolean_ops(question, terms)

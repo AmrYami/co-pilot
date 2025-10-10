@@ -277,21 +277,44 @@ def build_eq_where(
     allow = {c.upper() for c in (allowed_columns or [])}
     for f in eq_filters or []:
         col = _norm(str(f.get("col") or "").upper())
-        if col and (not allow or col in allow):
-            val = f.get("val", "")
-            ci = bool(f.get("ci", True))
-            trim = bool(f.get("trim", True))
-            bname = f"eq_{idx}"
-            if ci and trim:
-                parts.append(f"UPPER(TRIM({col})) = UPPER(TRIM(:{bname}))")
-            elif ci:
-                parts.append(f"UPPER({col}) = UPPER(:{bname})")
-            elif trim:
-                parts.append(f"TRIM({col}) = TRIM(:{bname})")
+        if not col or (allow and col not in allow):
+            continue
+        op = str(f.get("op") or "eq").lower()
+        val = f.get("val", "")
+        ci = bool(f.get("ci", True))
+        trim = bool(f.get("trim", True))
+        bname = f"eq_{idx}"
+        left_expr = col
+        if trim:
+            left_expr = f"TRIM({left_expr})"
+        if op == "like":
+            pattern = val
+            if isinstance(pattern, str) and pattern and not pattern.startswith("%") and not pattern.endswith("%"):
+                pattern = f"%{pattern}%"
+            binds[bname] = pattern
+            right_expr = f":{bname}"
+            if trim:
+                right_expr = f"TRIM({right_expr})"
+            if ci:
+                parts.append(f"UPPER({left_expr}) LIKE UPPER({right_expr})")
             else:
-                parts.append(f"{col} = :{bname}")
-            binds[bname] = val
+                parts.append(f"{left_expr} LIKE {right_expr}")
             idx += 1
+            continue
+        if ci:
+            left_cmp = f"UPPER({left_expr})"
+        else:
+            left_cmp = left_expr
+        right_expr = f":{bname}"
+        if trim:
+            right_expr = f"TRIM({right_expr})"
+        if ci:
+            right_cmp = f"UPPER({right_expr})"
+        else:
+            right_cmp = right_expr
+        parts.append(f"{left_cmp} = {right_cmp}")
+        binds[bname] = val
+        idx += 1
     where = ("(" + " AND ".join(parts) + ")") if parts else ""
     return where, binds
 

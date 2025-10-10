@@ -11,8 +11,15 @@ Parse /dw/rate comments:
 import re
 from typing import Dict, List, Tuple
 
+_OR_SPLIT_RE = re.compile(r"\s+or\s+|\s*\|\s*|,", re.IGNORECASE)
+_AND_SPLIT_RE = re.compile(r"\s*(?:&|\band\b)\s*", re.IGNORECASE)
+
 _RE_FTS = re.compile(r"fts:\s*(?P<payload>.+?)(?:;|$)", re.IGNORECASE)
 _RE_EQ  = re.compile(r"eq:\s*(?P<col>[^=]+?)\s*=\s*(?P<val>[^;]+?)(?:\((?P<flags>[^)]+)\))?(?:;|$)", re.IGNORECASE)
+_RE_LIKE = re.compile(
+    r"(contains|has|have):\s*(?P<col>[^=]+?)\s*=\s*(?P<val>[^;]+?)(?:\((?P<flags>[^)]+)\))?(?:;|$)",
+    re.IGNORECASE,
+)
 _RE_ORDER = re.compile(r"order_by:\s*(?P<col>[A-Za-z0-9_ ]+)\s*(?P<dir>asc|desc)?", re.IGNORECASE)
 _RE_GROUP = re.compile(r"group_by:\s*(?P<col>[A-Za-z0-9_ ]+)", re.IGNORECASE)
 _RE_GROSS = re.compile(r"gross:\s*(?P<v>true|false)", re.IGNORECASE)
@@ -24,14 +31,31 @@ def _clean(s: str) -> str:
     return s.rstrip(".;, ")
 
 
+def _strip_quotes(value: str) -> str:
+    text = (value or "").strip()
+    if len(text) >= 2 and text[0] in {'"', "'"} and text[-1] == text[0]:
+        return text[1:-1]
+    return text
+
+
+def _split_values(payload: str) -> List[str]:
+    values: List[str] = []
+    for part in _OR_SPLIT_RE.split(payload or ""):
+        cleaned = _clean(_strip_quotes(part))
+        if cleaned:
+            values.append(cleaned)
+    return values
+
+
 def parse_fts(payload: str) -> Tuple[List[List[str]], str]:
     pl = _clean(payload)
-    # support "|" for OR, "&" for AND (explicit grammar)
-    if "&" in pl and "|" not in pl:
-        parts = [p.strip() for p in pl.split("&") if p.strip()]
+    if not pl:
+        return [], "OR"
+    # Treat explicit AND connectors when no OR separators are present
+    if re.search(r"(?:&|\band\b)", pl, re.IGNORECASE) and not re.search(r"(?:\bor\b|\|)", pl, re.IGNORECASE):
+        parts = [p.strip() for p in _AND_SPLIT_RE.split(pl) if p.strip()]
         return [[p] for p in parts], "AND"
-    # default OR on "|"
-    parts = [p.strip() for p in pl.split("|") if p.strip()]
+    parts = _split_values(pl)
     return [[p] for p in parts], "OR"
 
 
@@ -66,9 +90,35 @@ def parse_rate_comment(comment: str) -> Dict:
         out["fts_operator"] = op
     for m in _RE_EQ.finditer(c):
         col = _clean(m.group("col")).upper().replace(" ", "_")
-        val = _clean(m.group("val"))
         flags = parse_flags(m.group("flags") or "")
-        out["eq_filters"].append({"col": col, "val": val, "ci": flags["ci"], "trim": flags["trim"]})
+        values = _split_values(m.group("val") or "")
+        for value in values:
+            out["eq_filters"].append(
+                {
+                    "col": col,
+                    "val": value,
+                    "ci": flags["ci"],
+                    "trim": flags["trim"],
+                    "op": "eq",
+                }
+            )
+    for m in _RE_LIKE.finditer(c):
+        col = _clean(m.group("col")).upper().replace(" ", "_")
+        flags = parse_flags(m.group("flags") or "")
+        values = _split_values(m.group("val") or "")
+        for value in values:
+            pattern = value
+            if pattern and not pattern.startswith("%") and not pattern.endswith("%"):
+                pattern = f"%{pattern}%"
+            out["eq_filters"].append(
+                {
+                    "col": col,
+                    "val": pattern,
+                    "ci": flags["ci"],
+                    "trim": flags["trim"],
+                    "op": "like",
+                }
+            )
     m_order = _RE_ORDER.search(c)
     if m_order:
         out["order_by"] = _clean(m_order.group("col")).upper().replace(" ", "_")

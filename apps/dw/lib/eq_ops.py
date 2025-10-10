@@ -99,9 +99,24 @@ def build_eq_where(eq_filters: List[Dict], settings: Dict, bind_prefix="eq") -> 
         val = _clean_val(f.get("val"))
         ci = bool(f.get("ci", True))
         trim = bool(f.get("trim", True))
+        op = str(f.get("op") or "eq").lower()
         if not col or not val:
             continue
         left = col
+        if op == "like":
+            pname = f"{bind_prefix}_{idx}"
+            idx += 1
+            pattern = val
+            if isinstance(pattern, str) and pattern and not pattern.startswith("%") and not pattern.endswith("%"):
+                pattern = f"%{pattern}%"
+            binds[pname] = pattern
+            expr_col = f"TRIM({left})" if trim else left
+            rhs = f"TRIM(:{pname})" if trim else f":{pname}"
+            if ci:
+                clauses.append(f"UPPER({expr_col}) LIKE UPPER({rhs})")
+            else:
+                clauses.append(f"{expr_col} LIKE {rhs}")
+            continue
         # REQUEST_TYPE synonyms special handling
         if col == "REQUEST_TYPE":
             mode, eqs, prefs = _apply_synonyms_request_type(val, settings)
