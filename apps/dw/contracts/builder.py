@@ -4,7 +4,7 @@ from datetime import date, datetime
 from typing import Dict, Tuple, Optional, List, Iterable
 
 from apps.dw.aliases import resolve_column_alias
-from apps.dw.common.eq_aliases import get_eq_alias_map, resolve_eq_targets
+from apps.dw.common.eq_aliases import resolve_eq_targets
 from apps.dw.contracts.text_filters import extract_eq_filters
 from apps.dw.fts_utils import resolve_fts_columns
 from apps.dw.settings_defaults import DEFAULT_EXPLICIT_FILTER_COLUMNS
@@ -240,7 +240,7 @@ def _select_allowed_columns(columns: Iterable[str], allowed: set[str]) -> List[s
     return selected
 
 
-def _expand_columns_for_entry(entry: Dict, alias_map: Dict[str, List[str]], allowed: set[str]) -> List[str]:
+def _expand_columns_for_entry(entry: Dict, allowed: set[str]) -> List[str]:
     tokens: List[str] = []
     raw_token = entry.get("raw_col")
     col_token = entry.get("col")
@@ -250,7 +250,7 @@ def _expand_columns_for_entry(entry: Dict, alias_map: Dict[str, List[str]], allo
         tokens.append(col_token)
 
     for token in tokens:
-        expanded = resolve_eq_targets(token, mapping=alias_map)
+        expanded = resolve_eq_targets(token)
         filtered = _select_allowed_columns(expanded, allowed)
         if filtered:
             return filtered
@@ -286,7 +286,6 @@ def _build_eq_clauses(
     eq_filters: List[Dict],
     binds: Dict[str, object],
     *,
-    alias_map: Dict[str, List[str]],
     allowed: set[str],
 ) -> Tuple[List[str], Dict[str, object]]:
     clauses: List[str] = []
@@ -298,7 +297,7 @@ def _build_eq_clauses(
     }
     next_index = 0
     for entry in eq_filters:
-        columns = _expand_columns_for_entry(entry, alias_map, allowed)
+        columns = _expand_columns_for_entry(entry, allowed)
         if not columns:
             continue
         while f"eq_{next_index}" in existing:
@@ -368,12 +367,10 @@ def build_contract_sql(
             filtered.append(entry)
 
         if filtered:
-            alias_map = get_eq_alias_map(settings)
             allowed = _normalize_allowed_columns(_get_explicit_eq_columns(settings))
             clauses, new_binds = _build_eq_clauses(
                 filtered,
                 binds,
-                alias_map=alias_map,
                 allowed=allowed,
             )
             if clauses:
