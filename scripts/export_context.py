@@ -39,8 +39,8 @@ def table_columns(engine, name: str, schema: str | None = None) -> Set[str]:
                 clauses.append("lower(table_schema)=lower(:s)")
                 params["s"] = schema
             sql = f"SELECT column_name FROM information_schema.columns WHERE {' AND '.join(clauses)}"
-            rows = conn.execute(text(sql), params).fetchall()
-            return {r[0] for r in rows}
+            rows = conn.execute(text(sql), params or {}).mappings().all()
+            return {row.get("column_name") for row in rows if row.get("column_name")}
     except Exception:
         return set()
 

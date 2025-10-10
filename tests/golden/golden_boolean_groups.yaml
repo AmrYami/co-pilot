@@ -6,22 +6,25 @@ cases:
     must_contain:
       - "UPPER(NVL(CONTRACT_SUBJECT,'')) LIKE UPPER(:fts_bg_"
       - "OR UPPER(NVL(CONTRACT_PURPOSE,'')) LIKE UPPER(:fts_bg_"
-      - "AND UPPER(TRIM(ENTITY)) = UPPER(TRIM(:eq_bg_"
-      - "AND UPPER(TRIM(REPRESENTATIVE_EMAIL)) = UPPER(TRIM(:eq_bg_"
+      - "AND UPPER(TRIM(ENTITY)) IN (:eq_bg_"
+      - "AND UPPER(TRIM(REPRESENTATIVE_EMAIL)) IN (:eq_bg_"
       - ") OR ("
-      - "CONTRACT_STAKEHOLDER_1"
-      - "OWNER_DEPARTMENT"
+      - "CONTRACT_STAKEHOLDER_1)) IN (:eq_bg_"
+      - "OWNER_DEPARTMENT)) IN (:eq_bg_"
       - "ORDER BY REQUEST_DATE DESC"
     must_not_contain:
       - "ORDER BY REQUEST_DATE_DESC"
+    debug_must_contain:
+      - "\"where_text\":"
+      - "\"binds_text\":"
 
   - id: same_column_orlist_email
     question: "ENTITY = DSFH and REPRESENTATIVE_EMAIL = samer@procare-sa.com or rehab.elfwakhry@oracle.com and department = AL FARABI"
     full_text_search: false
     allow_zero_rows: true
     must_contain:
-      - "UPPER(TRIM(REPRESENTATIVE_EMAIL)) = UPPER(TRIM(:eq_bg_"
-      - " OR UPPER(TRIM(REPRESENTATIVE_EMAIL)) = UPPER(TRIM(:eq_bg_"
+      - "UPPER(TRIM(REPRESENTATIVE_EMAIL)) IN (:eq_bg_"
+      - "UPPER(TRIM(DEPARTMENT_1)) IN (:eq_bg_"
 
   - id: has_contains_like_single_group
     question: "list all contracts has it or home care and ENTITY has DSFH or Farabi and department = AL FARABI"
@@ -29,8 +32,8 @@ cases:
     allow_zero_rows: true
     must_contain:
       - "UPPER(TRIM(ENTITY)) LIKE UPPER(TRIM(:eq_bg_"
-      - " OR UPPER(TRIM(ENTITY)) LIKE UPPER(TRIM(:eq_bg_"
-      - "OWNER_DEPARTMENT"
+      - "UPPER(TRIM(DEPARTMENT_1)) IN (:eq_bg_"
+      - "OWNER_DEPARTMENT)) IN (:eq_bg_"
 
   - id: have_contains_like_stakeholder_multi
     question: "ENTITY have DSFH or Farabi and stakeholder = Amr Taher A Maghrabi or Abdulellah Mazen Fakeeh and department = AL FARABI"
@@ -38,8 +41,9 @@ cases:
     allow_zero_rows: true
     must_contain:
       - "UPPER(TRIM(ENTITY)) LIKE UPPER(TRIM(:eq_bg_"
-      - "CONTRACT_STAKEHOLDER_1"
-      - "CONTRACT_STAKEHOLDER_8"
+      - "CONTRACT_STAKEHOLDER_1)) IN (:eq_bg_"
+      - "CONTRACT_STAKEHOLDER_8)) IN (:eq_bg_"
+      - "OWNER_DEPARTMENT)) IN (:eq_bg_"
 
   - id: fts_shown_in_debug_text
     question: "list all contracts has it or home care"
@@ -47,3 +51,4 @@ cases:
     allow_zero_rows: true
     debug_must_contain:
       - "FTS(it OR home care)"
+      - "where_text"

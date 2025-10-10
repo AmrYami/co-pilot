@@ -392,19 +392,22 @@ def _build_eq_clauses(
     return clauses, new_binds
 
 
+def _wrap_ci_trim_expr(expr: str, *, ci: bool = True, trim: bool = True) -> str:
+    value = expr
+    if trim:
+        value = f"TRIM({value})"
+    if ci:
+        value = f"UPPER({value})"
+    return value
+
+
 def _like_or_eq_expr(column: str, bind: str, use_like: bool, *, ci: bool = True, trim: bool = True) -> str:
     """Return a normalized comparison (LIKE or =) for the given column/bind."""
 
-    def _normalize(expr: str) -> str:
-        value = expr
-        if trim:
-            value = f"TRIM({value})"
-        if ci:
-            value = f"UPPER({value})"
-        return value
-
     op = "LIKE" if use_like else "="
-    return f"{_normalize(column)} {op} {_normalize(f':{bind}')}"
+    column_expr = _wrap_ci_trim_expr(column, ci=ci, trim=trim)
+    bind_expr = _wrap_ci_trim_expr(f":{bind}", ci=ci, trim=trim)
+    return f"{column_expr} {op} {bind_expr}"
 
 
 def build_group_clause(
@@ -436,17 +439,65 @@ def build_group_clause(
         columns = [col for col in resolved if col and col.strip().upper() in allowed_columns]
         if not columns:
             continue
-        unique_values = [*dict.fromkeys(values)]
-        if not unique_values:
+        processed_values: List[str] = []
+        seen_keys: set[str] = set()
+        for value in values:
+            text = str(value or "").strip()
+            if not text:
+                continue
+            key = text.upper()
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            processed_values.append(text)
+        if not processed_values:
             continue
-        ors: List[str] = []
-        for value in unique_values:
+        bind_names: List[str] = []
+        for value in processed_values:
             bind_name = f"eq_bg_{len(binds_accum)}"
-            binds_accum.append((bind_name, f"%{value}%" if op == "like" else value))
+            if op == "like":
+                bind_value = f"%{value}%"
+            else:
+                normalized = value
+                if normalized and isinstance(normalized, str):
+                    normalized = normalized.strip().upper()
+                bind_value = normalized
+            binds_accum.append((bind_name, bind_value))
+            bind_names.append(bind_name)
+        if not bind_names:
+            continue
+        if op == "like":
+            column_clauses: List[str] = []
             for col in columns:
-                ors.append(_like_or_eq_expr(col, bind_name, op == "like"))
-        if ors:
-            subclauses.append("(" + " OR ".join(ors) + ")")
+                comparisons = [
+                    _like_or_eq_expr(col, name, True)
+                    for name in bind_names
+                ]
+                if not comparisons:
+                    continue
+                if len(comparisons) == 1:
+                    column_clauses.append(comparisons[0])
+                else:
+                    column_clauses.append("(" + " OR ".join(comparisons) + ")")
+            if not column_clauses:
+                continue
+            if len(column_clauses) == 1:
+                subclauses.append(column_clauses[0])
+            else:
+                subclauses.append("(" + " OR ".join(column_clauses) + ")")
+            continue
+
+        placeholders = [f":{name}" for name in bind_names]
+        column_eqs: List[str] = []
+        for col in columns:
+            lhs = _wrap_ci_trim_expr(col)
+            column_eqs.append(f"{lhs} IN (" + ",".join(placeholders) + ")")
+        if not column_eqs:
+            continue
+        if len(column_eqs) == 1:
+            subclauses.append(column_eqs[0])
+        else:
+            subclauses.append("(" + " OR ".join(column_eqs) + ")")
 
     if not subclauses:
         return ""

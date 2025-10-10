@@ -6,6 +6,7 @@ from dateutil.relativedelta import relativedelta
 
 from apps.dw.patchlib.settings_util import get_fts_engine, get_fts_columns
 from apps.dw.patchlib.fts_builder import build_like_fts
+from apps.dw.common.eq_aliases import resolve_eq_targets
 
 
 LOGGER = logging.getLogger("dw.sql_builder")
@@ -697,15 +698,43 @@ def _rate_build_eq_where(eq_filters: List[Dict[str, Any]], enum_syn: Dict[str, A
     if not eq_filters:
         return "", binds
     parts: List[str] = []
+
+    def _wrap(expr: str, *, ci: bool, trim: bool) -> str:
+        value = expr
+        if trim:
+            value = f"TRIM({value})"
+        if ci:
+            value = f"UPPER({value})"
+        return value
+
+    def _normalize_bind(value: Any, *, ci: bool, trim: bool) -> Any:
+        if isinstance(value, str):
+            text = value
+            if trim:
+                text = text.strip()
+            if ci:
+                text = text.upper()
+            return text
+        return value
+
     for ef in eq_filters:
         col = ef.get("col")
-        val = ef.get("val")
+        values_raw: List[Any] = []
+        if isinstance(ef.get("values"), (list, tuple, set)):
+            values_raw = list(ef.get("values"))
+        elif "val" in ef:
+            values_raw = [ef.get("val")]
+        elif "value" in ef:
+            values_raw = [ef.get("value")]
         ci = bool(ef.get("ci", True))
         tr = bool(ef.get("trim", True))
         if not col:
             continue
-        col_sql = str(col)
-        if str(col).upper() == "REQUEST_TYPE" and enum_syn:
+        col_token = str(col).strip()
+        if not col_token:
+            continue
+        # Request type keeps bespoke behaviour for enum synonyms
+        if col_token.upper() == "REQUEST_TYPE" and enum_syn:
             equals: List[str] = []
             prefix: List[str] = []
             contains: List[str] = []
@@ -717,47 +746,84 @@ def _rate_build_eq_where(eq_filters: List[Dict[str, Any]], enum_syn: Dict[str, A
             prefix = [p.upper().strip() for p in prefix]
             contains = [c.upper().strip() for c in contains]
             sub: List[str] = []
-            if equals:
-                eq_list = equals + [str(val).upper()]
-                eq_binds: List[str] = []
-                for v in eq_list:
+            if equals or values_raw:
+                eq_values = equals + [str(v).strip().upper() for v in values_raw if v not in (None, "")]
+                eq_values = list(dict.fromkeys(eq_values))
+                bind_names: List[str] = []
+                for value in eq_values:
                     idx = len([k for k in binds.keys() if k.startswith(f"eq_{col}_")])
-                    bname = f"eq_{col}_{idx}"
-                    binds[bname] = v
-                    eq_binds.append(f":{bname}")
-                target = "UPPER(TRIM({}))".format(col_sql) if tr else col_sql
-                if ci:
-                    target = f"UPPER({target})"
-                sub.append(f"{target} IN (" + ",".join(eq_binds) + ")")
+                    name = f"eq_{col}_{idx}"
+                    binds[name] = value
+                    bind_names.append(name)
+                target = _wrap(col_token, ci=ci, trim=tr)
+                placeholders = [f":{name}" for name in bind_names]
+                if placeholders:
+                    sub.append(f"{target} IN (" + ",".join(placeholders) + ")")
             for pf in prefix:
                 idx = len([k for k in binds.keys() if k.startswith(f"pf_{col}_")])
                 bname = f"pf_{col}_{idx}"
                 binds[bname] = f"{pf}%"
-                target = "TRIM({})".format(col_sql) if tr else col_sql
-                target = f"UPPER({target})" if ci else target
+                target = _wrap(col_token, ci=ci, trim=tr)
                 sub.append(f"{target} LIKE :{bname}")
             for ct in contains:
                 idx = len([k for k in binds.keys() if k.startswith(f"ct_{col}_")])
                 bname = f"ct_{col}_{idx}"
                 binds[bname] = f"%{ct}%"
-                target = "TRIM({})".format(col_sql) if tr else col_sql
-                target = f"UPPER({target})" if ci else target
+                target = _wrap(col_token, ci=ci, trim=tr)
                 sub.append(f"{target} LIKE :{bname}")
             if sub:
                 parts.append("(" + " OR ".join(sub) + ")")
             continue
-        idx = len([k for k in binds.keys() if k.startswith(f"eq_{col}_")])
-        bname = f"eq_{col}_{idx}"
-        binds[bname] = val
-        lhs = col_sql
-        rhs = f":{bname}"
-        if tr:
-            lhs = f"TRIM({lhs})"
-            rhs = f"TRIM({rhs})"
-        if ci:
-            lhs = f"UPPER({lhs})"
-            rhs = f"UPPER({rhs})"
-        parts.append(f"{lhs} = {rhs}")
+
+        if not values_raw:
+            continue
+        deduped: List[Any] = []
+        seen_keys: set[Any] = set()
+        for value in values_raw:
+            if value in (None, ""):
+                continue
+            key = value
+            if isinstance(value, str):
+                key = value.strip().upper() if ci else value.strip()
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            deduped.append(value)
+        if not deduped:
+            continue
+
+        resolved = resolve_eq_targets(col_token) or [col_token]
+        columns: List[str] = []
+        seen_cols: set[str] = set()
+        for candidate in resolved:
+            if not candidate:
+                continue
+            upper = candidate.strip().upper()
+            if upper in seen_cols:
+                continue
+            seen_cols.add(upper)
+            columns.append(candidate.strip())
+        if not columns:
+            columns.append(col_token)
+
+        bind_names: List[str] = []
+        for value in deduped:
+            idx = len([k for k in binds.keys() if k.startswith(f"eq_{col}_")])
+            bname = f"eq_{col}_{idx}"
+            binds[bname] = _normalize_bind(value, ci=ci, trim=tr)
+            bind_names.append(bname)
+
+        placeholders = [f":{name}" for name in bind_names]
+        column_clauses: List[str] = []
+        for column in columns:
+            lhs = _wrap(column, ci=ci, trim=tr)
+            column_clauses.append(f"{lhs} IN (" + ",".join(placeholders) + ")")
+        if column_clauses:
+            if len(column_clauses) == 1:
+                parts.append(column_clauses[0])
+            else:
+                parts.append("(" + " OR ".join(column_clauses) + ")")
+
     return ("(" + " AND ".join(parts) + ")" if parts else ""), binds
 
 

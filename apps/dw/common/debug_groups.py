@@ -74,6 +74,7 @@ def build_boolean_debug(question: str, fts_columns: List[str] | None = None) -> 
 
     blocks: List[Dict[str, Any]] = []
     lines_for_summary: List[str] = []
+    allowed_for_debug: set[str] = set()
     for index, group in enumerate(groups):
         block_id = ascii_uppercase[index] if index < len(ascii_uppercase) else f"#{index + 1}"
         fts_tokens = list(group.fts_tokens)
@@ -83,6 +84,10 @@ def build_boolean_debug(question: str, fts_columns: List[str] | None = None) -> 
         field_parts: List[str] = []
         for column, values, op in group.field_terms:
             expanded = resolve_eq_targets(column)  # يعتمد على DB settings / fallbacks
+            if expanded:
+                allowed_for_debug.update(col.strip().upper() for col in expanded if col)
+            if column:
+                allowed_for_debug.add(column.strip().upper())
             entry = {
                 "field": column,
                 "op": "eq" if op == "eq" else "like",
@@ -109,4 +114,27 @@ def build_boolean_debug(question: str, fts_columns: List[str] | None = None) -> 
         )
 
     summary = " OR ".join(lines_for_summary) if lines_for_summary else "(TRUE)"
-    return {"summary": summary, "blocks": blocks}
+
+    where_text = ""
+    binds_preview: Dict[str, Any] = {}
+    try:
+        from apps.dw.contracts.builder import build_boolean_where_from_question
+
+        if groups:
+            allowed = {col for col in allowed_for_debug if col}
+            where_text, binds_preview = build_boolean_where_from_question(
+                _coerce_question(question),
+                fts_columns=effective_columns,
+                allowed_columns=allowed or set(),
+            )
+    except Exception:  # pragma: no cover - debug fallback when contracts.builder unavailable
+        where_text = ""
+        binds_preview = {}
+
+    result: Dict[str, Any] = {"summary": summary, "blocks": blocks}
+    if where_text:
+        result["where_text"] = where_text
+    if binds_preview:
+        ordered = sorted(binds_preview.items())
+        result["binds_text"] = ", ".join(f"{name}={value}" for name, value in ordered)
+    return result
