@@ -1,0 +1,8 @@
+cases:
+  - id: order_by_normalized
+    question: "list all"
+    full_text_search: false
+    allow_zero_rows: true
+    require_order_by: REQUEST_DATE
+    must_not_contain:
+      - "REQUEST_DATE_DESC DESC"
