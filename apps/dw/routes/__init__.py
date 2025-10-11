@@ -35,6 +35,8 @@ def _settings_dict() -> Dict[str, Any]:
         "DW_EXPLICIT_FILTER_COLUMNS",
         "DW_ENUM_SYNONYMS",
         "DW_CONTRACT_TABLE",
+        "DW_EQ_ALIAS_COLUMNS",
+        "DW_DATE_COLUMN",
     ]
     cfg: Dict[str, Any] = {}
     for key in keys:
@@ -392,6 +394,12 @@ def rate() -> Any:
         "DW_FTS_ENGINE": settings.get_fts_engine(),
         "DW_CONTRACT_TABLE": contract_table,
     }
+    alias_map = raw_settings.get("DW_EQ_ALIAS_COLUMNS")
+    if alias_map:
+        builder_settings["DW_EQ_ALIAS_COLUMNS"] = alias_map
+    date_column = raw_settings.get("DW_DATE_COLUMN")
+    if date_column:
+        builder_settings["DW_DATE_COLUMN"] = date_column
 
     intent = {
         "date_column": "OVERLAP",
@@ -399,6 +407,7 @@ def rate() -> Any:
         "fts_operator": operator,
         "full_text_search": bool(tokens),
         "eq_filters": hints.get("eq_filters") or [],
+        "boolean_groups": hints.get("boolean_groups") or [],
         "group_by": group_col,
         "gross": gross_flag,
         "sort_by": sort_by_hint,
