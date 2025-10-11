@@ -41,9 +41,12 @@ def register_engine(name: str, engine: Any) -> None:
     REGISTRY[str(name).lower()] = engine
 
 
-def resolve_engine(name: str):
-    key = (name or "").lower()
-    engine = REGISTRY.get(key)
+def resolve_engine(name: str | None):
+    key = (name or "").strip().lower()
+    if key in {"", "like"}:
+        engine = REGISTRY.get("like")
+    else:
+        engine = REGISTRY.get(key)
     if not engine:
         engine = REGISTRY.get("like")
         if not engine:
