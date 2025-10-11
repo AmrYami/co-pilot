@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from string import ascii_uppercase
-from typing import Any, Dict, Iterable, List
+from typing import Any, Dict, Iterable, List, Tuple
 
 from apps.dw.common.bool_groups import Group, infer_boolean_groups
 from apps.dw.common.eq_aliases import resolve_eq_targets
@@ -64,7 +64,160 @@ def _coerce_question(question: str | None) -> str:
     return str(question).strip()
 
 
-def build_boolean_debug(question: str, fts_columns: List[str] | None = None) -> Dict[str, Any]:
+_FIELD_PRIORITY = {
+    "ENTITY": 0,
+    "REPRESENTATIVE_EMAIL": 1,
+    "REPRESENTATIVE": 1,
+    "STAKEHOLDER": 2,
+    "STAKEHOLDERS": 2,
+    "DEPARTMENT": 3,
+    "DEPARTMENTS": 3,
+}
+
+
+def _field_sort_key(name: str, index: int) -> Tuple[int, int]:
+    normalized = (name or "").strip().upper()
+    rank = _FIELD_PRIORITY.get(normalized, 100 + index)
+    return rank, index
+
+
+def _dedupe_values(values: Iterable[str]) -> List[str]:
+    seen: set[str] = set()
+    out: List[str] = []
+    for value in values:
+        text = str(value or "").strip()
+        if not text:
+            continue
+        key = text.upper()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(text)
+    return out
+
+
+def _wrap_column(expr: str, *, ci: bool, trim: bool) -> str:
+    wrapped = expr
+    if trim:
+        wrapped = f"TRIM({wrapped})"
+    if ci:
+        wrapped = f"UPPER({wrapped})"
+    return wrapped
+
+
+def _wrap_bind(name: str, *, ci: bool, trim: bool) -> str:
+    expr = f":{name}"
+    if trim:
+        expr = f"TRIM({expr})"
+    if ci:
+        expr = f"UPPER({expr})"
+    return expr
+
+
+def _build_boolean_where(
+    groups: List[Group],
+    *,
+    ci: bool,
+    trim: bool,
+) -> Tuple[str, Dict[str, Any]]:
+    bind_index = 0
+    binds: Dict[str, Any] = {}
+    clauses: List[str] = []
+
+    for group in groups:
+        field_entries: List[Tuple[str, Dict[str, Any]]] = []
+        for idx, (column, values, op) in enumerate(group.field_terms):
+            if not column:
+                continue
+            cleaned_values = _dedupe_values(values)
+            if not cleaned_values:
+                continue
+            expanded = resolve_eq_targets(column) or [column]
+            entry = {
+                "field": column,
+                "op": "like" if op == "like" else "eq",
+                "values": cleaned_values,
+                "expanded_columns": expanded,
+            }
+            field_entries.append((f"{column}", entry))
+
+        if not field_entries:
+            continue
+
+        # Stable ordering per group
+        ordered_fields = [entry for _, entry in sorted(
+            (
+                (_field_sort_key(name, idx), data)
+                for idx, (name, data) in enumerate(field_entries)
+            ),
+            key=lambda item: item[0],
+        )]
+
+        field_clauses: List[str] = []
+        for entry in ordered_fields:
+            field_name = (entry.get("field") or "").strip()
+            op = entry.get("op", "eq")
+            values_list = entry.get("values") or []
+            expanded_cols = entry.get("expanded_columns") or [field_name]
+            if not values_list:
+                continue
+
+            bind_names: List[str] = []
+            for value in values_list:
+                bind_name = f"eq_bg_{bind_index}"
+                bind_index += 1
+                if op == "like":
+                    binds[bind_name] = f"%{value}%"
+                else:
+                    binds[bind_name] = value.upper()
+                bind_names.append(bind_name)
+            if not bind_names:
+                continue
+
+            if op == "like":
+                column_clauses: List[str] = []
+                for col in expanded_cols:
+                    column_expr = _wrap_column(col, ci=ci, trim=trim)
+                    comparisons = [
+                        f"{column_expr} LIKE {_wrap_bind(name, ci=ci, trim=trim)}"
+                        for name in bind_names
+                    ]
+                    if comparisons:
+                        column_clauses.append("(" + " OR ".join(comparisons) + ")")
+                if column_clauses:
+                    field_clauses.append("(" + " OR ".join(column_clauses) + ")")
+                continue
+
+            bind_expr = ", ".join(
+                _wrap_bind(name, ci=ci, trim=trim) for name in bind_names
+            )
+            column_checks: List[str] = []
+            for col in expanded_cols:
+                column_expr = _wrap_column(col, ci=ci, trim=trim)
+                column_checks.append(f"{column_expr} IN ({bind_expr})")
+            if column_checks:
+                if len(column_checks) == 1:
+                    field_clauses.append(column_checks[0])
+                else:
+                    field_clauses.append("(" + " OR ".join(column_checks) + ")")
+
+        if field_clauses:
+            clauses.append("(" + " AND ".join(field_clauses) + ")")
+
+    if not clauses:
+        return "", {}
+
+    where_text = " OR ".join(clauses) if len(clauses) > 1 else clauses[0]
+    return where_text, binds
+
+
+def build_boolean_debug(
+    question: str,
+    fts_columns: List[str] | None = None,
+    *,
+    case_insensitive: bool = True,
+    trim_values: bool = True,
+) -> Dict[str, Any]:
     """Return debug metadata for inferred boolean groups."""
 
     groups: List[Group] = infer_boolean_groups(_coerce_question(question))
@@ -74,28 +227,41 @@ def build_boolean_debug(question: str, fts_columns: List[str] | None = None) -> 
 
     blocks: List[Dict[str, Any]] = []
     lines_for_summary: List[str] = []
-    allowed_for_debug: set[str] = set()
+
     for index, group in enumerate(groups):
         block_id = ascii_uppercase[index] if index < len(ascii_uppercase) else f"#{index + 1}"
         fts_tokens = list(group.fts_tokens)
         fts_text = f"FTS({' OR '.join(fts_tokens)})" if fts_tokens else ""
 
-        field_entries: List[Dict[str, Any]] = []
-        field_parts: List[str] = []
-        for column, values, op in group.field_terms:
-            expanded = resolve_eq_targets(column)  # يعتمد على DB settings / fallbacks
-            if expanded:
-                allowed_for_debug.update(col.strip().upper() for col in expanded if col)
-            if column:
-                allowed_for_debug.add(column.strip().upper())
+        raw_fields: List[Tuple[str, Dict[str, Any]]] = []
+        for field_index, (column, values, op) in enumerate(group.field_terms):
+            if not column:
+                continue
+            expanded = resolve_eq_targets(column) or [column]
             entry = {
                 "field": column,
-                "op": "eq" if op == "eq" else "like",
+                "op": "like" if op == "like" else "eq",
                 "values": list(values),
                 "expanded_columns": expanded,
             }
-            field_entries.append(entry)
-            field_parts.append(_pretty_field(column, op, values))
+            raw_fields.append((column, entry))
+
+        ordered_entries = [
+            entry
+            for _, entry in sorted(
+                (
+                    (_field_sort_key(name, idx), data)
+                    for idx, (name, data) in enumerate(raw_fields)
+                ),
+                key=lambda item: item[0],
+            )
+        ]
+
+        field_parts: List[str] = []
+        for entry in ordered_entries:
+            field_parts.append(
+                _pretty_field(entry.get("field"), entry.get("op", "eq"), entry.get("values") or [])
+            )
 
         pretty_bits = []
         if fts_text:
@@ -109,35 +275,47 @@ def build_boolean_debug(question: str, fts_columns: List[str] | None = None) -> 
                 "id": block_id,
                 "fts": fts_tokens,
                 "fts_columns_count": len(effective_columns),
-                "fields": field_entries,
+                "fields": ordered_entries,
             }
         )
 
     summary = " OR ".join(lines_for_summary) if lines_for_summary else "(TRUE)"
 
-    where_text = ""
-    binds_preview: Dict[str, Any] = {}
-    plan_result: Dict[str, Any] = {}
+    where_text, bind_values = _build_boolean_where(
+        groups,
+        ci=case_insensitive,
+        trim=trim_values,
+    )
+
+    binds_text = ""
+    if bind_values:
+        parts = []
+        for key, value in bind_values.items():
+            if isinstance(value, str):
+                preview = value.upper() if case_insensitive else value
+            else:
+                preview = value
+            parts.append(f"{key}={preview}")
+        binds_text = ", ".join(parts)
+
+    result: Dict[str, Any] = {"summary": summary, "blocks": blocks}
+    if where_text:
+        result["where_text"] = where_text
+    if bind_values:
+        result["binds"] = bind_values
+    if binds_text:
+        result["binds_text"] = binds_text
+
+    # Best-effort plan metadata for parity with legacy builder
     try:
-        from apps.dw.contracts.builder import (
-            build_boolean_where_from_plan,
-            build_boolean_where_from_question,
-        )
+        from apps.dw.contracts.builder import build_boolean_where_from_plan
 
         if groups:
-            allowed = {col for col in allowed_for_debug if col}
-            question_text = _coerce_question(question)
-            where_text, binds_preview = build_boolean_where_from_question(
-                question_text,
-                fts_columns=effective_columns,
-                allowed_columns=allowed or set(),
-            )
-
+            settings_obj = None
             try:
                 settings_obj = get_settings()
             except Exception:  # pragma: no cover - defensive fallback
                 settings_obj = None
-
             plan_candidate = build_boolean_where_from_plan(
                 groups,
                 settings_obj,
@@ -145,42 +323,14 @@ def build_boolean_debug(question: str, fts_columns: List[str] | None = None) -> 
             )
             if isinstance(plan_candidate, dict) and plan_candidate.get("where_sql"):
                 plan_result = {
-                    "where_sql": plan_candidate.get("where_sql")
-                    or plan_candidate.get("where_text")
-                    or "",
-                    "where_text": plan_candidate.get("where_text")
-                    or plan_candidate.get("where_sql")
-                    or "",
+                    "where_sql": plan_candidate.get("where_sql", ""),
+                    "where_text": plan_candidate.get("where_text", ""),
                     "binds": dict(plan_candidate.get("binds") or {}),
                 }
                 if plan_candidate.get("binds_text"):
                     plan_result["binds_text"] = plan_candidate["binds_text"]
-                if not where_text:
-                    where_text = plan_result["where_text"]
-                if plan_result["binds"]:
-                    binds_preview = dict(plan_result["binds"])
-    except Exception:  # pragma: no cover - debug fallback when contracts.builder unavailable
-        where_text = ""
-        binds_preview = {}
-        plan_result = {}
+                result["plan"] = plan_result
+    except Exception:  # pragma: no cover - ignore plan issues in debug mode
+        pass
 
-    result: Dict[str, Any] = {"summary": summary, "blocks": blocks}
-    if where_text:
-        result["where_text"] = where_text
-    if binds_preview:
-        ordered = sorted(binds_preview.items())
-        result["binds_text"] = ", ".join(f"{name}={value!r}" for name, value in ordered)
-    if plan_result:
-        if plan_result.get("binds") and "binds_text" not in result:
-            ordered = sorted(plan_result["binds"].items())
-            result["binds_text"] = ", ".join(
-                f"{name}={value!r}" for name, value in ordered
-            )
-        result["plan"] = {
-            "where_sql": plan_result.get("where_sql", ""),
-            "where_text": plan_result.get("where_text", ""),
-            "binds": plan_result.get("binds", {}),
-        }
-        if plan_result.get("binds_text"):
-            result.setdefault("plan", {})["binds_text"] = plan_result["binds_text"]
     return result
