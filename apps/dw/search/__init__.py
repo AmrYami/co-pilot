@@ -1,6 +1,6 @@
 """Search helpers for DW endpoints."""
 
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .filters import build_eq_where
 from .fts import (
@@ -11,8 +11,89 @@ from .fts import (
     resolve_fts_config,
 )
 from .legacy import extract_search_tokens, inject_fulltext_where, is_fulltext_allowed
-from .fts_registry import get_engine, resolve_engine, register_engine
+from .fts_registry import get_engine as _get_registered_engine, resolve_engine, register_engine
 from ..settings_access import get_setting
+
+try:  # pragma: no cover - optional dependency
+    from apps.dw.fts_like import build_fts_where as _legacy_like_builder
+except Exception:  # pragma: no cover - fallback when legacy helpers absent
+    _legacy_like_builder = None
+
+
+def _build_like_where(
+    columns: Sequence[str],
+    groups: Sequence[Sequence[str]],
+    *,
+    operator: str = "OR",
+) -> Tuple[str, Dict[str, str]]:
+    """Fallback LIKE-based builder used when no registry engine is found."""
+
+    if _legacy_like_builder is None:
+        return "", {}
+
+    normalized_groups: List[List[str]] = []
+    for group in groups or []:
+        cleaned = [str(token or "").strip() for token in group or [] if str(token or "").strip()]
+        if cleaned:
+            normalized_groups.append(cleaned)
+    if not normalized_groups:
+        return "", {}
+
+    try:
+        return _legacy_like_builder(normalized_groups, columns, op_between_groups=operator)
+    except TypeError:  # pragma: no cover - defensive
+        return _legacy_like_builder(normalized_groups, columns)  # type: ignore[misc]
+
+
+def _build_nofts_where(
+    columns: Sequence[str],
+    groups: Sequence[Sequence[str]],
+    *,
+    operator: str = "OR",
+) -> Tuple[str, Dict[str, str]]:
+    """Explicit no-FTS builder used when FTS is disabled."""
+
+    return "", {}
+
+
+try:  # pragma: no cover - optional engine
+    from .oracle_text import build_oracle_text_where as _build_oracle_text_where
+except Exception:  # pragma: no cover - oracle text may be unavailable in tests
+    _build_oracle_text_where = None
+
+
+ENGINE_MAP: Dict[str, Optional[Callable[[Sequence[str], Sequence[Sequence[str]], str], Tuple[str, Dict[str, str]]]]] = {
+    "like": lambda columns, groups, operator="OR": _build_like_where(
+        columns, groups, operator=operator
+    ),
+    "oracle_text": (
+        (lambda columns, groups, operator="OR": _build_oracle_text_where(columns, groups, operator=operator))
+        if _build_oracle_text_where
+        else None
+    ),
+    "none": lambda columns, groups, operator="OR": _build_nofts_where(
+        columns, groups, operator=operator
+    ),
+}
+
+
+def get_engine(name: Optional[str]):
+    """Resolve an FTS engine with a safe fallback to ``like``."""
+
+    normalized = (name or "").strip().lower()
+
+    builder = _get_registered_engine(normalized) if normalized else None
+    if not builder:
+        candidate = ENGINE_MAP.get(normalized)
+        if candidate:
+            builder = candidate
+
+    if not builder:
+        fallback = ENGINE_MAP.get("like")
+        if fallback:
+            builder = fallback
+
+    return builder
 
 
 def _clean_columns(columns: Iterable[object]) -> List[str]:
@@ -80,6 +161,7 @@ def build_fulltext_where(
 
 
 __all__ = [
+    "ENGINE_MAP",
     "build_boolean_groups_where",
     "build_eq_where",
     "build_fulltext_where",
