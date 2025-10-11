@@ -357,8 +357,6 @@ def rate() -> Any:
     tokens = fts_cfg.get("tokens") or []
     fts_columns = _dedupe_columns(fts_cfg.get("columns") or [])
     fts_engine = fts_cfg.get("engine") or settings.get_fts_engine()
-    if fts_cfg.get("error") == "no_engine":
-        fts_engine = "like"
 
     date_column = raw_settings.get("DW_DATE_COLUMN") or "REQUEST_DATE"
     fts_engine_obj = resolve_engine(fts_engine)
@@ -413,8 +411,11 @@ def rate() -> Any:
     qb.limit(top_n)
 
     final_sql, binds = qb.compile()
-    logger.info(json.dumps({"final_sql": {"size": len(final_sql), "sql": final_sql}}))
-    rows = fetch_rows(final_sql, binds)
+    final_sql_to_run = final_sql
+    logger.info(
+        json.dumps({"final_sql": {"size": len(final_sql_to_run), "sql": final_sql_to_run}})
+    )
+    rows = fetch_rows(final_sql_to_run, binds)
 
     fts_bind_names = [name for name in binds if name.startswith("fts_")]
 
@@ -449,7 +450,7 @@ def rate() -> Any:
             "eq_filters": len(intent["eq_filters"]),
         },
         "builder_notes": builder_notes,
-        "final_sql": {"sql": final_sql, "size": len(final_sql)},
+        "final_sql": {"sql": final_sql_to_run, "size": len(final_sql_to_run)},
     }
 
     meta = {
@@ -469,7 +470,7 @@ def rate() -> Any:
     response = {
         "ok": True,
         "inquiry_id": inquiry_id,
-        "sql": final_sql,
+        "sql": final_sql_to_run,
         "debug": debug,
         "meta": meta,
         "rows": rows,

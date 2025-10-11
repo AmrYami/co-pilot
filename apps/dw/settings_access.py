@@ -56,12 +56,17 @@ class DWSettings:
         return default
 
     def _settings_lookup(self, key: str, namespace: str | None, default=None):
-        ns = namespace or "dw::common"
+        ns = (namespace or "").strip() or "dw::common"
+        scope = "global" if namespace == "global" else "namespace"
+        kwargs = {"namespace": ns} if scope == "namespace" else {}
         try:
-            return _get_setting(key, scope="namespace", namespace=ns, default=default)
+            return _get_setting(key, scope=scope, default=default, **kwargs)
         except TypeError:
             # Legacy helper signature without ``default`` parameter.
-            value = _get_setting(key, scope="namespace", namespace=ns)
+            try:
+                value = _get_setting(key, scope=scope, **kwargs)
+            except TypeError:
+                value = _get_setting(key)
             return value if value is not None else default
 
     def get_fts_engine(self) -> str:
@@ -113,12 +118,13 @@ class DWSettings:
 
         ns_key = namespace or "dw::common"
         engine = self.get_with_global("DW_FTS_ENGINE")
-        if not engine:
+        if engine in (None, ""):
             engine = self._settings_lookup("DW_FTS_ENGINE", ns_key, default=None)
-        if not engine:
+        if engine in (None, ""):
             engine = self._settings_lookup("DW_FTS_ENGINE", "global", default=None)
-        engine_missing = not engine
-        engine_text = str(engine or "like").strip().lower() or "like"
+        engine_text = str(engine or "").strip().lower()
+        if not engine_text:
+            engine_text = "like"
 
         columns_map = self.get_with_global("DW_FTS_COLUMNS")
         if not columns_map:
@@ -163,8 +169,6 @@ class DWSettings:
             "tokens": filtered_tokens,
             "min_token_len": min_len,
         }
-        if engine_missing:
-            config["error"] = "no_engine"
         if not columns:
             config["error"] = "no_columns"
         return config

@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 try:  # pragma: no cover - allow unit tests without Flask dependency
     from flask import Blueprint, current_app, jsonify, request
@@ -101,18 +101,33 @@ from apps.dw.lib.sql_utils import gross_expr as gross_expr_v2, merge_where as me
 def _settings_lookup(settings_obj: Any, key: str, namespace: Optional[str]) -> Any:
     if settings_obj is None:
         return None
+
+    scopes: List[Tuple[Optional[str], Dict[str, Any]]] = []
+    ns_value = (namespace or "").strip()
+    if ns_value:
+        scopes.append(("namespace", {"namespace": ns_value}))
+    scopes.append(("global", {}))
+    scopes.append((None, {}))
+
     for attr in ("get_json", "get"):
         getter = getattr(settings_obj, attr, None)
         if not callable(getter):
             continue
-        try:
-            value = getter(key, scope="namespace", namespace=namespace)
-        except TypeError:
-            value = getter(key)
-        except Exception:
-            continue
-        if value:
-            return value
+        for scope, extra in scopes:
+            try:
+                if scope is None:
+                    value = getter(key)
+                else:
+                    value = getter(key, scope=scope, **extra)
+            except TypeError:
+                try:
+                    value = getter(key)
+                except Exception:
+                    continue
+            except Exception:
+                continue
+            if value is not None:
+                return value
     return None
 
 
