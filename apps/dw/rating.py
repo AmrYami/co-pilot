@@ -38,7 +38,8 @@ except Exception:  # pragma: no cover
     def text(sql: str):  # type: ignore
         return sql
 
-from apps.dw.common.debug_groups import build_boolean_debug
+from apps.dw.common.debug_groups import build_boolean_debug, build_boolean_where
+from apps.dw.common.sort_utils import normalize_sort
 
 from .attempts import run_attempt
 from .online_learning import store_rate_hints
@@ -196,16 +197,35 @@ def rate():
         else:
             fts_debug["operator"] = operator
 
+        boolean_groups = hints.get("boolean_groups") or []
+        first_group = boolean_groups[0] if isinstance(boolean_groups, list) and boolean_groups else None
+        where_bg = ""
+        bg_binds: Dict[str, Any] = {}
+        bg_binds_text = ""
+        if isinstance(first_group, dict):
+            where_bg, bg_binds, bg_binds_text = build_boolean_where(first_group)
+
         eq_filters = list(hints.get("eq_filters") or [])
         eq_sql = ""
         eq_binds: Dict[str, Any] = {}
-        if eq_filters:
+        if eq_filters and not where_bg:
             eq_sql, eq_binds = build_eq_where_v2(eq_filters, settings_bundle, bind_prefix="eq")
 
-        where_sql = merge_where_v2([fts_sql, eq_sql])
+        where_parts: List[str] = []
+        if fts_sql:
+            where_parts.append(fts_sql)
+        if where_bg:
+            where_parts.append(where_bg)
+        elif eq_sql:
+            where_parts.append(eq_sql)
+
+        where_sql = merge_where_v2(where_parts)
         binds: Dict[str, Any] = {}
         binds.update(fts_binds)
-        binds.update(eq_binds)
+        if where_bg:
+            binds.update(bg_binds)
+        else:
+            binds.update(eq_binds)
 
         group_by = hints.get("group_by") or None
         gross_flag = hints.get("gross") if hints.get("gross") is not None else (False if group_by else None)
@@ -224,22 +244,26 @@ def rate():
         if group_by:
             sql_lines.append(f"GROUP BY {group_by}")
 
-        effective_order_by = hints.get("order_by")
-        order_dir = (hints.get("order_dir") or "DESC").upper()
-        effective_sort_by = effective_order_by
+        sort_hint = hints.get("order_by")
+        sort_col, sort_desc = normalize_sort(sort_hint, default_col="REQUEST_DATE")
+        order_dir_hint = (hints.get("order_dir") or "").upper()
+        if order_dir_hint in {"ASC", "DESC"}:
+            sort_desc = order_dir_hint != "ASC"
+        effective_sort_by = sort_col
         if group_by:
-            if effective_order_by:
-                order_clause = f"ORDER BY {effective_order_by} {order_dir}"
+            if sort_hint:
+                order_clause = f"ORDER BY {sort_col} {'DESC' if sort_desc else 'ASC'}"
             else:
                 if gross_flag is True:
                     effective_sort_by = "TOTAL_GROSS"
+                    sort_desc = True
                     order_clause = "ORDER BY TOTAL_GROSS DESC"
                 else:
                     effective_sort_by = "CNT"
+                    sort_desc = True
                     order_clause = "ORDER BY CNT DESC"
         else:
-            effective_sort_by = effective_order_by or "REQUEST_DATE"
-            order_clause = f"ORDER BY {effective_sort_by} {order_dir}"
+            order_clause = f"ORDER BY {sort_col} {'DESC' if sort_desc else 'ASC'}"
 
         sql = "\n".join(sql_lines)
         sql = order_by_safe_v2(sql, order_clause)
@@ -252,26 +276,32 @@ def rate():
             "fts_operator": operator,
             "fts_columns": fts_columns,
             "eq_filters": eq_filters,
+            "boolean_groups": boolean_groups,
             "group_by": group_by,
             "gross": gross_flag,
             "sort_by": effective_sort_by,
-            "sort_desc": order_clause.strip().upper().endswith(" DESC"),
+            "sort_desc": sort_desc,
         }
         fts_debug.setdefault("columns", fts_columns)
         fts_debug.setdefault("binds", fts_debug.get("binds", {}))
 
+        rate_hints = {
+            "comment_present": bool(comment),
+            "eq_filters": len(eq_filters),
+            "group_by": [group_by] if group_by else None,
+            "order_by_applied": bool(order_clause),
+            "where_applied": bool(groups or eq_filters or where_bg),
+            "gross": bool(gross_flag),
+            "gross_expr": gross_expr_v2() if gross_flag else None,
+        }
+        if isinstance(first_group, dict):
+            rate_hints["eq_filters"] = len(first_group.get("fields") or [])
+            rate_hints["where_applied"] = True
+
         debug = {
             "intent": intent,
             "fts": fts_debug,
-            "rate_hints": {
-                "comment_present": bool(comment),
-                "eq_filters": len(eq_filters),
-                "group_by": [group_by] if group_by else None,
-                "order_by_applied": bool(order_clause),
-                "where_applied": bool(groups or eq_filters),
-                "gross": bool(gross_flag),
-                "gross_expr": gross_expr_v2() if gross_flag else None,
-            },
+            "rate_hints": rate_hints,
             "validation": {
                 "ok": True,
                 "errors": [],
@@ -279,6 +309,23 @@ def rate():
                 "bind_names": list(binds.keys()),
             },
         }
+
+        if where_bg:
+            debug["where_text"] = where_bg
+            if bg_binds_text:
+                debug["binds_text"] = bg_binds_text
+            if fts_sql:
+                def _wrap_clause(expr: str) -> str:
+                    text = (expr or "").strip()
+                    if not text:
+                        return text
+                    if text.startswith("(") and text.endswith(")"):
+                        return text
+                    return f"({text})"
+
+                debug["where_text_full"] = f"{_wrap_clause(fts_sql)} AND {_wrap_clause(where_bg)}"
+
+        debug["final_sql"] = {"size": len(sql), "sql": sql}
 
         return sql, binds, debug
     if not inquiry_id or rating < 1 or rating > 5:
