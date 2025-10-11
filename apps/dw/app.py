@@ -1709,6 +1709,27 @@ def answer():
     if "binds" not in meta_out:
         meta_out["binds"] = _json_safe_binds(binds or {})
     meta_fts = (meta_out or {}).get("fts") if isinstance(meta_out, dict) else None
+    intent_debug = {
+        "explicit_dates": _dates_to_iso(explicit_dates),
+        "top_n": top_n,
+        "full_text_search": full_text_search,
+        "fts": {
+            "mode": fts_mode,
+            "tokens": fts_groups,
+            "columns": fts_columns,
+        },
+    }
+    if isinstance(boolean_debug, dict):
+        blocks_dbg = boolean_debug.get("blocks")
+        if blocks_dbg:
+            intent_debug["boolean_groups"] = blocks_dbg
+        where_dbg = boolean_debug.get("where_text")
+        if isinstance(where_dbg, str) and where_dbg.strip():
+            intent_debug["boolean_groups_where"] = where_dbg.strip()
+        bind_dbg = boolean_debug.get("binds")
+        if isinstance(bind_dbg, dict) and bind_dbg:
+            intent_debug["boolean_groups_binds"] = list(bind_dbg.keys())
+
     response = {
         "ok": True,
         "inquiry_id": inquiry_id,
@@ -1717,18 +1738,7 @@ def answer():
         "sql": sql,
         "meta": meta_out,
         "explain": explain,
-        "debug": {
-            "intent": {
-                "explicit_dates": _dates_to_iso(explicit_dates),
-                "top_n": top_n,
-                "full_text_search": full_text_search,
-                "fts": {
-                    "mode": fts_mode,
-                    "tokens": fts_groups,
-                    "columns": fts_columns,
-                },
-            }
-        },
+        "debug": {"intent": intent_debug},
     }
     debug_section = response.get("debug") if isinstance(response, dict) else None
     if isinstance(debug_section, dict):
@@ -1741,7 +1751,10 @@ def answer():
     if fts_where_sql:
         where_parts.append(str(fts_where_sql))
     if isinstance(eq_where_text, str) and eq_where_text.strip():
-        where_parts.append(eq_where_text.strip())
+        eq_clause = eq_where_text.strip()
+        if not (eq_clause.startswith("(") and eq_clause.endswith(")")):
+            eq_clause = f"({eq_clause})"
+        where_parts.append(eq_clause)
 
     final_sql_lines: List[str] = [f'SELECT * FROM "{table_name}"']
     if where_parts:
@@ -1766,8 +1779,20 @@ def answer():
     if isinstance(eq_bind_map, dict):
         for key, value in eq_bind_map.items():
             combined_binds[key] = value
+    filtered_meta_binds: Dict[str, Any] = {}
     if isinstance(existing_meta_binds, dict):
-        for key, value in existing_meta_binds.items():
+        filtered_meta_binds = dict(existing_meta_binds)
+        if isinstance(eq_bind_map, dict) and eq_bind_map:
+            filtered_meta_binds = {
+                key: value
+                for key, value in filtered_meta_binds.items()
+                if not (
+                    isinstance(key, str)
+                    and key.lower().startswith("eq_")
+                    and not key.lower().startswith("eq_bg_")
+                )
+            }
+        for key, value in filtered_meta_binds.items():
             combined_binds.setdefault(key, value)
     if combined_binds and isinstance(response.get("meta"), dict):
         response["meta"]["binds"] = _json_safe_binds(combined_binds)

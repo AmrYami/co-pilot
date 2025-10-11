@@ -64,7 +64,14 @@ def basic_checks(sql: str, allowed_binds: Optional[Iterable[str]] = None) -> Dic
         errs.append("forbidden_dml")
     binds = analyze_binds(cleaned)
     whitelist = set((allowed_binds or WHITELIST_BINDS) or [])
-    illegal = [b for b in (name.lower() for name in binds) if b not in whitelist]
+    illegal: List[str] = []
+    for name in binds:
+        lowered = name.lower()
+        if lowered in whitelist:
+            continue
+        if lowered.startswith("eq_bg_"):
+            continue
+        illegal.append(lowered)
     if illegal:
         errs.append(f"illegal_binds:{','.join(illegal)}")
     binds_lower = [name.lower() for name in binds]
