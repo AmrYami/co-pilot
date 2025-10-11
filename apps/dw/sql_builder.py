@@ -7,6 +7,7 @@ from dateutil.relativedelta import relativedelta
 from apps.dw.patchlib.settings_util import get_fts_engine, get_fts_columns
 from apps.dw.patchlib.fts_builder import build_like_fts
 from apps.dw.common.eq_aliases import resolve_eq_targets
+from apps.dw.fts import FTSEngine
 
 
 LOGGER = logging.getLogger("dw.sql_builder")
@@ -720,31 +721,72 @@ GROSS_EXPR_RATE = "NVL(CONTRACT_VALUE_NET_OF_VAT,0) + CASE WHEN NVL(VAT,0) BETWE
 
 
 def _rate_build_fts_where(fts: Dict[str, Any], binds: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
-    engine = (_rate_get_setting("DW_FTS_ENGINE", scope="namespace") or "like")
-    try:
-        engine = engine.lower()
-    except Exception:
-        engine = "like"
-    if not fts or not fts.get("enabled") or engine != "like":
+    if not fts or not fts.get("enabled"):
         return "", binds
-    columns: List[str] = fts.get("columns") or []
-    groups: List[List[str]] = fts.get("tokens") or []
-    operator = fts.get("operator", "OR")
+
+    engine_name = fts.get("engine")
+    raw_min_len = fts.get("min_token_len")
+    settings_ctx: Dict[str, Any] = {}
+    if raw_min_len is not None:
+        settings_ctx["DW_FTS_MIN_TOKEN_LEN"] = raw_min_len
+    else:
+        settings_ctx["DW_FTS_MIN_TOKEN_LEN"] = _rate_get_setting(
+            "DW_FTS_MIN_TOKEN_LEN",
+            scope="namespace",
+        ) or 2
+    engine = FTSEngine.from_name(engine_name, settings=settings_ctx)
+
+    try:
+        min_token_len = max(1, int(engine.min_token_len))
+    except Exception:
+        min_token_len = 2
+
+    columns: List[str] = []
+    for col in fts.get("columns") or []:
+        col_str = str(col).strip()
+        if col_str:
+            columns.append(col_str)
+    if not columns:
+        return "", binds
+
+    filtered_groups: List[List[str]] = []
+    for group in fts.get("tokens") or []:
+        tokens: List[str] = []
+        for tok in group or []:
+            if not isinstance(tok, str):
+                continue
+            cleaned = tok.strip()
+            if not cleaned or len(cleaned) < min_token_len:
+                continue
+            tokens.append(cleaned)
+        if tokens:
+            filtered_groups.append(tokens)
+    if not filtered_groups:
+        return "", binds
+
+    bind_index = len([k for k in binds.keys() if k.startswith("fts_")])
     clauses: List[str] = []
-    for g in groups:
-        g_clauses: List[str] = []
-        for tok in g:
-            idx = len([k for k in binds.keys() if k.startswith("fts_")])
-            bname = f"fts_{idx}"
-            binds[bname] = f"%{tok}%"
-            col_clauses = [f"UPPER(NVL({c},'')) LIKE UPPER(:{bname})" for c in columns]
-            g_clauses.append("(" + " OR ".join(col_clauses) + ")")
-        if g_clauses:
-            group_expr = "(" + (" AND ".join(g_clauses) if len(g_clauses) > 1 else g_clauses[0]) + ")"
-            clauses.append(group_expr)
+    for group in filtered_groups:
+        group_parts: List[str] = []
+        for token in group:
+            bind_name = f"fts_{bind_index}"
+            bind_index += 1
+            binds[bind_name] = f"%{token}%"
+            per_column = [
+                f"UPPER(NVL({column},'')) LIKE UPPER(:{bind_name})" for column in columns
+            ]
+            group_parts.append("(" + " OR ".join(per_column) + ")")
+        if group_parts:
+            if len(group_parts) == 1:
+                clauses.append(group_parts[0])
+            else:
+                clauses.append("(" + " AND ".join(group_parts) + ")")
+
     if not clauses:
         return "", binds
-    joiner = " OR " if (operator or "OR").upper() == "OR" else " AND "
+
+    operator = (fts.get("operator") or "OR").upper()
+    joiner = " OR " if operator == "OR" else " AND "
     return "(" + joiner.join(clauses) + ")", binds
 
 

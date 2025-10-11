@@ -3,6 +3,8 @@ from flask import Blueprint, request, jsonify
 from apps.dw.sql_builder import build_rate_sql
 from apps.dw.settings import get_setting
 from apps.dw.learning import record_feedback, to_patch_from_comment
+from apps.dw.fts import FTSEngine
+from apps.dw.patchlib.settings_util import get_fts_columns
 
 rate_bp = Blueprint("rate", __name__)
 
@@ -21,6 +23,16 @@ def rate():
 
     resp = {"ok": True, "inquiry_id": inquiry_id, "debug": {}}
 
+    raw_engine = get_setting("DW_FTS_ENGINE", scope="namespace")
+    engine_name = str(raw_engine).strip().lower() if raw_engine else "like"
+    raw_min_len = get_setting("DW_FTS_MIN_TOKEN_LEN", scope="namespace")
+    try:
+        min_token_len = max(1, int(raw_min_len)) if raw_min_len is not None else 2
+    except Exception:
+        min_token_len = 2
+    fts_engine = FTSEngine.from_name(engine_name, settings={"DW_FTS_MIN_TOKEN_LEN": min_token_len})
+    fts_columns = [col for col in get_fts_columns("Contract") if col]
+
     if patch:
         intent = {
             "eq_filters": patch.get("eq_filters") or [],
@@ -28,7 +40,9 @@ def rate():
                 "enabled": bool(patch.get("fts_tokens")),
                 "operator": patch.get("fts_operator") or "OR",
                 "tokens": [[t] for t in (patch.get("fts_tokens") or [])],
-                "columns": (get_setting("DW_FTS_COLUMNS", scope="namespace") or {}).get("Contract", []),
+                "columns": fts_columns,
+                "engine": fts_engine.name,
+                "min_token_len": fts_engine.min_token_len,
             },
             "group_by": patch.get("group_by"),
             "sort_by": patch.get("sort_by"),
@@ -39,7 +53,14 @@ def rate():
     else:
         intent = {
             "eq_filters": [],
-            "fts": {"enabled": False},
+            "fts": {
+                "enabled": False,
+                "operator": "OR",
+                "tokens": [],
+                "columns": fts_columns,
+                "engine": fts_engine.name,
+                "min_token_len": fts_engine.min_token_len,
+            },
             "group_by": None,
             "sort_by": "REQUEST_DATE",
             "sort_desc": True,

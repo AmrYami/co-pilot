@@ -9,6 +9,36 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 VALID_ENGINES = {"like", "contains", "tsvector"}
 
 
+class FTSEngine:
+    """Simple resolver for DW FTS engine configuration."""
+
+    def __init__(self, name: str, *, min_token_len: int = 2) -> None:
+        self.name = (name or "like").strip().lower() or "like"
+        try:
+            self.min_token_len = max(1, int(min_token_len))
+        except Exception:
+            self.min_token_len = 2
+
+    @staticmethod
+    def like(*, min_token_len: int = 2) -> "FTSEngine":
+        return FTSEngine("like", min_token_len=min_token_len)
+
+    @staticmethod
+    def from_name(name: Optional[str], settings: Optional[Dict[str, Any]] = None) -> "FTSEngine":
+        settings = settings or {}
+        raw_min = settings.get("DW_FTS_MIN_TOKEN_LEN", 2)
+        try:
+            min_len = max(1, int(raw_min))
+        except Exception:
+            min_len = 2
+
+        normalized = (name or "").strip().lower()
+        if normalized in ("", "like"):
+            return FTSEngine.like(min_token_len=min_len)
+        # Placeholder for future engines; default to LIKE for unknown values.
+        return FTSEngine.like(min_token_len=min_len)
+
+
 def _cfg_get(cfg: Any, key: str, default: Any = None) -> Any:
     if isinstance(cfg, dict):
         return cfg.get(key, default)
