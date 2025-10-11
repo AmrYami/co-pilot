@@ -8,7 +8,7 @@ Usage:
 from __future__ import annotations
 import os, json, argparse
 from typing import Optional, Iterable, Set
-from sqlalchemy import create_engine, text, inspect
+from sqlalchemy import create_engine, text
 try:
     # Optional: load .env if present
     from dotenv import load_dotenv  # type: ignore
@@ -24,17 +24,18 @@ def _pick(cols: Iterable[str], *candidates: str) -> Optional[str]:
     return None
 
 def table_exists(engine, name: str, schema: str | None = None) -> bool:
-    """Compatibility wrapper that works with SQLAlchemy 2.x."""
+    """Check table existence using ``information_schema`` for 2.x engines."""
 
     try:
-        insp = inspect(engine)
-        candidates = [name]
+        clauses = ["LOWER(table_name) = LOWER(:t)"]
+        params = {"t": name}
         if schema:
-            return insp.has_table(name, schema=schema)
-        return any(
-            insp.has_table(candidate, schema=schema)
-            for candidate in (name, name.lower(), name.upper())
-        )
+            clauses.append("LOWER(table_schema) = LOWER(:s)")
+            params["s"] = schema
+        sql = "SELECT 1 FROM information_schema.tables WHERE " + " AND ".join(clauses) + " LIMIT 1"
+        with engine.connect() as conn:
+            result = conn.execute(text(sql), params).first()
+            return result is not None
     except Exception:
         return False
 
@@ -67,16 +68,25 @@ def main():
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
 
-    # Read from env (works with .env). Keep default for local dev.
-    url = os.environ.get("MEMORY_DB_URL", "postgresql+psycopg2://postgres:123456789@localhost/copilot_mem_dev")
+    # Read from env (works with .env); write placeholders if missing.
+    url = os.getenv("MEMORY_DB_URL", "").strip()
     if not url:
-        for f in ("settings_export.json","examples_export.json","rules_export.json","patches_export.json","runs_metrics_24h.json"):
+        for f in (
+            "settings_export.json",
+            "examples_export.json",
+            "rules_export.json",
+            "patches_export.json",
+            "runs_metrics_24h.json",
+        ):
             with open(os.path.join(args.out, f), "w") as fp:
-                json.dump({"warning":"MEMORY_DB_URL not set"}, fp, indent=2)
+                json.dump({"warning": "MEMORY_DB_URL not set"}, fp, indent=2)
         print("MEMORY_DB_URL not set; wrote placeholders to", args.out)
         return 0
 
     eng = create_engine(url, pool_pre_ping=True)  # 2.0-safe
+
+    def _has_column(columns: Set[str], name: str) -> bool:
+        return any((col or "").lower() == name.lower() for col in columns)
 
     # settings
     settings = dump(eng, """
@@ -89,18 +99,28 @@ def main():
       json.dump(settings, fp, indent=2, default=str)
 
     if table_exists(eng, "dw_examples"):
-        examples = dump(
-            eng,
-            """
-        SELECT q_norm AS question,
-               sql AS sql,
-               success_count,
-               COALESCE(updated_at, created_at) AS updated_at
-          FROM dw_examples
-         ORDER BY COALESCE(updated_at, created_at) DESC
-         LIMIT 1000
-        """,
-        )
+        ex_cols = table_columns(eng, "dw_examples")
+        order_col = None
+        timestamp_expr = "NULL AS updated_at"
+        if _has_column(ex_cols, "updated_at"):
+            order_col = "updated_at"
+            timestamp_expr = "updated_at AS updated_at"
+        elif _has_column(ex_cols, "created_at"):
+            order_col = "created_at"
+            timestamp_expr = "created_at AS updated_at"
+        query = [
+            "SELECT q_norm AS question,",
+            "       sql AS sql,",
+            "       success_count,",
+            f"       {timestamp_expr}",
+            "  FROM dw_examples",
+        ]
+        if order_col:
+            query.append(f" ORDER BY {order_col} DESC")
+        else:
+            query.append(" ORDER BY q_norm ASC")
+        query.append(" LIMIT 1000")
+        examples = dump(eng, "\n".join(query))
     else:
         examples = {"warning":"dw_examples not found"}
     with open(os.path.join(args.out, "examples_export.json"), "w") as fp:

@@ -99,6 +99,125 @@ def build_boolean_where(group: dict) -> Tuple[str, Dict[str, str], str]:
         where_sql = f"({where_sql})"
     binds_text = ", ".join(f"{key}='{str(value).upper()}'" for key, value in binds.items())
     return where_sql, binds, binds_text
+
+
+def build_boolean_groups_where(
+    groups: List[Dict[str, Any]],
+    *,
+    ci: bool = True,
+    trim: bool = True,
+    bind_prefix: str = "eq_bg_",
+) -> Tuple[str, Dict[str, Any]]:
+    """Render boolean group descriptors into a WHERE clause.
+
+    This helper mirrors the logic used for debug ``where_text`` rendering so that
+    downstream callers can safely reuse the exact SQL fragments (including bind
+    names) when composing executable statements.
+    """
+
+    if not groups:
+        return "", {}
+
+    binds: Dict[str, Any] = {}
+    clauses: List[str] = []
+    bind_index = 0
+
+    for group in groups:
+        raw_fields = group.get("fields") if isinstance(group, dict) else None
+        if not isinstance(raw_fields, list):
+            continue
+
+        field_clauses: List[str] = []
+        for entry in raw_fields:
+            if not isinstance(entry, dict):
+                continue
+
+            field_name = (entry.get("field") or "").strip()
+            if not field_name:
+                continue
+
+            values = entry.get("values") or []
+            cleaned_values: List[str] = []
+            seen_values: set[str] = set()
+            for value in values:
+                text = str(value or "").strip()
+                if not text:
+                    continue
+                key = text.upper()
+                if key in seen_values:
+                    continue
+                seen_values.add(key)
+                cleaned_values.append(text)
+
+            if not cleaned_values:
+                continue
+
+            expanded = entry.get("expanded_columns")
+            if not expanded:
+                expanded = resolve_eq_targets(field_name)
+            if not expanded:
+                expanded = [field_name]
+
+            columns = [str(col).strip() for col in expanded if str(col or "").strip()]
+            if not columns:
+                continue
+
+            op = str(entry.get("op") or "eq").lower()
+
+            bind_names: List[str] = []
+            for value in cleaned_values:
+                bind_name = f"{bind_prefix}{bind_index}"
+                bind_index += 1
+                if op == "like":
+                    bind_value = value
+                    if value and "%" not in value:
+                        bind_value = f"%{value}%"
+                    binds[bind_name] = bind_value.upper()
+                else:
+                    binds[bind_name] = value.upper()
+                bind_names.append(bind_name)
+
+            if not bind_names:
+                continue
+
+            if op == "like":
+                column_clauses: List[str] = []
+                for column in columns:
+                    column_expr = _wrap_column(column, ci=ci, trim=trim)
+                    comparisons = [
+                        f"{column_expr} LIKE {_wrap_bind(name, ci=ci, trim=trim)}"
+                        for name in bind_names
+                    ]
+                    if comparisons:
+                        column_clauses.append("(" + " OR ".join(comparisons) + ")")
+                if column_clauses:
+                    field_clauses.append("(" + " OR ".join(column_clauses) + ")")
+                continue
+
+            bind_list = ", ".join(
+                _wrap_bind(name, ci=ci, trim=trim) for name in bind_names
+            )
+            column_checks: List[str] = []
+            for column in columns:
+                column_expr = _wrap_column(column, ci=ci, trim=trim)
+                column_checks.append(f"{column_expr} IN ({bind_list})")
+
+            if not column_checks:
+                continue
+
+            if len(column_checks) == 1:
+                field_clauses.append(column_checks[0])
+            else:
+                field_clauses.append("(" + " OR ".join(column_checks) + ")")
+
+        if field_clauses:
+            clauses.append("(" + " AND ".join(field_clauses) + ")")
+
+    if not clauses:
+        return "", {}
+
+    where_sql = " OR ".join(clauses) if len(clauses) > 1 else clauses[0]
+    return where_sql, binds
 from apps.dw.settings import get_settings
 
 
