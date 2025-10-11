@@ -24,10 +24,33 @@ def _pick(cols: Iterable[str], *candidates: str) -> Optional[str]:
     return None
 
 def table_exists(engine, name: str, schema: str | None = None) -> bool:
-    insp = inspect(engine)
-    for cand in (name, name.lower(), name.upper()):
-        if insp.has_table(cand, schema=schema):
-            return True
+    """Compatibility wrapper that works with SQLAlchemy 2.x."""
+
+    try:
+        with engine.connect() as conn:
+            clauses = ["table_name = :t"]
+            params = {"t": name}
+            if schema:
+                clauses.append("table_schema = :s")
+                params["s"] = schema
+            sql = (
+                "SELECT 1 FROM information_schema.tables "
+                f"WHERE {' AND '.join(clauses)} LIMIT 1"
+            )
+            result = conn.execute(text(sql), params).first()
+            if result:
+                return True
+    except Exception:
+        pass
+
+    # Fallback to inspector for odd warehouse setups.
+    try:
+        insp = inspect(engine)
+        for cand in (name, name.lower(), name.upper()):
+            if insp.has_table(cand, schema=schema):
+                return True
+    except Exception:
+        return False
     return False
 
 def table_columns(engine, name: str, schema: str | None = None) -> Set[str]:
@@ -88,7 +111,7 @@ def main():
         q_col    = _pick(ex_cols, "question_norm", "q_norm", "question") or "question_norm"
         sql_col  = _pick(ex_cols, "sql", "sql_text", "final_sql") or "sql"
         succ_col = _pick(ex_cols, "success_count", "used_count", "usage_count")
-        ts_col   = _pick(ex_cols, "updated_at", "created_at", "ts", "timestamp")
+        ts_col   = _pick(ex_cols, "created_at", "updated_at", "ts", "timestamp")
         select_list = [f"{q_col} AS question", f"{sql_col} AS sql"]
         if succ_col: select_list.append(f"{succ_col} AS success_count")
         if ts_col:   select_list.append(f"{ts_col} AS created_at")

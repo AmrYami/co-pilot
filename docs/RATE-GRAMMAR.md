@@ -61,3 +61,41 @@ fts: "term one" | "term two"
 
 Every knob maps to the corresponding SELECT / ORDER BY / aggregation options in
 `build_rate_sql`.
+
+## Quick cheatsheet (AND/OR + groups)
+
+Use the following mini-reference when writing `/dw/rate` comments that rely on
+boolean groups:
+
+* `fts: it or home care`
+* `eq: ENTITY = DSFH or Farabi`
+* `eq: REPRESENTATIVE_EMAIL = a@x.com or b@y.com`
+* `eq: stakeholder = "Amr Taher" or "Abdulellah Fakeeh"`
+  * expands to `CONTRACT_STAKEHOLDER_1 … CONTRACT_STAKEHOLDER_8`
+* `eq: department = AL FARABI or SUPPORT SERVICES`
+  * expands to `DEPARTMENT_1 … DEPARTMENT_8` plus `OWNER_DEPARTMENT`
+* `order_by: REQUEST_DATE desc`
+
+Grouping syntax:
+
+* `group: or` starts a new block combined with OR against the previous block.
+* Without `group: ...` hints, everything stays within the first (implicit) block
+  and is AND-ed together.
+
+Example:
+
+```
+fts: it or home care;
+eq: ENTITY = DSFH or Farabi;
+eq: REPRESENTATIVE_EMAIL = a@x.com or b@y.com;
+group: or;
+eq: stakeholder = Amr or Abdulellah;
+eq: department = AL FARABI;
+```
+
+translates to:
+
+```
+WHERE (FTS ...) AND (ENTITY IN (...) AND REPRESENTATIVE_EMAIL IN (...))
+   OR (CONTRACT_STAKEHOLDER_1..8 IN (...) AND DEPARTMENT_1..8/OWNER_DEPARTMENT IN (...))
+```
