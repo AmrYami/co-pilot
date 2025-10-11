@@ -39,8 +39,8 @@ def table_columns(engine, name: str, schema: str | None = None) -> Set[str]:
                 clauses.append("lower(table_schema)=lower(:s)")
                 params["s"] = schema
             sql = f"SELECT column_name FROM information_schema.columns WHERE {' AND '.join(clauses)}"
-            rows = conn.execute(text(sql), params).fetchall()
-            return {r[0] for r in rows}
+            rows = conn.execute(text(sql), params or {}).mappings().all()
+            return {row.get("column_name") for row in rows if row.get("column_name")}
     except Exception:
         return set()
 
@@ -81,6 +81,8 @@ def main():
       json.dump(settings, fp, indent=2, default=str)
 
     # examples (column names vary across branches: question_norm|q_norm, sql|sql_text|final_sql, created_at|updated_at)
+    # If present in DB, include normative question text + timestamps in exports
+    # to help reproducible golden/regressions.
     if table_exists(eng, "dw_examples"):
         ex_cols = table_columns(eng, "dw_examples")
         q_col    = _pick(ex_cols, "question_norm", "q_norm", "question") or "question_norm"
