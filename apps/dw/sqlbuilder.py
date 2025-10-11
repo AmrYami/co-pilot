@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import re
 
 from apps.dw.common.eq_aliases import resolve_eq_targets
+from apps.dw.filters import build_boolean_groups_where
 from core.nlu.schema import NLIntent
 
 
@@ -292,6 +293,7 @@ def parse_rate_comment(comment: str) -> Dict[str, Any]:
         "fts_tokens": [],
         "fts_operator": "OR",
         "eq_filters": [],
+        "boolean_groups": [],
         "group_by": None,
         "gross": None,
         "sort_by": None,
@@ -351,6 +353,25 @@ def parse_rate_comment(comment: str) -> Dict[str, Any]:
                     hints["top_n"] = int(payload)
                 except ValueError:
                     pass
+
+    eq_filters = hints.get("eq_filters") or []
+    if eq_filters:
+        fields: List[Dict[str, Any]] = []
+        for entry in eq_filters:
+            column = str(entry.get("col") or "").strip()
+            if not column:
+                continue
+            values = list(entry.get("values") or [])
+            if not values:
+                fallback = entry.get("val")
+                if fallback:
+                    values = [fallback]
+            if not values:
+                continue
+            op = str(entry.get("op") or "eq").lower()
+            fields.append({"field": column, "op": "like" if op == "like" else "eq", "values": values})
+        if fields:
+            hints["boolean_groups"] = [{"id": "A", "fields": fields}]
 
     text = comment.strip()
     match = re.search(
@@ -498,6 +519,7 @@ def build_sql_from_intent(
     fts_operator = (intent.get("fts_operator") or "OR").upper()
     full_text_search = bool(intent.get("full_text_search") or (fts_tokens and fts_engine == "like"))
     eq_filters = intent.get("eq_filters") or []
+    boolean_groups = intent.get("boolean_groups") or []
     group_by = intent.get("group_by")
     gross = intent.get("gross")
     sort_by = intent.get("sort_by")
@@ -509,8 +531,12 @@ def build_sql_from_intent(
         sort_desc, note = direction_from_words([direction_hint])
         dbg["notes"].append(note)
 
+    date_column = str(settings.get("DW_DATE_COLUMN") if isinstance(settings, dict) else "REQUEST_DATE")
+    if not date_column or date_column.strip() == "{}":
+        date_column = "REQUEST_DATE"
+    date_column = date_column.strip()
     if sort_by is None:
-        sort_by = "REQUEST_DATE"
+        sort_by = date_column
     if sort_desc is None:
         sort_desc = True
 
@@ -529,18 +555,47 @@ def build_sql_from_intent(
     elif full_text_search and fts_engine != "like":
         dbg["notes"].append("unsupported_fts_engine_fallback_like_disabled")
 
-    if eq_filters:
-        w, b = build_eq_where(eq_filters, eq_allowed)
-        if w:
-            where_parts.append(w)
-            binds.update(b)
-            dbg["notes"].append(f"eq_filters={len(b)}")
+    bg_where_sql = ""
+    bg_binds: Dict[str, Any] = {}
+    if boolean_groups:
+        bg_where_sql, bg_binds = build_boolean_groups_where(boolean_groups, settings)
+    elif eq_filters:
+        fallback_fields: List[Dict[str, Any]] = []
+        for entry in eq_filters:
+            column = str(entry.get("col") or "").strip()
+            if not column:
+                continue
+            values = list(entry.get("values") or [])
+            if not values and entry.get("val"):
+                values = [entry["val"]]
+            if not values:
+                continue
+            op = str(entry.get("op") or "eq").lower()
+            fallback_fields.append(
+                {"field": column, "op": "like" if op == "like" else "eq", "values": values}
+            )
+        if fallback_fields:
+            bg_where_sql, bg_binds = build_boolean_groups_where(
+                [{"id": "A", "fields": fallback_fields}],
+                settings,
+            )
+    if bg_where_sql:
+        where_parts.append(bg_where_sql)
+        binds.update(bg_binds)
+        dbg["notes"].append(f"boolean_groups={len(bg_binds)}")
 
     where_clause = ""
     if where_parts:
         where_clause = "WHERE " + " AND ".join([p for p in where_parts if p])
 
-    order_clause = f"ORDER BY {sort_by} {'DESC' if sort_desc else 'ASC'}"
+    sort_by_text = str(sort_by or date_column).strip()
+    if not sort_by_text:
+        sort_by_text = date_column
+    upper_sort = sort_by_text.upper()
+    if upper_sort.endswith(" DESC") or upper_sort.endswith(" ASC"):
+        sort_by_text = sort_by_text.rsplit(" ", 1)[0]
+    sort_by_text = sort_by_text.replace("_DESC", "").strip() or date_column
+    order_clause = f"ORDER BY {sort_by_text} {'DESC' if sort_desc else 'ASC'}"
 
     if group_by:
         if gross:
