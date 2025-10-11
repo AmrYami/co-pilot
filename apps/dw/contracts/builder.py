@@ -1,7 +1,7 @@
 from __future__ import annotations
 import re
 from datetime import date, datetime
-from typing import Dict, Tuple, Optional, List, Iterable
+from typing import Any, Dict, Tuple, Optional, List, Iterable
 
 from apps.dw.aliases import resolve_column_alias
 from apps.dw.common.eq_aliases import resolve_eq_targets
@@ -541,6 +541,85 @@ def build_boolean_where_from_question(
     return where_sql, binds
 
 
+def _summarize_boolean_group(group: Group) -> str:
+    bits: List[str] = []
+    if group.fts_tokens:
+        bits.append("FTS(" + " OR ".join(group.fts_tokens) + ")")
+    for column, values, op in group.field_terms:
+        if not column or not values:
+            continue
+        cleaned_values = [str(val).strip() for val in values if str(val or "").strip()]
+        if not cleaned_values:
+            continue
+        joined = " OR ".join(cleaned_values)
+        if op == "like":
+            bits.append(f"{column} CONTAINS ({joined})")
+        else:
+            bits.append(f"{column} = ({joined})")
+    if not bits:
+        return "(TRUE)"
+    return "(" + " AND ".join(bits) + ")"
+
+
+def build_boolean_where_from_plan(
+    blocks: List[Group],
+    settings: Optional[dict],
+    *,
+    fts_columns: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Render a boolean-group plan into SQL text + bind metadata."""
+
+    if not blocks:
+        return {}
+
+    settings_map = _as_settings_dict(settings)
+    allowed = _normalize_allowed_columns(_get_explicit_eq_columns(settings_map))
+    if not allowed:
+        allowed = _normalize_allowed_columns(DEFAULT_EXPLICIT_FILTER_COLUMNS)
+
+    effective_fts = list(fts_columns or [])
+    if not effective_fts:
+        effective_fts = _get_fts_columns(settings_map)
+
+    clauses: List[str] = []
+    binds_accum: List[Tuple[str, object]] = []
+    summary_parts: List[str] = []
+    field_count = 0
+
+    for group in blocks:
+        summary_parts.append(_summarize_boolean_group(group))
+        field_count += sum(1 for column, values, _ in group.field_terms if column and values)
+        clause = build_group_clause(
+            group,
+            fts_columns=effective_fts,
+            allowed_columns=allowed,
+            binds_accum=binds_accum,
+        )
+        if clause:
+            clauses.append(clause)
+
+    if not clauses:
+        return {}
+
+    where_text = "(" + " OR ".join(clauses) + ")"
+    binds: Dict[str, object] = {name: value for name, value in binds_accum}
+    ordered = sorted(binds.items())
+    binds_text = ", ".join(
+        f"{name}='{str(value).upper()}'" if isinstance(value, str) else f"{name}={value!r}"
+        for name, value in ordered
+    )
+
+    summary = " OR ".join(summary_parts) if summary_parts else "(TRUE)"
+    plan: Dict[str, Any] = {
+        "summary": summary,
+        "where_text": where_text,
+        "binds_text": binds_text,
+        "binds": binds,
+        "field_count": field_count,
+    }
+    return plan
+
+
 def build_contract_sql(
     *,
     question: str,
@@ -589,6 +668,13 @@ def build_contract_sql(
             base_where.append(bool_where)
             binds.update(bool_binds)
             boolean_override = True
+            plan = build_boolean_where_from_plan(
+                boolean_groups,
+                settings_map,
+                fts_columns=use_fts_columns,
+            )
+            if plan:
+                intent["boolean_plan"] = plan
             if notes is not None:
                 notes.setdefault(
                     "boolean_groups",

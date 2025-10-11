@@ -468,6 +468,14 @@ def rate():
                 "binds": binds,
                 "intent": intent_snapshot,
             }
+            plan = intent_snapshot.get("boolean_plan") if isinstance(intent_snapshot, dict) else None
+            if isinstance(plan, dict):
+                where_text = plan.get("where_text")
+                if where_text:
+                    hints_debug["where_text"] = where_text
+                binds_text = plan.get("binds_text")
+                if binds_text:
+                    hints_debug["binds_text"] = binds_text
         except Exception as exc:
             hints_debug = {"error": str(exc)}
 
@@ -556,6 +564,21 @@ def rate():
                 "bind_names": list(rate_binds.keys()),
             },
         }
+        plan = intent_snapshot.get("boolean_plan") if isinstance(intent_snapshot, dict) else None
+        if isinstance(plan, dict):
+            rate_debug.setdefault("intent", {})["boolean_plan"] = plan
+            where_text = plan.get("where_text")
+            if where_text:
+                rate_debug["where_text"] = where_text
+            binds_text = plan.get("binds_text")
+            if binds_text:
+                rate_debug["binds_text"] = binds_text
+            field_count = plan.get("field_count")
+            hints_section = rate_debug.get("rate_hints")
+            if isinstance(hints_section, dict):
+                hints_section["where_applied"] = True
+                if isinstance(field_count, int):
+                    hints_section["eq_filters"] = field_count
         if hints_debug:
             rate_debug.setdefault("legacy", {})["rate_hints"] = hints_debug
     elif rate_debug:
