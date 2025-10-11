@@ -27,31 +27,16 @@ def table_exists(engine, name: str, schema: str | None = None) -> bool:
     """Compatibility wrapper that works with SQLAlchemy 2.x."""
 
     try:
-        with engine.connect() as conn:
-            clauses = ["table_name = :t"]
-            params = {"t": name}
-            if schema:
-                clauses.append("table_schema = :s")
-                params["s"] = schema
-            sql = (
-                "SELECT 1 FROM information_schema.tables "
-                f"WHERE {' AND '.join(clauses)} LIMIT 1"
-            )
-            result = conn.execute(text(sql), params).first()
-            if result:
-                return True
-    except Exception:
-        pass
-
-    # Fallback to inspector for odd warehouse setups.
-    try:
         insp = inspect(engine)
-        for cand in (name, name.lower(), name.upper()):
-            if insp.has_table(cand, schema=schema):
-                return True
+        candidates = [name]
+        if schema:
+            return insp.has_table(name, schema=schema)
+        return any(
+            insp.has_table(candidate, schema=schema)
+            for candidate in (name, name.lower(), name.upper())
+        )
     except Exception:
         return False
-    return False
 
 def table_columns(engine, name: str, schema: str | None = None) -> Set[str]:
     try:
@@ -83,7 +68,7 @@ def main():
     os.makedirs(args.out, exist_ok=True)
 
     # Read from env (works with .env). Keep default for local dev.
-    url = os.getenv("MEMORY_DB_URL", "postgresql+psycopg2://postgres:123456789@localhost/copilot_mem_dev")
+    url = os.environ.get("MEMORY_DB_URL", "postgresql+psycopg2://postgres:123456789@localhost/copilot_mem_dev")
     if not url:
         for f in ("settings_export.json","examples_export.json","rules_export.json","patches_export.json","runs_metrics_24h.json"):
             with open(os.path.join(args.out, f), "w") as fp:
@@ -103,20 +88,19 @@ def main():
     with open(os.path.join(args.out, "settings_export.json"), "w") as fp:
       json.dump(settings, fp, indent=2, default=str)
 
-    # examples (column names vary across branches: question_norm|q_norm, sql|sql_text|final_sql, created_at|updated_at)
-    # If present in DB, include normative question text + timestamps in exports
-    # to help reproducible golden/regressions.
     if table_exists(eng, "dw_examples"):
-        ex_cols = table_columns(eng, "dw_examples")
-        q_col    = _pick(ex_cols, "question_norm", "q_norm", "question") or "question_norm"
-        sql_col  = _pick(ex_cols, "sql", "sql_text", "final_sql") or "sql"
-        succ_col = _pick(ex_cols, "success_count", "used_count", "usage_count")
-        ts_col   = _pick(ex_cols, "created_at", "updated_at", "ts", "timestamp")
-        select_list = [f"{q_col} AS question", f"{sql_col} AS sql"]
-        if succ_col: select_list.append(f"{succ_col} AS success_count")
-        if ts_col:   select_list.append(f"{ts_col} AS created_at")
-        order_by = f" ORDER BY {ts_col} DESC" if ts_col else ""
-        examples = dump(eng, f"SELECT {', '.join(select_list)} FROM dw_examples{order_by} LIMIT 1000")
+        examples = dump(
+            eng,
+            """
+        SELECT q_norm AS question,
+               sql AS sql,
+               success_count,
+               COALESCE(updated_at, created_at) AS updated_at
+          FROM dw_examples
+         ORDER BY COALESCE(updated_at, created_at) DESC
+         LIMIT 1000
+        """,
+        )
     else:
         examples = {"warning":"dw_examples not found"}
     with open(os.path.join(args.out, "examples_export.json"), "w") as fp:

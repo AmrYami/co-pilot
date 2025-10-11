@@ -7,6 +7,98 @@ from typing import Any, Dict, Iterable, List, Tuple
 
 from apps.dw.common.bool_groups import Group, infer_boolean_groups
 from apps.dw.common.eq_aliases import resolve_eq_targets
+
+
+def build_boolean_where(group: dict) -> Tuple[str, Dict[str, str], str]:
+    """
+    Build a SQL WHERE fragment for a single boolean group descriptor.
+
+    - Within the same field we OR values via an ``IN`` list.
+    - Across different fields we AND the clauses together.
+    - For expanded/alias columns we OR the ``IN`` clause across each column.
+
+    Returns ``(where_sql, binds, binds_text)`` where ``where_sql`` already
+    includes parentheses around the combined expression.
+    """
+
+    bind_index = 0
+    binds: Dict[str, str] = {}
+    field_clauses: List[str] = []
+
+    fields = group.get("fields") if isinstance(group, dict) else None
+    if not isinstance(fields, list):
+        fields = []
+
+    for raw_field in fields:
+        if not isinstance(raw_field, dict):
+            continue
+
+        raw_values = raw_field.get("values") if isinstance(raw_field.get("values"), list) else []
+        cleaned_values: List[str] = []
+        seen_values: set[str] = set()
+        for value in raw_values:
+            text = str(value or "").strip()
+            if not text:
+                continue
+            key = text.upper()
+            if key in seen_values:
+                continue
+            seen_values.add(key)
+            cleaned_values.append(text)
+
+        if not cleaned_values:
+            continue
+
+        columns = raw_field.get("expanded_columns") or [raw_field.get("field")]
+        if not isinstance(columns, list):
+            columns = [columns]
+        normalized_columns = [str(col).strip() for col in columns if str(col or "").strip()]
+        if not normalized_columns:
+            continue
+
+        op = str(raw_field.get("op") or "eq").lower()
+        bind_names: List[str] = []
+        for value in cleaned_values:
+            bind_name = f"eq_bg_{bind_index}"
+            bind_index += 1
+            if op == "like":
+                bind_value = value
+                if value and "%" not in value:
+                    bind_value = f"%{value}%"
+                binds[bind_name] = bind_value.upper()
+            else:
+                binds[bind_name] = value.upper()
+            bind_names.append(bind_name)
+
+        if not bind_names:
+            continue
+
+        if op == "like":
+            per_column: List[str] = []
+            for column in normalized_columns:
+                lhs = f"UPPER(TRIM({column}))"
+                comparisons = [f"{lhs} LIKE UPPER(TRIM(:{name}))" for name in bind_names]
+                per_column.append("(" + " OR ".join(comparisons) + ")")
+            if per_column:
+                field_clauses.append("(" + " OR ".join(per_column) + ")")
+            continue
+
+        in_list = ", ".join(f"UPPER(TRIM(:{name}))" for name in bind_names)
+        per_column = [
+            f"UPPER(TRIM({column})) IN ({in_list})" for column in normalized_columns
+        ]
+        if per_column:
+            joined = " OR ".join(per_column)
+            field_clauses.append(f"({joined})")
+
+    if not field_clauses:
+        return "", {}, ""
+
+    where_sql = " AND ".join(field_clauses)
+    if not where_sql.startswith("("):
+        where_sql = f"({where_sql})"
+    binds_text = ", ".join(f"{key}='{str(value).upper()}'" for key, value in binds.items())
+    return where_sql, binds, binds_text
 from apps.dw.settings import get_settings
 
 
