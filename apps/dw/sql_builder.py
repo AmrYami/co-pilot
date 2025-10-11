@@ -405,6 +405,20 @@ def apply_order_by(sql: str, col: str, desc: bool) -> str:
     return f"{sql_no_ob}\nORDER BY {col} {direction}"
 
 
+def _normalize_order_hint(col: Optional[str], desc: bool) -> Tuple[str, bool]:
+    if not col:
+        return col or "", desc
+    mapping = {
+        "REQUEST_DATE_DESC": ("REQUEST_DATE", True),
+        "REQUEST_DATE_ASC": ("REQUEST_DATE", False),
+    }
+    key = str(col).strip().upper()
+    if key in mapping:
+        mapped_col, mapped_desc = mapping[key]
+        return mapped_col, mapped_desc
+    return col, desc
+
+
 def build_sql(intent: Dict[str, Any], settings, *, table: str = "Contract") -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
     """
     Returns (sql, binds, meta)
@@ -451,6 +465,20 @@ def build_sql(intent: Dict[str, Any], settings, *, table: str = "Contract") -> T
         binds["date_start"] = exp_dates["start"]
         binds["date_end"] = exp_dates["end"]
         where_parts.append("REQUEST_DATE BETWEEN :date_start AND :date_end")
+
+    plan = it.get("boolean_plan") or {}
+    plan_where = plan.get("where_text") if isinstance(plan, dict) else None
+    plan_binds = plan.get("binds") if isinstance(plan, dict) else None
+    if plan_where and isinstance(plan_binds, dict) and plan_binds:
+        where_parts.append(plan_where)
+        binds.update(plan_binds)
+        meta["boolean_plan"] = {"applied": True, "binds": list(plan_binds.keys())}
+    else:
+        legacy_binds: Dict[str, Any] = {}
+        legacy_clauses = build_eq_where(it.get("eq_filters") or [], legacy_binds)
+        if legacy_clauses:
+            where_parts.extend(legacy_clauses)
+            binds.update(legacy_binds)
 
     fts_clause, fts_binds = _build_fts_where_from_intent(it)
     if fts_clause:
@@ -612,6 +640,7 @@ def build_sql(intent: Dict[str, Any], settings, *, table: str = "Contract") -> T
             lines.append(f"WHERE {where_expr}")
         lines.append(f"GROUP BY {group_by}")
         sql = "\n".join(lines)
+        order_col, order_desc = _normalize_order_hint(order_col, order_desc)
         sql = apply_order_by(sql, order_col, order_desc)
         sql = _ensure_single_order_by(sql)
         if top_n:
@@ -640,6 +669,7 @@ def build_sql(intent: Dict[str, Any], settings, *, table: str = "Contract") -> T
     else:
         order_col = measure
         order_desc = sort_desc
+    order_col, order_desc = _normalize_order_hint(order_col, order_desc)
     sql = apply_order_by(sql, order_col, order_desc)
     sql = _ensure_single_order_by(sql)
     if top_n:
