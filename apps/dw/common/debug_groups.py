@@ -136,5 +136,5 @@ def build_boolean_debug(question: str, fts_columns: List[str] | None = None) -> 
         result["where_text"] = where_text
     if binds_preview:
         ordered = sorted(binds_preview.items())
-        result["binds_text"] = ", ".join(f"{name}={value}" for name, value in ordered)
+        result["binds_text"] = ", ".join(f"{name}={value!r}" for name, value in ordered)
     return result

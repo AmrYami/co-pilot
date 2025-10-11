@@ -308,6 +308,12 @@ def _respond(payload: Dict[str, Any], response: Dict[str, Any]):
             summary_text = plan.get("summary", "") or ""
             debug_section["boolean_groups"] = blocks
             debug_section["boolean_groups_text"] = summary_text
+            where_text = plan.get("where_text")
+            if where_text:
+                debug_section["where_text"] = where_text
+            binds_text = plan.get("binds_text")
+            if binds_text:
+                debug_section["binds_text"] = binds_text
             if blocks and isinstance(blocks[0], dict):
                 first_block = blocks[0]
                 block_fts = first_block.get("fts") if isinstance(first_block.get("fts"), list) else []

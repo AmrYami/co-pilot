@@ -402,7 +402,11 @@ def _wrap_ci_trim_expr(expr: str, *, ci: bool = True, trim: bool = True) -> str:
 
 
 def _like_or_eq_expr(column: str, bind: str, use_like: bool, *, ci: bool = True, trim: bool = True) -> str:
-    """Return a normalized comparison (LIKE or =) for the given column/bind."""
+    """
+    Normalized comparison:
+      - LIKE:  UPPER(TRIM(col)) LIKE UPPER(TRIM(:b))
+      - EQ:    UPPER(TRIM(col)) =    UPPER(TRIM(:b))
+    """
 
     op = "LIKE" if use_like else "="
     column_expr = _wrap_ci_trim_expr(column, ci=ci, trim=trim)
@@ -480,11 +484,19 @@ def build_group_clause(
                 subclauses.append("(" + " OR ".join(column_clauses) + ")")
             continue
 
-        placeholders = [f":{name}" for name in bind_names]
+        placeholders = [_wrap_ci_trim_expr(f":{name}") for name in bind_names]
+        seen_placeholders: set[str] = set()
+        deduped_placeholders = []
+        for placeholder in placeholders:
+            if placeholder in seen_placeholders:
+                continue
+            seen_placeholders.add(placeholder)
+            deduped_placeholders.append(placeholder)
+        placeholders = deduped_placeholders
         column_eqs: List[str] = []
         for col in columns:
             lhs = _wrap_ci_trim_expr(col)
-            column_eqs.append(f"{lhs} IN (" + ",".join(placeholders) + ")")
+            column_eqs.append(f"{lhs} IN (" + ", ".join(placeholders) + ")")
         if not column_eqs:
             continue
         if len(column_eqs) == 1:
