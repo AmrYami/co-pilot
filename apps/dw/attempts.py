@@ -25,6 +25,7 @@ from apps.dw.settings_utils import load_explicit_filter_columns
 
 from .builder import build_sql
 from .intent import NLIntent, parse_intent_legacy
+from .logs import scrub_binds
 from .rate_hints import (
     append_where,
     apply_rate_hints,
@@ -255,7 +256,8 @@ def run_attempt(
             "error": fts_meta.get("error"),
         },
     )
-    _log(logger, "final_sql", {"size": len(sql), "sql": sql})
+    final_sql_payload = {"size": len(sql), "sql": sql, "binds": scrub_binds(binds)}
+    _log(logger, "final_sql", final_sql_payload)
     _log(
         logger,
         "validation",
@@ -269,6 +271,8 @@ def run_attempt(
         if app and "DW_ENGINE" in app.config
         else ([], [])
     )
+
+    final_sql_snapshot = {"sql": sql, "binds": dict(binds)}
 
     result = {
         "ok": True,
@@ -298,4 +302,6 @@ def run_attempt(
             "rate_hints": hints_meta,
         },
     }
+    result["final_sql"] = final_sql_snapshot
+    result["meta"]["final_sql"] = final_sql_snapshot
     return result
