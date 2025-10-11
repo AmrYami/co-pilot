@@ -61,6 +61,7 @@ from .search import (
 )
 from .learn.store import save_feedback
 from apps.dw.learning_store import record_example, record_patch
+from .logs import jlog, new_ctx, scrub_binds, timed
 
 
 def _default_namespace(ns: Optional[str]) -> str:
@@ -187,18 +188,51 @@ def rate():
     app = current_app
     engine = app.config["MEM_ENGINE"]
     data = request.get_json(force=True) or {}
+    ctx = new_ctx(route="dw/rate", inquiry_id=data.get("inquiry_id"))
+    raw_payload = {
+        key: value
+        for key, value in data.items()
+        if key not in {"comment", "feedback"}
+    }
+    safe_payload = scrub_binds(raw_payload)
     user_email_raw = data.get("auth_email") or data.get("user_email")
     user_email = (user_email_raw or "").strip() or None
     inquiry_id = int(data.get("inquiry_id") or 0)
+    ctx["inquiry_id"] = inquiry_id or ctx.get("inquiry_id")
     rating = int(data.get("rating") or 0)
     feedback = (data.get("feedback") or "").strip() or None
     comment = (data.get("comment") or "").strip()
     if not comment and feedback:
         comment = feedback
-    structured_hints = parse_rate_comment_structured(comment or "")
+    jlog(
+        "rate.receive",
+        trace_id=ctx["trace_id"],
+        inquiry_id=inquiry_id or None,
+        rating=rating,
+        payload=safe_payload,
+        comment_len=len(comment or ""),
+    )
+    with timed("rate.parse.structured", trace_id=ctx["trace_id"]):
+        structured_hints = parse_rate_comment_structured(comment or "")
     structured_hints["full_text_search"] = bool(structured_hints.get("fts_tokens"))
+    jlog(
+        "rate.intent.structured",
+        trace_id=ctx["trace_id"],
+        summary={
+            "fts_tokens": len(structured_hints.get("fts_tokens") or []),
+            "eq_filters": len(structured_hints.get("eq_filters") or []),
+            "group_by": bool(structured_hints.get("group_by")),
+            "sort_by": structured_hints.get("sort_by"),
+        },
+    )
 
     if not inquiry_id or rating < 1 or rating > 5:
+        jlog(
+            "rate.invalid_payload",
+            trace_id=ctx["trace_id"],
+            inquiry_id=inquiry_id or None,
+            rating=rating,
+        )
         return jsonify({"ok": False, "error": "invalid payload"}), 400
 
     with engine.begin() as cx:
@@ -275,8 +309,29 @@ def rate():
         "DW_FTS_MIN_TOKEN_LEN": min_token_len_setting,
         "DW_EQ_ALIAS_COLUMNS": eq_alias_map_setting,
     }
+    jlog(
+        "rate.settings",
+        trace_id=ctx["trace_id"],
+        snapshot={
+            "DW_FTS_ENGINE": engine_setting,
+            "DW_FTS_COLUMNS_len": len(fts_columns),
+            "DW_EXPLICIT_FILTER_COLUMNS_len": len(eq_allowed),
+            "DW_EQ_ALIAS_COLUMNS_keys": sorted(list(eq_alias_map_setting.keys())),
+        },
+    )
 
-    structured_hints_v2 = parse_rate_comment_v2(comment or "")
+    with timed("rate.parse.v2", trace_id=ctx["trace_id"]):
+        structured_hints_v2 = parse_rate_comment_v2(comment or "")
+    jlog(
+        "rate.intent.v2",
+        trace_id=ctx["trace_id"],
+        summary={
+            "fts_groups": len(structured_hints_v2.get("fts_tokens") or []),
+            "eq_filters": len(structured_hints_v2.get("eq_filters") or []),
+            "group_by": bool(structured_hints_v2.get("group_by")),
+            "order_by": structured_hints_v2.get("order_by"),
+        },
+    )
 
     def _build_sql_from_v2(
         hints: Dict[str, Any]
@@ -515,6 +570,12 @@ def rate():
     if structured_hint_present_v2:
         try:
             rate_sql, rate_binds, rate_debug = _build_sql_from_v2(structured_hints_v2)
+            jlog(
+                "rate.sql.v2",
+                trace_id=ctx["trace_id"],
+                sql_preview=(rate_sql or "")[:300],
+                binds=scrub_binds(rate_binds),
+            )
             intent_from_v2 = rate_debug.get("intent") if isinstance(rate_debug, dict) else None
             if isinstance(intent_from_v2, dict):
                 if intent_from_v2.get("fts_tokens") is not None:
@@ -533,6 +594,11 @@ def rate():
                     structured_hints["sort_desc"] = intent_from_v2.get("sort_desc")
                 structured_hints["full_text_search"] = bool(intent_from_v2.get("full_text_search"))
         except Exception as exc:  # pragma: no cover - defensive fallback
+            jlog(
+                "rate.sql.v2.error",
+                trace_id=ctx["trace_id"],
+                error=str(exc),
+            )
             rate_sql = None
             rate_binds = {}
             rate_debug = {"error": str(exc)}
@@ -627,6 +693,12 @@ def rate():
                     sort_by=structured_hints.get("sort_by") or None,
                     sort_desc=structured_hints.get("sort_desc"),
                 )
+                jlog(
+                    "rate.sql.legacy.group",
+                    trace_id=ctx["trace_id"],
+                    sql_preview=(rate_sql or "")[:300],
+                    binds=scrub_binds(rate_binds),
+                )
             else:
                 rate_sql, rate_binds = select_all_sql(
                     fts_tokens=list(structured_hints.get("fts_tokens") or []),
@@ -637,7 +709,18 @@ def rate():
                     sort_by=structured_hints.get("sort_by") or None,
                     sort_desc=structured_hints.get("sort_desc"),
                 )
+                jlog(
+                    "rate.sql.legacy",
+                    trace_id=ctx["trace_id"],
+                    sql_preview=(rate_sql or "")[:300],
+                    binds=scrub_binds(rate_binds),
+                )
         except Exception as exc:
+            jlog(
+                "rate.sql.legacy.error",
+                trace_id=ctx["trace_id"],
+                error=str(exc),
+            )
             rate_sql = None
             rate_binds = {}
             rate_debug = {"error": str(exc)}
@@ -708,6 +791,13 @@ def rate():
         if hints_debug:
             rate_debug.setdefault("legacy", {})["rate_hints"] = hints_debug
 
+    if rate_debug:
+        jlog(
+            "rate.debug",
+            trace_id=ctx["trace_id"],
+            debug_keys=sorted(rate_debug.keys()),
+        )
+
     if structured_hint_present:
         try:
             save_feedback(
@@ -721,7 +811,18 @@ def rate():
                     "namespace": effective_namespace,
                 },
             )
+            jlog(
+                "rate.feedback.save",
+                trace_id=ctx["trace_id"],
+                inquiry_id=inquiry_id or None,
+                rating=rating,
+            )
         except Exception:
+            jlog(
+                "rate.feedback.error",
+                trace_id=ctx["trace_id"],
+                inquiry_id=inquiry_id or None,
+            )
             pass
 
     def _augment_response(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -835,6 +936,11 @@ def rate():
             or (env_flag("DW_ACCURACY_FIRST", True) and "det_overlaps_gross")
             or "deterministic"
         )
+        jlog(
+            "rate.alt.plan",
+            trace_id=ctx["trace_id"],
+            strategy=alt_strategy,
+        )
         if inquiry_row:
             ns, q = inquiry_row[0], inquiry_row[1]
             fts_present = bool(
@@ -850,6 +956,13 @@ def rate():
                 strategy=alt_strategy,
                 full_text_search=True if fts_present else None,
                 rate_comment=comment or None,
+            )
+            jlog(
+                "rate.alt.run",
+                trace_id=ctx["trace_id"],
+                namespace=ns,
+                strategy=alt_strategy,
+                retry=bool(alt),
             )
             if comment and hints_dict:
                 store_rate_hints(q, hints_dict)
@@ -877,10 +990,22 @@ def rate():
                 )
             response_payload = {"ok": True, "retry": True, "inquiry_id": inquiry_id, **alt}
             response_payload = _augment_response(response_payload)
+            jlog(
+                "rate.response",
+                trace_id=ctx["trace_id"],
+                inquiry_id=inquiry_id or None,
+                retry=response_payload.get("retry"),
+            )
             return jsonify(response_payload)
 
         response = {"ok": True, "retry": False, "inquiry_id": inquiry_id}
         response = _augment_response(response)
+        jlog(
+            "rate.response",
+            trace_id=ctx["trace_id"],
+            inquiry_id=inquiry_id or None,
+            retry=response.get("retry"),
+        )
         return jsonify(response)
 
     if rating < 3 and env_flag("DW_ESCALATE_ON_LOW_RATING", True):
@@ -903,4 +1028,10 @@ def rate():
 
     response: Dict[str, Any] = {"ok": True, "retry": False, "inquiry_id": inquiry_id}
     response = _augment_response(response)
+    jlog(
+        "rate.response",
+        trace_id=ctx["trace_id"],
+        inquiry_id=inquiry_id or None,
+        retry=response.get("retry"),
+    )
     return jsonify(response)
