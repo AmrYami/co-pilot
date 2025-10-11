@@ -676,6 +676,8 @@ def build_contract_sql(
             )
             if plan:
                 intent["boolean_plan"] = plan
+                if isinstance(plan.get("binds"), dict):
+                    binds.update(plan.get("binds") or {})
             if notes is not None:
                 notes.setdefault(
                     "boolean_groups",

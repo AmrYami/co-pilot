@@ -52,3 +52,19 @@ cases:
     debug_must_contain:
       - "FTS(it OR home care)"
       - "where_text"
+
+  - id: boolean_groups_simple_in_and_alias
+    question: |
+      list all contracts has it or home care and ENTITY has DSFH or Farabi and
+      REPRESENTATIVE_EMAIL = samer@procare-sa.com or rehab.elfwakhry@oracle.com and
+      stakeholder = Amr Taher A Maghrabi or Abdulellah Mazen Fakeeh and
+      department = AL FARABI or SUPPORT SERVICES
+    full_text_search: true
+    allow_zero_rows: true
+    must_contain:
+      - "WHERE (UPPER(NVL(CONTRACT_SUBJECT,'')) LIKE UPPER(:fts_bg_"
+      - "UPPER(TRIM(ENTITY)) IN (UPPER(TRIM(:eq_bg_0)), UPPER(TRIM(:eq_bg_1)))"
+      - "UPPER(TRIM(REPRESENTATIVE_EMAIL)) IN (UPPER(TRIM(:eq_bg_2)), UPPER(TRIM(:eq_bg_3)))"
+      - "UPPER(TRIM(CONTRACT_STAKEHOLDER_1)) IN"
+      - "UPPER(TRIM(OWNER_DEPARTMENT)) IN"
+      - "ORDER BY REQUEST_DATE DESC"

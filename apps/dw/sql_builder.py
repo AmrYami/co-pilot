@@ -487,11 +487,16 @@ def build_sql(intent: Dict[str, Any], settings, *, table: str = "Contract") -> T
         plan_where = plan.get("where_sql") or plan.get("where_text")
         plan_binds = plan.get("binds") if isinstance(plan.get("binds"), dict) else {}
         if plan_where:
-            where_parts.append(plan_where)
+            wrapped_plan = plan_where if plan_where.strip().startswith("(") else f"({plan_where})"
+            where_parts.append(wrapped_plan)
             if plan_binds:
                 binds.update(plan_binds)
             plan_applied = True
-            meta["boolean_plan"] = {"applied": True, "binds": list(plan_binds.keys())}
+            meta["boolean_plan"] = {
+                "applied": True,
+                "binds": list(plan_binds.keys()),
+                "where_sql": plan_where,
+            }
     if not plan_applied:
         legacy_binds: Dict[str, Any] = {}
         legacy_clauses = build_eq_where(it.get("eq_filters") or [], legacy_binds)

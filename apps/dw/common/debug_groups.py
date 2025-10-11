@@ -117,19 +117,52 @@ def build_boolean_debug(question: str, fts_columns: List[str] | None = None) -> 
 
     where_text = ""
     binds_preview: Dict[str, Any] = {}
+    plan_result: Dict[str, Any] = {}
     try:
-        from apps.dw.contracts.builder import build_boolean_where_from_question
+        from apps.dw.contracts.builder import (
+            build_boolean_where_from_plan,
+            build_boolean_where_from_question,
+        )
 
         if groups:
             allowed = {col for col in allowed_for_debug if col}
+            question_text = _coerce_question(question)
             where_text, binds_preview = build_boolean_where_from_question(
-                _coerce_question(question),
+                question_text,
                 fts_columns=effective_columns,
                 allowed_columns=allowed or set(),
             )
+
+            try:
+                settings_obj = get_settings()
+            except Exception:  # pragma: no cover - defensive fallback
+                settings_obj = None
+
+            plan_candidate = build_boolean_where_from_plan(
+                groups,
+                settings_obj,
+                fts_columns=effective_columns,
+            )
+            if isinstance(plan_candidate, dict) and plan_candidate.get("where_sql"):
+                plan_result = {
+                    "where_sql": plan_candidate.get("where_sql")
+                    or plan_candidate.get("where_text")
+                    or "",
+                    "where_text": plan_candidate.get("where_text")
+                    or plan_candidate.get("where_sql")
+                    or "",
+                    "binds": dict(plan_candidate.get("binds") or {}),
+                }
+                if plan_candidate.get("binds_text"):
+                    plan_result["binds_text"] = plan_candidate["binds_text"]
+                if not where_text:
+                    where_text = plan_result["where_text"]
+                if plan_result["binds"]:
+                    binds_preview = dict(plan_result["binds"])
     except Exception:  # pragma: no cover - debug fallback when contracts.builder unavailable
         where_text = ""
         binds_preview = {}
+        plan_result = {}
 
     result: Dict[str, Any] = {"summary": summary, "blocks": blocks}
     if where_text:
@@ -137,4 +170,17 @@ def build_boolean_debug(question: str, fts_columns: List[str] | None = None) -> 
     if binds_preview:
         ordered = sorted(binds_preview.items())
         result["binds_text"] = ", ".join(f"{name}={value!r}" for name, value in ordered)
+    if plan_result:
+        if plan_result.get("binds") and "binds_text" not in result:
+            ordered = sorted(plan_result["binds"].items())
+            result["binds_text"] = ", ".join(
+                f"{name}={value!r}" for name, value in ordered
+            )
+        result["plan"] = {
+            "where_sql": plan_result.get("where_sql", ""),
+            "where_text": plan_result.get("where_text", ""),
+            "binds": plan_result.get("binds", {}),
+        }
+        if plan_result.get("binds_text"):
+            result.setdefault("plan", {})["binds_text"] = plan_result["binds_text"]
     return result
