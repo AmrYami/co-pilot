@@ -32,18 +32,23 @@ def _settings_dict() -> Dict[str, Any]:
     keys = [
         "DW_FTS_ENGINE",
         "DW_FTS_COLUMNS",
+        "DW_FTS_MIN_TOKEN_LEN",
         "DW_EXPLICIT_FILTER_COLUMNS",
         "DW_ENUM_SYNONYMS",
         "DW_CONTRACT_TABLE",
         "DW_EQ_ALIAS_COLUMNS",
         "DW_DATE_COLUMN",
     ]
-    cfg: Dict[str, Any] = {}
+    namespace_cfg: Dict[str, Any] = {}
+    global_cfg: Dict[str, Any] = {}
     for key in keys:
         value = _get_setting(key, scope="namespace", namespace="dw::common", default=None)
         if value is not None:
-            cfg[key] = value
-    return cfg
+            namespace_cfg[key] = value
+        global_value = _get_setting(key, scope="namespace", namespace="global", default=None)
+        if global_value is not None:
+            global_cfg[key] = global_value
+    return {"__namespace__": namespace_cfg, "__global__": global_cfg}
 
 
 def _load_dw_settings() -> DWSettings:
@@ -358,11 +363,11 @@ def rate() -> Any:
     comment = (payload.get("comment") or "").strip()
 
     settings = _load_dw_settings()
-    fts_columns = _fts_columns_from_settings(settings)
-    raw_settings = dict(settings.ns)
+    raw_settings: Dict[str, Any] = dict(settings.global_ns)
+    raw_settings.update(settings.ns)
 
     hints = parse_rate_comment_v2(comment)
-    tokens = hints.get("fts_tokens") or []
+    raw_tokens = hints.get("fts_tokens") or []
     operator = (hints.get("fts_operator") or "OR").upper()
     group_col = hints.get("group_by")
     group_cols = [group_col] if group_col else []
@@ -373,6 +378,17 @@ def rate() -> Any:
     direction_hint = hints.get("direction_hint")
 
     contract_table = raw_settings.get("DW_CONTRACT_TABLE") or "Contract"
+
+    fts_cfg = settings.resolve_fts_config(
+        tokens=raw_tokens,
+        table_name=contract_table,
+        namespace="dw::common",
+    )
+    tokens = fts_cfg.get("tokens") or []
+    fts_columns = _dedupe_columns(fts_cfg.get("columns") or [])
+    fts_engine = fts_cfg.get("engine") or settings.get_fts_engine()
+    if fts_cfg.get("error") == "no_engine":
+        fts_engine = "like"
 
     builder_fts: Dict[str, List[str]] = {}
     raw_fts = raw_settings.get("DW_FTS_COLUMNS")
@@ -391,7 +407,7 @@ def rate() -> Any:
     builder_settings = {
         "DW_FTS_COLUMNS": builder_fts,
         "DW_EXPLICIT_FILTER_COLUMNS": explicit_cols,
-        "DW_FTS_ENGINE": settings.get_fts_engine(),
+        "DW_FTS_ENGINE": fts_engine,
         "DW_CONTRACT_TABLE": contract_table,
     }
     alias_map = raw_settings.get("DW_EQ_ALIAS_COLUMNS")
@@ -445,6 +461,8 @@ def rate() -> Any:
             "binds": fts_bind_names or None,
             "engine": builder_settings.get("DW_FTS_ENGINE"),
             "operator": operator if tokens else None,
+            "error": fts_cfg.get("error"),
+            "min_token_len": fts_cfg.get("min_token_len"),
         },
         "intent": intent_debug,
         "validation": {
@@ -470,6 +488,8 @@ def rate() -> Any:
             "engine": builder_settings.get("DW_FTS_ENGINE"),
             "operator": operator if tokens else None,
             "columns": fts_columns if tokens else [],
+            "error": fts_cfg.get("error"),
+            "min_token_len": fts_cfg.get("min_token_len"),
         },
         "clarifier_intent": intent_debug,
     }
