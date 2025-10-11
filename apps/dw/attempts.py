@@ -191,12 +191,11 @@ def run_attempt(
                     or []
                 )
                 groups = [[token] for token in tokens]
-                predicate, fts_binds = build_fulltext_where(
-                    groups=groups,
-                    columns=columns,
+                predicate, fts_binds, fts_error = build_fulltext_where(
+                    columns,
+                    groups,
                     engine=fts_conf.get("engine", "like"),
-                    min_len=min_len,
-                    bind_prefix="fts_",
+                    operator="OR",
                 )
                 if predicate:
                     sql = inject_fulltext_where(sql, predicate)
@@ -210,7 +209,14 @@ def run_attempt(
                         }
                     )
                 else:
-                    fts_meta["error"] = "no_columns" if not columns else "no_predicate"
+                    if fts_error == "no_engine":
+                        fts_meta["error"] = fts_error
+                    elif not columns:
+                        fts_meta["error"] = "no_columns"
+                    elif fts_error:
+                        fts_meta["error"] = fts_error
+                    else:
+                        fts_meta["error"] = "no_predicate"
             else:
                 fts_meta["error"] = "no_tokens"
         except Exception as exc:  # pragma: no cover - defensive guard

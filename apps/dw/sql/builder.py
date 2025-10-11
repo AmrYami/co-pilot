@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 GROSS_EXPR = (
     "NVL(CONTRACT_VALUE_NET_OF_VAT,0) + CASE WHEN NVL(VAT,0) BETWEEN 0 AND 1 "
@@ -32,6 +32,113 @@ def _normalize_identifier(name: str) -> str:
     if text.startswith('"') and text.endswith('"'):
         return text
     return text.upper().replace(" ", "_")
+
+
+def _in_list_bind_keys(
+    prefix: str,
+    start_idx: int,
+    values: Iterable[Any],
+) -> Tuple[List[str], Dict[str, Any], int]:
+    keys: List[str] = []
+    binds: Dict[str, Any] = {}
+    idx = start_idx
+    for value in values:
+        key = f"{prefix}_{idx}"
+        binds[key] = value
+        keys.append(f":{key}")
+        idx += 1
+    return keys, binds, idx
+
+
+def build_eq_boolean_groups_where(
+    boolean_groups: Iterable[Dict[str, Any]],
+    *,
+    bind_prefix: str = "eq_bg",
+    start_index: int = 0,
+) -> Tuple[str, Dict[str, Any], int]:
+    """Render boolean ``IN`` clauses from structured boolean group filters."""
+
+    binds: Dict[str, Any] = {}
+    clauses: List[str] = []
+    next_index = start_index
+
+    for group in boolean_groups or []:
+        if not isinstance(group, dict):
+            continue
+        fields = group.get("fields")
+        if not isinstance(fields, list):
+            continue
+        field_clauses: List[str] = []
+        for field in fields:
+            if not isinstance(field, dict):
+                continue
+            values = [v for v in (field.get("values") or []) if v is not None]
+            if not values:
+                continue
+            columns = field.get("expanded_columns") or [field.get("field")]
+            normalized_columns = [
+                _normalize_identifier(str(col)) for col in columns if col
+            ]
+            normalized_columns = [col for col in normalized_columns if col]
+            if not normalized_columns:
+                continue
+            placeholders, local_binds, next_index = _in_list_bind_keys(
+                bind_prefix, next_index, values
+            )
+            if not placeholders:
+                continue
+            binds.update(local_binds)
+            in_list = ", ".join(placeholders)
+            column_checks = [
+                f"UPPER(TRIM({column})) IN ({in_list})" for column in normalized_columns
+            ]
+            field_clauses.append("(" + " OR ".join(column_checks) + ")")
+        if field_clauses:
+            clauses.append("(" + " AND ".join(field_clauses) + ")")
+
+    if not clauses:
+        return "", {}, start_index
+
+    return "(" + " OR ".join(clauses) + ")", binds, next_index
+
+
+def normalize_order_by(
+    order_by: Optional[str],
+    sort_by: Optional[str],
+    sort_desc: Optional[Any],
+) -> str:
+    """Normalize order-by inputs ensuring a single direction suffix."""
+
+    candidate = (sort_by or order_by or "REQUEST_DATE") or "REQUEST_DATE"
+    text = str(candidate).strip()
+    descending: Optional[bool]
+
+    if isinstance(sort_desc, str):
+        normalized = sort_desc.strip().lower()
+        if normalized in {"true", "1", "yes"}:
+            descending = True
+        elif normalized in {"false", "0", "no"}:
+            descending = False
+        else:
+            descending = None
+    else:
+        descending = bool(sort_desc) if sort_desc is not None else None
+
+    upper = text.upper()
+    if upper.endswith(" DESC"):
+        text = text[: -4]
+        descending = True if descending is None else descending
+    elif upper.endswith(" ASC"):
+        text = text[: -3]
+        descending = False if descending is None else descending
+
+    if text.upper().endswith("_DESC"):
+        text = text[: -5]
+        descending = True if descending is None else descending
+
+    column = _normalize_identifier(text) or "REQUEST_DATE"
+    direction = "DESC" if descending or descending is None else "ASC"
+    return f"{column} {direction}"
 
 
 def _apply_flags(expr: str, *, ci: bool, trim: bool) -> str:

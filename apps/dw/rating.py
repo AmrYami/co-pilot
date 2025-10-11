@@ -291,25 +291,39 @@ def rate():
             or fts_columns_map.get("*")
             or []
         )
-        fts_where, fts_binds = build_fulltext_where(
-            groups=groups,
-            columns=fts_columns_local,
+        min_len = int(fts_conf.get("min_len", 2) or 2)
+        filtered_groups: List[List[str]] = []
+        for group in groups or []:
+            if not isinstance(group, list):
+                continue
+            cleaned: List[str] = []
+            for token in group:
+                text = str(token or "").strip()
+                if len(text) >= min_len:
+                    cleaned.append(text)
+            if cleaned:
+                filtered_groups.append(cleaned)
+        fts_where, fts_binds, fts_error = build_fulltext_where(
+            fts_columns_local,
+            filtered_groups,
             engine=fts_conf.get("engine", "like"),
-            min_len=int(fts_conf.get("min_len", 2) or 2),
-            bind_prefix="fts_",
-            group_operator=operator,
+            operator=operator,
         )
         fts_debug: Dict[str, Any] = {
             "enabled": bool(fts_where),
-            "error": None,
-            "groups": groups,
+            "error": fts_error,
+            "groups": filtered_groups,
             "columns": fts_columns_local,
             "operator": operator,
             "binds": dict(fts_binds),
             "engine": fts_conf.get("engine"),
         }
-        if groups and not fts_where:
-            fts_debug["error"] = "no_columns" if not fts_columns_local else "no_tokens"
+        if filtered_groups and not fts_where and fts_error is None:
+            fts_debug["error"] = "no_predicate"
+        elif groups and not filtered_groups:
+            fts_debug["error"] = "no_tokens"
+        elif filtered_groups and not fts_columns_local:
+            fts_debug["error"] = "no_columns"
 
         boolean_groups = hints.get("boolean_groups") or []
         eq_alias_map = namespace_settings.get("DW_EQ_ALIAS_COLUMNS", {}) or {}

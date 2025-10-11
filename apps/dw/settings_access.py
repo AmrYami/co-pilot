@@ -33,6 +33,19 @@ def _dedupe_columns(columns: Iterable[str]) -> List[str]:
     return result
 
 
+def get_setting(key: str, *, scope=None, namespace=None, default=None):
+    """Safe wrapper around the optional ``settings_util`` dependency."""
+
+    try:
+        return _get_setting(key, scope=scope, namespace=namespace, default=default)
+    except TypeError:
+        try:
+            value = _get_setting(key, scope=scope, namespace=namespace)
+        except TypeError:
+            value = _get_setting(key)
+        return default if value is None else value
+
+
 class DWSettings:
     """Thin wrapper that exposes helpers around raw namespace settings."""
 
