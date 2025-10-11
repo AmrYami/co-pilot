@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 try:  # pragma: no cover - allow unit tests without Flask dependency
     from flask import Blueprint, current_app, jsonify, request
@@ -39,6 +39,7 @@ except Exception:  # pragma: no cover
         return sql
 
 from apps.dw.common.debug_groups import build_boolean_debug
+from apps.dw.common.sort_utils import normalize_sort
 
 from .attempts import run_attempt
 from .online_learning import store_rate_hints
@@ -53,6 +54,11 @@ from .rate_comment import parse_rate_comment as parse_rate_comment_structured
 from .sql_builders import GROSS_EXPR, group_by_sql, select_all_sql
 from .settings_defaults import DEFAULT_EXPLICIT_FILTER_COLUMNS
 from .fts_utils import DEFAULT_CONTRACT_FTS_COLUMNS
+from .search import (
+    build_boolean_groups_where,
+    build_fulltext_where,
+    resolve_fts_config,
+)
 from .learn.store import save_feedback
 from apps.dw.learning_store import record_example, record_patch
 
@@ -92,7 +98,6 @@ def _build_example_tags(hints: Dict[str, Any]) -> List[str]:
         tags.append(f"order:{sort_by}")
     return tags
 from apps.dw.lib.eq_ops import build_eq_where as build_eq_where_v2
-from apps.dw.lib.fts_ops import build_fts_where as build_fts_where_v2
 from apps.dw.lib.rate_ops import parse_rate_comment as parse_rate_comment_v2
 from apps.dw.lib.sql_utils import gross_expr as gross_expr_v2, merge_where as merge_where_v2, order_by_safe as order_by_safe_v2
 
@@ -100,18 +105,33 @@ from apps.dw.lib.sql_utils import gross_expr as gross_expr_v2, merge_where as me
 def _settings_lookup(settings_obj: Any, key: str, namespace: Optional[str]) -> Any:
     if settings_obj is None:
         return None
+
+    scopes: List[Tuple[Optional[str], Dict[str, Any]]] = []
+    ns_value = (namespace or "").strip()
+    if ns_value:
+        scopes.append(("namespace", {"namespace": ns_value}))
+    scopes.append(("global", {}))
+    scopes.append((None, {}))
+
     for attr in ("get_json", "get"):
         getter = getattr(settings_obj, attr, None)
         if not callable(getter):
             continue
-        try:
-            value = getter(key, scope="namespace", namespace=namespace)
-        except TypeError:
-            value = getter(key)
-        except Exception:
-            continue
-        if value:
-            return value
+        for scope, extra in scopes:
+            try:
+                if scope is None:
+                    value = getter(key)
+                else:
+                    value = getter(key, scope=scope, **extra)
+            except TypeError:
+                try:
+                    value = getter(key)
+                except Exception:
+                    continue
+            except Exception:
+                continue
+            if value is not None:
+                return value
     return None
 
 
@@ -178,109 +198,6 @@ def rate():
     structured_hints = parse_rate_comment_structured(comment or "")
     structured_hints["full_text_search"] = bool(structured_hints.get("fts_tokens"))
 
-    def _build_sql_from_v2(hints: Dict[str, Any]) -> Tuple[Optional[str], Dict[str, Any], Dict[str, Any]]:
-        groups = hints.get("fts_tokens") or []
-        operator = hints.get("fts_operator") or "OR"
-        fts_sql = ""
-        fts_binds: Dict[str, Any] = {}
-        fts_debug: Dict[str, Any] = {
-            "enabled": False,
-            "error": None,
-            "groups": groups,
-            "columns": fts_columns,
-        }
-        if groups:
-            fts_sql, fts_binds, fts_debug = build_fts_where_v2(settings_bundle, groups, operator)
-            fts_debug.setdefault("groups", groups)
-            fts_debug["operator"] = operator
-        else:
-            fts_debug["operator"] = operator
-
-        eq_filters = list(hints.get("eq_filters") or [])
-        eq_sql = ""
-        eq_binds: Dict[str, Any] = {}
-        if eq_filters:
-            eq_sql, eq_binds = build_eq_where_v2(eq_filters, settings_bundle, bind_prefix="eq")
-
-        where_sql = merge_where_v2([fts_sql, eq_sql])
-        binds: Dict[str, Any] = {}
-        binds.update(fts_binds)
-        binds.update(eq_binds)
-
-        group_by = hints.get("group_by") or None
-        gross_flag = hints.get("gross") if hints.get("gross") is not None else (False if group_by else None)
-        select_clause = "*"
-        if group_by:
-            select_parts = [f"{group_by} AS GROUP_KEY"]
-            if gross_flag is True:
-                select_parts.append(f"{gross_expr_v2()} AS TOTAL_GROSS")
-            else:
-                select_parts.append("COUNT(*) AS CNT")
-            select_clause = ", ".join(select_parts)
-
-        sql_lines: List[str] = [f'SELECT {select_clause} FROM "Contract"']
-        if where_sql:
-            sql_lines.append(where_sql)
-        if group_by:
-            sql_lines.append(f"GROUP BY {group_by}")
-
-        effective_order_by = hints.get("order_by")
-        order_dir = (hints.get("order_dir") or "DESC").upper()
-        effective_sort_by = effective_order_by
-        if group_by:
-            if effective_order_by:
-                order_clause = f"ORDER BY {effective_order_by} {order_dir}"
-            else:
-                if gross_flag is True:
-                    effective_sort_by = "TOTAL_GROSS"
-                    order_clause = "ORDER BY TOTAL_GROSS DESC"
-                else:
-                    effective_sort_by = "CNT"
-                    order_clause = "ORDER BY CNT DESC"
-        else:
-            effective_sort_by = effective_order_by or "REQUEST_DATE"
-            order_clause = f"ORDER BY {effective_sort_by} {order_dir}"
-
-        sql = "\n".join(sql_lines)
-        sql = order_by_safe_v2(sql, order_clause)
-
-        intent = {
-            "wants_all_columns": not bool(group_by),
-            "full_text_search": bool(groups),
-            "fts_tokens": [token for group in groups for token in group],
-            "fts_groups": groups,
-            "fts_operator": operator,
-            "fts_columns": fts_columns,
-            "eq_filters": eq_filters,
-            "group_by": group_by,
-            "gross": gross_flag,
-            "sort_by": effective_sort_by,
-            "sort_desc": order_clause.strip().upper().endswith(" DESC"),
-        }
-        fts_debug.setdefault("columns", fts_columns)
-        fts_debug.setdefault("binds", fts_debug.get("binds", {}))
-
-        debug = {
-            "intent": intent,
-            "fts": fts_debug,
-            "rate_hints": {
-                "comment_present": bool(comment),
-                "eq_filters": len(eq_filters),
-                "group_by": [group_by] if group_by else None,
-                "order_by_applied": bool(order_clause),
-                "where_applied": bool(groups or eq_filters),
-                "gross": bool(gross_flag),
-                "gross_expr": gross_expr_v2() if gross_flag else None,
-            },
-            "validation": {
-                "ok": True,
-                "errors": [],
-                "binds": list(binds.keys()),
-                "bind_names": list(binds.keys()),
-            },
-        }
-
-        return sql, binds, debug
     if not inquiry_id or rating < 1 or rating > 5:
         return jsonify({"ok": False, "error": "invalid payload"}), 400
 
@@ -333,16 +250,208 @@ def rate():
     fts_columns = _resolve_fts_columns(settings_obj, effective_namespace)
     eq_allowed = _resolve_eq_columns(settings_obj, effective_namespace)
     engine_setting = _settings_lookup(settings_obj, "DW_FTS_ENGINE", effective_namespace) or "like"
+    min_token_len_setting = _settings_lookup(
+        settings_obj, "DW_FTS_MIN_TOKEN_LEN", effective_namespace
+    )
     synonyms_setting = _settings_lookup(settings_obj, "DW_ENUM_SYNONYMS", effective_namespace) or {}
+    eq_alias_map_setting = (
+        _settings_lookup(settings_obj, "DW_EQ_ALIAS_COLUMNS", effective_namespace) or {}
+    )
     settings_bundle: Dict[str, Any] = {
         "DW_FTS_COLUMNS": {"value": {"Contract": fts_columns}},
         "DW_FTS_ENGINE": {"value": str(engine_setting or "like")},
         "DW_EXPLICIT_FILTER_COLUMNS": {"value": eq_allowed},
     }
+    if min_token_len_setting is not None:
+        settings_bundle["DW_FTS_MIN_TOKEN_LEN"] = {"value": min_token_len_setting}
     if synonyms_setting:
         settings_bundle["DW_ENUM_SYNONYMS"] = {"value": synonyms_setting}
+    if eq_alias_map_setting:
+        settings_bundle["DW_EQ_ALIAS_COLUMNS"] = {"value": eq_alias_map_setting}
+
+    namespace_settings: Dict[str, Any] = {
+        "DW_FTS_ENGINE": engine_setting,
+        "DW_FTS_COLUMNS": {"Contract": fts_columns},
+        "DW_FTS_MIN_TOKEN_LEN": min_token_len_setting,
+        "DW_EQ_ALIAS_COLUMNS": eq_alias_map_setting,
+    }
 
     structured_hints_v2 = parse_rate_comment_v2(comment or "")
+
+    def _build_sql_from_v2(
+        hints: Dict[str, Any]
+    ) -> Tuple[Optional[str], Dict[str, Any], Dict[str, Any]]:
+        groups = hints.get("fts_tokens") or []
+        operator = (hints.get("fts_operator") or "OR").upper()
+        fts_conf = resolve_fts_config(namespace_settings)
+        fts_columns_map = fts_conf.get("fts_columns_map") or {}
+        fts_columns_local = (
+            fts_columns_map.get("Contract")
+            or fts_columns_map.get("CONTRACT")
+            or fts_columns_map.get("*")
+            or []
+        )
+        fts_where, fts_binds = build_fulltext_where(
+            groups=groups,
+            columns=fts_columns_local,
+            engine=fts_conf.get("engine", "like"),
+            min_len=int(fts_conf.get("min_len", 2) or 2),
+            bind_prefix="fts_",
+            group_operator=operator,
+        )
+        fts_debug: Dict[str, Any] = {
+            "enabled": bool(fts_where),
+            "error": None,
+            "groups": groups,
+            "columns": fts_columns_local,
+            "operator": operator,
+            "binds": dict(fts_binds),
+            "engine": fts_conf.get("engine"),
+        }
+        if groups and not fts_where:
+            fts_debug["error"] = "no_columns" if not fts_columns_local else "no_tokens"
+
+        boolean_groups = hints.get("boolean_groups") or []
+        eq_alias_map = namespace_settings.get("DW_EQ_ALIAS_COLUMNS", {}) or {}
+        bg_where, bg_binds = build_boolean_groups_where(boolean_groups, eq_alias_map)
+        bg_binds_text = ", ".join(
+            f"{key}='{value}'" for key, value in bg_binds.items()
+        )
+
+        eq_filters = list(hints.get("eq_filters") or [])
+        eq_sql = ""
+        eq_binds: Dict[str, Any] = {}
+        if eq_filters and not bg_where:
+            eq_sql, eq_binds = build_eq_where_v2(
+                eq_filters, settings_bundle, bind_prefix="eq"
+            )
+
+        where_parts: List[str] = []
+        if fts_where:
+            where_parts.append(fts_where)
+        if bg_where:
+            where_parts.append(bg_where)
+        elif eq_sql:
+            where_parts.append(eq_sql)
+
+        where_sql = merge_where_v2(where_parts)
+        binds: Dict[str, Any] = {}
+        binds.update(fts_binds)
+        if bg_where:
+            binds.update(bg_binds)
+        else:
+            binds.update(eq_binds)
+
+        group_by = hints.get("group_by") or None
+        gross_flag = (
+            hints.get("gross")
+            if hints.get("gross") is not None
+            else (False if group_by else None)
+        )
+        select_clause = "*"
+        if group_by:
+            select_parts = [f"{group_by} AS GROUP_KEY"]
+            if gross_flag is True:
+                select_parts.append(f"{gross_expr_v2()} AS TOTAL_GROSS")
+            else:
+                select_parts.append("COUNT(*) AS CNT")
+            select_clause = ", ".join(select_parts)
+
+        sql_lines: List[str] = [f'SELECT {select_clause} FROM "Contract"']
+        if where_sql:
+            sql_lines.append(where_sql)
+        if group_by:
+            sql_lines.append(f"GROUP BY {group_by}")
+
+        sort_hint = hints.get("order_by")
+        sort_col, sort_desc = normalize_sort(sort_hint, default_col="REQUEST_DATE")
+        order_dir_hint = (hints.get("order_dir") or "").upper()
+        if order_dir_hint in {"ASC", "DESC"}:
+            sort_desc = order_dir_hint != "ASC"
+        effective_sort_by = sort_col
+        if group_by:
+            if sort_hint:
+                order_clause = f"ORDER BY {sort_col} {'DESC' if sort_desc else 'ASC'}"
+            else:
+                if gross_flag is True:
+                    effective_sort_by = "TOTAL_GROSS"
+                    sort_desc = True
+                    order_clause = "ORDER BY TOTAL_GROSS DESC"
+                else:
+                    effective_sort_by = "CNT"
+                    sort_desc = True
+                    order_clause = "ORDER BY CNT DESC"
+        else:
+            order_clause = f"ORDER BY {sort_col} {'DESC' if sort_desc else 'ASC'}"
+
+        sql = "\n".join(sql_lines)
+        sql = order_by_safe_v2(sql, order_clause)
+
+        intent = {
+            "wants_all_columns": not bool(group_by),
+            "full_text_search": bool(groups),
+            "fts_tokens": [token for group in groups for token in group],
+            "fts_groups": groups,
+            "fts_operator": operator,
+            "fts_columns": fts_columns_local,
+            "eq_filters": eq_filters,
+            "boolean_groups": boolean_groups,
+            "group_by": group_by,
+            "gross": gross_flag,
+            "sort_by": effective_sort_by,
+            "sort_desc": sort_desc,
+        }
+
+        rate_hints = {
+            "comment_present": bool(comment),
+            "eq_filters": len(eq_filters),
+            "group_by": [group_by] if group_by else None,
+            "order_by_applied": bool(order_clause),
+            "where_applied": bool(groups or eq_filters or bg_where),
+            "gross": bool(gross_flag),
+            "gross_expr": gross_expr_v2() if gross_flag else None,
+        }
+        if boolean_groups:
+            rate_hints["eq_filters"] = sum(
+                len((entry or {}).get("values") or [])
+                for group in boolean_groups
+                for entry in (group.get("fields") or [])
+                if isinstance(entry, dict)
+            )
+            rate_hints["where_applied"] = True
+
+        debug = {
+            "intent": intent,
+            "fts": fts_debug,
+            "rate_hints": rate_hints,
+            "validation": {
+                "ok": True,
+                "errors": [],
+                "binds": list(binds.keys()),
+                "bind_names": list(binds.keys()),
+            },
+        }
+
+        if bg_where:
+            debug["where_text"] = bg_where
+            if bg_binds_text:
+                debug["binds_text"] = bg_binds_text
+            if fts_where:
+                def _wrap_clause(expr: str) -> str:
+                    text = (expr or "").strip()
+                    if not text:
+                        return text
+                    if text.startswith("(") and text.endswith(")"):
+                        return text
+                    return f"({text})"
+
+                debug["where_text_full"] = (
+                    f"{_wrap_clause(fts_where)} AND {_wrap_clause(bg_where)}"
+                )
+
+        debug["final_sql"] = {"size": len(sql), "sql": sql}
+
+        return sql, binds, debug
 
     def _flatten_groups(groups: Optional[List[List[str]]]) -> List[str]:
         flattened: List[str] = []
@@ -468,6 +577,14 @@ def rate():
                 "binds": binds,
                 "intent": intent_snapshot,
             }
+            plan = intent_snapshot.get("boolean_plan") if isinstance(intent_snapshot, dict) else None
+            if isinstance(plan, dict):
+                where_text = plan.get("where_text")
+                if where_text:
+                    hints_debug["where_text"] = where_text
+                binds_text = plan.get("binds_text")
+                if binds_text:
+                    hints_debug["binds_text"] = binds_text
         except Exception as exc:
             hints_debug = {"error": str(exc)}
 
@@ -556,6 +673,21 @@ def rate():
                 "bind_names": list(rate_binds.keys()),
             },
         }
+        plan = intent_snapshot.get("boolean_plan") if isinstance(intent_snapshot, dict) else None
+        if isinstance(plan, dict):
+            rate_debug.setdefault("intent", {})["boolean_plan"] = plan
+            where_text = plan.get("where_text")
+            if where_text:
+                rate_debug["where_text"] = where_text
+            binds_text = plan.get("binds_text")
+            if binds_text:
+                rate_debug["binds_text"] = binds_text
+            field_count = plan.get("field_count")
+            hints_section = rate_debug.get("rate_hints")
+            if isinstance(hints_section, dict):
+                hints_section["where_applied"] = True
+                if isinstance(field_count, int):
+                    hints_section["eq_filters"] = field_count
         if hints_debug:
             rate_debug.setdefault("legacy", {})["rate_hints"] = hints_debug
     elif rate_debug:
@@ -621,6 +753,12 @@ def rate():
             plan = build_boolean_debug(base_question, fts_columns)
             debug_section["boolean_groups"] = plan.get("blocks", [])
             debug_section["boolean_groups_text"] = plan.get("summary", "")
+            where_text = plan.get("where_text")
+            if where_text:
+                debug_section["where_text"] = where_text
+            binds_text = plan.get("binds_text")
+            if binds_text:
+                debug_section["binds_text"] = binds_text
         except Exception as exc:  # pragma: no cover - debug best-effort
             debug_section["boolean_groups_error"] = str(exc)
 

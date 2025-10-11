@@ -1,7 +1,7 @@
 from __future__ import annotations
 import re
 from datetime import date, datetime
-from typing import Dict, Tuple, Optional, List, Iterable
+from typing import Any, Dict, Tuple, Optional, List, Iterable
 
 from apps.dw.aliases import resolve_column_alias
 from apps.dw.common.eq_aliases import resolve_eq_targets
@@ -392,19 +392,26 @@ def _build_eq_clauses(
     return clauses, new_binds
 
 
-def _like_or_eq_expr(column: str, bind: str, use_like: bool, *, ci: bool = True, trim: bool = True) -> str:
-    """Return a normalized comparison (LIKE or =) for the given column/bind."""
+def _wrap_ci_trim_expr(expr: str, *, ci: bool = True, trim: bool = True) -> str:
+    value = expr
+    if trim:
+        value = f"TRIM({value})"
+    if ci:
+        value = f"UPPER({value})"
+    return value
 
-    def _normalize(expr: str) -> str:
-        value = expr
-        if trim:
-            value = f"TRIM({value})"
-        if ci:
-            value = f"UPPER({value})"
-        return value
+
+def _like_or_eq_expr(column: str, bind: str, use_like: bool, *, ci: bool = True, trim: bool = True) -> str:
+    """
+    Normalized comparison:
+      - LIKE:  UPPER(TRIM(col)) LIKE UPPER(TRIM(:b))
+      - EQ:    UPPER(TRIM(col)) =    UPPER(TRIM(:b))
+    """
 
     op = "LIKE" if use_like else "="
-    return f"{_normalize(column)} {op} {_normalize(f':{bind}')}"
+    column_expr = _wrap_ci_trim_expr(column, ci=ci, trim=trim)
+    bind_expr = _wrap_ci_trim_expr(f":{bind}", ci=ci, trim=trim)
+    return f"{column_expr} {op} {bind_expr}"
 
 
 def build_group_clause(
@@ -436,17 +443,66 @@ def build_group_clause(
         columns = [col for col in resolved if col and col.strip().upper() in allowed_columns]
         if not columns:
             continue
-        unique_values = [*dict.fromkeys(values)]
-        if not unique_values:
+        processed_values: List[str] = []
+        seen_keys: set[str] = set()
+        for value in values:
+            text = str(value or "").strip()
+            if not text:
+                continue
+            key = text.upper()
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            processed_values.append(text)
+        if not processed_values:
             continue
-        ors: List[str] = []
-        for value in unique_values:
+        bind_names: List[str] = []
+        for value in processed_values:
             bind_name = f"eq_bg_{len(binds_accum)}"
-            binds_accum.append((bind_name, f"%{value}%" if op == "like" else value))
+            if op == "like":
+                bind_value = f"%{value}%"
+            else:
+                normalized = value
+                if normalized and isinstance(normalized, str):
+                    normalized = normalized.strip().upper()
+                bind_value = normalized
+            binds_accum.append((bind_name, bind_value))
+            bind_names.append(bind_name)
+        if not bind_names:
+            continue
+        if op == "like":
+            column_clauses: List[str] = []
             for col in columns:
-                ors.append(_like_or_eq_expr(col, bind_name, op == "like"))
-        if ors:
-            subclauses.append("(" + " OR ".join(ors) + ")")
+                comparisons = [
+                    _like_or_eq_expr(col, bn, True)
+                    for bn in bind_names
+                ]
+                if not comparisons:
+                    continue
+                column_clauses.append("(" + " OR ".join(comparisons) + ")")
+            if column_clauses:
+                subclauses.append("(" + " OR ".join(column_clauses) + ")")
+            continue
+
+        placeholders = [_wrap_ci_trim_expr(f":{name}") for name in bind_names]
+        seen_placeholders: set[str] = set()
+        deduped_placeholders = []
+        for placeholder in placeholders:
+            if placeholder in seen_placeholders:
+                continue
+            seen_placeholders.add(placeholder)
+            deduped_placeholders.append(placeholder)
+        placeholders = deduped_placeholders
+        column_eqs: List[str] = []
+        for col in columns:
+            lhs = _wrap_ci_trim_expr(col)
+            column_eqs.append(f"{lhs} IN (" + ", ".join(placeholders) + ")")
+        if not column_eqs:
+            continue
+        if len(column_eqs) == 1:
+            subclauses.append(column_eqs[0])
+        else:
+            subclauses.append("(" + " OR ".join(column_eqs) + ")")
 
     if not subclauses:
         return ""
@@ -483,6 +539,86 @@ def build_boolean_where_from_question(
     where_sql = " OR ".join(clauses)
     binds = {name: value for name, value in binds_accum}
     return where_sql, binds
+
+
+def _summarize_boolean_group(group: Group) -> str:
+    bits: List[str] = []
+    if group.fts_tokens:
+        bits.append("FTS(" + " OR ".join(group.fts_tokens) + ")")
+    for column, values, op in group.field_terms:
+        if not column or not values:
+            continue
+        cleaned_values = [str(val).strip() for val in values if str(val or "").strip()]
+        if not cleaned_values:
+            continue
+        joined = " OR ".join(cleaned_values)
+        if op == "like":
+            bits.append(f"{column} CONTAINS ({joined})")
+        else:
+            bits.append(f"{column} = ({joined})")
+    if not bits:
+        return "(TRUE)"
+    return "(" + " AND ".join(bits) + ")"
+
+
+def build_boolean_where_from_plan(
+    blocks: List[Group],
+    settings: Optional[dict],
+    *,
+    fts_columns: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Render a boolean-group plan into SQL text + bind metadata."""
+
+    if not blocks:
+        return {}
+
+    settings_map = _as_settings_dict(settings)
+    allowed = _normalize_allowed_columns(_get_explicit_eq_columns(settings_map))
+    if not allowed:
+        allowed = _normalize_allowed_columns(DEFAULT_EXPLICIT_FILTER_COLUMNS)
+
+    effective_fts = list(fts_columns or [])
+    if not effective_fts:
+        effective_fts = _get_fts_columns(settings_map)
+
+    clauses: List[str] = []
+    binds_accum: List[Tuple[str, object]] = []
+    summary_parts: List[str] = []
+    field_count = 0
+
+    for group in blocks:
+        summary_parts.append(_summarize_boolean_group(group))
+        field_count += sum(1 for column, values, _ in group.field_terms if column and values)
+        clause = build_group_clause(
+            group,
+            fts_columns=effective_fts,
+            allowed_columns=allowed,
+            binds_accum=binds_accum,
+        )
+        if clause:
+            clauses.append(clause)
+
+    if not clauses:
+        return {}
+
+    where_text = "(" + " OR ".join(clauses) + ")"
+    binds: Dict[str, object] = {name: value for name, value in binds_accum}
+    ordered = sorted(binds.items())
+    binds_text = ", ".join(
+        f"{name}='{str(value).upper()}'" if isinstance(value, str) else f"{name}={value!r}"
+        for name, value in ordered
+    )
+
+    summary = " OR ".join(summary_parts) if summary_parts else "(TRUE)"
+    plan: Dict[str, Any] = {
+        "summary": summary,
+        "where_text": where_text,
+        "where_sql": where_text,
+        "binds_text": binds_text,
+        "binds": binds,
+        "field_count": field_count,
+    }
+    return plan
 
 
 def build_contract_sql(
@@ -533,6 +669,15 @@ def build_contract_sql(
             base_where.append(bool_where)
             binds.update(bool_binds)
             boolean_override = True
+            plan = build_boolean_where_from_plan(
+                boolean_groups,
+                settings_map,
+                fts_columns=use_fts_columns,
+            )
+            if plan:
+                intent["boolean_plan"] = plan
+                if isinstance(plan.get("binds"), dict):
+                    binds.update(plan.get("binds") or {})
             if notes is not None:
                 notes.setdefault(
                     "boolean_groups",
