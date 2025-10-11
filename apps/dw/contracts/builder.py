@@ -613,6 +613,7 @@ def build_boolean_where_from_plan(
     plan: Dict[str, Any] = {
         "summary": summary,
         "where_text": where_text,
+        "where_sql": where_text,
         "binds_text": binds_text,
         "binds": binds,
         "field_count": field_count,

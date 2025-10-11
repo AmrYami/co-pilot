@@ -73,9 +73,11 @@ def build_eq_where(
             continue
         bind_name = f"eq_{idx}"
         binds[bind_name] = filt.get("val")
-        predicates.append(
-            _wrap_ci_trim(col, bind_name, bool(filt.get("ci")), bool(filt.get("trim")))
-        )
+        ci_flag = filt.get("ci")
+        trim_flag = filt.get("trim")
+        ci = True if ci_flag is None else bool(ci_flag)
+        tr = True if trim_flag is None else bool(trim_flag)
+        predicates.append(_wrap_ci_trim(col, bind_name, ci, tr))
         idx += 1
     return predicates
 
@@ -408,6 +410,19 @@ def apply_order_by(sql: str, col: str, desc: bool) -> str:
 def _normalize_order_hint(col: Optional[str], desc: bool) -> Tuple[str, bool]:
     if not col:
         return col or "", desc
+
+    stripped = col.strip() if isinstance(col, str) else col
+    if isinstance(stripped, str) and not stripped.startswith('"'):
+        key = stripped.upper()
+        if key.endswith("_DESC") and len(stripped) > 5:
+            base = stripped[:-5]
+            if base:
+                return base, True
+        if key.endswith("_ASC") and len(stripped) > 4:
+            base = stripped[:-4]
+            if base:
+                return base, False
+
     mapping = {
         "REQUEST_DATE_DESC": ("REQUEST_DATE", True),
         "REQUEST_DATE_ASC": ("REQUEST_DATE", False),
@@ -466,14 +481,18 @@ def build_sql(intent: Dict[str, Any], settings, *, table: str = "Contract") -> T
         binds["date_end"] = exp_dates["end"]
         where_parts.append("REQUEST_DATE BETWEEN :date_start AND :date_end")
 
-    plan = it.get("boolean_plan") or {}
-    plan_where = plan.get("where_text") if isinstance(plan, dict) else None
-    plan_binds = plan.get("binds") if isinstance(plan, dict) else None
-    if plan_where and isinstance(plan_binds, dict) and plan_binds:
-        where_parts.append(plan_where)
-        binds.update(plan_binds)
-        meta["boolean_plan"] = {"applied": True, "binds": list(plan_binds.keys())}
-    else:
+    plan = it.get("boolean_plan")
+    plan_applied = False
+    if isinstance(plan, dict):
+        plan_where = plan.get("where_sql") or plan.get("where_text")
+        plan_binds = plan.get("binds") if isinstance(plan.get("binds"), dict) else {}
+        if plan_where:
+            where_parts.append(plan_where)
+            if plan_binds:
+                binds.update(plan_binds)
+            plan_applied = True
+            meta["boolean_plan"] = {"applied": True, "binds": list(plan_binds.keys())}
+    if not plan_applied:
         legacy_binds: Dict[str, Any] = {}
         legacy_clauses = build_eq_where(it.get("eq_filters") or [], legacy_binds)
         if legacy_clauses:
