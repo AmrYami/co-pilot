@@ -29,6 +29,9 @@ def test_inject_fulltext_where_with_existing_where():
 
 def test_build_fulltext_where_like_builder():
     groups = [["acme"], ["services"]]
-    predicate, binds = build_fulltext_where(groups, ["NAME", "OWNER"], engine="like")
+    predicate, binds, error = build_fulltext_where(
+        ["NAME", "OWNER"], groups, engine="like"
+    )
+    assert error is None
     assert predicate.count("LIKE") == 4
     assert binds == {"fts_0": "%acme%", "fts_1": "%services%"}

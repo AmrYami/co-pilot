@@ -3,10 +3,48 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+from .search.fts_registry import register_engine
 
 
 VALID_ENGINES = {"like", "contains", "tsvector"}
+
+
+@register_engine("like")
+def build_like_where(
+    fts_columns: Sequence[str],
+    fts_groups: Sequence[Sequence[str] | str],
+    *,
+    operator: str = "OR",
+) -> Tuple[str, Dict[str, str]]:
+    """Build a LIKE-based predicate for the supplied token groups."""
+
+    columns = [str(col or "").strip() for col in fts_columns if str(col or "").strip()]
+    if not columns:
+        return "", {}
+
+    glue = " AND " if (operator or "").upper() == "AND" else " OR "
+    binds: Dict[str, str] = {}
+    clauses: List[str] = []
+
+    for idx, group in enumerate(fts_groups or []):
+        if isinstance(group, (list, tuple)):
+            parts = [str(token or "").strip() for token in group]
+            token = " ".join(part for part in parts if part)
+        else:
+            token = str(group or "").strip()
+        if not token:
+            continue
+        bind = f"fts_{idx}"
+        binds[bind] = f"%{token}%"
+        per_column = [f"UPPER(NVL({col},'')) LIKE UPPER(:{bind})" for col in columns]
+        clauses.append("(" + " OR ".join(per_column) + ")")
+
+    if not clauses:
+        return "", {}
+
+    return "(" + glue.join(clauses) + ")", binds
 
 
 class FTSEngine:

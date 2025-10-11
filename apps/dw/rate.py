@@ -13,6 +13,7 @@ from apps.dw.search import (
 )
 from apps.dw.search.filters import build_eq_where
 from apps.dw.fts_utils import DEFAULT_CONTRACT_FTS_COLUMNS
+from apps.dw.sql.builder import build_eq_boolean_groups_where, normalize_order_by
 
 rate_bp = Blueprint("rate", __name__)
 
@@ -132,43 +133,58 @@ def rate():
     intent_fts["tokens"] = filtered_groups
     intent_fts["enabled"] = bool(filtered_groups)
 
-    fts_sql, fts_binds, next_index = build_fulltext_where(
-        engine_name,
+    fts_where, fts_binds, fts_error = build_fulltext_where(
         search_columns,
         filtered_groups,
+        engine=engine_name,
         operator=fts_operator,
-        bind_prefix="fts_",
-        start_index=0,
     )
 
     alias_map = alias_map_raw if isinstance(alias_map_raw, dict) else {}
     eq_filters: List[Dict[str, Any]] = intent.get("eq_filters") or []
-    eq_sql, eq_binds, next_index = build_eq_where(
+    eq_sql, eq_binds, _ = build_eq_where(
         eq_filters,
         alias_map,
         bind_prefix="eq_",
-        start_index=next_index,
+        start_index=0,
+    )
+
+    boolean_groups: List[Dict[str, Any]] = []
+    if patch and isinstance(patch.get("boolean_groups"), list):
+        for group in patch.get("boolean_groups") or []:
+            if isinstance(group, dict):
+                boolean_groups.append(group)
+
+    bg_where, bg_binds, _ = build_eq_boolean_groups_where(
+        boolean_groups,
+        bind_prefix="eq_bg",
+        start_index=0,
     )
 
     where_parts: List[str] = []
-    if fts_sql:
-        where_parts.append(fts_sql)
+    if fts_where:
+        where_parts.append(fts_where)
+    if bg_where:
+        where_parts.append(bg_where)
     if eq_sql:
         where_parts.append(eq_sql)
 
     where_sql = f" WHERE {' AND '.join(where_parts)}" if where_parts else ""
-    final_sql = f'SELECT * FROM "{contract_table}"{where_sql} ORDER BY {order_column} DESC'
+    order_clause = normalize_order_by(
+        intent.get("order_by"), intent.get("sort_by"), intent.get("sort_desc")
+    )
+    final_sql = f'SELECT * FROM "{contract_table}"{where_sql} ORDER BY {order_clause}'
 
     binds: Dict[str, str] = {}
     binds.update(fts_binds)
+    binds.update(bg_binds)
     binds.update(eq_binds)
 
-    fts_error: Optional[str] = None
     if filtered_groups and not search_columns:
         fts_error = "no_columns"
     elif not filtered_groups and (patch and patch.get("fts_tokens")):
         fts_error = "no_tokens"
-    elif filtered_groups and not fts_sql:
+    elif filtered_groups and not fts_where and fts_error is None:
         fts_error = "no_predicate"
 
     enum_syn = (get_setting("DW_ENUM_SYNONYMS", scope="namespace") or {}).get(
@@ -199,6 +215,11 @@ def rate():
             "operator": fts_operator,
             "binds": list(fts_binds.keys()),
             "error": fts_error,
+        },
+        "boolean_groups": {
+            "groups": boolean_groups,
+            "sql": bg_where,
+            "binds": list(bg_binds.keys()),
         },
         "eq": {
             "filters": eq_filters,
