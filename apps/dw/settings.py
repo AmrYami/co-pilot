@@ -18,6 +18,46 @@ from core.settings import Settings
 _NAMESPACE = "dw::common"
 
 
+def get_dw_namespace(app: str = "dw") -> str:
+    """Return the canonical DW namespace used across services."""
+
+    base = (app or "dw").strip() or "dw"
+    return f"{base}::common"
+
+
+def load_settings(store) -> Dict[str, Any]:
+    """Load DW settings from ``store`` honouring the unified namespace."""
+
+    if store is None:
+        return {}
+
+    namespace = get_dw_namespace()
+    namespace_settings: Dict[str, Any] = {}
+    global_settings: Dict[str, Any] = {}
+
+    reader = getattr(store, "read_namespace", None)
+    if callable(reader):
+        try:
+            data = reader(namespace)
+            if isinstance(data, dict):
+                namespace_settings = dict(data)
+        except Exception:  # pragma: no cover - defensive
+            namespace_settings = {}
+
+    reader_global = getattr(store, "read_global", None)
+    if callable(reader_global):
+        try:
+            data = reader_global()
+            if isinstance(data, dict):
+                global_settings = dict(data)
+        except Exception:  # pragma: no cover - defensive
+            global_settings = {}
+
+    merged: Dict[str, Any] = dict(global_settings)
+    merged.update(namespace_settings)
+    return merged
+
+
 def _coerce(value: Any, value_type: str) -> Any:
     value_type_norm = (value_type or "").lower()
     if value_type_norm == "json":
@@ -223,8 +263,10 @@ def get_setting(key, default=None, scope=None, as_type=None):
 
 
 __all__ = [
+    "get_dw_namespace",
     "get_settings",
     "get_namespace_json",
+    "load_settings",
     "get_fts_columns",
     "get_short_token_allow",
     "get_setting",
