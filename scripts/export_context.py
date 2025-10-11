@@ -81,6 +81,8 @@ def main():
       json.dump(settings, fp, indent=2, default=str)
 
     # examples (column names vary across branches: question_norm|q_norm, sql|sql_text|final_sql, created_at|updated_at)
+    # If present in DB, include normative question text + timestamps in exports
+    # to help reproducible golden/regressions.
     if table_exists(eng, "dw_examples"):
         ex_cols = table_columns(eng, "dw_examples")
         q_col    = _pick(ex_cols, "question_norm", "q_norm", "question") or "question_norm"

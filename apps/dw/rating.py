@@ -621,6 +621,12 @@ def rate():
             plan = build_boolean_debug(base_question, fts_columns)
             debug_section["boolean_groups"] = plan.get("blocks", [])
             debug_section["boolean_groups_text"] = plan.get("summary", "")
+            where_text = plan.get("where_text")
+            if where_text:
+                debug_section["where_text"] = where_text
+            binds_text = plan.get("binds_text")
+            if binds_text:
+                debug_section["binds_text"] = binds_text
         except Exception as exc:  # pragma: no cover - debug best-effort
             debug_section["boolean_groups_error"] = str(exc)
 
