@@ -6,6 +6,23 @@ import re
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
+VALID_ENGINES = {"like", "contains", "tsvector"}
+
+
+def _cfg_get(cfg: Any, key: str, default: Any = None) -> Any:
+    if isinstance(cfg, dict):
+        return cfg.get(key, default)
+    getter = getattr(cfg, "get", None)
+    if callable(getter):
+        try:
+            value = getter(key, default)
+        except TypeError:
+            value = getter(key)
+        if value is not None:
+            return value
+    return default
+
+
 _STOP_WORDS = {"list", "all", "contracts", "where", "has", "have"}
 
 
@@ -226,10 +243,85 @@ def build_like_fts_where(
     return where_sql, binds
 
 
+def build_fts_clause(
+    table: str,
+    groups: List[List[str]],
+    operator: str,
+    cfg: Any,
+) -> Tuple[str, Dict[str, str], List[str]]:
+    """Return a SQL fragment for FTS with bind parameters and used columns."""
+
+    raw_engine = _cfg_get(cfg, "DW_FTS_ENGINE", "like")
+    engine = str(raw_engine or "like").lower()
+    if engine not in VALID_ENGINES:
+        engine = "like"
+
+    columns_setting = _cfg_get(cfg, "DW_FTS_COLUMNS", {}) or {}
+    columns_cfg = columns_setting if isinstance(columns_setting, dict) else {}
+
+    specific = (
+        columns_cfg.get(table)
+        or columns_cfg.get(table.strip('"'))
+        or columns_cfg.get(table.upper())
+        or columns_cfg.get(table.lower())
+    )
+    fallback = columns_cfg.get("*")
+    ordered_cols: List[str] = []
+    seen_cols: set[str] = set()
+    for collection in (specific, fallback):
+        if not isinstance(collection, list):
+            continue
+        for col in collection:
+            normalized = str(col or "").strip()
+            if not normalized or normalized in seen_cols:
+                continue
+            seen_cols.add(normalized)
+            ordered_cols.append(normalized)
+
+    if not ordered_cols:
+        return "", {}, []
+
+    min_len_raw = _cfg_get(cfg, "DW_FTS_MIN_TOKEN_LEN", 2)
+    try:
+        min_len = int(min_len_raw)
+    except (TypeError, ValueError):
+        min_len = 2
+    if min_len < 0:
+        min_len = 0
+
+    binds: Dict[str, str] = {}
+    used_tokens: List[str] = []
+    group_clauses: List[str] = []
+
+    for group in groups or []:
+        token_clauses: List[str] = []
+        for raw in group or []:
+            token = str(raw or "").strip()
+            if len(token) < min_len:
+                continue
+            bind_name = f"fts_{len(used_tokens)}"
+            used_tokens.append(token)
+            binds[bind_name] = f"%{token}%"
+            comparisons = [
+                f"UPPER(NVL({column},'')) LIKE UPPER(:{bind_name})" for column in ordered_cols
+            ]
+            token_clauses.append("(" + " OR ".join(comparisons) + ")")
+        if token_clauses:
+            group_clauses.append("(" + " OR ".join(token_clauses) + ")")
+
+    if not group_clauses:
+        return "", {}, []
+
+    glue = " OR " if str(operator or "").upper() == "OR" else " AND "
+    clause = "(" + glue.join(group_clauses) + ")"
+    return clause, binds, ordered_cols
+
+
 __all__ = [
     "extract_fts_tokens",
     "build_fts_where",
     "build_fts_tokens",
     "get_fts_columns",
     "build_like_fts_where",
+    "build_fts_clause",
 ]
