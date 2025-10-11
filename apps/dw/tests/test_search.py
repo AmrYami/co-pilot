@@ -7,9 +7,6 @@ ROOT = pathlib.Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
 
-pytest.importorskip("sqlalchemy")
-from sqlalchemy import create_engine, text
-
 from apps.dw.search import build_fulltext_where, extract_search_tokens, inject_fulltext_where
 
 
@@ -30,22 +27,8 @@ def test_inject_fulltext_where_with_existing_where():
     assert updated.endswith("ORDER BY 1")
 
 
-def test_build_fulltext_where_sqlite():
-    engine = create_engine("sqlite:///:memory:")
-    with engine.begin() as cx:
-        cx.execute(
-            text(
-                """
-                CREATE TABLE Contract (
-                    id INTEGER PRIMARY KEY,
-                    name TEXT,
-                    owner VARCHAR(50),
-                    amount NUMERIC
-                )
-                """
-            )
-        )
-    predicate, binds, columns = build_fulltext_where(engine, "Contract", ["acme"])
-    assert predicate.count("LOWER(") == len(columns)
-    assert binds == {"kw1": "%acme%"}
-    assert set(columns) == {"name", "owner"}
+def test_build_fulltext_where_like_builder():
+    groups = [["acme"], ["services"]]
+    predicate, binds = build_fulltext_where(groups, ["NAME", "OWNER"], engine="like")
+    assert predicate.count("LIKE") == 4
+    assert binds == {"fts_0": "%acme%", "fts_1": "%services%"}
