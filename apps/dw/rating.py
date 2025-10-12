@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -62,6 +63,7 @@ from .search import (
 from .learn.store import save_feedback
 from apps.dw.learning_store import record_example, record_patch
 from .logs import jlog, new_ctx, scrub_binds, timed
+from apps.dw.db import fetch_rows
 
 
 def _default_namespace(ns: Optional[str]) -> str:
@@ -101,6 +103,24 @@ def _build_example_tags(hints: Dict[str, Any]) -> List[str]:
 from apps.dw.lib.eq_ops import build_eq_where as build_eq_where_v2
 from apps.dw.lib.rate_ops import parse_rate_comment as parse_rate_comment_v2
 from apps.dw.lib.sql_utils import gross_expr as gross_expr_v2, merge_where as merge_where_v2, order_by_safe as order_by_safe_v2
+
+
+logger = logging.getLogger("dw")
+
+
+# === Feature Flags (safe by default) ===
+DW_RATE_EXECUTE_FINAL = os.getenv("DW_RATE_EXECUTE_FINAL", "").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+DW_RATE_ENABLE_ALT_PLAN = os.getenv("DW_RATE_ENABLE_ALT_PLAN", "").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 
 
 def _settings_lookup(settings_obj: Any, key: str, namespace: Optional[str]) -> Any:
@@ -213,6 +233,14 @@ def rate():
         rating=rating,
         payload=safe_payload,
         comment_len=len(comment or ""),
+    )
+    logger.info(
+        "rate.receive",
+        extra={
+            "inquiry_id": inquiry_id or None,
+            "rating": rating,
+            "comment_len": len(comment or ""),
+        },
     )
     with timed("rate.parse.structured", trace_id=ctx["trace_id"]):
         structured_hints = parse_rate_comment_structured(comment or "")
@@ -333,6 +361,16 @@ def rate():
             "eq_filters": len(structured_hints_v2.get("eq_filters") or []),
             "group_by": bool(structured_hints_v2.get("group_by")),
             "order_by": structured_hints_v2.get("order_by"),
+        },
+    )
+    logger.info(
+        "rate.intent.v2",
+        extra={
+            "summary": {
+                "fts_groups": len(structured_hints_v2.get("fts_tokens") or []),
+                "eq_filters": len(structured_hints_v2.get("eq_filters") or []),
+                "order_by": structured_hints_v2.get("order_by"),
+            }
         },
     )
 
@@ -579,6 +617,13 @@ def rate():
                 sql_preview=(rate_sql or "")[:300],
                 binds=scrub_binds(rate_binds),
             )
+            logger.info(
+                "rate.sql.v2",
+                extra={
+                    "sql_preview": (rate_sql or "")[:200],
+                    "binds": scrub_binds(rate_binds),
+                },
+            )
             intent_from_v2 = rate_debug.get("intent") if isinstance(rate_debug, dict) else None
             if isinstance(intent_from_v2, dict):
                 if intent_from_v2.get("fts_tokens") is not None:
@@ -800,6 +845,10 @@ def rate():
             trace_id=ctx["trace_id"],
             debug_keys=sorted(rate_debug.keys()),
         )
+        logger.info(
+            "rate.debug",
+            extra={"debug_keys": sorted(rate_debug.keys())},
+        )
 
     if explain_only:
         response_payload: Dict[str, Any] = {
@@ -852,7 +901,10 @@ def rate():
             if intent_debug:
                 meta["clarifier_intent"] = intent_debug
             payload.setdefault("rows", [])
-            payload["retry"] = payload.get("retry") or True
+            if payload.get("retry"):
+                payload["retry"] = True
+            else:
+                payload.setdefault("retry", False)
             for key, value in rate_debug.items():
                 if value is None:
                     continue
@@ -945,89 +997,101 @@ def rate():
         except Exception:
             pass
 
-    if (
+    alt_conditions = (
         not explain_only
         and not no_retry
         and engine is not None
         and rating < 3
         and env_int("DW_MAX_RERUNS", 1) > 0
-    ):
-        alt_strategy = (
-            request.args.get("strategy")
-            or (env_flag("DW_ACCURACY_FIRST", True) and "det_overlaps_gross")
-            or "deterministic"
-        )
-        jlog(
-            "rate.alt.plan",
-            trace_id=ctx["trace_id"],
-            strategy=alt_strategy,
-        )
-        if inquiry_row:
-            ns, q = inquiry_row[0], inquiry_row[1]
-            fts_present = bool(
-                (hints_dict.get("fts_tokens") if hints_dict else None)
-                or (hints_dict.get("full_text_search") if hints_dict else None)
-                or getattr(hints_obj, "fts_tokens", None)
-                or getattr(hints_obj, "full_text_search", None)
-            )
-            alt = run_attempt(
-                q,
-                ns,
-                attempt_no=2,
-                strategy=alt_strategy,
-                full_text_search=True if fts_present else None,
-                rate_comment=comment or None,
+    )
+    if alt_conditions:
+        if DW_RATE_ENABLE_ALT_PLAN:
+            alt_strategy = (
+                request.args.get("strategy")
+                or (env_flag("DW_ACCURACY_FIRST", True) and "det_overlaps_gross")
+                or "deterministic"
             )
             jlog(
-                "rate.alt.run",
+                "rate.alt.plan",
                 trace_id=ctx["trace_id"],
-                namespace=ns,
                 strategy=alt_strategy,
-                retry=bool(alt),
             )
-            if comment and hints_dict:
-                store_rate_hints(q, hints_dict)
-            if hints_debug:
-                alt.setdefault("debug", {})["rate_hints"] = hints_debug
-            with engine.begin() as cx:
-                cx.execute(
-                    text(
-                        """
-                    INSERT INTO mem_runs(namespace, input_query, status, context_pack, created_at)
-                    VALUES(:ns, :q, 'complete', :ctx, NOW())
-                """
-                    ),
-                    {
-                        "ns": ns,
-                        "q": q,
-                        "ctx": json.dumps(
-                            {
-                                "inquiry_id": inquiry_id,
-                                "attempt_no": 2,
-                                "strategy": alt_strategy,
-                            }
-                        ),
-                    },
+            if inquiry_row:
+                ns, q = inquiry_row[0], inquiry_row[1]
+                fts_present = bool(
+                    (hints_dict.get("fts_tokens") if hints_dict else None)
+                    or (hints_dict.get("full_text_search") if hints_dict else None)
+                    or getattr(hints_obj, "fts_tokens", None)
+                    or getattr(hints_obj, "full_text_search", None)
                 )
-            response_payload = {"ok": True, "retry": True, "inquiry_id": inquiry_id, **alt}
-            response_payload = _augment_response(response_payload)
+                alt = run_attempt(
+                    q,
+                    ns,
+                    attempt_no=2,
+                    strategy=alt_strategy,
+                    full_text_search=True if fts_present else None,
+                    rate_comment=comment or None,
+                )
+                jlog(
+                    "rate.alt.run",
+                    trace_id=ctx["trace_id"],
+                    namespace=ns,
+                    strategy=alt_strategy,
+                    retry=bool(alt),
+                )
+                if comment and hints_dict:
+                    store_rate_hints(q, hints_dict)
+                if hints_debug:
+                    alt.setdefault("debug", {})["rate_hints"] = hints_debug
+                with engine.begin() as cx:
+                    cx.execute(
+                        text(
+                            """
+                        INSERT INTO mem_runs(namespace, input_query, status, context_pack, created_at)
+                        VALUES(:ns, :q, 'complete', :ctx, NOW())
+                    """
+                        ),
+                        {
+                            "ns": ns,
+                            "q": q,
+                            "ctx": json.dumps(
+                                {
+                                    "inquiry_id": inquiry_id,
+                                    "attempt_no": 2,
+                                    "strategy": alt_strategy,
+                                }
+                            ),
+                        },
+                    )
+                response_payload = {
+                    "ok": True,
+                    "retry": True,
+                    "inquiry_id": inquiry_id,
+                    **alt,
+                }
+                response_payload = _augment_response(response_payload)
+                jlog(
+                    "rate.response",
+                    trace_id=ctx["trace_id"],
+                    inquiry_id=inquiry_id or None,
+                    retry=response_payload.get("retry"),
+                )
+                return jsonify(response_payload)
+
+            response = {"ok": True, "retry": False, "inquiry_id": inquiry_id}
+            response = _augment_response(response)
             jlog(
                 "rate.response",
                 trace_id=ctx["trace_id"],
                 inquiry_id=inquiry_id or None,
-                retry=response_payload.get("retry"),
+                retry=response.get("retry"),
             )
-            return jsonify(response_payload)
-
-        response = {"ok": True, "retry": False, "inquiry_id": inquiry_id}
-        response = _augment_response(response)
-        jlog(
-            "rate.response",
-            trace_id=ctx["trace_id"],
-            inquiry_id=inquiry_id or None,
-            retry=response.get("retry"),
-        )
-        return jsonify(response)
+            return jsonify(response)
+        else:
+            logger.info(
+                "rate.alt.skip",
+                extra={"reason": "feature_flag", "inquiry_id": inquiry_id or None},
+            )
 
     if rating < 3 and env_flag("DW_ESCALATE_ON_LOW_RATING", True):
         with engine.begin() as cx:
@@ -1049,6 +1113,20 @@ def rate():
 
     response: Dict[str, Any] = {"ok": True, "retry": False, "inquiry_id": inquiry_id}
     response = _augment_response(response)
+    if DW_RATE_EXECUTE_FINAL and rate_sql:
+        try:
+            logger.info(
+                "rate.exec.final",
+                extra={"preview": (rate_sql or "")[:180]},
+            )
+            final_rows = fetch_rows(rate_sql, rate_binds)
+            response.setdefault("meta", {})["rowcount"] = len(final_rows)
+            response["rows"] = final_rows[:2]
+        except Exception as exc:  # pragma: no cover - defensive logging
+            logger.info(
+                "rate.exec.final.error",
+                extra={"error": str(exc)},
+            )
     jlog(
         "rate.response",
         trace_id=ctx["trace_id"],
