@@ -1,0 +1,14 @@
+namespace: dw::common
+route: /dw/rate
+
+tests:
+  - name: rate_request_type_renewal_ci
+    request:
+      inquiry_id: 27
+      rating: 1
+      comment: "eq: REQUEST_TYPE = Renewal;"
+    expect:
+      retry: false
+      sql_contains:
+        - "UPPER(TRIM(REQUEST_TYPE))"
+        - "LIKE"
