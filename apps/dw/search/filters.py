@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Dict, List, Tuple
 
+from apps.dw.sql_utils import ci, ci_eq, ci_like
+
 
 def build_eq_clause(
     field: str,
@@ -22,11 +24,10 @@ def build_eq_clause(
         return ""
 
     if len(bind_names) == 1:
-        bind_expr = f"UPPER(TRIM(:{bind_names[0]}))"
-        comparisons = [f"UPPER(TRIM({column})) = {bind_expr}" for column in columns]
+        comparisons = [ci_eq(column, bind_names[0]) for column in columns]
     else:
-        bind_list = ", ".join(f"UPPER(TRIM(:{name}))" for name in bind_names)
-        comparisons = [f"UPPER(TRIM({column})) IN ({bind_list})" for column in columns]
+        bind_list = ", ".join(f"UPPER(:{name})" for name in bind_names)
+        comparisons = [f"{ci(column)} IN ({bind_list})" for column in columns]
 
     return "(" + " OR ".join(comparisons) + ")"
 
@@ -36,6 +37,7 @@ def build_eq_where(
     alias_map: Dict[str, List[str]],
     bind_prefix: str = "eq_",
     start_index: int = 0,
+    request_type_synonyms: Dict[str, Dict] | None = None,
 ) -> Tuple[str, Dict[str, str], int]:
     """Aggregate equality filters using OR/IN semantics with alias expansion."""
 
@@ -73,6 +75,65 @@ def build_eq_where(
             unique_values.append(norm)
 
         if not unique_values:
+            continue
+
+        if logical_col.upper() == "REQUEST_TYPE":
+            syn_cfg = request_type_synonyms or {}
+            rt_clauses: List[str] = []
+            eq_seen: set[str] = set()
+            like_seen: set[str] = set()
+            fallback_values: List[str] = []
+
+            for value in unique_values:
+                key = value.strip().lower()
+                entry = syn_cfg.get(key, {}) if key else {}
+                equals_vals = [v for v in entry.get("equals", []) if v]
+                prefix_vals = [v for v in entry.get("prefix", []) if v]
+                if not equals_vals and not prefix_vals:
+                    fallback_values.append(value)
+                    continue
+
+                for eq_val in equals_vals:
+                    eq_text = str(eq_val).strip()
+                    if not eq_text:
+                        continue
+                    eq_key = eq_text.upper()
+                    if eq_key in eq_seen:
+                        continue
+                    eq_seen.add(eq_key)
+                    bind_name = f"{bind_prefix}{idx}"
+                    idx += 1
+                    binds[bind_name] = eq_text
+                    rt_clauses.append(ci_eq("REQUEST_TYPE", bind_name))
+
+                for pref_val in prefix_vals:
+                    pref_text = str(pref_val).strip()
+                    if not pref_text:
+                        continue
+                    pref_key = pref_text.upper()
+                    if pref_key in like_seen:
+                        continue
+                    like_seen.add(pref_key)
+                    bind_name = f"{bind_prefix}{idx}"
+                    idx += 1
+                    binds[bind_name] = f"{pref_text}%"
+                    rt_clauses.append(ci_like("REQUEST_TYPE", bind_name))
+
+            for fallback in fallback_values:
+                fb_text = fallback.strip()
+                if not fb_text:
+                    continue
+                fb_key = fb_text.upper()
+                if fb_key in eq_seen:
+                    continue
+                eq_seen.add(fb_key)
+                bind_name = f"{bind_prefix}{idx}"
+                idx += 1
+                binds[bind_name] = fb_text
+                rt_clauses.append(ci_eq("REQUEST_TYPE", bind_name))
+
+            if rt_clauses:
+                parts.append("(" + " OR ".join(rt_clauses) + ")")
             continue
 
         bind_names: List[str] = []
