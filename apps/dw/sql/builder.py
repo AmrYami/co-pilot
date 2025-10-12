@@ -238,32 +238,60 @@ class QueryBuilder:
                 equals_vals = [v for v in synonyms.get("equals", []) if v is not None]
                 prefix_vals = [v for v in synonyms.get("prefix", []) if v is not None]
                 contains_vals = [v for v in synonyms.get("contains", []) if v is not None]
+
+                def _dedupe_upper(items: Iterable[Any]) -> List[str]:
+                    seen: set[str] = set()
+                    ordered: List[str] = []
+                    for raw in items:
+                        if not isinstance(raw, str):
+                            continue
+                        text = raw.strip()
+                        if not text:
+                            continue
+                        key = text.upper()
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        ordered.append(key)
+                    return ordered
+
+                eq_items = _dedupe_upper(equals_vals)
+                prefix_items = _dedupe_upper(prefix_vals)
+                contains_items = _dedupe_upper(contains_vals)
+
                 clauses: List[str] = []
-                col_expr = _apply_flags(column, ci=ci, trim=tr)
-                for value in equals_vals:
+                # Synonym clauses always enforce CI + TRIM semantics to match /dw/answer.
+                col_expr = _apply_flags(column, ci=True, trim=True)
+
+                for value in eq_items:
                     bind = f"eq_{self._bind_idx}"
                     self._bind_idx += 1
                     self._binds[bind] = value
-                    bind_expr = _apply_flags(f":{bind}", ci=ci, trim=tr)
+                    bind_expr = _apply_flags(f":{bind}", ci=True, trim=True)
                     clauses.append(f"{col_expr} = {bind_expr}")
-                for value in prefix_vals:
+
+                for value in prefix_items:
                     bind = f"eq_{self._bind_idx}"
                     self._bind_idx += 1
-                    if isinstance(value, str) and not value.endswith("%"):
-                        self._binds[bind] = f"{value}%"
-                    else:
-                        self._binds[bind] = value
-                    bind_expr = _apply_flags(f":{bind}", ci=ci, trim=tr)
+                    pattern = value
+                    if not pattern.endswith("%"):
+                        pattern = f"{pattern}%"
+                    self._binds[bind] = pattern
+                    bind_expr = _apply_flags(f":{bind}", ci=True, trim=True)
                     clauses.append(f"{col_expr} LIKE {bind_expr}")
-                for value in contains_vals:
+
+                for value in contains_items:
                     bind = f"eq_{self._bind_idx}"
                     self._bind_idx += 1
-                    if isinstance(value, str) and not value.startswith("%"):
-                        self._binds[bind] = f"%{value}%"
-                    else:
-                        self._binds[bind] = value
-                    bind_expr = _apply_flags(f":{bind}", ci=ci, trim=tr)
+                    pattern = value
+                    if not pattern.startswith("%"):
+                        pattern = f"%{pattern}"
+                    if not pattern.endswith("%"):
+                        pattern = f"{pattern}%"
+                    self._binds[bind] = pattern
+                    bind_expr = _apply_flags(f":{bind}", ci=True, trim=True)
                     clauses.append(f"{col_expr} LIKE {bind_expr}")
+
                 if clauses:
                     self._where_parts.append("(" + " OR ".join(clauses) + ")")
                     continue

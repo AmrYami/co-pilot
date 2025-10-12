@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import uuid
 from typing import Any, Dict, Iterable, List, Tuple
 
 from flask import Blueprint, jsonify, request
@@ -20,6 +21,8 @@ from apps.dw.sqlbuilder import (
     direction_from_words,
     parse_rate_comment as parse_rate_comment_v2,
 )
+from apps.dw.logs import scrub_binds
+from apps.dw.utils import env_flag
 
 try:  # pragma: no cover - lightweight fallback for tests without settings backend
     from apps.dw.settings_util import get_setting as _get_setting
@@ -135,6 +138,86 @@ def _apply_eq_synonyms_if_needed(
                 [x.strip().upper() for x in contains_raw],
             )
     return "none", [], [], []
+
+
+def _dedupe_upper(values: Iterable[Any]) -> List[str]:
+    seen: set[str] = set()
+    ordered: List[str] = []
+    for raw in values:
+        if not isinstance(raw, str):
+            continue
+        text = raw.strip()
+        if not text:
+            continue
+        upper = text.upper()
+        if upper in seen:
+            continue
+        seen.add(upper)
+        ordered.append(upper)
+    return ordered
+
+
+def _collect_request_type_synonyms(
+    values: Iterable[str],
+    mapping: Dict[str, Dict[str, Iterable[Any]]],
+) -> Tuple[List[str], List[str], List[str]]:
+    equals: List[str] = []
+    prefixes: List[str] = []
+    contains: List[str] = []
+    for raw in values:
+        if not isinstance(raw, str):
+            continue
+        text = raw.strip()
+        if not text:
+            continue
+        upper = text.upper()
+        equals.append(upper)
+        for key, spec in mapping.items():
+            if not isinstance(spec, dict):
+                continue
+            key_upper = str(key).strip().upper()
+            eq_list = _dedupe_upper(spec.get("equals", []))
+            if upper == key_upper or upper in eq_list:
+                equals.extend(eq_list or [key_upper])
+                prefixes.extend(_dedupe_upper(spec.get("prefix", [])))
+                contains.extend(_dedupe_upper(spec.get("contains", [])))
+                break
+    return _dedupe_upper(equals), _dedupe_upper(prefixes), _dedupe_upper(contains)
+
+
+def _inject_request_type_synonyms(
+    eq_filters: List[Dict[str, Any]], settings: DWSettings
+) -> List[Dict[str, Any]]:
+    if not eq_filters:
+        return []
+    mapping = settings.get_request_type_synonyms()
+    if not mapping:
+        return [dict(entry) for entry in eq_filters if isinstance(entry, dict)]
+
+    enriched: List[Dict[str, Any]] = []
+    for entry in eq_filters:
+        if not isinstance(entry, dict):
+            continue
+        updated = dict(entry)
+        col = str(updated.get("col") or updated.get("column") or "").strip()
+        if col.upper() == "REQUEST_TYPE":
+            values: List[str] = []
+            if isinstance(updated.get("values"), (list, tuple)):
+                values.extend(str(v) for v in updated.get("values") if v is not None)
+            fallback = updated.get("val")
+            if fallback is not None:
+                values.append(str(fallback))
+            eq_vals, pref_vals, contains_vals = _collect_request_type_synonyms(values, mapping)
+            if eq_vals or pref_vals or contains_vals:
+                updated["synonyms"] = {
+                    "equals": eq_vals,
+                    "prefix": pref_vals,
+                    "contains": contains_vals,
+                }
+                updated["ci"] = True
+                updated["trim"] = True
+        enriched.append(updated)
+    return enriched
 
 
 def _after_marker(text: str) -> str:
@@ -362,12 +445,14 @@ def rate() -> Any:
     fts_engine_obj = resolve_engine(fts_engine)
     min_token_len = fts_cfg.get("min_token_len", 2)
 
+    eq_filters_raw = hints.get("eq_filters") or []
+    eq_filters = _inject_request_type_synonyms(eq_filters_raw, settings)
     intent = {
         "date_column": "OVERLAP",
         "fts_tokens": tokens,
         "fts_operator": operator,
         "full_text_search": bool(tokens),
-        "eq_filters": hints.get("eq_filters") or [],
+        "eq_filters": eq_filters,
         "boolean_groups": hints.get("boolean_groups") or [],
         "group_by": group_col,
         "gross": gross_flag,
@@ -386,10 +471,10 @@ def rate() -> Any:
         for token in tokens:
             qb.add_fts_group([token], op=operator)
 
-    if intent["boolean_groups"]:
-        qb.apply_boolean_groups(intent["boolean_groups"])
-    elif intent["eq_filters"]:
+    if intent["eq_filters"]:
         qb.apply_eq_filters(intent["eq_filters"])
+    elif intent["boolean_groups"]:
+        qb.apply_boolean_groups(intent["boolean_groups"])
 
     if group_col:
         qb.group_by([group_col], gross=bool(gross_flag))
@@ -412,10 +497,25 @@ def rate() -> Any:
 
     final_sql, binds = qb.compile()
     final_sql_to_run = final_sql
+
+    trace_id = request.headers.get("X-Trace-Id") or uuid.uuid4().hex
+    logger.info({"event": "rate.primary.start", "trace_id": trace_id})
     logger.info(
-        json.dumps({"final_sql": {"size": len(final_sql_to_run), "sql": final_sql_to_run}})
+        {
+            "event": "rate.primary.sql",
+            "trace_id": trace_id,
+            "sql_preview": final_sql_to_run[:300],
+            "binds": scrub_binds(binds),
+        }
     )
+
     rows = fetch_rows(final_sql_to_run, binds)
+    rowcount = len(rows)
+    logger.info({"event": "rate.primary.done", "trace_id": trace_id, "rowcount": rowcount})
+
+    allow_alt_retry = not env_flag("DW_RATE_DISABLE_ALT_RETRY", False)
+    if rowcount == 0 and not allow_alt_retry:
+        logger.info({"event": "rate.alt.skip", "trace_id": trace_id, "reason": "disabled"})
 
     fts_bind_names = [name for name in binds if name.startswith("fts_")]
 
@@ -454,7 +554,7 @@ def rate() -> Any:
     }
 
     meta = {
-        "attempt_no": 2,
+        "attempt_no": 1,
         "binds": binds,
         "fts": {
             "enabled": bool(tokens),
@@ -465,6 +565,9 @@ def rate() -> Any:
             "min_token_len": min_token_len,
         },
         "clarifier_intent": intent_debug,
+        "allow_alt_retry": allow_alt_retry,
+        "trace_id": trace_id,
+        "rowcount": rowcount,
     }
 
     response = {
@@ -474,7 +577,7 @@ def rate() -> Any:
         "debug": debug,
         "meta": meta,
         "rows": rows,
-        "retry": True,
+        "retry": False,
     }
     return jsonify(response)
 
