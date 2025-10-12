@@ -88,6 +88,7 @@ from .contracts.filters import parse_explicit_filters
 from .contracts.contract_planner import plan_contract_query
 from .rating import rate_bp
 from .tests.rate_suite import rate_tests_bp
+from .tests.routes import tests_bp as rate_builder_tests_bp
 
 LOGGER = logging.getLogger("dw.app")
 
@@ -96,6 +97,7 @@ dw_bp = Blueprint("dw", __name__)
 init_db()
 dw_bp.register_blueprint(rate_bp, url_prefix="")
 dw_bp.register_blueprint(rate_tests_bp, url_prefix="/tests")
+dw_bp.register_blueprint(rate_builder_tests_bp, url_prefix="")
 
 
 def _ns() -> str:

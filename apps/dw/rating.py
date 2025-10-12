@@ -186,8 +186,10 @@ rate_bp = Blueprint("dw_rate", __name__)
 @rate_bp.post("/rate")
 def rate():
     app = current_app
-    engine = app.config["MEM_ENGINE"]
+    engine = app.config.get("MEM_ENGINE") if app else None
     data = request.get_json(force=True) or {}
+    explain_only = bool(request.args.get("explain_only") or data.get("explain_only"))
+    no_retry = (request.args.get("no_retry") == "1") or bool(data.get("no_retry"))
     ctx = new_ctx(route="dw/rate", inquiry_id=data.get("inquiry_id"))
     raw_payload = {
         key: value
@@ -235,23 +237,24 @@ def rate():
         )
         return jsonify({"ok": False, "error": "invalid payload"}), 400
 
-    with engine.begin() as cx:
-        cx.execute(
-            text(
-                """
-            UPDATE mem_inquiries
-               SET rating = :r,
-                   feedback_comment = COALESCE(:fb, feedback_comment),
-                   satisfied = CASE WHEN :r >= 4 THEN TRUE ELSE NULL END,
-                   updated_at = NOW()
-             WHERE id = :iid
-        """
-            ),
-            {"r": rating, "fb": feedback, "iid": inquiry_id},
-        )
+    if not explain_only and engine is not None:
+        with engine.begin() as cx:
+            cx.execute(
+                text(
+                    """
+                UPDATE mem_inquiries
+                   SET rating = :r,
+                       feedback_comment = COALESCE(:fb, feedback_comment),
+                       satisfied = CASE WHEN :r >= 4 THEN TRUE ELSE NULL END,
+                       updated_at = NOW()
+                 WHERE id = :iid
+            """
+                ),
+                {"r": rating, "fb": feedback, "iid": inquiry_id},
+            )
 
     inquiry_row: Optional[tuple[str, str]] = None
-    if rating < 3 or rating >= 4:
+    if not explain_only and engine is not None and (rating < 3 or rating >= 4):
         with engine.connect() as cx:
             row = cx.execute(
                 text(
@@ -798,6 +801,18 @@ def rate():
             debug_keys=sorted(rate_debug.keys()),
         )
 
+    if explain_only:
+        response_payload: Dict[str, Any] = {
+            "ok": True,
+            "retry": False,
+            "inquiry_id": inquiry_id,
+            "sql": rate_sql,
+            "debug": rate_debug or {},
+            "meta": {"binds": rate_binds, "strategy": "builder_only"},
+            "rows": [],
+        }
+        return jsonify(response_payload)
+
     if structured_hint_present:
         try:
             save_feedback(
@@ -930,7 +945,13 @@ def rate():
         except Exception:
             pass
 
-    if rating < 3 and env_int("DW_MAX_RERUNS", 1) > 0:
+    if (
+        not explain_only
+        and not no_retry
+        and engine is not None
+        and rating < 3
+        and env_int("DW_MAX_RERUNS", 1) > 0
+    ):
         alt_strategy = (
             request.args.get("strategy")
             or (env_flag("DW_ACCURACY_FIRST", True) and "det_overlaps_gross")
