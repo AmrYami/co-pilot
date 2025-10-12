@@ -7,9 +7,20 @@ try:  # pragma: no cover - optional helper
 except Exception:  # pragma: no cover - fallback when helper absent
     _external_to_upper_trim = None  # type: ignore[assignment]
 
-from apps.dw.db import run_query
+try:
+    from apps.dw.db import run_query
+except ImportError:  # pragma: no cover - fallback for simplified stubs
+    from apps.dw.db import fetch_rows as run_query
 from apps.dw.logger import log
-from apps.dw.settings import get_setting_json, get_setting_value
+
+try:  # pragma: no cover - allow import when optional dependencies missing
+    from apps.dw.settings import get_setting_json, get_setting_value
+except Exception:  # pragma: no cover - fallback for tests without full stack
+    def get_setting_json(*_args, **_kwargs):  # type: ignore[return-type]
+        return {}
+
+    def get_setting_value(*_args, **_kwargs):  # type: ignore[return-type]
+        return None
 
 
 def _to_upper_trim(col_sql: str) -> str:
@@ -143,6 +154,20 @@ def build_fts_like(
     return "(" + " OR ".join(groups_or) + ")", binds
 
 
+def build_select_all(table: str, order_by: str | None = None, desc: bool = True) -> str:
+    """
+    Build a simple SELECT * with optional ORDER BY.
+    NOTE: `order_by` must be validated/whitelisted by caller.
+    """
+    base = f'SELECT * FROM "{table}"'
+    if order_by:
+        direction = "DESC" if desc else "ASC"
+        # Use a triple-quoted f-string for multi-line SQL
+        return f"""SELECT * FROM "{table}"
+ORDER BY {order_by} {direction}"""
+    return base
+
+
 def assemble_sql(table: str, where_parts: List[str], order_by: str | None) -> str:
     where_sql = " AND ".join([part for part in where_parts if part and part.strip()])
     if not where_sql:
@@ -150,9 +175,7 @@ def assemble_sql(table: str, where_parts: List[str], order_by: str | None) -> st
     if not order_by:
         default_order = get_setting_value("DW_DATE_COLUMN", scope="namespace") or "REQUEST_DATE"
         order_by = f"{default_order} DESC"
-    return f'SELECT * FROM "{table}"
-WHERE {where_sql}
-ORDER BY {order_by}'
+    return f"{build_select_all(table)}\nWHERE {where_sql}\nORDER BY {order_by}"
 
 
 def run_rate(comment: str, table: str = "Contract") -> Dict[str, object]:
@@ -214,6 +237,7 @@ def run_rate(comment: str, table: str = "Contract") -> Dict[str, object]:
 __all__ = [
     "assemble_sql",
     "build_eq_condition",
+    "build_select_all",
     "build_fts_like",
     "run_rate",
 ]
