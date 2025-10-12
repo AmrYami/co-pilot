@@ -1,5 +1,5 @@
 namespace: dw::common
-route: /dw/rate
+route: /dw/test/rate
 
 tests:
   - name: 01-order-only
