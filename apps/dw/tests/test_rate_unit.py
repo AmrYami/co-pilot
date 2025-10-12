@@ -38,10 +38,22 @@ def app():
             }
         }
     }
-    app.config["SETTINGS"] = _SettingsStub({"DW_ENUM_SYNONYMS": synonyms})
+    alias_map = {
+        "DEPARTMENT": [*(f"DEPARTMENT_{i}" for i in range(1, 9)), "OWNER_DEPARTMENT"],
+        "STAKEHOLDER": [f"CONTRACT_STAKEHOLDER_{i}" for i in range(1, 9)],
+    }
+    fts_columns = {"Contract": ["CONTRACT_SUBJECT", "ENTITY", "REPRESENTATIVE_EMAIL"]}
+    app.config["SETTINGS"] = _SettingsStub(
+        {
+            "DW_ENUM_SYNONYMS": synonyms,
+            "DW_EQ_ALIAS_COLUMNS": alias_map,
+            "DW_FTS_COLUMNS": fts_columns,
+        }
+    )
     app.config["MEM_ENGINE"] = None
     app.register_blueprint(rate_bp, url_prefix="/dw")
     app.register_blueprint(tests_bp)
+    monkeypatch.setattr("apps.dw.rate_pipeline.run_query", lambda sql, binds: [])
     return app
 
 
@@ -65,8 +77,8 @@ def test_02_eq_request_type_synonyms(client):
     r = post_rate(client, "eq: REQUEST_TYPE = Renewal;")
     j = r.get_json()
     sql = (j.get("sql") or "").upper()
-    assert "REQUEST_TYPE IN (:EQ_0" in sql
-    binds = (j.get("meta") or {}).get("binds") or {}
+    assert "REQUEST_TYPE IN (UPPER(:EQ_0" in sql
+    binds = j.get("binds") or {}
     for k in ("eq_0", "eq_1", "eq_2", "eq_3", "eq_4", "eq_5", "eq_6"):
         assert k in binds
 
@@ -74,21 +86,21 @@ def test_02_eq_request_type_synonyms(client):
 def test_03_fts_simple(client):
     r = post_rate(client, "fts: it;")
     j = r.get_json()
-    assert "%IT%" in (j.get("meta", {}).get("binds", {}).get("fts_0", "")).upper()
+    assert "%IT%" in (j.get("binds", {}).get("fts_0", "")).upper()
 
 
 def test_04_alias_stakeholder_expand(client):
     r = post_rate(client, "eq: stakeholder = A or B;")
     j = r.get_json()
-    wt = (j.get("debug") or {}).get("where_text", "")
-    assert "CONTRACT_STAKEHOLDER_8" in wt
+    sql = (j.get("sql") or "").upper()
+    assert "CONTRACT_STAKEHOLDER_8" in sql
 
 
 def test_05_alias_department_expand(client):
     r = post_rate(client, "eq: department = X or Y;")
     j = r.get_json()
-    wt = (j.get("debug") or {}).get("where_text", "")
-    assert "OWNER_DEPARTMENT" in wt and "DEPARTMENT_8" in wt
+    sql = (j.get("sql") or "").upper()
+    assert "OWNER_DEPARTMENT" in sql and "DEPARTMENT_8" in sql
 
 
 def test_06_full_query_like_yours(client):

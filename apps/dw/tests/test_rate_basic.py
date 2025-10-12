@@ -42,9 +42,21 @@ def client(monkeypatch):
     app = Flask(__name__)
     app.config["TESTING"] = True
     synonyms = {"Contract.REQUEST_TYPE": REQUEST_TYPE_SYNONYMS}
-    app.config["SETTINGS"] = _SettingsStub({"DW_ENUM_SYNONYMS": synonyms})
+    alias_map = {
+        "DEPARTMENT": [*(f"DEPARTMENT_{i}" for i in range(1, 9)), "OWNER_DEPARTMENT"],
+        "STAKEHOLDER": [f"CONTRACT_STAKEHOLDER_{i}" for i in range(1, 9)],
+    }
+    fts_columns = {"Contract": ["CONTRACT_SUBJECT", "ENTITY", "REPRESENTATIVE_EMAIL"]}
+    app.config["SETTINGS"] = _SettingsStub(
+        {
+            "DW_ENUM_SYNONYMS": synonyms,
+            "DW_EQ_ALIAS_COLUMNS": alias_map,
+            "DW_FTS_COLUMNS": fts_columns,
+        }
+    )
     app.config["MEM_ENGINE"] = None
     app.register_blueprint(rate_bp, url_prefix="/dw")
+    monkeypatch.setattr("apps.dw.rate_pipeline.run_query", lambda sql, binds: [])
 
     with app.test_client() as test_client:
         yield test_client
