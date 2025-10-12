@@ -378,7 +378,8 @@ def _canon_ws(s: str) -> str:
     return re.sub(r"\s+", " ", s or "").strip()
 
 # Stable, package-relative path to the golden YAML file
-GOLDEN_PATH = Path(__file__).with_name("golden_dw_contracts.yaml")
+BASE_DIR = Path(__file__).resolve().parents[3]
+GOLDEN_PATH = (BASE_DIR / "apps/dw/tests/golden_dw_contracts.yaml").resolve()
 DEFAULT_NS = "dw::common"
 
 # NOTE: keep comments in English inside code.
@@ -416,18 +417,22 @@ def _load_yaml(path: Path) -> Dict[str, Any]:
     try:
         with path.open("r", encoding="utf-8") as f:
             data = yaml.load(f, Loader=GoldenLoader) or {}
-        if not isinstance(data, dict):
-            raise ValueError(f"Golden YAML root must be a mapping, got: {type(data).__name__}")
-        if "cases" not in data or not isinstance(data["cases"], list):
-            raise ValueError("Golden YAML missing a 'cases' list.")
-        data.setdefault("namespace", DEFAULT_NS)
-        return data
-    except FileNotFoundError:
+    except FileNotFoundError as exc:
         logging.error("Golden YAML not found at %s", path)
-        return {}
-    except Exception as e:
-        logging.exception("Failed to load golden YAML: %s", e)
-        return {}
+        raise FileNotFoundError(f"Golden YAML not found at {path}") from exc
+    except yaml.YAMLError as exc:
+        logging.error("Failed to parse golden YAML %s: %s", path, exc)
+        raise ValueError(f"YAML parse error: {exc}") from exc
+    except Exception as exc:
+        logging.error("Unexpected error while loading golden YAML %s: %s", path, exc)
+        raise
+
+    if not isinstance(data, dict):
+        raise ValueError(f"Golden YAML root must be a mapping, got: {type(data).__name__}")
+    if "cases" not in data or not isinstance(data["cases"], list):
+        raise ValueError("Golden YAML missing a 'cases' list.")
+    data.setdefault("namespace", DEFAULT_NS)
+    return data
 
 
 def _dense(s: str) -> str:
@@ -734,18 +739,27 @@ def run_golden_tests(
     flask_app: Optional[Flask] = None,
     namespace: Optional[str] = None,
     limit: Optional[int] = None,
+    path: Optional[str | Path] = None,
 ) -> Dict[str, Any]:
     ns_clean = namespace.strip() if isinstance(namespace, str) else None
 
-    data = _load_yaml(GOLDEN_PATH)
-    if not data:
+    if path:
+        candidate = Path(path)
+        target_path = (BASE_DIR / candidate).resolve() if not candidate.is_absolute() else candidate
+    else:
+        target_path = GOLDEN_PATH
+
+    try:
+        data = _load_yaml(target_path)
+    except Exception as exc:
         return {
             "ok": False,
             "total": 0,
             "passed": 0,
             "results": [],
-            "error": "Golden YAML failed to load.",
+            "error": f"Golden YAML failed to load: {exc}",
             "namespace": ns_clean or DEFAULT_NS,
+            "file": str(target_path),
         }
 
     raw_cases: List[Dict[str, Any]] = data.get("cases", [])
