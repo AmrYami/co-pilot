@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from apps.dw.lib.eq_ops import build_enum_filter_ci
+
 GROSS_EXPR = (
     "NVL(CONTRACT_VALUE_NET_OF_VAT,0) + CASE WHEN NVL(VAT,0) BETWEEN 0 AND 1 "
     "THEN NVL(CONTRACT_VALUE_NET_OF_VAT,0) * NVL(VAT,0) ELSE NVL(VAT,0) END"
@@ -259,16 +261,14 @@ class QueryBuilder:
                 prefix_items = _dedupe_upper(prefix_vals)
                 contains_items = _dedupe_upper(contains_vals)
 
-                clauses: List[str] = []
-                # Synonym clauses always enforce CI + TRIM semantics to match /dw/answer.
-                col_expr = _apply_flags(column, ci=True, trim=True)
+                eq_bind_names: List[str] = []
+                like_bind_names: List[str] = []
 
                 for value in eq_items:
                     bind = f"eq_{self._bind_idx}"
                     self._bind_idx += 1
                     self._binds[bind] = value
-                    bind_expr = _apply_flags(f":{bind}", ci=True, trim=True)
-                    clauses.append(f"{col_expr} = {bind_expr}")
+                    eq_bind_names.append(bind)
 
                 for value in prefix_items:
                     bind = f"eq_{self._bind_idx}"
@@ -277,8 +277,7 @@ class QueryBuilder:
                     if not pattern.endswith("%"):
                         pattern = f"{pattern}%"
                     self._binds[bind] = pattern
-                    bind_expr = _apply_flags(f":{bind}", ci=True, trim=True)
-                    clauses.append(f"{col_expr} LIKE {bind_expr}")
+                    like_bind_names.append(bind)
 
                 for value in contains_items:
                     bind = f"eq_{self._bind_idx}"
@@ -289,11 +288,11 @@ class QueryBuilder:
                     if not pattern.endswith("%"):
                         pattern = f"{pattern}%"
                     self._binds[bind] = pattern
-                    bind_expr = _apply_flags(f":{bind}", ci=True, trim=True)
-                    clauses.append(f"{col_expr} LIKE {bind_expr}")
+                    like_bind_names.append(bind)
 
-                if clauses:
-                    self._where_parts.append("(" + " OR ".join(clauses) + ")")
+                clause, _ = build_enum_filter_ci(column, eq_bind_names, like_bind_names)
+                if clause:
+                    self._where_parts.append(clause)
                     continue
             values: List[Any] = []
             if isinstance(filt.get("values"), (list, tuple)):

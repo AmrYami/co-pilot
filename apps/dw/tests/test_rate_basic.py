@@ -66,8 +66,8 @@ def test_rate_eq_request_type_simple(client):
     assert data.get("retry") is False
     dbg = data["debug"]
     sql = dbg["final_sql"]["sql"]
-    assert "REQUEST_TYPE IN" in sql
-    assert ":eq_0" in sql
+    assert "UPPER(TRIM(REQUEST_TYPE))" in sql
+    assert "= UPPER(:eq_0)" in sql or "= UPPER(:eq_1)" in sql
     validation = dbg["validation"]
     assert "bind_names" in validation and len(validation["bind_names"]) >= 1
 
