@@ -5,6 +5,24 @@ from __future__ import annotations
 from typing import Optional, Tuple
 
 
+def ci(col: str) -> str:
+    """Return a case-insensitive, trimmed representation of ``col``."""
+
+    return f"UPPER(TRIM({col}))"
+
+
+def ci_eq(col: str, bind: str) -> str:
+    """Return a case-insensitive equality comparison for ``col``."""
+
+    return f"{ci(col)} = UPPER(:{bind})"
+
+
+def ci_like(col: str, bind: str) -> str:
+    """Return a case-insensitive LIKE comparison for ``col``."""
+
+    return f"{ci(col)} LIKE UPPER(:{bind})"
+
+
 GROSS_SQL = (
     "NVL(CONTRACT_VALUE_NET_OF_VAT,0) + "
     "CASE WHEN NVL(VAT,0) BETWEEN 0 AND 1 "

@@ -59,6 +59,7 @@ def rate():
     _ensure_setting("DW_FTS_ENGINE", "like")
     _ensure_setting("DW_FTS_COLUMNS", {})
     alias_map_raw = _ensure_setting("DW_EQ_ALIAS_COLUMNS", {}) or {}
+    enum_synonyms_setting = _ensure_setting("DW_ENUM_SYNONYMS", {}) or {}
     raw_min_len = _ensure_setting("DW_FTS_MIN_TOKEN_LEN", 2)
     contract_table = str(_ensure_setting("DW_CONTRACT_TABLE", "Contract") or "Contract")
     order_column = str(_ensure_setting("DW_DATE_COLUMN", "REQUEST_DATE") or "REQUEST_DATE")
@@ -142,11 +143,13 @@ def rate():
 
     alias_map = alias_map_raw if isinstance(alias_map_raw, dict) else {}
     eq_filters: List[Dict[str, Any]] = intent.get("eq_filters") or []
+    request_type_synonyms = enum_synonyms_setting.get("Contract.REQUEST_TYPE", {})
     eq_sql, eq_binds, _ = build_eq_where(
         eq_filters,
         alias_map,
         bind_prefix="eq_",
         start_index=0,
+        request_type_synonyms=request_type_synonyms,
     )
 
     boolean_groups: List[Dict[str, Any]] = []
@@ -187,9 +190,7 @@ def rate():
     elif filtered_groups and not fts_where and fts_error is None:
         fts_error = "no_predicate"
 
-    enum_syn = (get_setting("DW_ENUM_SYNONYMS", scope="namespace") or {}).get(
-        "Contract.REQUEST_TYPE", {}
-    )
+    enum_syn = request_type_synonyms
     legacy_sql: Optional[str] = None
     legacy_binds: Dict[str, Any] = {}
     try:
