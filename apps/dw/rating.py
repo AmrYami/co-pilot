@@ -13,6 +13,7 @@ def rate():
     payload = request.get_json() or {}
     inquiry_id = payload.get("inquiry_id")
     comment = (payload.get("comment") or "").strip()
+    rating = payload.get("rating")
 
     log.info(
         {
@@ -27,7 +28,7 @@ def rate():
     )
 
     try:
-        result = run_rate(comment, table="Contract", inquiry_id=inquiry_id)
+        result = run_rate(inquiry_id=inquiry_id, rating=rating, comment=comment)
         log.info({"event": "rate.response", "inquiry_id": inquiry_id, "retry": False})
         return jsonify(result), 200
     except Exception as exc:  # pragma: no cover - defensive
