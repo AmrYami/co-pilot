@@ -60,7 +60,7 @@ def _run_one(case: Case) -> Dict[str, Any]:
         if frag not in (sql_top or ""):
             result["errors"].append(f"SQL missing fragment: {frag!r}")
 
-    binds = ((data.get("meta") or {}).get("binds") or {})
+    binds = data.get("binds") or ((data.get("meta") or {}).get("binds") or {})
     for key, expected in case.expect.binds_include.items():
         if key not in binds:
             result["errors"].append(f"Bind {key} not found")
