@@ -23,6 +23,41 @@ from core.settings import Settings
 _NAMESPACE = "dw::common"
 
 
+def get_namespace_settings(namespace: str = "dw::common") -> Dict[str, Any]:
+    """Return a mapping with settings for ``namespace``.
+
+    The helper mirrors the lightweight loader used by the DW answer endpoint. When the
+    requested namespace is the default (``dw::common``) we rely on the cached snapshot
+    exposed by :func:`get_settings`. For other namespaces we fall back to the general
+    :class:`core.settings.Settings` accessor so callers can reuse the same interface
+    without importing heavy dependencies in multiple places.
+    """
+
+    ns = (namespace or _NAMESPACE).strip() or _NAMESPACE
+    if ns == _NAMESPACE:
+        return dict(get_settings())
+
+    settings = Settings(namespace=ns)
+    keys = (
+        "DEFAULT_DATASOURCE",
+        "DW_CONTRACT_TABLE",
+        "DW_FTS_ENGINE",
+        "DW_FTS_COLUMNS",
+        "DW_DATE_COLUMN",
+        "DW_SELECT_ALL_DEFAULT",
+        "EMPTY_RESULT_AUTORETRY",
+        "DW_FTS_MIN_TOKEN_LEN",
+    )
+    resolved: Dict[str, Any] = {}
+    for key in keys:
+        value = settings.get(key, scope="namespace", namespace=ns)
+        if value is None:
+            value = settings.get(key, scope="global", namespace="global")
+        if value is not None:
+            resolved[key] = value
+    return resolved
+
+
 def get_dw_namespace(app: str = "dw") -> str:
     """Return the canonical DW namespace used across services."""
 
