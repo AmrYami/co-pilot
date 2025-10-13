@@ -27,27 +27,9 @@ def rate():
     )
 
     try:
-        result = run_rate(comment, table="Contract")
-        log.info(
-            {
-                "event": "rate.sql.exec",
-                "inquiry_id": inquiry_id,
-                "sql": result["sql"],
-                "binds": result["binds"],
-            }
-        )
-
-        response = {
-            "ok": True,
-            "retry": False,
-            "inquiry_id": inquiry_id,
-            "sql": result["sql"],
-            "rows": result["rows"],
-            "debug": result["debug"],
-            "binds": result["binds"],
-        }
+        result = run_rate(comment, table="Contract", inquiry_id=inquiry_id)
         log.info({"event": "rate.response", "inquiry_id": inquiry_id, "retry": False})
-        return jsonify(response), 200
+        return jsonify(result), 200
     except Exception as exc:  # pragma: no cover - defensive
         log.exception("rate.failed")
         return jsonify({"ok": False, "error": str(exc), "inquiry_id": inquiry_id}), 500

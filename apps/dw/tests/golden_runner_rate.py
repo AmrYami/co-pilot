@@ -35,27 +35,61 @@ def run_golden_rate():
             400,
         )
 
-    tests = data.get("tests", []) if isinstance(data, dict) else []
+    namespace = "dw::common"
+    cases = []
+    if isinstance(data, dict):
+        namespace = data.get("namespace", namespace)
+        cases = data.get("cases") or data.get("tests") or []
+
     passed = 0
     results = []
 
     app = current_app._get_current_object()
     with app.test_client() as client:
-        for case in tests:
-            comment = case.get("comment", "") if isinstance(case, dict) else ""
+        for case in cases:
+            if not isinstance(case, dict):
+                continue
+
+            comment = case.get("rate_comment") or case.get("comment") or ""
             response = client.post(
                 "/dw/rate",
                 json={"inquiry_id": 1, "rating": 1, "comment": comment},
             )
-            ok = response.status_code == (case.get("expect_status", 200) if isinstance(case, dict) else 200)
+            expect = case.get("expect", {})
+            expect_status = case.get("expect_status")
+            if not expect_status and isinstance(expect, dict):
+                expect_status = expect.get("status")
+            ok = response.status_code == (expect_status or 200)
             body = response.get_json(silent=True) or {}
             sql = ((body.get("debug") or {}).get("final_sql") or {}).get("sql", "")
-            for needle in (case.get("expect_sql_contains", []) if isinstance(case, dict) else []):
+
+            sql_contains = []
+            if isinstance(expect, dict):
+                sql_contains = expect.get("sql_contains", []) or expect.get("sql_contains_all", [])
+            for needle in sql_contains:
                 if needle not in sql:
                     ok = False
+
+            binds = body.get("binds") or {}
+            expect_binds = expect.get("binds") if isinstance(expect, dict) else None
+            if isinstance(expect_binds, dict):
+                ok = ok and all(binds.get(k) == v for k, v in expect_binds.items())
+
+            binds_subset = expect.get("binds_subset") if isinstance(expect, dict) else None
+            if isinstance(binds_subset, dict):
+                for key, value in binds_subset.items():
+                    if binds.get(key) != value:
+                        ok = False
+
+            rows_min = expect.get("rows_min") if isinstance(expect, dict) else None
+            if isinstance(rows_min, int):
+                rows = body.get("rows") or []
+                if len(rows) < rows_min:
+                    ok = False
+
             results.append(
                 {
-                    "name": case.get("name") if isinstance(case, dict) else None,
+                    "name": case.get("name"),
                     "ok": ok,
                     "status_code": response.status_code,
                 }
@@ -63,7 +97,7 @@ def run_golden_rate():
             if ok:
                 passed += 1
 
-    total = len(tests)
+    total = len(results)
     status_code = 200 if passed == total else 400
     return (
         jsonify(
@@ -72,7 +106,7 @@ def run_golden_rate():
                 "passed": passed,
                 "total": total,
                 "results": results,
-                "namespace": "dw::common",
+                "namespace": namespace,
             }
         ),
         status_code,
