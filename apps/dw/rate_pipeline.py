@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, List, Tuple
 
-from apps.dw.rate_dbexec import exec_sql_with_columns
 from apps.dw.rate_parser import parse_rate_comment
 from apps.dw.sql_builders_rate import (
     build_empty_all,
@@ -14,12 +14,16 @@ from apps.dw.sql_builders_rate import (
     build_not_like_all,
     qn,
 )
+from apps.dw.sql_exec_shared import execute_select, get_engine_for_default_datasource
 
 try:  # pragma: no cover - optional dependency during tests
     from apps.dw.settings import get_setting
 except Exception:  # pragma: no cover - fallback when settings helper unavailable
     def get_setting(*_args, **kwargs):  # type: ignore[return-type]
         return kwargs.get("default")
+
+
+logger = logging.getLogger("dw.rate")
 
 
 def _request_type_synonyms() -> Dict[str, Dict[str, List[str]]]:
@@ -106,6 +110,30 @@ def _resolve_fts_columns(settings: Dict[str, Any], table: str = "Contract") -> L
     if not candidates:
         candidates = config.get("*", [])
     return _normalize_columns(candidates)
+
+
+def _get_bool_setting(key: str, default: bool = False) -> bool:
+    truthy = {"1", "true", "t", "yes", "y", "on"}
+    falsy = {"0", "false", "f", "no", "n", "off"}
+
+    for scope in ("namespace", "global"):
+        value = get_setting(key, scope=scope, default=None)
+        if value is None:
+            continue
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        text = str(value).strip().lower()
+        if not text:
+            continue
+        if text in truthy:
+            return True
+        if text in falsy:
+            return False
+        return default
+
+    return default
 
 
 def build_where_sql(intent: Dict[str, Any], settings: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
@@ -205,6 +233,7 @@ def run_rate(inquiry_id: int, rating: int, comment: str) -> Dict[str, Any]:
     eq_alias_raw = get_setting("DW_EQ_ALIAS_COLUMNS", scope="namespace") or {}
     fts_columns_raw = get_setting("DW_FTS_COLUMNS", scope="namespace") or {}
     fts_engine = get_setting("DW_FTS_ENGINE", scope="namespace") or "like"
+    validate_only = _get_bool_setting("VALIDATE_WITH_EXPLAIN_ONLY", default=False)
     intent = parse_rate_comment(comment or "")
 
     rt_syn = _request_type_synonyms()
@@ -235,7 +264,29 @@ def run_rate(inquiry_id: int, rating: int, comment: str) -> Dict[str, Any]:
     order_clause = intent.get("order_by") or f"{date_col} DESC"
     sql = f'SELECT * FROM "{table}"\nWHERE {where_sql}\nORDER BY {order_clause}'
 
-    columns, rows = exec_sql_with_columns(sql, binds, table)
+    columns: List[str] = []
+    rows: List[List[Any]] = []
+    row_count = 0
+
+    if not validate_only:
+        app_engine = get_engine_for_default_datasource()
+        logger.info(
+            {
+                "event": "rate.sql.exec",
+                "inquiry_id": inquiry_id,
+                "sql": sql,
+                "binds": binds,
+            }
+        )
+        columns, rows, row_count = execute_select(app_engine, sql, binds, max_rows=500)
+        logger.info(
+            {
+                "event": "rate.sql.done",
+                "inquiry_id": inquiry_id,
+                "rows": row_count,
+                "columns_count": len(columns),
+            }
+        )
 
     debug_intent = {
         "fts_groups": intent.get("fts_groups", []),
@@ -264,7 +315,7 @@ def run_rate(inquiry_id: int, rating: int, comment: str) -> Dict[str, Any]:
         "bind_names": list(binds.keys()),
         "binds": binds,
         "errors": [],
-        "row_count": len(rows),
+        "row_count": row_count,
     }
 
     resp: Dict[str, Any] = {
