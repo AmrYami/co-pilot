@@ -11,8 +11,8 @@ except Exception:  # pragma: no cover - fallback when settings helper unavailabl
 
 _OR_SPLIT = re.compile(r"\s+or\s+", re.IGNORECASE)
 
-NEG_EQ_PAT = r"(?:!=|<>|≠|not\s*=|does\s*not\s*equal|doesn['’]?t\s*equal|is\s*not|لا\s*يساوي|مش\s*مساوي|غير|ماه?وش)"
-NOT_CONTAINS_PAT = r"(?:does\s*not\s*(?:contain|have|include)|not\s*(?:like|contain|contains|have|include)|doesn['’]?t\s*(?:contain|have|include)|without|لا\s*يحتوي|مش\s*فيه|مافيهوش|بدون)"
+NEG_EQ_PAT = r"(?:!=|<>|≠|\bne\b|not\s*=|not\s*equal(?:\s*to)?|does\s*not\s*equal|doesn['’]?t\s*equal|is\s*not|لا\s*يساوي|مش\s*مساوي|غير|ماه?وش)"
+NOT_CONTAINS_PAT = r"(?:does\s*not\s*(?:contain|have|has|include)|not\s*(?:like|contain|contains|have|has|include)|doesn['’]?t\s*(?:contain|have|has|include)|exclude|excludes|excluding|without|لا\s*يحتوي|مش\s*فيه|مافيهوش|بدون)"
 IS_EMPTY_PAT = r"(?:is\s*empty|is\s*null|=\s*''\s*|فارغ|خالي|NULL)"
 IS_NOT_EMPTY_PAT = r"(?:is\s*not\s*empty|is\s*not\s*null|<>\s*''\s*|مش\s*فاضي|غير\s*فارغ)"
 
@@ -60,7 +60,7 @@ def parse_rate_comment(comment: str) -> Dict[str, Any]:
                 intent["eq"].setdefault(col_key, [])
                 intent["eq"][col_key].extend(vals)
             continue
-        if low.startswith("neq:"):
+        if any(low.startswith(prefix) for prefix in ("neq:", "ne:")):
             expr = p.split(":", 1)[1]
             m = re.match(
                 r"\s*([^=<>]+?)\s*(?:!=|<>|=)\s*(.+)$", expr.strip(), flags=re.IGNORECASE
@@ -80,7 +80,20 @@ def parse_rate_comment(comment: str) -> Dict[str, Any]:
                 intent["contains"].setdefault(col_key, [])
                 intent["contains"][col_key].extend(vals)
             continue
-        if low.startswith("not_contains:") or low.startswith("not-like:"):
+        not_contains_prefixes = (
+            "not_contains:",
+            "not contains:",
+            "not-like:",
+            "not_like:",
+            "not_has:",
+            "not has:",
+            "doesnt contain:",
+            "doesn't contain:",
+            "doesnt have:",
+            "doesn't have:",
+            "exclude:",
+        )
+        if any(low.startswith(prefix) for prefix in not_contains_prefixes):
             expr = p.split(":", 1)[1]
             m = re.match(r"\s*([^=]+?)\s*=\s*(.+)$", expr.strip(), flags=re.IGNORECASE)
             if m:
