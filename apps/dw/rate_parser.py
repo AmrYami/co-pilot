@@ -11,10 +11,10 @@ except Exception:  # pragma: no cover - fallback when settings helper unavailabl
 
 _OR_SPLIT = re.compile(r"\s+or\s+", re.IGNORECASE)
 
-NEG_EQ_PAT = r"(?:!=|<>|does\s*not\s*equal|doesn['’]?t\s*equal|is\s*not)"
-NOT_CONTAINS_PAT = r"(?:does\s*not\s*(?:contain|have|include)|not\s*(?:like|contain|have|include)|doesn['’]?t\s*(?:contain|have|include)|without)"
-IS_EMPTY_PAT = r"(?:is\s*empty|is\s*null|=\s*''\s*)"
-IS_NOT_EMPTY_PAT = r"(?:is\s*not\s*empty|is\s*not\s*null|<>\s*''\s*)"
+NEG_EQ_PAT = r"(?:!=|<>|≠|not\s*=|does\s*not\s*equal|doesn['’]?t\s*equal|is\s*not|لا\s*يساوي|مش\s*مساوي|غير|ماه?وش)"
+NOT_CONTAINS_PAT = r"(?:does\s*not\s*(?:contain|have|include)|not\s*(?:like|contain|contains|have|include)|doesn['’]?t\s*(?:contain|have|include)|without|لا\s*يحتوي|مش\s*فيه|مافيهوش|بدون)"
+IS_EMPTY_PAT = r"(?:is\s*empty|is\s*null|=\s*''\s*|فارغ|خالي|NULL)"
+IS_NOT_EMPTY_PAT = r"(?:is\s*not\s*empty|is\s*not\s*null|<>\s*''\s*|مش\s*فاضي|غير\s*فارغ)"
 
 
 def _split_directives(comment: str) -> List[str]:
@@ -29,14 +29,6 @@ def _parse_list(val: str) -> List[str]:
     return [p.strip() for p in parts if p.strip()]
 
 
-def _alias_expand(col: str) -> List[str]:
-    aliases = (get_setting("DW_EQ_ALIAS_COLUMNS", scope="namespace") or {}).copy()
-    col_up = col.strip().upper()
-    if col_up in aliases:
-        return [c.strip() for c in aliases[col_up]]
-    return [col_up]
-
-
 def parse_rate_comment(comment: str) -> Dict[str, Any]:
     intent: Dict[str, Any] = {
         "fts_groups": [],
@@ -44,10 +36,10 @@ def parse_rate_comment(comment: str) -> Dict[str, Any]:
         "neq": {},
         "contains": {},
         "not_contains": {},
-        "empty": [],
         "empty_any": [],
         "empty_all": [],
         "not_empty": [],
+        "not_contains_tokens": {},
         "order_by": None,
     }
     parts = _split_directives(comment or "")
@@ -64,10 +56,9 @@ def parse_rate_comment(comment: str) -> Dict[str, Any]:
             m = re.match(r"\s*([^=]+?)\s*=\s*(.+)$", expr.strip(), flags=re.IGNORECASE)
             if m:
                 col, vals = m.group(1).strip(), _parse_list(m.group(2))
-                cols = _alias_expand(col)
-                for c in cols:
-                    intent["eq"].setdefault(c, [])
-                    intent["eq"][c].extend(vals)
+                col_key = col.strip().upper()
+                intent["eq"].setdefault(col_key, [])
+                intent["eq"][col_key].extend(vals)
             continue
         if low.startswith("neq:"):
             expr = p.split(":", 1)[1]
@@ -76,30 +67,33 @@ def parse_rate_comment(comment: str) -> Dict[str, Any]:
             )
             if m:
                 col, vals = m.group(1).strip(), _parse_list(m.group(2))
-                cols = _alias_expand(col)
-                for c in cols:
-                    intent["neq"].setdefault(c, [])
-                    intent["neq"][c].extend(vals)
+                col_key = col.strip().upper()
+                intent["neq"].setdefault(col_key, [])
+                intent["neq"][col_key].extend(vals)
             continue
         if low.startswith("contains:"):
             expr = p.split(":", 1)[1]
             m = re.match(r"\s*([^=]+?)\s*=\s*(.+)$", expr.strip(), flags=re.IGNORECASE)
             if m:
                 col, vals = m.group(1).strip(), _parse_list(m.group(2))
-                cols = _alias_expand(col)
-                for c in cols:
-                    intent["contains"].setdefault(c, [])
-                    intent["contains"][c].extend(vals)
+                col_key = col.strip().upper()
+                intent["contains"].setdefault(col_key, [])
+                intent["contains"][col_key].extend(vals)
             continue
         if low.startswith("not_contains:") or low.startswith("not-like:"):
             expr = p.split(":", 1)[1]
             m = re.match(r"\s*([^=]+?)\s*=\s*(.+)$", expr.strip(), flags=re.IGNORECASE)
             if m:
                 col, vals = m.group(1).strip(), _parse_list(m.group(2))
-                cols = _alias_expand(col)
-                for c in cols:
-                    intent["not_contains"].setdefault(c, [])
-                    intent["not_contains"][c].extend(vals)
+                col_key = col.strip().upper()
+                cleaned = [v for v in vals if v]
+                if cleaned:
+                    intent["not_contains"].setdefault(col_key, [])
+                    intent["not_contains"][col_key].extend(cleaned)
+                    tokens = [token.strip() for token in cleaned if token.strip()]
+                    if tokens:
+                        intent["not_contains_tokens"].setdefault(col_key, [])
+                        intent["not_contains_tokens"][col_key].extend(tokens)
             continue
         if low.startswith("empty_all:"):
             cols = [c.strip() for c in p.split(":", 1)[1].split(",") if c.strip()]
@@ -112,12 +106,12 @@ def parse_rate_comment(comment: str) -> Dict[str, Any]:
         if low.startswith("empty:"):
             cols = [c.strip() for c in p.split(":", 1)[1].split(",") if c.strip()]
             for c in cols:
-                intent["empty"].append([c.upper()])
+                intent["empty_any"].append([c.upper()])
             continue
         if low.startswith("not_empty:"):
             cols = [c.strip() for c in p.split(":", 1)[1].split(",") if c.strip()]
             for c in cols:
-                intent["not_empty"].append([c.upper()])
+                intent["not_empty"].append(c.upper())
             continue
         if low.startswith("order_by:"):
             intent["order_by"] = p.split(":", 1)[1].strip()
@@ -127,13 +121,13 @@ def parse_rate_comment(comment: str) -> Dict[str, Any]:
             r"^\s*([\w\.\s]+?)\s+" + IS_EMPTY_PAT + r"\s*$", p, flags=re.IGNORECASE
         )
         if m:
-            intent["empty"].append([m.group(1).strip().upper()])
+            intent["empty_any"].append([m.group(1).strip().upper()])
             continue
         m = re.search(
             r"^\s*([\w\.\s]+?)\s+" + IS_NOT_EMPTY_PAT + r"\s*$", p, flags=re.IGNORECASE
         )
         if m:
-            intent["not_empty"].append([m.group(1).strip().upper()])
+            intent["not_empty"].append(m.group(1).strip().upper())
             continue
 
         m = re.search(
@@ -141,9 +135,9 @@ def parse_rate_comment(comment: str) -> Dict[str, Any]:
         )
         if m:
             col, vals = m.group(1).strip(), _parse_list(m.group(2))
-            for c in _alias_expand(col):
-                intent["neq"].setdefault(c, [])
-                intent["neq"][c].extend(vals)
+            col_key = col.strip().upper()
+            intent["neq"].setdefault(col_key, [])
+            intent["neq"][col_key].extend(vals)
             continue
 
         m = re.search(
@@ -153,9 +147,15 @@ def parse_rate_comment(comment: str) -> Dict[str, Any]:
         )
         if m:
             col, vals = m.group(1).strip(), _parse_list(m.group(2))
-            for c in _alias_expand(col):
-                intent["not_contains"].setdefault(c, [])
-                intent["not_contains"][c].extend(vals)
+            col_key = col.strip().upper()
+            cleaned = [v for v in vals if v]
+            if cleaned:
+                intent["not_contains"].setdefault(col_key, [])
+                intent["not_contains"][col_key].extend(cleaned)
+                tokens = [token.strip() for token in cleaned if token.strip()]
+                if tokens:
+                    intent["not_contains_tokens"].setdefault(col_key, [])
+                    intent["not_contains_tokens"][col_key].extend(tokens)
             continue
 
     settings = get_setting("DW_FTS_COLUMNS", scope="namespace") or {}
