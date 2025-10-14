@@ -1,3 +1,4 @@
+from datetime import date, datetime
 from typing import Any, Dict, List, Optional
 
 from flask import Blueprint, current_app, jsonify, request
@@ -14,6 +15,7 @@ from apps.dw.search import (
 from apps.dw.search.filters import build_eq_where
 from apps.dw.fts_utils import DEFAULT_CONTRACT_FTS_COLUMNS
 from apps.dw.sql.builder import build_eq_boolean_groups_where, normalize_order_by
+from apps.dw.rate_dates import build_date_clause
 
 rate_bp = Blueprint("rate", __name__)
 
@@ -152,6 +154,17 @@ def rate():
         request_type_synonyms=request_type_synonyms,
     )
 
+    date_intent = None
+    date_sql: Optional[str] = None
+    date_binds: Dict[str, Any] = {}
+    date_debug: Dict[str, Any] = {}
+    try:
+        date_intent, date_sql, date_binds, date_debug = build_date_clause(
+            comment, effective_settings
+        )
+    except Exception:
+        date_intent, date_sql, date_binds, date_debug = None, None, {}, {}
+
     boolean_groups: List[Dict[str, Any]] = []
     if patch and isinstance(patch.get("boolean_groups"), list):
         for group in patch.get("boolean_groups") or []:
@@ -171,14 +184,27 @@ def rate():
         where_parts.append(bg_where)
     if eq_sql:
         where_parts.append(eq_sql)
+    if date_sql:
+        where_parts.append(f"({date_sql})")
 
     where_sql = f" WHERE {' AND '.join(where_parts)}" if where_parts else ""
+    has_explicit_sort = bool(
+        patch
+        and (
+            patch.get("sort_by") is not None
+            or patch.get("order_by") is not None
+            or patch.get("sort_desc") is not None
+        )
+    )
     order_clause = normalize_order_by(
         intent.get("order_by"), intent.get("sort_by"), intent.get("sort_desc")
     )
+    if date_intent and getattr(date_intent, "order_by_override", None) and not has_explicit_sort:
+        order_clause = date_intent.order_by_override
     final_sql = f'SELECT * FROM "{contract_table}"{where_sql} ORDER BY {order_clause}'
 
-    binds: Dict[str, str] = {}
+    binds: Dict[str, Any] = {}
+    binds.update(date_binds)
     binds.update(fts_binds)
     binds.update(bg_binds)
     binds.update(eq_binds)
@@ -198,6 +224,29 @@ def rate():
     except Exception:
         legacy_sql = None
         legacy_binds = {}
+
+    def _serialize_bind(value: Any) -> Any:
+        if isinstance(value, (date, datetime)):
+            return value.isoformat()
+        return value
+
+    date_debug_payload: Optional[Dict[str, Any]] = None
+    if date_sql and date_intent:
+        date_debug_payload = {
+            "mode": getattr(date_intent, "mode", None),
+            "column": getattr(date_intent, "column", None),
+            "sql": date_sql,
+            "binds": {k: _serialize_bind(v) for k, v in date_binds.items()},
+            "input": getattr(date_intent, "input_text", None),
+            "order_override": getattr(date_intent, "order_by_override", None),
+            "raw": date_debug,
+        }
+    elif date_sql:
+        date_debug_payload = {
+            "sql": date_sql,
+            "binds": {k: _serialize_bind(v) for k, v in date_binds.items()},
+            "raw": date_debug,
+        }
 
     debug_payload = {
         "intent": intent,
@@ -230,6 +279,8 @@ def rate():
         },
         "final_sql": {"size": len(final_sql), "sql": final_sql},
     }
+    if date_debug_payload:
+        debug_payload["date_window"] = date_debug_payload
     if legacy_sql:
         debug_payload["legacy_sql"] = {
             "sql": legacy_sql,
