@@ -14,6 +14,12 @@ import re
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Tuple
 
+from apps.dw.rate_time import (
+    DateWindow as TimeDateWindow,
+    RateIntent as TimeRateIntent,
+    build_rate_sql as build_rate_sql_time,
+)
+
 
 # ---------------------------------------------------------------------------
 # Intent model
@@ -39,6 +45,7 @@ class RateIntent:
     when_kind: Optional[str] = None  # requested | active | expiring
     date_start: Optional[dt.date] = None
     date_end: Optional[dt.date] = None
+    raw_comment: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -260,6 +267,7 @@ def parse_rate_comment(comment: str, settings: Dict[str, object] | None = None) 
 
     text = (comment or "").strip()
     intent = RateIntent()
+    intent.raw_comment = comment or ""
 
     for match in re.finditer(r"fts:\s*([^;]+)", text, flags=re.IGNORECASE):
         group = match.group(1)
@@ -348,12 +356,128 @@ def parse_rate_comment(comment: str, settings: Dict[str, object] | None = None) 
 
 
 # ---------------------------------------------------------------------------
+# New builder bridge (apps.dw.rate_time)
+# ---------------------------------------------------------------------------
+
+
+def _can_use_time_builder(intent: RateIntent, settings: Dict[str, object]) -> bool:
+    if intent.numeric:
+        return False
+    if intent.limit is not None or intent.offset is not None:
+        return False
+    if any((column or "").strip().upper() == "REQUEST_TYPE" for column, _ in intent.eq_filters):
+        return False
+    select_clause = settings.get("DW_SELECT_ALL_DEFAULT") if isinstance(settings, dict) else None
+    if isinstance(select_clause, str) and select_clause.strip():
+        return False
+    return True
+
+
+def _translate_to_time_intent(intent: RateIntent, settings: Dict[str, object]) -> TimeRateIntent:
+    table = str(settings.get("DW_CONTRACT_TABLE", "Contract") or "Contract")
+    time_intent = TimeRateIntent(table=table)
+
+    def _extend_dict(target: Dict[str, List[str]], column: str, values: List[str]) -> None:
+        col = column.strip().upper()
+        if not col:
+            return
+        bucket = target.setdefault(col, [])
+        for value in values:
+            if value and str(value).strip():
+                bucket.append(str(value).strip())
+
+    for column, values in intent.eq_filters:
+        _extend_dict(time_intent.eq_filters, column, values)
+
+    for column, values in intent.neq_filters:
+        _extend_dict(time_intent.neq_filters, column, values)
+
+    for column, values in intent.contains:
+        _extend_dict(time_intent.contains, column, values)
+
+    for column, values in intent.not_contains:
+        _extend_dict(time_intent.not_contains, column, values)
+
+    if intent.empty_all:
+        seen: List[str] = []
+        for group in intent.empty_all:
+            for column in group:
+                col = column.strip().upper()
+                if col and col not in seen:
+                    seen.append(col)
+        time_intent.empty_all = seen
+
+    if intent.empty_any:
+        seen: List[str] = []
+        for group in intent.empty_any:
+            for column in group:
+                col = column.strip().upper()
+                if col and col not in seen:
+                    seen.append(col)
+        time_intent.empty_any = seen
+
+    if intent.not_empty:
+        time_intent.not_empty = [col.strip().upper() for col in intent.not_empty if col and col.strip()]
+
+    if intent.fts_groups:
+        time_intent.fts_groups = [
+            [token.strip() for token in group if token and token.strip()]
+            for group in intent.fts_groups
+            if group
+        ]
+
+    if intent.order_by:
+        order_parts: List[str] = []
+        for column, direction in intent.order_by:
+            if not column or not column.strip():
+                continue
+            dir_token = "ASC" if str(direction).lower().startswith("asc") else "DESC"
+            order_parts.append(f"{column.strip().upper()} {dir_token}")
+        if order_parts:
+            time_intent.order_by = ", ".join(order_parts)
+
+    if not time_intent.order_by:
+        default_order = str(settings.get("DW_DATE_COLUMN", "REQUEST_DATE") or "REQUEST_DATE").upper()
+        time_intent.order_by = f"{default_order} DESC"
+
+    if intent.date_start and intent.date_end:
+        kind = intent.when_kind or "active"
+        if kind == "requested":
+            mapped = "REQUEST"
+        elif kind == "expiring":
+            mapped = "END_ONLY"
+        else:
+            mapped = "OVERLAP"
+        time_intent.date_window = TimeDateWindow(kind=mapped, start=intent.date_start, end=intent.date_end)
+
+    return time_intent
+
+
+def build_sql(intent: RateIntent, settings: Dict[str, object]) -> Tuple[str, Dict[str, object]]:
+    """Return an ``(sql, binds)`` pair, preferring the new rate_time builder when possible."""
+
+    if isinstance(settings, dict) and _can_use_time_builder(intent, settings):
+        try:
+            time_intent = _translate_to_time_intent(intent, settings)
+            settings_payload = dict(settings)
+            raw_comment = intent.raw_comment or settings_payload.get("_raw_comment", "")
+            settings_payload["_raw_comment"] = raw_comment
+            sql, binds, _debug = build_rate_sql_time(time_intent, settings_payload)
+            return sql, binds
+        except Exception:
+            # Fallback to the legacy builder if translation or build fails.
+            pass
+
+    return _build_sql_legacy(intent, settings)
+
+
+# ---------------------------------------------------------------------------
 # SQL builder
 # ---------------------------------------------------------------------------
 
 
-def build_sql(intent: RateIntent, settings: Dict[str, object]) -> Tuple[str, Dict[str, object]]:
-    """Return an ``(sql, binds)`` pair for the provided intent."""
+def _build_sql_legacy(intent: RateIntent, settings: Dict[str, object]) -> Tuple[str, Dict[str, object]]:
+    """Legacy SQL builder maintained for backwards compatibility."""
 
     table = str(settings.get("DW_CONTRACT_TABLE", "Contract") or "Contract")
 
