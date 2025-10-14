@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, Optional, Tuple
 
+from apps.dw.rate.date_windows import compile_date_sql, detect_date_window
+
 try:  # Optional dependency used elsewhere in the DW stack
     import dateparser  # type: ignore
 except Exception:  # pragma: no cover - optional dependency may not exist
@@ -264,6 +266,45 @@ def build_date_clause(
 
     comment = comment or ""
     settings = settings or {}
+
+    # Try the new lightweight detector first (supports EN/AR free-form text).
+    win = detect_date_window(comment)
+    if win and win.start and win.end:
+        require_both = bool(int(settings.get("DW_OVERLAP_REQUIRE_BOTH_DATES", 1) or 0))
+        strict_overlap = bool(int(settings.get("DW_OVERLAP_STRICT", 1) or 0))
+        sql_fragment, binds, suggested_order = compile_date_sql(
+            win,
+            overlap_require_both=require_both,
+            overlap_strict=strict_overlap,
+        )
+        if sql_fragment:
+            column = win.col
+            if not column:
+                if win.kind == "REQUEST":
+                    column = "REQUEST_DATE"
+                elif win.kind == "END_ONLY":
+                    column = "END_DATE"
+            order_override = None
+            if suggested_order and suggested_order != "REQUEST_DATE DESC":
+                order_override = suggested_order
+            intent = DateIntent(
+                mode=win.kind,
+                column=column,
+                start=win.start,
+                end=win.end,
+                input_text=comment,
+                order_by_override=order_override,
+            )
+            debug = {
+                "detected": win.detected,
+                "kind": win.kind,
+                "col": win.col or column,
+                "start": win.start.isoformat(),
+                "end": win.end.isoformat(),
+                "suggested_order_by": suggested_order,
+            }
+            return intent, sql_fragment, binds, debug
+
     parts = _split_parts(comment)
 
     explicit_key: Optional[str] = None
