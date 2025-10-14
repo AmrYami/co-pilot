@@ -1,13 +1,16 @@
 from typing import Dict, Any, Iterable, Optional, Sequence, Tuple, List
 import logging
+import os
 import re
-from datetime import date
+from datetime import date, datetime
 from dateutil.relativedelta import relativedelta
 
 from apps.dw.patchlib.settings_util import get_fts_engine, get_fts_columns
 from apps.dw.patchlib.fts_builder import build_like_fts
 from apps.dw.common.eq_aliases import resolve_eq_targets
 from apps.dw.fts import FTSEngine
+from apps.dw.rate.time_parser import parse_time_windows
+from apps.dw.rate.sql_builder import apply_time_windows, choose_order_by
 
 
 LOGGER = logging.getLogger("dw.sql_builder")
@@ -989,6 +992,25 @@ def _rate_build_fetch(top_n: Any) -> str:
     return f" FETCH FIRST {n} ROWS ONLY" if n else ""
 
 
+def _env_flag_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return int(str(raw))
+    except ValueError:
+        lowered = str(raw).strip().lower()
+        if lowered in {"true", "t", "yes", "y"}:
+            return 1
+        if lowered in {"false", "f", "no", "n"}:
+            return 0
+        return default
+
+
+def _trunc_today() -> date:
+    return datetime.utcnow().date()
+
+
 def build_rate_sql(intent: Dict[str, Any], enum_syn: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
     binds: Dict[str, Any] = {}
     select, group_clause, alias = _rate_build_group_select(intent.get("group_by"), bool(intent.get("gross")))
@@ -999,13 +1021,21 @@ def build_rate_sql(intent: Dict[str, Any], enum_syn: Dict[str, Any]) -> Tuple[st
     fts_clause, binds = _rate_build_fts_where(intent.get("fts") or {}, binds)
     if fts_clause:
         where_parts.append(fts_clause)
+    comment = str(intent.get("comment") or "")
+    windows = parse_time_windows(comment, today=_trunc_today())
+    flags = {"DW_OVERLAP_REQUIRE_BOTH_DATES": _env_flag_int("DW_OVERLAP_REQUIRE_BOTH_DATES", 1)}
+    apply_time_windows(where_parts, binds, windows, flags)
     where_sql = " WHERE " + " AND ".join(where_parts) if where_parts else ""
     sort_by = intent.get("sort_by")
     sort_desc = bool(intent.get("sort_desc"))
     if intent.get("group_by") and not sort_by:
         sort_by = alias
         sort_desc = True
-    order_sql = _rate_build_order_by(sort_by or "REQUEST_DATE", sort_desc if sort_by else True)
+    user_order_clause = None
+    if sort_by:
+        user_order_clause = _rate_build_order_by(sort_by, sort_desc).strip()
+    final_order = choose_order_by(user_order_clause, windows)
+    order_sql = f" {final_order}" if final_order else ""
     fetch_sql = _rate_build_fetch(intent.get("top_n"))
     sql = f"{select} FROM \"Contract\"{where_sql}{group_clause}{order_sql}{fetch_sql}"
     return sql, binds

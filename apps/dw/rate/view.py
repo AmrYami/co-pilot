@@ -111,6 +111,8 @@ def rate():
             "gross": None,
         }
 
+    intent["comment"] = comment
+
     intent_fts = intent.get("fts", {})
     intent_fts["columns"] = search_columns
     intent_fts["engine"] = engine_name
