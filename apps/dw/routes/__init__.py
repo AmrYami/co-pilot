@@ -11,7 +11,7 @@ from typing import Any, Dict, Iterable, List, Tuple
 from flask import Blueprint, jsonify, request
 from sqlalchemy import text
 
-from apps.dw.db import fetch_rows, get_memory_session
+from apps.dw.db import fetch_rows, get_memory_engine, get_memory_session
 from apps.dw.eq_parser import extract_eq_filters_from_natural_text, strip_eq_from_text
 from apps.dw.search import resolve_engine
 from apps.dw.settings_access import DWSettings
@@ -79,7 +79,7 @@ def persist_feedback(
 ) -> None:
     """Upsert feedback rows in dw_feedback while preserving moderation status."""
 
-    query = text(
+    upsert_stmt = text(
         """
         INSERT INTO dw_feedback (
             inquiry_id, auth_email, rating, comment,
@@ -88,7 +88,7 @@ def persist_feedback(
         VALUES (
             :inquiry_id, :auth_email, :rating, :comment,
             CAST(:intent_json AS JSONB), :resolved_sql, CAST(:binds_json AS JSONB),
-            'pending', now(), now()
+            :status, now(), now()
         )
         ON CONFLICT (inquiry_id) DO UPDATE SET
             rating       = EXCLUDED.rating,
@@ -99,10 +99,26 @@ def persist_feedback(
             status       = CASE
                              WHEN dw_feedback.status IN ('approved', 'rejected')
                                THEN dw_feedback.status
+                             WHEN :status = 'auto_approved'
+                               THEN 'auto_approved'
                              ELSE 'pending'
                            END,
             updated_at   = now()
         RETURNING id;
+        """
+    )
+
+    insert_stmt = text(
+        """
+        INSERT INTO dw_feedback (
+            inquiry_id, auth_email, rating, comment,
+            intent_json, resolved_sql, binds_json, status, created_at, updated_at
+        )
+        VALUES (
+            :inquiry_id, :auth_email, :rating, :comment,
+            CAST(:intent_json AS JSONB), :resolved_sql, CAST(:binds_json AS JSONB),
+            :status, now(), now()
+        );
         """
     )
 
@@ -122,19 +138,56 @@ def persist_feedback(
             {"inq": inquiry_id},
         ).mappings().first()
         auth_email = ((row or {}).get("auth_email") or "").strip().lower()
-    db_session.execute(
-        query,
-        {
-            "inquiry_id": inquiry_id,
-            "auth_email": auth_email,
-            "rating": int(rating or 0),
-            "comment": (comment or "").strip(),
-            "intent_json": json.dumps(intent or {}, default=str, ensure_ascii=False),
-            "resolved_sql": resolved_sql or "",
-            "binds_json": json.dumps(binds_json or {}, default=str, ensure_ascii=False),
-        },
-    )
-    db_session.commit()
+    if not auth_email:
+        try:
+            auth_email = (
+                get_setting(
+                    "AUTH_EMAIL",
+                    default="",
+                    scope="global",
+                    namespace="global",
+                )
+                or ""
+            ).strip().lower()
+        except Exception:  # pragma: no cover - settings backend optional in tests
+            auth_email = ""
+
+    rating_value = int(rating or 0)
+    status = "pending" if rating_value <= 3 else "auto_approved"
+
+    payload = {
+        "inquiry_id": inquiry_id,
+        "auth_email": auth_email,
+        "rating": rating_value,
+        "comment": (comment or "").strip(),
+        "intent_json": json.dumps(intent or {}, default=str, ensure_ascii=False),
+        "resolved_sql": resolved_sql or "",
+        "binds_json": json.dumps(binds_json or {}, default=str, ensure_ascii=False),
+        "status": status,
+    }
+
+    try:
+        engine = db_session.get_bind() if hasattr(db_session, "get_bind") else None
+    except Exception:  # pragma: no cover - very defensive: SQLAlchemy session quirks
+        engine = None
+    if engine is None:
+        engine = get_memory_engine()
+
+    try:
+        with engine.begin() as conn:
+            conn.execute(upsert_stmt, payload)
+        logger.info({"event": "rate.feedback.persist_ok", "inquiry_id": inquiry_id, "mode": "upsert"})
+    except Exception as exc:  # pragma: no cover - fallback path only exercised on failure
+        logger.warning(
+            {
+                "event": "rate.feedback.upsert_failed_fallback_insert",
+                "inquiry_id": inquiry_id,
+                "error": str(exc),
+            }
+        )
+        with engine.begin() as conn:
+            conn.execute(insert_stmt, payload)
+        logger.info({"event": "rate.feedback.persist_ok", "inquiry_id": inquiry_id, "mode": "insert"})
 
 def _settings_dict() -> Dict[str, Any]:
     keys = [
