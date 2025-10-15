@@ -11,10 +11,37 @@ from sqlalchemy import text
 from sqlalchemy.engine import Connection
 
 from apps.dw.db import get_memory_engine
+from apps.dw.feedback import normalize_status
 
 bp = Blueprint("dw_admin", __name__)
 
 eng = get_memory_engine()
+
+
+APPROVE_FEEDBACK_SQL = text(
+    """
+    UPDATE dw_feedback
+       SET status='approved',
+           approver_email=:admin_email,
+           admin_note=:note,
+           updated_at=NOW()
+     WHERE id = ANY(:ids)
+    RETURNING id
+    """
+)
+
+
+REJECT_FEEDBACK_SQL = text(
+    """
+    UPDATE dw_feedback
+       SET status='rejected',
+           approver_email=:admin_email,
+           rejected_reason=:reason,
+           updated_at=NOW()
+     WHERE id = ANY(:ids)
+    RETURNING id
+    """
+)
 
 
 def _get_admin_emails(conn: Connection) -> set[str]:
@@ -51,9 +78,12 @@ def _require_admin(conn: Optional[Connection] = None) -> str:
     """Ensure the requester is an admin and return the normalized email."""
     body = request.get_json(silent=True) if request.is_json else None
     auth_email = (
-        request.headers.get("X-Auth-Email")
+        request.headers.get("X-Admin-Email")
+        or request.headers.get("X-Auth-Email")
+        or request.args.get("admin_email")
         or request.args.get("auth_email")
         or (body.get("auth_email") if isinstance(body, dict) else None)
+        or (body.get("admin_email") if isinstance(body, dict) else None)
         or ""
     ).strip()
     if not auth_email:
@@ -67,7 +97,7 @@ def _require_admin(conn: Optional[Connection] = None) -> str:
 
     if auth_email.lower() not in admins:
         abort(403, description="Not in ADMIN_EMAILS")
-    return auth_email
+    return auth_email.lower()
 
 
 def _row_to_dict(row):
@@ -76,10 +106,44 @@ def _row_to_dict(row):
     return dict(row)
 
 
+def _coerce_positive_int(value, default):
+    try:
+        result = int(value)
+        if result < 0:
+            return default
+        return result
+    except (TypeError, ValueError):
+        return default
+
+
+def _extract_ids(payload) -> list[int]:
+    if isinstance(payload, dict):
+        raw_ids = payload.get("ids")
+        if raw_ids is None:
+            single = payload.get("id")
+            raw_ids = [single] if single is not None else []
+    else:
+        raw_ids = []
+
+    if not isinstance(raw_ids, (list, tuple, set)):
+        raw_ids = [raw_ids]
+
+    ids: list[int] = []
+    for raw in raw_ids:
+        try:
+            if raw is None:
+                continue
+            ids.append(int(raw))
+        except (TypeError, ValueError):
+            continue
+    return ids
+
+
 @bp.get("/feedback")
 def list_feedback():
-    status = (request.args.get("status") or "pending").strip().lower()
-    limit = int(request.args.get("limit") or 50)
+    status = normalize_status(request.args.get("status"), default="")
+    limit = _coerce_positive_int(request.args.get("limit"), 50)
+    offset = _coerce_positive_int(request.args.get("offset"), 0)
     with eng.begin() as conn:
         _require_admin(conn)
         rows = conn.execute(
@@ -102,14 +166,47 @@ def list_feedback():
                   f.updated_at
                 FROM dw_feedback f
                 LEFT JOIN mem_inquiries i ON i.id = f.inquiry_id
-                WHERE (:s = '' OR LOWER(COALESCE(f.status,'')) = :s)
+                WHERE (:status = '' OR LOWER(COALESCE(f.status,'')) = :status)
                 ORDER BY f.created_at DESC
-                LIMIT :lim
+                LIMIT :limit OFFSET :offset
                 """
             ),
-            {"s": status, "lim": limit},
-        ).all()
-    return jsonify([_row_to_dict(r) for r in rows])
+            {"status": status, "limit": limit, "offset": offset},
+        ).mappings().all()
+    dict_rows = [_row_to_dict(r) for r in rows]
+    return jsonify({"ok": True, "rows": dict_rows, "count": len(dict_rows)})
+
+
+@bp.post("/feedback/approve")
+def approve_feedback_bulk():
+    payload = request.get_json(force=True) or {}
+    ids = _extract_ids(payload)
+    if not ids:
+        abort(400, description="No feedback ids supplied")
+    note = (payload.get("admin_note") or "").strip()
+    with eng.begin() as conn:
+        admin_email = _require_admin(conn)
+        result = conn.execute(
+            APPROVE_FEEDBACK_SQL,
+            {"ids": ids, "admin_email": admin_email, "note": note},
+        ).mappings().all()
+    return jsonify({"ok": True, "approved": [row["id"] for row in result]})
+
+
+@bp.post("/feedback/reject")
+def reject_feedback_bulk():
+    payload = request.get_json(force=True) or {}
+    ids = _extract_ids(payload)
+    if not ids:
+        abort(400, description="No feedback ids supplied")
+    reason = (payload.get("reason") or "").strip()
+    with eng.begin() as conn:
+        admin_email = _require_admin(conn)
+        result = conn.execute(
+            REJECT_FEEDBACK_SQL,
+            {"ids": ids, "admin_email": admin_email, "reason": reason},
+        ).mappings().all()
+    return jsonify({"ok": True, "rejected": [row["id"] for row in result]})
 
 
 @bp.get("/feedback/<int:fid>")
@@ -154,19 +251,10 @@ def approve_feedback(fid: int):
     with eng.begin() as conn:
         approver = _require_admin(conn)
         result = conn.execute(
-            text(
-                """
-                UPDATE dw_feedback
-                   SET status='approved',
-                       approver_email=:appr,
-                       admin_note=:note,
-                       updated_at=NOW()
-                 WHERE id=:id
-                """
-            ),
-            {"appr": approver, "note": admin_note, "id": fid},
-        )
-        if result.rowcount == 0:
+            APPROVE_FEEDBACK_SQL,
+            {"ids": [fid], "admin_email": approver, "note": admin_note},
+        ).mappings().all()
+        if not result:
             abort(404, description="feedback not found")
 
         if apply_patch:
@@ -208,19 +296,10 @@ def reject_feedback(fid: int):
     with eng.begin() as conn:
         approver = _require_admin(conn)
         result = conn.execute(
-            text(
-                """
-                UPDATE dw_feedback
-                   SET status='rejected',
-                       approver_email=:appr,
-                       rejected_reason=:rsn,
-                       updated_at=NOW()
-                 WHERE id=:id
-                """
-            ),
-            {"appr": approver, "rsn": reason, "id": fid},
-        )
-        if result.rowcount == 0:
+            REJECT_FEEDBACK_SQL,
+            {"ids": [fid], "admin_email": approver, "reason": reason},
+        ).mappings().all()
+        if not result:
             abort(404, description="feedback not found")
     return jsonify({"ok": True, "id": fid, "status": "rejected"})
 
