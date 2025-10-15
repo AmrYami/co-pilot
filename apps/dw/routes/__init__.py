@@ -8,7 +8,8 @@ import re
 import uuid
 from typing import Any, Dict, Iterable, List, Tuple
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, jsonify, request, current_app
+from sqlalchemy import text
 
 from apps.dw.db import fetch_rows
 from apps.dw.eq_parser import extract_eq_filters_from_natural_text, strip_eq_from_text
@@ -414,6 +415,13 @@ def rate() -> Any:
     payload = request.get_json(force=True, silent=True) or {}
     inquiry_id = payload.get("inquiry_id")
     comment = (payload.get("comment") or "").strip()
+    rating = payload.get("rating")
+    auth_email = (
+        payload.get("auth_email")
+        or request.headers.get("X-Auth-Email")
+        or ""
+    ).strip()
+    auth_email = auth_email.lower() or None
 
     settings = _load_dw_settings()
     raw_settings: Dict[str, Any] = dict(settings.global_ns)
@@ -552,6 +560,38 @@ def rate() -> Any:
         "builder_notes": builder_notes,
         "final_sql": {"sql": final_sql_to_run, "size": len(final_sql_to_run)},
     }
+
+    mem_engine = current_app.config.get("MEM_ENGINE")
+    if mem_engine is None:
+        pipeline = current_app.config.get("PIPELINE") or current_app.config.get("pipeline")
+        if pipeline is not None:
+            mem_engine = getattr(pipeline, "mem_engine", None)
+
+    if mem_engine is not None:
+        try:
+            intent_payload = json.dumps(intent, default=str)
+            binds_payload = json.dumps(binds, default=str)
+            with mem_engine.begin() as cn:
+                cn.execute(
+                    text(
+                        """
+              INSERT INTO dw_feedback(inquiry_id, auth_email, rating, comment,
+                                      intent_json, binds_json, resolved_sql, status, created_at)
+              VALUES(:inq, :email, :rating, :comment, :intent::jsonb, :binds::jsonb, :sql, 'pending', NOW())
+            """
+                    ),
+                    {
+                        "inq": inquiry_id,
+                        "email": auth_email,
+                        "rating": rating,
+                        "comment": comment or None,
+                        "intent": intent_payload,
+                        "binds": binds_payload,
+                        "sql": final_sql_to_run,
+                    },
+                )
+        except Exception:  # pragma: no cover - defensive logging only
+            logger.warning("failed to record dw_feedback", exc_info=True)
 
     meta = {
         "attempt_no": 1,
