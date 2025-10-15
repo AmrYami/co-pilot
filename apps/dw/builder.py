@@ -1,14 +1,69 @@
 from __future__ import annotations
-from __future__ import annotations
 
 import re
 from typing import Any, Dict, List, Tuple
+
+from apps.dw.filters import build_boolean_groups_where
+from apps.dw.fts import build_fts_clause
 
 from .intent import NLIntent
 from .sql_builders import window_predicate
 from .utils import env_flag
 
 TABLE = '"Contract"'
+
+
+def _cfg_get(cfg: Any, key: str, default: Any = None) -> Any:
+    if isinstance(cfg, dict):
+        return cfg.get(key, default)
+    getter = getattr(cfg, "get", None)
+    if callable(getter):
+        try:
+            value = getter(key, default)
+        except TypeError:
+            value = getter(key)
+        if value is not None:
+            return value
+    return default
+
+
+def assemble_query(intent: dict, cfg: Any) -> dict:
+    table = _cfg_get(cfg, "DW_CONTRACT_TABLE", "Contract")
+    sql = f'SELECT * FROM "{table}"'
+    binds: Dict[str, Any] = {}
+    where_parts: List[str] = []
+
+    fts_sql, fts_binds, _ = build_fts_clause(
+        table,
+        intent.get("fts_groups", []),
+        intent.get("fts_operator", "OR"),
+        cfg,
+    )
+    if fts_sql:
+        where_parts.append(fts_sql)
+        binds.update(fts_binds)
+
+    bg_where, bg_binds = build_boolean_groups_where(intent.get("boolean_groups") or [], cfg)
+    if bg_where:
+        where_parts.append(bg_where)
+        binds.update(bg_binds)
+
+    if where_parts:
+        sql += "\nWHERE " + " AND ".join(where_parts)
+
+    date_column = _cfg_get(cfg, "DW_DATE_COLUMN", "REQUEST_DATE")
+    sort_by = intent.get("sort_by") or date_column
+    sort_desc = intent.get("sort_desc")
+    if sort_desc is None:
+        sort_desc = True
+    sort_by = str(sort_by or "").strip()
+    if not sort_by:
+        sort_by = str(date_column or "REQUEST_DATE").strip()
+    sort_by = sort_by.replace("_DESC", "")
+    direction = " DESC" if sort_desc else ""
+    sql += f"\nORDER BY {sort_by}{direction}"
+
+    return {"sql": sql, "binds": binds}
 
 
 def _gross_expr() -> str:

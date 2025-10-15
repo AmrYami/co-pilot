@@ -1,0 +1,53 @@
+namespace: dw::common
+
+cases:
+  - name: fts_only_it_or_home_care
+    rate_comment: "fts: it or home care"
+    expect:
+      sql_contains:
+        - "LIKE UPPER(:fts_0)"
+        - "LIKE UPPER(:fts_1)"
+      binds:
+        fts_0: "%IT%"
+        fts_1: "%HOME CARE%"
+      rows_min: 1
+
+  - name: eq_request_type_synonyms
+    rate_comment: "eq: REQUEST_TYPE = Renewal;"
+    expect:
+      sql_contains:
+        - "UPPER(TRIM(REQUEST_TYPE)) IN"
+      binds_subset:
+        eq_0: "RENEWAL"
+        eq_1: "RENEW"
+        eq_2: "RENEW CONTRACT"
+        eq_3: "RENEWED"
+        eq_4: "EXTENSION"
+      rows_min: 1
+
+  - name: eq_alias_department
+    rate_comment: "eq: department = AL FARABI or SUPPORT SERVICES;"
+    expect:
+      sql_contains:
+        - "DEPARTMENT_1"
+        - "OWNER_DEPARTMENT"
+      binds_subset:
+        eq_0: "AL FARABI"
+        eq_1: "SUPPORT SERVICES"
+
+  - name: eq_alias_stakeholder
+    rate_comment: "eq: stakeholder = Amr Taher A Maghrabi or Abdulellah Mazen Fakeeh;"
+    expect:
+      sql_contains:
+        - "CONTRACT_STAKEHOLDER_1"
+        - "CONTRACT_STAKEHOLDER_8"
+      binds_subset:
+        eq_0: "AMR TAHER A MAGHRABI"
+        eq_1: "ABDULELLAH MAZEN FAKEEH"
+
+  - name: mix_fts_eq_order
+    rate_comment: "fts: it or home care; eq: REQUEST_TYPE = renewal; order_by: REQUEST_DATE desc;"
+    expect:
+      sql_contains:
+        - "ORDER BY REQUEST_DATE desc"
+      rows_min: 1

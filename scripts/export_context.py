@@ -8,7 +8,7 @@ Usage:
 from __future__ import annotations
 import os, json, argparse
 from typing import Optional, Iterable, Set
-from sqlalchemy import create_engine, text, inspect
+from sqlalchemy import create_engine, text
 try:
     # Optional: load .env if present
     from dotenv import load_dotenv  # type: ignore
@@ -24,11 +24,20 @@ def _pick(cols: Iterable[str], *candidates: str) -> Optional[str]:
     return None
 
 def table_exists(engine, name: str, schema: str | None = None) -> bool:
-    insp = inspect(engine)
-    for cand in (name, name.lower(), name.upper()):
-        if insp.has_table(cand, schema=schema):
-            return True
-    return False
+    """Check table existence using ``information_schema`` for 2.x engines."""
+
+    try:
+        clauses = ["LOWER(table_name) = LOWER(:t)"]
+        params = {"t": name}
+        if schema:
+            clauses.append("LOWER(table_schema) = LOWER(:s)")
+            params["s"] = schema
+        sql = "SELECT 1 FROM information_schema.tables WHERE " + " AND ".join(clauses) + " LIMIT 1"
+        with engine.connect() as conn:
+            result = conn.execute(text(sql), params).first()
+            return result is not None
+    except Exception:
+        return False
 
 def table_columns(engine, name: str, schema: str | None = None) -> Set[str]:
     try:
@@ -39,8 +48,8 @@ def table_columns(engine, name: str, schema: str | None = None) -> Set[str]:
                 clauses.append("lower(table_schema)=lower(:s)")
                 params["s"] = schema
             sql = f"SELECT column_name FROM information_schema.columns WHERE {' AND '.join(clauses)}"
-            rows = conn.execute(text(sql), params).fetchall()
-            return {r[0] for r in rows}
+            rows = conn.execute(text(sql), params or {}).mappings().all()
+            return {row.get("column_name") for row in rows if row.get("column_name")}
     except Exception:
         return set()
 
@@ -59,16 +68,25 @@ def main():
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
 
-    # Read from env (works with .env). Keep default for local dev.
-    url = os.getenv("MEMORY_DB_URL", "postgresql+psycopg2://postgres:123456789@localhost/copilot_mem_dev")
+    # Read from env (works with .env); write placeholders if missing.
+    url = os.getenv("MEMORY_DB_URL", "").strip()
     if not url:
-        for f in ("settings_export.json","examples_export.json","rules_export.json","patches_export.json","runs_metrics_24h.json"):
+        for f in (
+            "settings_export.json",
+            "examples_export.json",
+            "rules_export.json",
+            "patches_export.json",
+            "runs_metrics_24h.json",
+        ):
             with open(os.path.join(args.out, f), "w") as fp:
-                json.dump({"warning":"MEMORY_DB_URL not set"}, fp, indent=2)
+                json.dump({"warning": "MEMORY_DB_URL not set"}, fp, indent=2)
         print("MEMORY_DB_URL not set; wrote placeholders to", args.out)
         return 0
 
     eng = create_engine(url, pool_pre_ping=True)  # 2.0-safe
+
+    def _has_column(columns: Set[str], name: str) -> bool:
+        return any((col or "").lower() == name.lower() for col in columns)
 
     # settings
     settings = dump(eng, """
@@ -80,18 +98,29 @@ def main():
     with open(os.path.join(args.out, "settings_export.json"), "w") as fp:
       json.dump(settings, fp, indent=2, default=str)
 
-    # examples (column names vary across branches: question_norm|q_norm, sql|sql_text|final_sql, created_at|updated_at)
     if table_exists(eng, "dw_examples"):
         ex_cols = table_columns(eng, "dw_examples")
-        q_col    = _pick(ex_cols, "question_norm", "q_norm", "question") or "question_norm"
-        sql_col  = _pick(ex_cols, "sql", "sql_text", "final_sql") or "sql"
-        succ_col = _pick(ex_cols, "success_count", "used_count", "usage_count")
-        ts_col   = _pick(ex_cols, "updated_at", "created_at", "ts", "timestamp")
-        select_list = [f"{q_col} AS question", f"{sql_col} AS sql"]
-        if succ_col: select_list.append(f"{succ_col} AS success_count")
-        if ts_col:   select_list.append(f"{ts_col} AS created_at")
-        order_by = f" ORDER BY {ts_col} DESC" if ts_col else ""
-        examples = dump(eng, f"SELECT {', '.join(select_list)} FROM dw_examples{order_by} LIMIT 1000")
+        order_col = None
+        timestamp_expr = "NULL AS updated_at"
+        if _has_column(ex_cols, "updated_at"):
+            order_col = "updated_at"
+            timestamp_expr = "updated_at AS updated_at"
+        elif _has_column(ex_cols, "created_at"):
+            order_col = "created_at"
+            timestamp_expr = "created_at AS updated_at"
+        query = [
+            "SELECT q_norm AS question,",
+            "       sql AS sql,",
+            "       success_count,",
+            f"       {timestamp_expr}",
+            "  FROM dw_examples",
+        ]
+        if order_col:
+            query.append(f" ORDER BY {order_col} DESC")
+        else:
+            query.append(" ORDER BY q_norm ASC")
+        query.append(" LIMIT 1000")
+        examples = dump(eng, "\n".join(query))
     else:
         examples = {"warning":"dw_examples not found"}
     with open(os.path.join(args.out, "examples_export.json"), "w") as fp:

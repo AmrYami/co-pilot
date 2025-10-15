@@ -87,6 +87,9 @@ from .contracts.fts import extract_fts_terms, build_fts_where_groups
 from .contracts.filters import parse_explicit_filters
 from .contracts.contract_planner import plan_contract_query
 from .rating import rate_bp
+from .tests.rate_suite import rate_tests_bp
+from .tests.routes import tests_bp as rate_builder_tests_bp
+from .tests.golden_runner_rate import golden_rate_bp
 
 LOGGER = logging.getLogger("dw.app")
 
@@ -94,6 +97,9 @@ LOGGER = logging.getLogger("dw.app")
 dw_bp = Blueprint("dw", __name__)
 init_db()
 dw_bp.register_blueprint(rate_bp, url_prefix="")
+dw_bp.register_blueprint(rate_tests_bp, url_prefix="/tests")
+dw_bp.register_blueprint(rate_builder_tests_bp, url_prefix="")
+dw_bp.register_blueprint(golden_rate_bp, url_prefix="")
 
 
 def _ns() -> str:
@@ -248,7 +254,9 @@ def _respond(payload: Dict[str, Any], response: Dict[str, Any]):
         pass
 
     debug_section = response.setdefault("debug", {}) if isinstance(response, dict) else {}
+    precomputed_boolean_debug = None
     if isinstance(debug_section, dict):
+        precomputed_boolean_debug = debug_section.pop("_precomputed_boolean_debug", None)
         fts_debug = debug_section.get("fts")
         if not isinstance(fts_debug, dict):
             fts_debug = {}
@@ -303,11 +311,20 @@ def _respond(payload: Dict[str, Any], response: Dict[str, Any]):
         try:
             question_text = _extract_question_for_debug(payload if isinstance(payload, dict) else {}, response)
             fts_columns = _extract_fts_columns_for_debug(response)
-            plan = build_boolean_debug(question_text, fts_columns)
+            if isinstance(precomputed_boolean_debug, dict):
+                plan = precomputed_boolean_debug
+            else:
+                plan = build_boolean_debug(question_text, fts_columns)
             blocks = plan.get("blocks", [])
             summary_text = plan.get("summary", "") or ""
             debug_section["boolean_groups"] = blocks
             debug_section["boolean_groups_text"] = summary_text
+            where_text = plan.get("where_text")
+            if where_text:
+                debug_section["where_text"] = where_text
+            binds_text = plan.get("binds_text")
+            if binds_text:
+                debug_section["binds_text"] = binds_text
             if blocks and isinstance(blocks[0], dict):
                 first_block = blocks[0]
                 block_fts = first_block.get("fts") if isinstance(first_block.get("fts"), list) else []
@@ -1665,6 +1682,8 @@ def answer():
         fts_columns=fts_columns,
     )
 
+    boolean_debug = build_boolean_debug(question, fts_columns)
+
     final_sql = sql
     LOGGER.info(json.dumps({"final_sql": {"size": len(final_sql.split()), "sql": final_sql}}))
     sql, binds, online_meta = _apply_online_rate_hints(sql, binds or {}, online_intent)
@@ -1696,6 +1715,27 @@ def answer():
     if "binds" not in meta_out:
         meta_out["binds"] = _json_safe_binds(binds or {})
     meta_fts = (meta_out or {}).get("fts") if isinstance(meta_out, dict) else None
+    intent_debug = {
+        "explicit_dates": _dates_to_iso(explicit_dates),
+        "top_n": top_n,
+        "full_text_search": full_text_search,
+        "fts": {
+            "mode": fts_mode,
+            "tokens": fts_groups,
+            "columns": fts_columns,
+        },
+    }
+    if isinstance(boolean_debug, dict):
+        blocks_dbg = boolean_debug.get("blocks")
+        if blocks_dbg:
+            intent_debug["boolean_groups"] = blocks_dbg
+        where_dbg = boolean_debug.get("where_text")
+        if isinstance(where_dbg, str) and where_dbg.strip():
+            intent_debug["boolean_groups_where"] = where_dbg.strip()
+        bind_dbg = boolean_debug.get("binds")
+        if isinstance(bind_dbg, dict) and bind_dbg:
+            intent_debug["boolean_groups_binds"] = list(bind_dbg.keys())
+
     response = {
         "ok": True,
         "inquiry_id": inquiry_id,
@@ -1704,19 +1744,65 @@ def answer():
         "sql": sql,
         "meta": meta_out,
         "explain": explain,
-        "debug": {
-            "intent": {
-                "explicit_dates": _dates_to_iso(explicit_dates),
-                "top_n": top_n,
-                "full_text_search": full_text_search,
-                "fts": {
-                    "mode": fts_mode,
-                    "tokens": fts_groups,
-                    "columns": fts_columns,
-                },
-            }
-        },
+        "debug": {"intent": intent_debug},
     }
+    debug_section = response.get("debug") if isinstance(response, dict) else None
+    if isinstance(debug_section, dict):
+        debug_section["_precomputed_boolean_debug"] = boolean_debug
+
+    eq_where_text = (
+        boolean_debug.get("where_text") if isinstance(boolean_debug, dict) else None
+    )
+    where_parts: List[str] = []
+    if fts_where_sql:
+        where_parts.append(str(fts_where_sql))
+    if isinstance(eq_where_text, str) and eq_where_text.strip():
+        eq_clause = eq_where_text.strip()
+        if not (eq_clause.startswith("(") and eq_clause.endswith(")")):
+            eq_clause = f"({eq_clause})"
+        where_parts.append(eq_clause)
+
+    final_sql_lines: List[str] = [f'SELECT * FROM "{table_name}"']
+    if where_parts:
+        final_sql_lines.append("WHERE " + " AND ".join(where_parts))
+    final_sql_lines.append("ORDER BY REQUEST_DATE DESC")
+    existing_meta_binds = (
+        response.get("meta", {}).get("binds")
+        if isinstance(response.get("meta"), dict)
+        else None
+    )
+    if isinstance(existing_meta_binds, dict) and "top_n" in existing_meta_binds:
+        final_sql_lines.append("FETCH FIRST :top_n ROWS ONLY")
+    response["sql"] = "\n".join(final_sql_lines)
+
+    combined_binds: Dict[str, Any] = {}
+    if fts_where_sql and isinstance(fts_binds, dict):
+        for key, value in fts_binds.items():
+            combined_binds.setdefault(key, value)
+    eq_bind_map = (
+        boolean_debug.get("binds") if isinstance(boolean_debug, dict) else None
+    )
+    if isinstance(eq_bind_map, dict):
+        for key, value in eq_bind_map.items():
+            combined_binds[key] = value
+    filtered_meta_binds: Dict[str, Any] = {}
+    if isinstance(existing_meta_binds, dict):
+        filtered_meta_binds = dict(existing_meta_binds)
+        if isinstance(eq_bind_map, dict) and eq_bind_map:
+            filtered_meta_binds = {
+                key: value
+                for key, value in filtered_meta_binds.items()
+                if not (
+                    isinstance(key, str)
+                    and key.lower().startswith("eq_")
+                    and not key.lower().startswith("eq_bg_")
+                )
+            }
+        for key, value in filtered_meta_binds.items():
+            combined_binds.setdefault(key, value)
+    if combined_binds and isinstance(response.get("meta"), dict):
+        response["meta"]["binds"] = _json_safe_binds(combined_binds)
+
     if isinstance(response.get("debug"), dict):
         error_value = meta_fts.get("error") if isinstance(meta_fts, dict) else None
         response["debug"]["fts"] = {

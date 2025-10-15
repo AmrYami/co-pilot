@@ -5,6 +5,9 @@ from typing import Any, Dict, List, Optional, Tuple
 import re
 
 from apps.dw.common.eq_aliases import resolve_eq_targets
+from apps.dw.filters import build_boolean_groups_where
+from apps.dw.search.fts_registry import resolve_engine
+from apps.dw.sql.builder import QueryBuilder
 from core.nlu.schema import NLIntent
 
 
@@ -292,6 +295,7 @@ def parse_rate_comment(comment: str) -> Dict[str, Any]:
         "fts_tokens": [],
         "fts_operator": "OR",
         "eq_filters": [],
+        "boolean_groups": [],
         "group_by": None,
         "gross": None,
         "sort_by": None,
@@ -351,6 +355,25 @@ def parse_rate_comment(comment: str) -> Dict[str, Any]:
                     hints["top_n"] = int(payload)
                 except ValueError:
                     pass
+
+    eq_filters = hints.get("eq_filters") or []
+    if eq_filters:
+        fields: List[Dict[str, Any]] = []
+        for entry in eq_filters:
+            column = str(entry.get("col") or "").strip()
+            if not column:
+                continue
+            values = list(entry.get("values") or [])
+            if not values:
+                fallback = entry.get("val")
+                if fallback:
+                    values = [fallback]
+            if not values:
+                continue
+            op = str(entry.get("op") or "eq").lower()
+            fields.append({"field": column, "op": "like" if op == "like" else "eq", "values": values})
+        if fields:
+            hints["boolean_groups"] = [{"id": "A", "fields": fields}]
 
     text = comment.strip()
     match = re.search(
@@ -485,83 +508,62 @@ def build_sql_from_intent(
     table: str = "Contract",
 ) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
     dbg = {"notes": []}
-    binds: Dict[str, Any] = {}
+
+    def _intent_get(key: str, default=None):
+        if isinstance(intent, dict):
+            return intent.get(key, default)
+        return getattr(intent, key, default)
 
     fts_cfg = settings.get("DW_FTS_COLUMNS") or {}
-    fts_cols = fts_cfg.get(table) or fts_cfg.get(table.upper())
-    if not fts_cols:
-        fts_cols = fts_cfg.get("*") or []
-    eq_allowed = settings.get("DW_EXPLICIT_FILTER_COLUMNS") or []
-    fts_engine = (settings.get("DW_FTS_ENGINE") or "like").strip().lower()
+    fts_cols = fts_cfg.get(table) or fts_cfg.get(table.upper()) or fts_cfg.get("*") or []
+    fts_engine_name = (settings.get("DW_FTS_ENGINE") or "like").strip().lower()
+    fts_engine = resolve_engine(fts_engine_name)
+    min_token_len = settings.get("DW_FTS_MIN_TOKEN_LEN", 2)
 
-    fts_tokens = intent.get("fts_tokens") or []
-    fts_operator = (intent.get("fts_operator") or "OR").upper()
-    full_text_search = bool(intent.get("full_text_search") or (fts_tokens and fts_engine == "like"))
-    eq_filters = intent.get("eq_filters") or []
-    group_by = intent.get("group_by")
-    gross = intent.get("gross")
-    sort_by = intent.get("sort_by")
-    sort_desc = intent.get("sort_desc")
-    top_n = intent.get("top_n")
-    direction_hint = intent.get("direction_hint")
+    fts_tokens = _intent_get("fts_tokens") or []
+    fts_groups = _intent_get("fts_groups") or [[tok] for tok in fts_tokens]
+    fts_operator = (_intent_get("fts_operator") or "OR").upper()
+    full_text_search = bool(_intent_get("full_text_search") and fts_cols and fts_engine)
+
+    boolean_groups = _intent_get("boolean_groups") or []
+    eq_filters = _intent_get("eq_filters") or []
+    group_by = _intent_get("group_by")
+    gross = _intent_get("gross")
+    sort_by = _intent_get("sort_by")
+    sort_desc = _intent_get("sort_desc")
+    top_n = _intent_get("top_n")
+    direction_hint = _intent_get("direction_hint")
+    wants_all = _intent_get("wants_all_columns", True)
 
     if (direction_hint is not None) and (sort_desc is None):
         sort_desc, note = direction_from_words([direction_hint])
         dbg["notes"].append(note)
 
-    if sort_by is None:
-        sort_by = "REQUEST_DATE"
+    date_column = str(settings.get("DW_DATE_COLUMN") or "REQUEST_DATE").strip() or "REQUEST_DATE"
     if sort_desc is None:
         sort_desc = True
 
-    select_clause = "*"
-    from_clause = f'FROM "{table}"'
-    where_parts: List[str] = []
+    qb = QueryBuilder(table=table, date_col=date_column)
+    qb.wants_all_columns(bool(wants_all))
 
-    if full_text_search and fts_engine == "like" and fts_cols and fts_tokens:
-        w, b = build_fts_where_like(fts_cols, fts_tokens, fts_operator)
-        if w:
-            where_parts.append(w)
-            binds.update(b)
-            dbg["notes"].append(
-                f"fts_like columns={len(fts_cols)} tokens={len(fts_tokens)} op={fts_operator}"
-            )
-    elif full_text_search and fts_engine != "like":
-        dbg["notes"].append("unsupported_fts_engine_fallback_like_disabled")
+    if full_text_search and fts_cols and fts_groups:
+        qb.use_fts(engine=fts_engine, columns=fts_cols, min_token_len=min_token_len)
+        for group in fts_groups:
+            qb.add_fts_group(group, op=fts_operator)
 
-    if eq_filters:
-        w, b = build_eq_where(eq_filters, eq_allowed)
-        if w:
-            where_parts.append(w)
-            binds.update(b)
-            dbg["notes"].append(f"eq_filters={len(b)}")
-
-    where_clause = ""
-    if where_parts:
-        where_clause = "WHERE " + " AND ".join([p for p in where_parts if p])
-
-    order_clause = f"ORDER BY {sort_by} {'DESC' if sort_desc else 'ASC'}"
+    if boolean_groups:
+        qb.apply_boolean_groups(boolean_groups)
+    elif eq_filters:
+        qb.apply_eq_filters(eq_filters)
 
     if group_by:
-        if gross:
-            select_clause = f"{group_by} AS GROUP_KEY, {GROSS_EXPR} AS TOTAL_GROSS, COUNT(*) AS CNT"
-            order_target = "TOTAL_GROSS"
-        else:
-            select_clause = f"{group_by} AS GROUP_KEY, COUNT(*) AS CNT"
-            order_target = "CNT"
-        group_clause = f"GROUP BY {group_by}"
-        sql = (
-            f"SELECT {select_clause} {from_clause} {where_clause} {group_clause} ORDER BY {order_target} "
-            f"{'DESC' if sort_desc else 'ASC'}"
-        )
-    else:
-        sql = f"SELECT {select_clause} {from_clause} {where_clause} {order_clause}"
+        qb.group_by(group_by if isinstance(group_by, list) else [group_by], gross=bool(gross))
 
-    if isinstance(top_n, int) and top_n > 0:
-        sql = f"{sql}\nFETCH FIRST {top_n} ROWS ONLY"
+    order_column = sort_by or ("TOTAL_GROSS" if (group_by and gross) else ("CNT" if group_by else date_column))
+    qb.order_by(order_column, desc=bool(sort_desc))
+    qb.limit(top_n)
 
-    parts = sql.split("ORDER BY")
-    if len(parts) > 2:
-        sql = "ORDER BY".join([parts[0]] + [" ".join(parts[-1].split())])
-
+    sql, binds = qb.compile()
+    dbg_notes = qb.debug_info().get("notes") or []
+    dbg["notes"].extend(dbg_notes)
     return sql.strip(), binds, dbg

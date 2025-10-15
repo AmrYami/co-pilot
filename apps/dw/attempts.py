@@ -25,6 +25,7 @@ from apps.dw.settings_utils import load_explicit_filter_columns
 
 from .builder import build_sql
 from .intent import NLIntent, parse_intent_legacy
+from .logs import scrub_binds
 from .rate_hints import (
     append_where,
     apply_rate_hints,
@@ -36,6 +37,7 @@ from .search import (
     extract_search_tokens,
     inject_fulltext_where,
     is_fulltext_allowed,
+    resolve_fts_config,
 )
 from .utils import env_flag
 
@@ -124,6 +126,43 @@ def run_attempt(
         settings_getter, namespace, DEFAULT_EXPLICIT_FILTER_COLUMNS
     )
 
+    def _settings_get(key: str, default: Any = None) -> Any:
+        if not callable(settings_getter):
+            return default
+        candidates = (
+            {"scope": "namespace", "namespace": namespace},
+            {"scope": "namespace"},
+            {},
+        )
+        for kwargs in candidates:
+            try:
+                value = settings_getter(key, **kwargs)
+            except TypeError:
+                continue
+            if value is not None:
+                return value
+        return default
+
+    def _unwrap_setting(value: Any, default: Any) -> Any:
+        if isinstance(value, dict) and "value" in value and len(value) == 1:
+            return value.get("value", default)
+        return value if value is not None else default
+
+    namespace_settings: Dict[str, Any] = {
+        "DW_FTS_ENGINE": _unwrap_setting(
+            _settings_get("DW_FTS_ENGINE", "like"), "like"
+        ),
+        "DW_FTS_COLUMNS": _unwrap_setting(_settings_get("DW_FTS_COLUMNS", {}), {}),
+        "DW_FTS_MIN_TOKEN_LEN": _unwrap_setting(
+            _settings_get("DW_FTS_MIN_TOKEN_LEN", 2), 2
+        ),
+        "DW_EQ_ALIAS_COLUMNS": _unwrap_setting(
+            _settings_get("DW_EQ_ALIAS_COLUMNS", {}), {}
+        ),
+    }
+
+    fts_conf = resolve_fts_config(namespace_settings)
+
     strict_hints = parse_rate_comment_strict(rate_comment)
     if rate_comment and not strict_hints.is_empty():
         intent = merge_rate_comment_hints(intent, strict_hints, allowed_columns)
@@ -140,12 +179,24 @@ def run_attempt(
     engine = app.config.get("DW_ENGINE") if app else None
     if intent.full_text_search and engine is not None:
         try:
-            tokens = extract_search_tokens(question)
+            min_len = int(fts_conf.get("min_len", 2) or 2)
+            tokens = extract_search_tokens(question, min_len=min_len)
             if tokens:
                 table_name = os.getenv("DW_FTS_TABLE", "Contract")
-                schema = os.getenv("DW_FTS_SCHEMA") or None
-                predicate, fts_binds, columns = build_fulltext_where(
-                    engine, table_name, tokens, schema=schema
+                columns_map = fts_conf.get("fts_columns_map") or {}
+                columns = (
+                    columns_map.get(table_name)
+                    or columns_map.get(table_name.upper())
+                    or columns_map.get(table_name.strip('"'))
+                    or columns_map.get("*")
+                    or []
+                )
+                groups = [[token] for token in tokens]
+                predicate, fts_binds, fts_error = build_fulltext_where(
+                    columns,
+                    groups,
+                    engine=fts_conf.get("engine", "like"),
+                    operator="OR",
                 )
                 if predicate:
                     sql = inject_fulltext_where(sql, predicate)
@@ -155,8 +206,18 @@ def run_attempt(
                             "tokens": tokens,
                             "columns": columns,
                             "binds": list(fts_binds.keys()),
+                            "engine": fts_conf.get("engine"),
                         }
                     )
+                else:
+                    if fts_error == "no_engine":
+                        fts_meta["error"] = fts_error
+                    elif not columns:
+                        fts_meta["error"] = "no_columns"
+                    elif fts_error:
+                        fts_meta["error"] = fts_error
+                    else:
+                        fts_meta["error"] = "no_predicate"
             else:
                 fts_meta["error"] = "no_tokens"
         except Exception as exc:  # pragma: no cover - defensive guard
@@ -195,7 +256,8 @@ def run_attempt(
             "error": fts_meta.get("error"),
         },
     )
-    _log(logger, "final_sql", {"size": len(sql), "sql": sql})
+    final_sql_payload = {"size": len(sql), "sql": sql, "binds": scrub_binds(binds)}
+    _log(logger, "final_sql", final_sql_payload)
     _log(
         logger,
         "validation",
@@ -209,6 +271,8 @@ def run_attempt(
         if app and "DW_ENGINE" in app.config
         else ([], [])
     )
+
+    final_sql_snapshot = {"sql": sql, "binds": dict(binds)}
 
     result = {
         "ok": True,
@@ -238,4 +302,6 @@ def run_attempt(
             "rate_hints": hints_meta,
         },
     }
+    result["final_sql"] = final_sql_snapshot
+    result["meta"]["final_sql"] = final_sql_snapshot
     return result

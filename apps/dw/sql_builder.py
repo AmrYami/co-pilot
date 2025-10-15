@@ -1,11 +1,16 @@
 from typing import Dict, Any, Iterable, Optional, Sequence, Tuple, List
 import logging
+import os
 import re
-from datetime import date
+from datetime import date, datetime
 from dateutil.relativedelta import relativedelta
 
 from apps.dw.patchlib.settings_util import get_fts_engine, get_fts_columns
 from apps.dw.patchlib.fts_builder import build_like_fts
+from apps.dw.common.eq_aliases import resolve_eq_targets
+from apps.dw.fts import FTSEngine
+from apps.dw.rate.time_parser import parse_time_windows
+from apps.dw.rate.sql_builder import apply_time_windows, choose_order_by
 
 
 LOGGER = logging.getLogger("dw.sql_builder")
@@ -72,9 +77,11 @@ def build_eq_where(
             continue
         bind_name = f"eq_{idx}"
         binds[bind_name] = filt.get("val")
-        predicates.append(
-            _wrap_ci_trim(col, bind_name, bool(filt.get("ci")), bool(filt.get("trim")))
-        )
+        ci_flag = filt.get("ci")
+        trim_flag = filt.get("trim")
+        ci = True if ci_flag is None else bool(ci_flag)
+        tr = True if trim_flag is None else bool(trim_flag)
+        predicates.append(_wrap_ci_trim(col, bind_name, ci, tr))
         idx += 1
     return predicates
 
@@ -404,6 +411,33 @@ def apply_order_by(sql: str, col: str, desc: bool) -> str:
     return f"{sql_no_ob}\nORDER BY {col} {direction}"
 
 
+def _normalize_order_hint(col: Optional[str], desc: bool) -> Tuple[str, bool]:
+    if not col:
+        return col or "", desc
+
+    stripped = col.strip() if isinstance(col, str) else col
+    if isinstance(stripped, str) and not stripped.startswith('"'):
+        key = stripped.upper()
+        if key.endswith("_DESC") and len(stripped) > 5:
+            base = stripped[:-5]
+            if base:
+                return base, True
+        if key.endswith("_ASC") and len(stripped) > 4:
+            base = stripped[:-4]
+            if base:
+                return base, False
+
+    mapping = {
+        "REQUEST_DATE_DESC": ("REQUEST_DATE", True),
+        "REQUEST_DATE_ASC": ("REQUEST_DATE", False),
+    }
+    key = str(col).strip().upper()
+    if key in mapping:
+        mapped_col, mapped_desc = mapping[key]
+        return mapped_col, mapped_desc
+    return col, desc
+
+
 def build_sql(intent: Dict[str, Any], settings, *, table: str = "Contract") -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
     """
     Returns (sql, binds, meta)
@@ -450,6 +484,29 @@ def build_sql(intent: Dict[str, Any], settings, *, table: str = "Contract") -> T
         binds["date_start"] = exp_dates["start"]
         binds["date_end"] = exp_dates["end"]
         where_parts.append("REQUEST_DATE BETWEEN :date_start AND :date_end")
+
+    plan = it.get("boolean_plan")
+    plan_applied = False
+    if isinstance(plan, dict):
+        plan_where = plan.get("where_sql") or plan.get("where_text")
+        plan_binds = plan.get("binds") if isinstance(plan.get("binds"), dict) else {}
+        if plan_where:
+            wrapped_plan = plan_where if plan_where.strip().startswith("(") else f"({plan_where})"
+            where_parts.append(wrapped_plan)
+            if plan_binds:
+                binds.update(plan_binds)
+            plan_applied = True
+            meta["boolean_plan"] = {
+                "applied": True,
+                "binds": list(plan_binds.keys()),
+                "where_sql": plan_where,
+            }
+    if not plan_applied:
+        legacy_binds: Dict[str, Any] = {}
+        legacy_clauses = build_eq_where(it.get("eq_filters") or [], legacy_binds)
+        if legacy_clauses:
+            where_parts.extend(legacy_clauses)
+            binds.update(legacy_binds)
 
     fts_clause, fts_binds = _build_fts_where_from_intent(it)
     if fts_clause:
@@ -611,6 +668,7 @@ def build_sql(intent: Dict[str, Any], settings, *, table: str = "Contract") -> T
             lines.append(f"WHERE {where_expr}")
         lines.append(f"GROUP BY {group_by}")
         sql = "\n".join(lines)
+        order_col, order_desc = _normalize_order_hint(order_col, order_desc)
         sql = apply_order_by(sql, order_col, order_desc)
         sql = _ensure_single_order_by(sql)
         if top_n:
@@ -639,6 +697,7 @@ def build_sql(intent: Dict[str, Any], settings, *, table: str = "Contract") -> T
     else:
         order_col = measure
         order_desc = sort_desc
+    order_col, order_desc = _normalize_order_hint(order_col, order_desc)
     sql = apply_order_by(sql, order_col, order_desc)
     sql = _ensure_single_order_by(sql)
     if top_n:
@@ -665,31 +724,72 @@ GROSS_EXPR_RATE = "NVL(CONTRACT_VALUE_NET_OF_VAT,0) + CASE WHEN NVL(VAT,0) BETWE
 
 
 def _rate_build_fts_where(fts: Dict[str, Any], binds: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
-    engine = (_rate_get_setting("DW_FTS_ENGINE", scope="namespace") or "like")
-    try:
-        engine = engine.lower()
-    except Exception:
-        engine = "like"
-    if not fts or not fts.get("enabled") or engine != "like":
+    if not fts or not fts.get("enabled"):
         return "", binds
-    columns: List[str] = fts.get("columns") or []
-    groups: List[List[str]] = fts.get("tokens") or []
-    operator = fts.get("operator", "OR")
+
+    engine_name = fts.get("engine")
+    raw_min_len = fts.get("min_token_len")
+    settings_ctx: Dict[str, Any] = {}
+    if raw_min_len is not None:
+        settings_ctx["DW_FTS_MIN_TOKEN_LEN"] = raw_min_len
+    else:
+        settings_ctx["DW_FTS_MIN_TOKEN_LEN"] = _rate_get_setting(
+            "DW_FTS_MIN_TOKEN_LEN",
+            scope="namespace",
+        ) or 2
+    engine = FTSEngine.from_name(engine_name, settings=settings_ctx)
+
+    try:
+        min_token_len = max(1, int(engine.min_token_len))
+    except Exception:
+        min_token_len = 2
+
+    columns: List[str] = []
+    for col in fts.get("columns") or []:
+        col_str = str(col).strip()
+        if col_str:
+            columns.append(col_str)
+    if not columns:
+        return "", binds
+
+    filtered_groups: List[List[str]] = []
+    for group in fts.get("tokens") or []:
+        tokens: List[str] = []
+        for tok in group or []:
+            if not isinstance(tok, str):
+                continue
+            cleaned = tok.strip()
+            if not cleaned or len(cleaned) < min_token_len:
+                continue
+            tokens.append(cleaned)
+        if tokens:
+            filtered_groups.append(tokens)
+    if not filtered_groups:
+        return "", binds
+
+    bind_index = len([k for k in binds.keys() if k.startswith("fts_")])
     clauses: List[str] = []
-    for g in groups:
-        g_clauses: List[str] = []
-        for tok in g:
-            idx = len([k for k in binds.keys() if k.startswith("fts_")])
-            bname = f"fts_{idx}"
-            binds[bname] = f"%{tok}%"
-            col_clauses = [f"UPPER(NVL({c},'')) LIKE UPPER(:{bname})" for c in columns]
-            g_clauses.append("(" + " OR ".join(col_clauses) + ")")
-        if g_clauses:
-            group_expr = "(" + (" AND ".join(g_clauses) if len(g_clauses) > 1 else g_clauses[0]) + ")"
-            clauses.append(group_expr)
+    for group in filtered_groups:
+        group_parts: List[str] = []
+        for token in group:
+            bind_name = f"fts_{bind_index}"
+            bind_index += 1
+            binds[bind_name] = f"%{token}%"
+            per_column = [
+                f"UPPER(NVL({column},'')) LIKE UPPER(:{bind_name})" for column in columns
+            ]
+            group_parts.append("(" + " OR ".join(per_column) + ")")
+        if group_parts:
+            if len(group_parts) == 1:
+                clauses.append(group_parts[0])
+            else:
+                clauses.append("(" + " AND ".join(group_parts) + ")")
+
     if not clauses:
         return "", binds
-    joiner = " OR " if (operator or "OR").upper() == "OR" else " AND "
+
+    operator = (fts.get("operator") or "OR").upper()
+    joiner = " OR " if operator == "OR" else " AND "
     return "(" + joiner.join(clauses) + ")", binds
 
 
@@ -697,67 +797,173 @@ def _rate_build_eq_where(eq_filters: List[Dict[str, Any]], enum_syn: Dict[str, A
     if not eq_filters:
         return "", binds
     parts: List[str] = []
+
+    def _wrap(expr: str, *, ci: bool, trim: bool) -> str:
+        value = expr
+        if trim:
+            value = f"TRIM({value})"
+        if ci:
+            value = f"UPPER({value})"
+        return value
+
+    def _normalize_bind(value: Any, *, ci: bool, trim: bool) -> Any:
+        if isinstance(value, str):
+            text = value
+            if trim:
+                text = text.strip()
+            if ci:
+                text = text.upper()
+            return text
+        return value
+
     for ef in eq_filters:
         col = ef.get("col")
-        val = ef.get("val")
+        val = ef.get("val") if "val" in ef else ef.get("value")
+        values_raw: List[Any] = []
+        if isinstance(ef.get("values"), (list, tuple, set)):
+            values_raw = list(ef.get("values"))
         ci = bool(ef.get("ci", True))
         tr = bool(ef.get("trim", True))
         if not col:
             continue
-        col_sql = str(col)
-        if str(col).upper() == "REQUEST_TYPE" and enum_syn:
+        col_token = str(col).strip()
+        if not col_token:
+            continue
+        # Request type keeps bespoke behaviour for enum synonyms
+        if col_token.upper() == "REQUEST_TYPE" and enum_syn:
             equals: List[str] = []
             prefix: List[str] = []
             contains: List[str] = []
             for cfg in enum_syn.values():
-                equals += cfg.get("equals", [])
-                prefix += cfg.get("prefix", [])
-                contains += cfg.get("contains", [])
-            equals = list({e.upper().strip(): e for e in equals}.keys())
-            prefix = [p.upper().strip() for p in prefix]
-            contains = [c.upper().strip() for c in contains]
+                equals += [v for v in cfg.get("equals", []) if v]
+                prefix += [v for v in cfg.get("prefix", []) if v]
+                contains += [v for v in cfg.get("contains", []) if v]
             sub: List[str] = []
-            if equals:
-                eq_list = equals + [str(val).upper()]
-                eq_binds: List[str] = []
-                for v in eq_list:
+            if equals or values_raw or (val not in (None, "")):
+                all_eq: List[str] = []
+                if equals:
+                    all_eq += [str(e) for e in equals]
+                if val not in (None, ""):
+                    all_eq.append(str(val))
+                if values_raw:
+                    all_eq += [str(v) for v in values_raw if v not in (None, "")]
+                norm: List[str] = []
+                seen: set[str] = set()
+                for s in all_eq:
+                    trimmed = s.strip()
+                    if not trimmed:
+                        continue
+                    key = trimmed.upper() if ci else trimmed
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    norm.append(trimmed.upper() if ci else trimmed)
+                bind_names: List[str] = []
+                for eqv in norm:
                     idx = len([k for k in binds.keys() if k.startswith(f"eq_{col}_")])
-                    bname = f"eq_{col}_{idx}"
-                    binds[bname] = v
-                    eq_binds.append(f":{bname}")
-                target = "UPPER(TRIM({}))".format(col_sql) if tr else col_sql
-                if ci:
-                    target = f"UPPER({target})"
-                sub.append(f"{target} IN (" + ",".join(eq_binds) + ")")
+                    bn = f"eq_{col}_{idx}"
+                    binds[bn] = _normalize_bind(eqv, ci=ci, trim=tr)
+                    bind_names.append(bn)
+                if bind_names:
+                    placeholders = ",".join(f":{bn}" for bn in bind_names)
+                    sub.append(f"{_wrap(col_token, ci=ci, trim=tr)} IN ({placeholders})")
+            prefix_norm: List[str] = []
+            prefix_seen: set[str] = set()
+            for pf in prefix:
+                text = str(pf).strip()
+                if not text:
+                    continue
+                key = text.upper() if ci else text
+                if key in prefix_seen:
+                    continue
+                prefix_seen.add(key)
+                prefix_norm.append(text.upper() if ci else text)
+            prefix = prefix_norm
+            contains_norm: List[str] = []
+            contains_seen: set[str] = set()
+            for ct in contains:
+                text = str(ct).strip()
+                if not text:
+                    continue
+                key = text.upper() if ci else text
+                if key in contains_seen:
+                    continue
+                contains_seen.add(key)
+                contains_norm.append(text.upper() if ci else text)
+            contains = contains_norm
+
             for pf in prefix:
                 idx = len([k for k in binds.keys() if k.startswith(f"pf_{col}_")])
                 bname = f"pf_{col}_{idx}"
                 binds[bname] = f"{pf}%"
-                target = "TRIM({})".format(col_sql) if tr else col_sql
-                target = f"UPPER({target})" if ci else target
+                target = _wrap(col_token, ci=ci, trim=tr)
                 sub.append(f"{target} LIKE :{bname}")
             for ct in contains:
                 idx = len([k for k in binds.keys() if k.startswith(f"ct_{col}_")])
                 bname = f"ct_{col}_{idx}"
                 binds[bname] = f"%{ct}%"
-                target = "TRIM({})".format(col_sql) if tr else col_sql
-                target = f"UPPER({target})" if ci else target
+                target = _wrap(col_token, ci=ci, trim=tr)
                 sub.append(f"{target} LIKE :{bname}")
             if sub:
                 parts.append("(" + " OR ".join(sub) + ")")
             continue
-        idx = len([k for k in binds.keys() if k.startswith(f"eq_{col}_")])
-        bname = f"eq_{col}_{idx}"
-        binds[bname] = val
-        lhs = col_sql
-        rhs = f":{bname}"
-        if tr:
-            lhs = f"TRIM({lhs})"
-            rhs = f"TRIM({rhs})"
-        if ci:
-            lhs = f"UPPER({lhs})"
-            rhs = f"UPPER({rhs})"
-        parts.append(f"{lhs} = {rhs}")
+
+        all_values: List[Any] = []
+        if val not in (None, ""):
+            all_values.append(val)
+        all_values.extend(values_raw)
+        if not all_values:
+            continue
+        deduped: List[Any] = []
+        seen_keys: set[Any] = set()
+        for value in all_values:
+            if value in (None, ""):
+                continue
+            normalized_value: Any = value.strip() if isinstance(value, str) else value
+            key = (
+                normalized_value.upper()
+                if ci and isinstance(normalized_value, str)
+                else normalized_value
+            )
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            deduped.append(normalized_value)
+        if not deduped:
+            continue
+
+        resolved = resolve_eq_targets(col_token) or [col_token]
+        columns: List[str] = []
+        seen_cols: set[str] = set()
+        for candidate in resolved:
+            if not candidate:
+                continue
+            upper = candidate.strip().upper()
+            if upper in seen_cols:
+                continue
+            seen_cols.add(upper)
+            columns.append(candidate.strip())
+        if not columns:
+            columns.append(col_token)
+
+        bind_names: List[str] = []
+        for value in deduped:
+            idx = len([k for k in binds.keys() if k.startswith(f"eq_{col}_")])
+            bname = f"eq_{col}_{idx}"
+            binds[bname] = _normalize_bind(value, ci=ci, trim=tr)
+            bind_names.append(bname)
+
+        placeholders = [f":{name}" for name in bind_names]
+        column_clauses: List[str] = []
+        for column in columns:
+            lhs = _wrap(column, ci=ci, trim=tr)
+            column_clauses.append(f"{lhs} IN (" + ",".join(placeholders) + ")")
+        if column_clauses:
+            if len(column_clauses) == 1:
+                parts.append(column_clauses[0])
+            else:
+                parts.append("(" + " OR ".join(column_clauses) + ")")
+
     return ("(" + " AND ".join(parts) + ")" if parts else ""), binds
 
 
@@ -786,6 +992,25 @@ def _rate_build_fetch(top_n: Any) -> str:
     return f" FETCH FIRST {n} ROWS ONLY" if n else ""
 
 
+def _env_flag_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return int(str(raw))
+    except ValueError:
+        lowered = str(raw).strip().lower()
+        if lowered in {"true", "t", "yes", "y"}:
+            return 1
+        if lowered in {"false", "f", "no", "n"}:
+            return 0
+        return default
+
+
+def _trunc_today() -> date:
+    return datetime.utcnow().date()
+
+
 def build_rate_sql(intent: Dict[str, Any], enum_syn: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
     binds: Dict[str, Any] = {}
     select, group_clause, alias = _rate_build_group_select(intent.get("group_by"), bool(intent.get("gross")))
@@ -796,13 +1021,21 @@ def build_rate_sql(intent: Dict[str, Any], enum_syn: Dict[str, Any]) -> Tuple[st
     fts_clause, binds = _rate_build_fts_where(intent.get("fts") or {}, binds)
     if fts_clause:
         where_parts.append(fts_clause)
+    comment = str(intent.get("comment") or "")
+    windows = parse_time_windows(comment, today=_trunc_today())
+    flags = {"DW_OVERLAP_REQUIRE_BOTH_DATES": _env_flag_int("DW_OVERLAP_REQUIRE_BOTH_DATES", 1)}
+    apply_time_windows(where_parts, binds, windows, flags)
     where_sql = " WHERE " + " AND ".join(where_parts) if where_parts else ""
     sort_by = intent.get("sort_by")
     sort_desc = bool(intent.get("sort_desc"))
     if intent.get("group_by") and not sort_by:
         sort_by = alias
         sort_desc = True
-    order_sql = _rate_build_order_by(sort_by or "REQUEST_DATE", sort_desc if sort_by else True)
+    user_order_clause = None
+    if sort_by:
+        user_order_clause = _rate_build_order_by(sort_by, sort_desc).strip()
+    final_order = choose_order_by(user_order_clause, windows)
+    order_sql = f" {final_order}" if final_order else ""
     fetch_sql = _rate_build_fetch(intent.get("top_n"))
     sql = f"{select} FROM \"Contract\"{where_sql}{group_clause}{order_sql}{fetch_sql}"
     return sql, binds

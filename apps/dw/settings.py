@@ -7,6 +7,11 @@ import os
 from functools import lru_cache
 from typing import Any, Dict, Iterable, List
 
+try:  # pragma: no cover - optional dependency when Flask missing in tests
+    from flask import current_app
+except Exception:  # pragma: no cover - tests without Flask
+    current_app = None  # type: ignore[assignment]
+
 try:
     from sqlalchemy import create_engine, text
 except Exception:  # pragma: no cover - optional dependency at runtime
@@ -16,6 +21,81 @@ except Exception:  # pragma: no cover - optional dependency at runtime
 from core.settings import Settings
 
 _NAMESPACE = "dw::common"
+
+
+def get_namespace_settings(namespace: str = "dw::common") -> Dict[str, Any]:
+    """Return a mapping with settings for ``namespace``.
+
+    The helper mirrors the lightweight loader used by the DW answer endpoint. When the
+    requested namespace is the default (``dw::common``) we rely on the cached snapshot
+    exposed by :func:`get_settings`. For other namespaces we fall back to the general
+    :class:`core.settings.Settings` accessor so callers can reuse the same interface
+    without importing heavy dependencies in multiple places.
+    """
+
+    ns = (namespace or _NAMESPACE).strip() or _NAMESPACE
+    if ns == _NAMESPACE:
+        return dict(get_settings())
+
+    settings = Settings(namespace=ns)
+    keys = (
+        "DEFAULT_DATASOURCE",
+        "DW_CONTRACT_TABLE",
+        "DW_FTS_ENGINE",
+        "DW_FTS_COLUMNS",
+        "DW_DATE_COLUMN",
+        "DW_SELECT_ALL_DEFAULT",
+        "EMPTY_RESULT_AUTORETRY",
+        "DW_FTS_MIN_TOKEN_LEN",
+    )
+    resolved: Dict[str, Any] = {}
+    for key in keys:
+        value = settings.get(key, scope="namespace", namespace=ns)
+        if value is None:
+            value = settings.get(key, scope="global", namespace="global")
+        if value is not None:
+            resolved[key] = value
+    return resolved
+
+
+def get_dw_namespace(app: str = "dw") -> str:
+    """Return the canonical DW namespace used across services."""
+
+    base = (app or "dw").strip() or "dw"
+    return f"{base}::common"
+
+
+def load_settings(store) -> Dict[str, Any]:
+    """Load DW settings from ``store`` honouring the unified namespace."""
+
+    if store is None:
+        return {}
+
+    namespace = get_dw_namespace()
+    namespace_settings: Dict[str, Any] = {}
+    global_settings: Dict[str, Any] = {}
+
+    reader = getattr(store, "read_namespace", None)
+    if callable(reader):
+        try:
+            data = reader(namespace)
+            if isinstance(data, dict):
+                namespace_settings = dict(data)
+        except Exception:  # pragma: no cover - defensive
+            namespace_settings = {}
+
+    reader_global = getattr(store, "read_global", None)
+    if callable(reader_global):
+        try:
+            data = reader_global()
+            if isinstance(data, dict):
+                global_settings = dict(data)
+        except Exception:  # pragma: no cover - defensive
+            global_settings = {}
+
+    merged: Dict[str, Any] = dict(global_settings)
+    merged.update(namespace_settings)
+    return merged
 
 
 def _coerce(value: Any, value_type: str) -> Any:
@@ -222,10 +302,137 @@ def get_setting(key, default=None, scope=None, as_type=None):
         return default
 
 
+def _current_settings_obj() -> Any:
+    if current_app is None:  # pragma: no cover - flask not installed
+        return None
+    try:
+        app = current_app._get_current_object()  # type: ignore[attr-defined]
+    except Exception:
+        return None
+    if not hasattr(app, "config"):
+        return None
+    return app.config.get("SETTINGS")
+
+
+def _lookup_from_settings(
+    settings_obj: Any,
+    key: str,
+    default: Any,
+    *,
+    scope: str | None,
+    namespace: str | None,
+    attr_names: Iterable[str],
+):
+    if settings_obj is None:
+        return None
+
+    if isinstance(settings_obj, dict):
+        value = settings_obj.get(key)
+        return default if value is None else value
+
+    options: List[Dict[str, Any]] = []
+    ns = namespace if namespace not in (None, "") else get_dw_namespace()
+    scoped = scope or "namespace"
+    options.append({"scope": scoped, "namespace": ns})
+    if scope:
+        options.append({"scope": scope})
+    if namespace:
+        options.append({"namespace": namespace})
+    options.append({})
+
+    for attr in attr_names:
+        getter = getattr(settings_obj, attr, None)
+        if not callable(getter):
+            continue
+        for params in options:
+            for include_default in (True, False):
+                kwargs = dict(params)
+                if include_default:
+                    kwargs["default"] = default
+                try:
+                    value = getter(key, **kwargs)
+                except TypeError:
+                    continue
+                except Exception:
+                    continue
+                if value is not None:
+                    return value
+    return None
+
+
+def get_setting_json(
+    key: str,
+    default: Any | None = None,
+    *,
+    scope: str | None = None,
+    namespace: str | None = None,
+) -> Any:
+    """Fetch a JSON setting with graceful fallbacks.
+
+    The function first consults the Flask application's ``SETTINGS`` object when
+    available so tests can inject lightweight stubs. If that lookup does not
+    yield a value it falls back to the DB-backed ``Settings`` helper.
+    """
+
+    settings_obj = _current_settings_obj()
+    value = _lookup_from_settings(
+        settings_obj,
+        key,
+        default,
+        scope=scope,
+        namespace=namespace,
+        attr_names=("get_json", "get"),
+    )
+    if value is not None:
+        return value
+
+    ns = namespace if namespace not in (None, "") else get_dw_namespace()
+    scoped = scope or "namespace"
+    try:
+        settings = Settings(namespace=ns)
+        return settings.get_json(key, default=default, scope=scoped)
+    except Exception:
+        return default
+
+
+def get_setting_value(
+    key: str,
+    default: Any | None = None,
+    *,
+    scope: str | None = None,
+    namespace: str | None = None,
+) -> Any:
+    """Fetch a scalar setting with the same precedence as ``get_setting_json``."""
+
+    settings_obj = _current_settings_obj()
+    value = _lookup_from_settings(
+        settings_obj,
+        key,
+        default,
+        scope=scope,
+        namespace=namespace,
+        attr_names=("get",),
+    )
+    if value is not None:
+        return value
+
+    ns = namespace if namespace not in (None, "") else get_dw_namespace()
+    scoped = scope or "namespace"
+    try:
+        settings = Settings(namespace=ns)
+        return settings.get(key, default=default, scope=scoped)
+    except Exception:
+        return default
+
+
 __all__ = [
+    "get_dw_namespace",
     "get_settings",
     "get_namespace_json",
+    "load_settings",
     "get_fts_columns",
     "get_short_token_allow",
     "get_setting",
+    "get_setting_json",
+    "get_setting_value",
 ]

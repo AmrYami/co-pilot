@@ -115,7 +115,7 @@ def test_answer_endpoint_combines_fts_and_eq(monkeypatch):
 
     assert resp.status_code == 200
     assert data["ok"] is True
-    assert "UPPER(TRIM(ENTITY)) = UPPER(TRIM(:eq_0))" in data["sql"]
+    assert "UPPER(TRIM(ENTITY)) IN (:eq_" in data["sql"]
     assert "LIKE UPPER(:fts_0)" in data["sql"]
     assert data["debug"]["fts"]["enabled"] is True
     assert data["rows"][0]["binds"]["eq_0"].upper() == "DSFH"
@@ -137,7 +137,7 @@ def test_rate_endpoint_uses_rate_comment(monkeypatch):
 
     assert resp.status_code == 200
     assert data["ok"] is True
-    assert "UPPER(TRIM(ENTITY)) = UPPER(TRIM(:eq_0))" in data["sql"]
+    assert "UPPER(TRIM(ENTITY)) IN (:eq_" in data["sql"]
     assert "LIKE UPPER(:fts_0)" in data["sql"]
     assert data["debug"]["validation"]["ok"] is True
 

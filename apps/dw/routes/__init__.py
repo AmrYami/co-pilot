@@ -2,22 +2,27 @@
 
 from __future__ import annotations
 
+import json
+import logging
 import re
+import uuid
 from typing import Any, Dict, Iterable, List, Tuple
 
 from flask import Blueprint, jsonify, request
 
 from apps.dw.db import fetch_rows
-from apps.dw.fts_like import build_fts_where
 from apps.dw.eq_parser import extract_eq_filters_from_natural_text, strip_eq_from_text
+from apps.dw.search import resolve_engine
 from apps.dw.settings_access import DWSettings
 from apps.dw.settings_defaults import DEFAULT_EXPLICIT_FILTER_COLUMNS
 from apps.dw.fts_utils import DEFAULT_CONTRACT_FTS_COLUMNS
+from apps.dw.sql import QueryBuilder
 from apps.dw.sqlbuilder import (
-    build_sql_from_intent,
     direction_from_words,
     parse_rate_comment as parse_rate_comment_v2,
 )
+from apps.dw.logs import scrub_binds
+from apps.dw.utils import env_flag
 
 try:  # pragma: no cover - lightweight fallback for tests without settings backend
     from apps.dw.settings_util import get_setting as _get_setting
@@ -27,21 +32,30 @@ except Exception:  # pragma: no cover
 
 bp = Blueprint("dw", __name__)
 
+logger = logging.getLogger("dw.routes")
+
 
 def _settings_dict() -> Dict[str, Any]:
     keys = [
         "DW_FTS_ENGINE",
         "DW_FTS_COLUMNS",
+        "DW_FTS_MIN_TOKEN_LEN",
         "DW_EXPLICIT_FILTER_COLUMNS",
         "DW_ENUM_SYNONYMS",
         "DW_CONTRACT_TABLE",
+        "DW_EQ_ALIAS_COLUMNS",
+        "DW_DATE_COLUMN",
     ]
-    cfg: Dict[str, Any] = {}
+    namespace_cfg: Dict[str, Any] = {}
+    global_cfg: Dict[str, Any] = {}
     for key in keys:
         value = _get_setting(key, scope="namespace", namespace="dw::common", default=None)
         if value is not None:
-            cfg[key] = value
-    return cfg
+            namespace_cfg[key] = value
+        global_value = _get_setting(key, scope="namespace", namespace="global", default=None)
+        if global_value is not None:
+            global_cfg[key] = global_value
+    return {"__namespace__": namespace_cfg, "__global__": global_cfg}
 
 
 def _load_dw_settings() -> DWSettings:
@@ -126,62 +140,84 @@ def _apply_eq_synonyms_if_needed(
     return "none", [], [], []
 
 
-def _eq_sql(
-    col: str,
-    val: str,
-    idx: int,
-    synonyms: Tuple[str, List[str], List[str], List[str]],
-) -> Tuple[str, Dict[str, Any]]:
-    mode, equals, prefix, contains = synonyms
-    binds: Dict[str, Any] = {}
-    column_expr = col.strip().upper()
-    if not column_expr.startswith('"'):
-        column_expr = column_expr.replace(" ", "_")
-    if mode == "request_type":
-        predicates: List[str] = []
-        if equals:
-            in_names: List[str] = []
-            for j, v in enumerate(equals):
-                bind = f"eq_{idx}_eq_{j}"
-                binds[bind] = v
-                in_names.append(f":{bind}")
-            predicates.append(f"UPPER(TRIM({column_expr})) IN ({', '.join(in_names)})")
-        for j, v in enumerate(prefix):
-            bind = f"eq_{idx}_pr_{j}"
-            binds[bind] = f"{v}%"
-            predicates.append(f"UPPER(TRIM({column_expr})) LIKE UPPER(:{bind})")
-        for j, v in enumerate(contains):
-            bind = f"eq_{idx}_ct_{j}"
-            binds[bind] = f"%{v}%"
-            predicates.append(f"UPPER(TRIM({column_expr})) LIKE UPPER(:{bind})")
-        if not predicates:
-            bind = f"eq_{idx}"
-            binds[bind] = val
-            predicates.append(f"UPPER(TRIM({column_expr})) = UPPER(TRIM(:{bind}))")
-        return "(" + " OR ".join(predicates) + ")", binds
-
-    bind = f"eq_{idx}"
-    binds[bind] = val
-    return f"UPPER(TRIM({column_expr})) = UPPER(TRIM(:{bind}))", binds
+def _dedupe_upper(values: Iterable[Any]) -> List[str]:
+    seen: set[str] = set()
+    ordered: List[str] = []
+    for raw in values:
+        if not isinstance(raw, str):
+            continue
+        text = raw.strip()
+        if not text:
+            continue
+        upper = text.upper()
+        if upper in seen:
+            continue
+        seen.add(upper)
+        ordered.append(upper)
+    return ordered
 
 
-def _compose_where(
-    fts_sql: str,
-    fts_binds: Dict[str, Any],
-    eq_sqls: List[str],
-    eq_binds: Dict[str, Any],
-) -> Tuple[str, Dict[str, Any]]:
-    parts: List[str] = []
-    if fts_sql:
-        parts.append(fts_sql)
-    if eq_sqls:
-        parts.append("(" + " AND ".join(eq_sqls) + ")")
-    if not parts:
-        return "", {}
-    combined: Dict[str, Any] = {}
-    combined.update(fts_binds or {})
-    combined.update(eq_binds or {})
-    return "WHERE " + " AND ".join(parts), combined
+def _collect_request_type_synonyms(
+    values: Iterable[str],
+    mapping: Dict[str, Dict[str, Iterable[Any]]],
+) -> Tuple[List[str], List[str], List[str]]:
+    equals: List[str] = []
+    prefixes: List[str] = []
+    contains: List[str] = []
+    for raw in values:
+        if not isinstance(raw, str):
+            continue
+        text = raw.strip()
+        if not text:
+            continue
+        upper = text.upper()
+        equals.append(upper)
+        for key, spec in mapping.items():
+            if not isinstance(spec, dict):
+                continue
+            key_upper = str(key).strip().upper()
+            eq_list = _dedupe_upper(spec.get("equals", []))
+            if upper == key_upper or upper in eq_list:
+                equals.extend(eq_list or [key_upper])
+                prefixes.extend(_dedupe_upper(spec.get("prefix", [])))
+                contains.extend(_dedupe_upper(spec.get("contains", [])))
+                break
+    return _dedupe_upper(equals), _dedupe_upper(prefixes), _dedupe_upper(contains)
+
+
+def _inject_request_type_synonyms(
+    eq_filters: List[Dict[str, Any]], settings: DWSettings
+) -> List[Dict[str, Any]]:
+    if not eq_filters:
+        return []
+    mapping = settings.get_request_type_synonyms()
+    if not mapping:
+        return [dict(entry) for entry in eq_filters if isinstance(entry, dict)]
+
+    enriched: List[Dict[str, Any]] = []
+    for entry in eq_filters:
+        if not isinstance(entry, dict):
+            continue
+        updated = dict(entry)
+        col = str(updated.get("col") or updated.get("column") or "").strip()
+        if col.upper() == "REQUEST_TYPE":
+            values: List[str] = []
+            if isinstance(updated.get("values"), (list, tuple)):
+                values.extend(str(v) for v in updated.get("values") if v is not None)
+            fallback = updated.get("val")
+            if fallback is not None:
+                values.append(str(fallback))
+            eq_vals, pref_vals, contains_vals = _collect_request_type_synonyms(values, mapping)
+            if eq_vals or pref_vals or contains_vals:
+                updated["synonyms"] = {
+                    "equals": eq_vals,
+                    "prefix": pref_vals,
+                    "contains": contains_vals,
+                }
+                updated["ci"] = True
+                updated["trim"] = True
+        enriched.append(updated)
+    return enriched
 
 
 def _after_marker(text: str) -> str:
@@ -264,43 +300,62 @@ def answer() -> Any:
         for col, val in raw_eq_pairs
         if col
     ]
-
-    eq_sqls: List[str] = []
-    eq_binds: Dict[str, Any] = {}
-    for idx, (col, val) in enumerate(eq_pairs):
-        sql_piece, binds = _eq_sql(col, val, idx, _apply_eq_synonyms_if_needed(settings, col, val))
-        eq_sqls.append(sql_piece)
-        eq_binds.update(binds)
+    eq_filters: List[Dict[str, Any]] = []
+    eq_applied: List[Dict[str, Any]] = []
+    for col, val in eq_pairs:
+        mode, equals, prefix, contains = _apply_eq_synonyms_if_needed(settings, col, val)
+        eq_applied.append({"col": col, "val": val})
+        if mode != "none":
+            eq_filters.append(
+                {
+                    "col": col,
+                    "val": val,
+                    "synonyms": {"equals": equals, "prefix": prefix, "contains": contains},
+                }
+            )
+        else:
+            eq_filters.append({"col": col, "val": val})
 
     token_groups, token_operator, token_reason = _extract_fts_groups(question, explicit_cols)
     should_enable_fts = full_text_flag or bool(token_groups)
-    fts_sql = ""
-    fts_binds: Dict[str, Any] = {}
+    groups = token_groups
+    if not groups and question:
+        groups = [[question]]
 
-    engine = settings.get_fts_engine()
+    engine_name = settings.get_fts_engine()
+    fts_engine = resolve_engine(engine_name)
+    raw_min_len = settings.get_with_global("DW_FTS_MIN_TOKEN_LEN", 2)
+    try:
+        min_token_len = max(1, int(raw_min_len))
+    except (TypeError, ValueError):
+        min_token_len = 2
+
+    contract_table = settings.get_with_global("DW_CONTRACT_TABLE", "Contract")
+    date_column = settings.get_with_global("DW_DATE_COLUMN", "REQUEST_DATE")
+
+    qb = QueryBuilder(table=contract_table, date_col=date_column)
+    qb.wants_all_columns(True)
 
     if should_enable_fts and fts_columns:
-        groups = token_groups
-        if not groups and question:
-            groups = [[question]]
-        fts_sql, fts_binds = build_fts_where(groups, fts_columns, token_operator)
+        qb.use_fts(engine=fts_engine, columns=fts_columns, min_token_len=min_token_len)
+        for group in groups:
+            qb.add_fts_group(group, op=token_operator)
 
-    where_sql, binds = _compose_where(fts_sql, fts_binds, eq_sqls, eq_binds)
-    order_sql = "ORDER BY REQUEST_DATE DESC"
+    if eq_filters:
+        qb.apply_eq_filters(eq_filters)
 
-    parts = ['SELECT * FROM "Contract"']
-    if where_sql:
-        parts.append(where_sql)
-    parts.append(order_sql)
-    final_sql = "\n".join(part for part in parts if part)
+    qb.order_by(date_column, desc=True)
 
+    final_sql, binds = qb.compile()
+    logger.info(json.dumps({"final_sql": {"size": len(final_sql), "sql": final_sql}}))
     rows = fetch_rows(final_sql, binds)
 
     flat_tokens = _flatten(token_groups) if token_groups else []
-    fts_reason = token_reason if (fts_sql or flat_tokens) else None
-    eq_applied = [{"col": col, "val": val} for col, val in eq_pairs]
+    fts_bind_names = [name for name in binds if name.startswith("fts_")]
+    fts_enabled = should_enable_fts and bool(fts_columns) and bool(fts_bind_names)
+    fts_reason = token_reason if (fts_enabled or flat_tokens) else None
     explain_parts: List[str] = []
-    if fts_sql:
+    if fts_enabled:
         cols_list = ", ".join(str(col) for col in fts_columns) or "(no columns configured)"
         explain_parts.append(
             f"FTS tokens joined with {token_operator} ({token_reason}). Columns: {cols_list}."
@@ -308,34 +363,39 @@ def answer() -> Any:
     if eq_applied:
         cols = ", ".join(item["col"] for item in eq_applied)
         explain_parts.append(f"Equality filters applied on {cols}.")
+
+    builder_notes = qb.debug_info().get("notes")
+
     debug = {
         "fts": {
-            "enabled": bool(fts_sql),
-            "tokens": flat_tokens if fts_sql else None,
-            "columns": fts_columns if fts_sql else None,
-            "binds": list(fts_binds.keys()) if fts_binds else None,
-            "engine": engine,
+            "enabled": bool(fts_enabled),
+            "tokens": flat_tokens if fts_enabled else None,
+            "columns": fts_columns if fts_enabled else None,
+            "binds": fts_bind_names or None,
+            "engine": engine_name,
             "reason": fts_reason,
         },
         "intent": {
-            "full_text_search": bool(fts_sql),
+            "full_text_search": bool(fts_enabled),
             "fts_tokens": flat_tokens,
-            "fts_operator": token_operator if fts_sql else None,
+            "fts_operator": token_operator if fts_enabled else None,
             "eq_filters": eq_applied,
         },
         "explain": explain_parts,
+        "final_sql": {"sql": final_sql, "size": len(final_sql)},
+        "builder_notes": builder_notes,
     }
 
     meta = {
         "binds": binds,
-        "strategy": "fts_like" if fts_sql else ("eq_only" if eq_sqls else "deterministic"),
+        "strategy": "fts_like" if fts_enabled else ("eq_only" if eq_filters else "deterministic"),
         "fts": {
-            "enabled": bool(fts_sql),
-            "mode": "explicit" if fts_sql else None,
-            "columns": fts_columns if fts_sql else [],
-            "binds": list(fts_binds.keys()) if fts_binds else [],
-            "engine": engine,
-            "operator": token_operator if fts_sql else None,
+            "enabled": bool(fts_enabled),
+            "mode": "explicit" if fts_enabled else None,
+            "columns": fts_columns if fts_enabled else [],
+            "binds": fts_bind_names,
+            "engine": engine_name,
+            "operator": token_operator if fts_enabled else None,
         },
     }
 
@@ -356,11 +416,11 @@ def rate() -> Any:
     comment = (payload.get("comment") or "").strip()
 
     settings = _load_dw_settings()
-    fts_columns = _fts_columns_from_settings(settings)
-    raw_settings = dict(settings.ns)
+    raw_settings: Dict[str, Any] = dict(settings.global_ns)
+    raw_settings.update(settings.ns)
 
     hints = parse_rate_comment_v2(comment)
-    tokens = hints.get("fts_tokens") or []
+    raw_tokens = hints.get("fts_tokens") or []
     operator = (hints.get("fts_operator") or "OR").upper()
     group_col = hints.get("group_by")
     group_cols = [group_col] if group_col else []
@@ -372,33 +432,28 @@ def rate() -> Any:
 
     contract_table = raw_settings.get("DW_CONTRACT_TABLE") or "Contract"
 
-    builder_fts: Dict[str, List[str]] = {}
-    raw_fts = raw_settings.get("DW_FTS_COLUMNS")
-    if isinstance(raw_fts, dict):
-        for key, value in raw_fts.items():
-            if isinstance(value, list):
-                builder_fts[str(key)] = list(value)
-    if fts_columns:
-        builder_fts.setdefault(contract_table, fts_columns)
-        builder_fts.setdefault(contract_table.upper(), fts_columns)
+    fts_cfg = settings.resolve_fts_config(
+        tokens=raw_tokens,
+        table_name=contract_table,
+        namespace="dw::common",
+    )
+    tokens = fts_cfg.get("tokens") or []
+    fts_columns = _dedupe_columns(fts_cfg.get("columns") or [])
+    fts_engine = fts_cfg.get("engine") or settings.get_fts_engine()
 
-    explicit_cols = settings.get_explicit_eq_columns() or DEFAULT_EXPLICIT_FILTER_COLUMNS
-    if not explicit_cols:
-        explicit_cols = DEFAULT_EXPLICIT_FILTER_COLUMNS
+    date_column = raw_settings.get("DW_DATE_COLUMN") or "REQUEST_DATE"
+    fts_engine_obj = resolve_engine(fts_engine)
+    min_token_len = fts_cfg.get("min_token_len", 2)
 
-    builder_settings = {
-        "DW_FTS_COLUMNS": builder_fts,
-        "DW_EXPLICIT_FILTER_COLUMNS": explicit_cols,
-        "DW_FTS_ENGINE": settings.get_fts_engine(),
-        "DW_CONTRACT_TABLE": contract_table,
-    }
-
+    eq_filters_raw = hints.get("eq_filters") or []
+    eq_filters = _inject_request_type_synonyms(eq_filters_raw, settings)
     intent = {
         "date_column": "OVERLAP",
         "fts_tokens": tokens,
         "fts_operator": operator,
         "full_text_search": bool(tokens),
-        "eq_filters": hints.get("eq_filters") or [],
+        "eq_filters": eq_filters,
+        "boolean_groups": hints.get("boolean_groups") or [],
         "group_by": group_col,
         "gross": gross_flag,
         "sort_by": sort_by_hint,
@@ -408,25 +463,67 @@ def rate() -> Any:
         "wants_all_columns": True,
     }
 
-    final_sql, binds, builder_dbg = build_sql_from_intent(intent, builder_settings, table=contract_table)
-    rows = fetch_rows(final_sql, binds)
+    qb = QueryBuilder(table=contract_table, date_col=date_column)
+    qb.wants_all_columns(True)
+
+    if tokens and fts_columns:
+        qb.use_fts(engine=fts_engine_obj, columns=fts_columns, min_token_len=min_token_len)
+        for token in tokens:
+            qb.add_fts_group([token], op=operator)
+
+    if intent["eq_filters"]:
+        qb.apply_eq_filters(intent["eq_filters"])
+    elif intent["boolean_groups"]:
+        qb.apply_boolean_groups(intent["boolean_groups"])
+
+    if group_col:
+        qb.group_by([group_col], gross=bool(gross_flag))
 
     sort_desc_effective = sort_desc_hint
+    extra_notes: List[str] = []
     if direction_hint is not None and sort_desc_effective is None:
-        sort_desc_effective, _ = direction_from_words([direction_hint])
+        sort_desc_effective, note = direction_from_words([direction_hint])
+        extra_notes.append(note)
     if sort_desc_effective is None:
         sort_desc_effective = True
 
     if group_cols:
         order_col = sort_by_hint or ("TOTAL_GROSS" if gross_flag else "CNT")
     else:
-        order_col = sort_by_hint or "REQUEST_DATE"
+        order_col = sort_by_hint or date_column or "REQUEST_DATE"
+
+    qb.order_by(order_col, desc=bool(sort_desc_effective))
+    qb.limit(top_n)
+
+    final_sql, binds = qb.compile()
+    final_sql_to_run = final_sql
+
+    trace_id = request.headers.get("X-Trace-Id") or uuid.uuid4().hex
+    logger.info({"event": "rate.primary.start", "trace_id": trace_id})
+    logger.info(
+        {
+            "event": "rate.primary.sql",
+            "trace_id": trace_id,
+            "sql_preview": final_sql_to_run[:300],
+            "binds": scrub_binds(binds),
+        }
+    )
+
+    rows = fetch_rows(final_sql_to_run, binds)
+    rowcount = len(rows)
+    logger.info({"event": "rate.primary.done", "trace_id": trace_id, "rowcount": rowcount})
+
+    allow_alt_retry = not env_flag("DW_RATE_DISABLE_ALT_RETRY", False)
+    if rowcount == 0 and not allow_alt_retry:
+        logger.info({"event": "rate.alt.skip", "trace_id": trace_id, "reason": "disabled"})
 
     fts_bind_names = [name for name in binds if name.startswith("fts_")]
 
     intent_debug = dict(intent)
     intent_debug["sort_by_effective"] = order_col
-    intent_debug["sort_desc_effective"] = sort_desc_effective
+    intent_debug["sort_desc_effective"] = bool(sort_desc_effective)
+
+    builder_notes = (qb.debug_info().get("notes") or []) + extra_notes
 
     debug = {
         "fts": {
@@ -434,8 +531,10 @@ def rate() -> Any:
             "tokens": tokens or None,
             "columns": fts_columns if tokens else None,
             "binds": fts_bind_names or None,
-            "engine": builder_settings.get("DW_FTS_ENGINE"),
+            "engine": fts_engine,
             "operator": operator if tokens else None,
+            "error": fts_cfg.get("error"),
+            "min_token_len": min_token_len,
         },
         "intent": intent_debug,
         "validation": {
@@ -450,29 +549,35 @@ def rate() -> Any:
             "order_by_applied": True,
             "eq_filters": len(intent["eq_filters"]),
         },
-        "builder_notes": builder_dbg.get("notes"),
+        "builder_notes": builder_notes,
+        "final_sql": {"sql": final_sql_to_run, "size": len(final_sql_to_run)},
     }
 
     meta = {
-        "attempt_no": 2,
+        "attempt_no": 1,
         "binds": binds,
         "fts": {
             "enabled": bool(tokens),
-            "engine": builder_settings.get("DW_FTS_ENGINE"),
+            "engine": fts_engine,
             "operator": operator if tokens else None,
             "columns": fts_columns if tokens else [],
+            "error": fts_cfg.get("error"),
+            "min_token_len": min_token_len,
         },
         "clarifier_intent": intent_debug,
+        "allow_alt_retry": allow_alt_retry,
+        "trace_id": trace_id,
+        "rowcount": rowcount,
     }
 
     response = {
         "ok": True,
         "inquiry_id": inquiry_id,
-        "sql": final_sql,
+        "sql": final_sql_to_run,
         "debug": debug,
         "meta": meta,
         "rows": rows,
-        "retry": True,
+        "retry": False,
     }
     return jsonify(response)
 

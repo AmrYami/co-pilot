@@ -16,7 +16,7 @@ except Exception:  # pragma: no cover - lightweight fallback
 
     String = Text = _DummyType  # type: ignore[assignment]
 
-from .utils import env_flag, env_int
+from apps.dw.utils import env_flag, env_int
 
 _STOPWORDS = {
     "the",
@@ -155,7 +155,8 @@ def inject_fulltext_where(sql_text: str, predicate: str) -> str:
     head = sql_text[:insert_pos].rstrip()
     tail = sql_text[insert_pos:]
 
-    if " where " in head.lower():
+    head_lower = head.lower()
+    if " where " in head_lower or "\nwhere " in head_lower:
         head = head + "\nAND " + predicate
     else:
         head = head + "\nWHERE " + predicate

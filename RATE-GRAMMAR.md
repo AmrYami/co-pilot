@@ -16,8 +16,10 @@ legacy pipe-delimited syntax.
 
 * `eq:` still expects `COLUMN = value` clauses separated by semicolons.
 * Each clause can contain multiple values joined with `or`, commas, or `|`.
-  * Example: `eq: ENTITY = DSFH or AL FARABI` produces two comparisons that are
-    OR-ed together.
+  * Example: `eq: ENTITY = DSFH or AL FARABI` collapses to a single
+    `UPPER(TRIM(ENTITY)) IN (UPPER(TRIM(:...)), ...)` predicate.
+  * Duplicate values collapse automatically so we only render unique bind
+    placeholders.
 * Case-insensitive (`ci`) and trimming (`trim`) flags remain available via
   parentheses: `eq: ENTITY = DSFH (ci, trim)`.
 * Columns defined in `DW_EQ_ALIAS_COLUMNS` expand automatically (e.g.
@@ -81,6 +83,18 @@ When you submit a rate, the response contains a friendly breakdown:
 }
 ```
 The FTS engine is displayed as `debug.fts.engine = "like"` when using LIKE.
+
+**where_text**
+```
+(UPPER(TRIM(ENTITY)) IN (UPPER(TRIM(:eq_bg_0)), UPPER(TRIM(:eq_bg_1)))
+ OR
+(UPPER(TRIM(CONTRACT_STAKEHOLDER_1)) IN (UPPER(TRIM(:eq_bg_2)), ...))
+```
+
+**binds_text**
+```
+eq_bg_0='DSFH', eq_bg_1='AL FARABI', eq_bg_2='AMR TAHER A MAGHRABI', ...
+```
 
 ## ORDER BY
 
