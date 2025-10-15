@@ -7,16 +7,14 @@ import os
 from typing import Optional
 
 from flask import Blueprint, abort, jsonify, request
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 from sqlalchemy.engine import Connection
+
+from apps.dw.db import get_memory_engine
 
 bp = Blueprint("dw_admin", __name__)
 
-MEM_DB_URL = os.getenv(
-    "MEMORY_DB_URL",
-    "postgresql+psycopg2://postgres:123456789@localhost/copilot_mem_dev",
-)
-eng = create_engine(MEM_DB_URL, pool_pre_ping=True, future=True)
+eng = get_memory_engine()
 
 
 def _get_admin_emails(conn: Connection) -> set[str]:

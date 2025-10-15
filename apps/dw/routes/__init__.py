@@ -8,10 +8,10 @@ import re
 import uuid
 from typing import Any, Dict, Iterable, List, Tuple
 
-from flask import Blueprint, jsonify, request, current_app
+from flask import Blueprint, jsonify, request
 from sqlalchemy import text
 
-from apps.dw.db import fetch_rows
+from apps.dw.db import fetch_rows, get_memory_engine
 from apps.dw.eq_parser import extract_eq_filters_from_natural_text, strip_eq_from_text
 from apps.dw.search import resolve_engine
 from apps.dw.settings_access import DWSettings
@@ -34,6 +34,34 @@ except Exception:  # pragma: no cover
 bp = Blueprint("dw", __name__)
 
 logger = logging.getLogger("dw.routes")
+
+UPSERT_FEEDBACK_SQL = text(
+    """
+    INSERT INTO dw_feedback (
+      inquiry_id, auth_email, rating, comment,
+      intent_json, resolved_sql, binds_json, status,
+      created_at, updated_at
+    ) VALUES (
+      :inquiry_id, :auth_email, :rating, :comment,
+      CAST(:intent_json AS JSONB), :resolved_sql, CAST(:binds_json AS JSONB), :status,
+      NOW(), NOW()
+    )
+    ON CONFLICT (inquiry_id)
+    DO UPDATE SET
+      rating       = EXCLUDED.rating,
+      comment      = EXCLUDED.comment,
+      intent_json  = COALESCE(EXCLUDED.intent_json, dw_feedback.intent_json),
+      resolved_sql = COALESCE(EXCLUDED.resolved_sql, dw_feedback.resolved_sql),
+      binds_json   = COALESCE(EXCLUDED.binds_json, dw_feedback.binds_json),
+      status       = EXCLUDED.status,
+      updated_at   = NOW()
+    RETURNING id, status, updated_at
+    """
+)
+
+FIND_FEEDBACK_SQL = text(
+    "SELECT id FROM dw_feedback WHERE inquiry_id = :inquiry_id LIMIT 1"
+)
 
 
 def _settings_dict() -> Dict[str, Any]:
@@ -413,15 +441,22 @@ def answer() -> Any:
 @bp.route("/dw/rate", methods=["POST"])
 def rate() -> Any:
     payload = request.get_json(force=True, silent=True) or {}
-    inquiry_id = payload.get("inquiry_id")
+    try:
+        inquiry_id = int(payload.get("inquiry_id"))
+    except (TypeError, ValueError):
+        inquiry_id = None
     comment = (payload.get("comment") or "").strip()
-    rating = payload.get("rating")
-    auth_email = (
+    try:
+        rating = int(payload.get("rating"))
+    except (TypeError, ValueError):
+        rating = 0
+    raw_auth_email = (
         payload.get("auth_email")
         or request.headers.get("X-Auth-Email")
         or ""
     ).strip()
-    auth_email = auth_email.lower() or None
+    auth_email = raw_auth_email.lower() or None
+    auth_email_db = raw_auth_email.upper().strip()
 
     settings = _load_dw_settings()
     raw_settings: Dict[str, Any] = dict(settings.global_ns)
@@ -561,37 +596,56 @@ def rate() -> Any:
         "final_sql": {"sql": final_sql_to_run, "size": len(final_sql_to_run)},
     }
 
-    mem_engine = current_app.config.get("MEM_ENGINE")
-    if mem_engine is None:
-        pipeline = current_app.config.get("PIPELINE") or current_app.config.get("pipeline")
-        if pipeline is not None:
-            mem_engine = getattr(pipeline, "mem_engine", None)
-
-    if mem_engine is not None:
+    status = "approved" if rating >= 4 else "pending"
+    if inquiry_id is not None:
         try:
-            intent_payload = json.dumps(intent, default=str)
-            binds_payload = json.dumps(binds, default=str)
-            with mem_engine.begin() as cn:
-                cn.execute(
-                    text(
-                        """
-              INSERT INTO dw_feedback(inquiry_id, auth_email, rating, comment,
-                                      intent_json, binds_json, resolved_sql, status, created_at)
-              VALUES(:inq, :email, :rating, :comment, :intent::jsonb, :binds::jsonb, :sql, 'pending', NOW())
-            """
-                    ),
-                    {
-                        "inq": inquiry_id,
-                        "email": auth_email,
-                        "rating": rating,
-                        "comment": comment or None,
-                        "intent": intent_payload,
-                        "binds": binds_payload,
-                        "sql": final_sql_to_run,
-                    },
-                )
+            mem_engine = get_memory_engine()
         except Exception:  # pragma: no cover - defensive logging only
-            logger.warning("failed to record dw_feedback", exc_info=True)
+            logger.warning("failed to acquire memory engine", exc_info=True)
+        else:
+            intent_payload = json.dumps(intent, default=str) if intent else None
+            binds_payload = json.dumps(binds, default=str) if binds else None
+            params = {
+                "inquiry_id": inquiry_id,
+                "auth_email": auth_email_db or None,
+                "rating": rating,
+                "comment": comment or None,
+                "intent_json": intent_payload,
+                "resolved_sql": final_sql_to_run,
+                "binds_json": binds_payload,
+                "status": status,
+            }
+            existing_id = None
+            row = None
+            try:
+                with mem_engine.begin() as cn:
+                    if inquiry_id is not None:
+                        existing_id = cn.execute(
+                            FIND_FEEDBACK_SQL, {"inquiry_id": inquiry_id}
+                        ).scalar_one_or_none()
+                    logger.info(
+                        {
+                            "event": "rate.db.upsert",
+                            "inquiry_id": inquiry_id,
+                            "status": status,
+                            "trace_id": trace_id,
+                        }
+                    )
+                    row = cn.execute(UPSERT_FEEDBACK_SQL, params).mappings().first()
+            except Exception:  # pragma: no cover - defensive logging only
+                logger.warning("failed to upsert dw_feedback", exc_info=True)
+            else:
+                if row:
+                    mapping = getattr(row, "_mapping", row)
+                    action = "inserted" if existing_id is None else "updated"
+                    logger.info(
+                        {
+                            "event": f"rate.db.{action}",
+                            "feedback_id": mapping.get("id") if hasattr(mapping, "get") else mapping["id"],
+                            "status": mapping.get("status") if hasattr(mapping, "get") else mapping["status"],
+                            "trace_id": trace_id,
+                        }
+                    )
 
     meta = {
         "attempt_no": 1,
