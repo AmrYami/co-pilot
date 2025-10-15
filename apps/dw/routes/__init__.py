@@ -24,6 +24,7 @@ from apps.dw.sqlbuilder import (
 )
 from apps.dw.logs import scrub_binds
 from apps.dw.utils import env_flag
+from apps.settings import get_setting
 
 try:  # pragma: no cover - lightweight fallback for tests without settings backend
     from apps.dw.settings_util import get_setting as _get_setting
@@ -35,7 +36,38 @@ bp = Blueprint("dw", __name__)
 
 logger = logging.getLogger("dw.routes")
 
-def upsert_feedback(
+
+def get_auth_email_from_ctx() -> str:
+    """Extract the authenticated email from the current request context."""
+
+    try:
+        payload = request.get_json(silent=True)
+    except Exception:  # pragma: no cover - defensive: Flask may raise on bad JSON
+        payload = None
+
+    if not isinstance(payload, dict):
+        payload = {}
+
+    auth_email = (payload.get("auth_email") or "").strip()
+    if not auth_email:
+        auth_email = (request.headers.get("X-Auth-Email") or "").strip()
+    if not auth_email:
+        try:
+            auth_email = (
+                get_setting(
+                    "AUTH_EMAIL",
+                    default="",
+                    scope="global",
+                    namespace="global",
+                )
+                or ""
+            ).strip()
+        except Exception:  # pragma: no cover - settings backend optional in tests
+            auth_email = ""
+    return auth_email.lower()
+
+
+def persist_feedback(
     db_session,
     *,
     inquiry_id: int,
@@ -43,51 +75,63 @@ def upsert_feedback(
     comment: str,
     intent,
     resolved_sql: str,
-    binds,
-    auth_email_hint: str | None = None,
-):
-    row = db_session.execute(
-        text(
-            """
-            SELECT COALESCE(mi.auth_email, dr.auth_email, '') AS auth_email
-              FROM mem_inquiries mi
-              LEFT JOIN dw_runs dr ON dr.inquiry_id = mi.id
-             WHERE mi.id = :inq
-             ORDER BY dr.created_at DESC
-             LIMIT 1
-            """
-        ),
-        {"inq": inquiry_id},
-    ).mappings().first()
-    auth_email = auth_email_hint or (row["auth_email"] if row else "")
+    binds_json,
+) -> None:
+    """Upsert feedback rows in dw_feedback while preserving moderation status."""
 
+    query = text(
+        """
+        INSERT INTO dw_feedback (
+            inquiry_id, auth_email, rating, comment,
+            intent_json, resolved_sql, binds_json, status, created_at, updated_at
+        )
+        VALUES (
+            :inquiry_id, :auth_email, :rating, :comment,
+            CAST(:intent_json AS JSONB), :resolved_sql, CAST(:binds_json AS JSONB),
+            'pending', now(), now()
+        )
+        ON CONFLICT (inquiry_id) DO UPDATE SET
+            rating       = EXCLUDED.rating,
+            comment      = EXCLUDED.comment,
+            intent_json  = EXCLUDED.intent_json,
+            resolved_sql = EXCLUDED.resolved_sql,
+            binds_json   = EXCLUDED.binds_json,
+            status       = CASE
+                             WHEN dw_feedback.status IN ('approved', 'rejected')
+                               THEN dw_feedback.status
+                             ELSE 'pending'
+                           END,
+            updated_at   = now()
+        RETURNING id;
+        """
+    )
+
+    auth_email = get_auth_email_from_ctx()
+    if not auth_email:
+        row = db_session.execute(
+            text(
+                """
+                SELECT COALESCE(mi.auth_email, dr.auth_email, '') AS auth_email
+                  FROM mem_inquiries mi
+                  LEFT JOIN dw_runs dr ON dr.inquiry_id = mi.id
+                 WHERE mi.id = :inq
+                 ORDER BY dr.created_at DESC
+                 LIMIT 1
+                """
+            ),
+            {"inq": inquiry_id},
+        ).mappings().first()
+        auth_email = ((row or {}).get("auth_email") or "").strip().lower()
     db_session.execute(
-        text(
-            """
-            INSERT INTO dw_feedback (
-                inquiry_id, auth_email, rating, comment,
-                intent_json, resolved_sql, binds_json, status, created_at, updated_at
-            ) VALUES (
-                :inquiry_id, :auth_email, :rating, :comment,
-                :intent::jsonb, :resolved_sql, :binds::jsonb, 'pending', now(), now()
-            )
-            ON CONFLICT (inquiry_id) DO UPDATE
-               SET rating       = EXCLUDED.rating,
-                   comment      = EXCLUDED.comment,
-                   intent_json  = EXCLUDED.intent_json,
-                   resolved_sql = EXCLUDED.resolved_sql,
-                   binds_json   = EXCLUDED.binds_json,
-                   updated_at   = now()
-            """
-        ),
+        query,
         {
             "inquiry_id": inquiry_id,
             "auth_email": auth_email,
             "rating": int(rating or 0),
             "comment": (comment or "").strip(),
-            "intent": json.dumps(intent or {}, default=str, ensure_ascii=False),
+            "intent_json": json.dumps(intent or {}, default=str, ensure_ascii=False),
             "resolved_sql": resolved_sql or "",
-            "binds": json.dumps(binds or {}, default=str, ensure_ascii=False),
+            "binds_json": json.dumps(binds_json or {}, default=str, ensure_ascii=False),
         },
     )
     db_session.commit()
@@ -478,12 +522,6 @@ def rate() -> Any:
         rating = int(payload.get("rating"))
     except (TypeError, ValueError):
         rating = 0
-    raw_auth_email = (
-        payload.get("auth_email")
-        or request.headers.get("X-Auth-Email")
-        or ""
-    ).strip()
-    auth_email = raw_auth_email.lower() or None
 
     settings = _load_dw_settings()
     raw_settings: Dict[str, Any] = dict(settings.global_ns)
@@ -627,17 +665,17 @@ def rate() -> Any:
         try:
             with get_memory_session() as mem_session:
                 logger.info({"event": "rate.persist.begin", "inquiry_id": inquiry_id})
-                upsert_feedback(
+                persist_feedback(
                     mem_session,
                     inquiry_id=inquiry_id,
                     rating=rating,
                     comment=comment,
                     intent=intent,
                     resolved_sql=final_sql_to_run,
-                    binds=binds,
-                    auth_email_hint=auth_email,
+                    binds_json=binds,
                 )
                 logger.info({"event": "rate.persist.done", "inquiry_id": inquiry_id})
+                logger.info({"event": "rate.feedback.persisted", "inquiry_id": inquiry_id})
         except Exception:  # pragma: no cover - defensive logging only
             logger.error("failed to persist dw_feedback", exc_info=True)
 
