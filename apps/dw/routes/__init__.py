@@ -22,6 +22,7 @@ from apps.dw.sqlbuilder import (
     direction_from_words,
     parse_rate_comment as parse_rate_comment_v2,
 )
+from apps.dw.feedback import normalize_status
 from apps.dw.logs import scrub_binds
 from apps.dw.utils import env_flag
 
@@ -48,6 +49,7 @@ UPSERT_FEEDBACK_SQL = text(
     )
     ON CONFLICT (inquiry_id)
     DO UPDATE SET
+      auth_email   = EXCLUDED.auth_email,
       rating       = EXCLUDED.rating,
       comment      = EXCLUDED.comment,
       intent_json  = COALESCE(EXCLUDED.intent_json, dw_feedback.intent_json),
@@ -55,14 +57,9 @@ UPSERT_FEEDBACK_SQL = text(
       binds_json   = COALESCE(EXCLUDED.binds_json, dw_feedback.binds_json),
       status       = EXCLUDED.status,
       updated_at   = NOW()
-    RETURNING id, status, updated_at
+    RETURNING id, status, updated_at, (xmax = 0) AS was_insert
     """
 )
-
-FIND_FEEDBACK_SQL = text(
-    "SELECT id FROM dw_feedback WHERE inquiry_id = :inquiry_id LIMIT 1"
-)
-
 
 def _settings_dict() -> Dict[str, Any]:
     keys = [
@@ -456,7 +453,6 @@ def rate() -> Any:
         or ""
     ).strip()
     auth_email = raw_auth_email.lower() or None
-    auth_email_db = raw_auth_email.upper().strip()
 
     settings = _load_dw_settings()
     raw_settings: Dict[str, Any] = dict(settings.global_ns)
@@ -596,33 +592,35 @@ def rate() -> Any:
         "final_sql": {"sql": final_sql_to_run, "size": len(final_sql_to_run)},
     }
 
-    status = "approved" if rating >= 4 else "pending"
+    default_status = "approved" if rating >= 4 else "pending"
+    status = normalize_status(payload.get("status"), default=default_status) or default_status
+    feedback_meta = None
     if inquiry_id is not None:
         try:
-            mem_engine = get_memory_engine()
+            db_conn = request.environ.get("db")  # type: ignore[assignment]
+        except Exception:
+            db_conn = None
+        try:
+            engine = get_memory_engine() if db_conn is None else None
         except Exception:  # pragma: no cover - defensive logging only
             logger.warning("failed to acquire memory engine", exc_info=True)
-        else:
-            intent_payload = json.dumps(intent, default=str) if intent else None
-            binds_payload = json.dumps(binds, default=str) if binds else None
-            params = {
-                "inquiry_id": inquiry_id,
-                "auth_email": auth_email_db or None,
-                "rating": rating,
-                "comment": comment or None,
-                "intent_json": intent_payload,
-                "resolved_sql": final_sql_to_run,
-                "binds_json": binds_payload,
-                "status": status,
-            }
-            existing_id = None
-            row = None
-            try:
-                with mem_engine.begin() as cn:
-                    if inquiry_id is not None:
-                        existing_id = cn.execute(
-                            FIND_FEEDBACK_SQL, {"inquiry_id": inquiry_id}
-                        ).scalar_one_or_none()
+            engine = None
+        intent_payload = json.dumps(intent, default=str) if intent else None
+        binds_payload = json.dumps(binds, default=str) if binds else None
+        params = {
+            "inquiry_id": inquiry_id,
+            "auth_email": auth_email,
+            "rating": rating,
+            "comment": comment or None,
+            "intent_json": intent_payload,
+            "resolved_sql": final_sql_to_run,
+            "binds_json": binds_payload,
+            "status": status,
+        }
+        row = None
+        try:
+            if db_conn is not None:
+                with db_conn.begin() as cn:
                     logger.info(
                         {
                             "event": "rate.db.upsert",
@@ -632,20 +630,40 @@ def rate() -> Any:
                         }
                     )
                     row = cn.execute(UPSERT_FEEDBACK_SQL, params).mappings().first()
-            except Exception:  # pragma: no cover - defensive logging only
-                logger.warning("failed to upsert dw_feedback", exc_info=True)
-            else:
-                if row:
-                    mapping = getattr(row, "_mapping", row)
-                    action = "inserted" if existing_id is None else "updated"
+            elif engine is not None:
+                with engine.begin() as cn:
                     logger.info(
                         {
-                            "event": f"rate.db.{action}",
-                            "feedback_id": mapping.get("id") if hasattr(mapping, "get") else mapping["id"],
-                            "status": mapping.get("status") if hasattr(mapping, "get") else mapping["status"],
+                            "event": "rate.db.upsert",
+                            "inquiry_id": inquiry_id,
+                            "status": status,
                             "trace_id": trace_id,
                         }
                     )
+                    row = cn.execute(UPSERT_FEEDBACK_SQL, params).mappings().first()
+        except Exception:  # pragma: no cover - defensive logging only
+            logger.warning("failed to upsert dw_feedback", exc_info=True)
+        else:
+            if row:
+                mapping = getattr(row, "_mapping", row)
+                feedback_id = mapping.get("id") if hasattr(mapping, "get") else mapping["id"]
+                was_insert = bool(
+                    mapping.get("was_insert") if hasattr(mapping, "get") else mapping["was_insert"]
+                )
+                action = "insert" if was_insert else "update"
+                feedback_meta = {
+                    "id": feedback_id,
+                    "action": action,
+                    "status": mapping.get("status") if hasattr(mapping, "get") else mapping["status"],
+                }
+                logger.info(
+                    {
+                        "event": f"rate.db.{action}",
+                        "feedback_id": feedback_id,
+                        "status": feedback_meta["status"],
+                        "trace_id": trace_id,
+                    }
+                )
 
     meta = {
         "attempt_no": 1,
@@ -663,6 +681,8 @@ def rate() -> Any:
         "trace_id": trace_id,
         "rowcount": rowcount,
     }
+    if feedback_meta:
+        meta["feedback"] = feedback_meta
 
     response = {
         "ok": True,
@@ -673,6 +693,8 @@ def rate() -> Any:
         "rows": rows,
         "retry": False,
     }
+    if feedback_meta:
+        response["feedback"] = feedback_meta
     return jsonify(response)
 
 
