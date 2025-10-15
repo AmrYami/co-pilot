@@ -11,7 +11,7 @@ from typing import Any, Dict, Iterable, List, Tuple
 from flask import Blueprint, jsonify, request
 from sqlalchemy import text
 
-from apps.dw.db import fetch_rows, get_memory_engine
+from apps.dw.db import fetch_rows, get_memory_session
 from apps.dw.eq_parser import extract_eq_filters_from_natural_text, strip_eq_from_text
 from apps.dw.search import resolve_engine
 from apps.dw.settings_access import DWSettings
@@ -22,7 +22,6 @@ from apps.dw.sqlbuilder import (
     direction_from_words,
     parse_rate_comment as parse_rate_comment_v2,
 )
-from apps.dw.feedback import normalize_status
 from apps.dw.logs import scrub_binds
 from apps.dw.utils import env_flag
 
@@ -40,26 +39,52 @@ UPSERT_FEEDBACK_SQL = text(
     """
     INSERT INTO dw_feedback (
       inquiry_id, auth_email, rating, comment,
-      intent_json, resolved_sql, binds_json, status,
-      created_at, updated_at
+      intent_json, resolved_sql, binds_json,
+      status, created_at, updated_at
     ) VALUES (
       :inquiry_id, :auth_email, :rating, :comment,
-      CAST(:intent_json AS JSONB), :resolved_sql, CAST(:binds_json AS JSONB), :status,
-      NOW(), NOW()
+      :intent_json::jsonb, :resolved_sql, :binds_json::jsonb,
+      :status, NOW(), NOW()
     )
-    ON CONFLICT (inquiry_id)
-    DO UPDATE SET
-      auth_email   = EXCLUDED.auth_email,
+    ON CONFLICT (inquiry_id) DO UPDATE SET
       rating       = EXCLUDED.rating,
       comment      = EXCLUDED.comment,
       intent_json  = COALESCE(EXCLUDED.intent_json, dw_feedback.intent_json),
-      resolved_sql = COALESCE(EXCLUDED.resolved_sql, dw_feedback.resolved_sql),
+      resolved_sql = EXCLUDED.resolved_sql,
       binds_json   = COALESCE(EXCLUDED.binds_json, dw_feedback.binds_json),
-      status       = EXCLUDED.status,
-      updated_at   = NOW()
-    RETURNING id, status, updated_at, (xmax = 0) AS was_insert
+      status       = CASE WHEN dw_feedback.status='rejected' THEN 'rejected'
+                          ELSE EXCLUDED.status END,
+      auth_email   = CASE WHEN EXCLUDED.auth_email <> '' THEN EXCLUDED.auth_email
+                          ELSE dw_feedback.auth_email END,
+      updated_at   = NOW();
     """
 )
+
+
+def persist_feedback(
+    mem_session,
+    *,
+    inquiry_id: int,
+    auth_email: str,
+    rating: int,
+    comment: str,
+    intent_json,
+    resolved_sql: str,
+    binds_json,
+    status: str = "pending",
+):
+    params = {
+        "inquiry_id": inquiry_id,
+        "auth_email": auth_email or "",
+        "rating": rating,
+        "comment": comment or "",
+        "intent_json": intent_json or None,
+        "resolved_sql": resolved_sql or "",
+        "binds_json": binds_json or None,
+        "status": status or "pending",
+    }
+    mem_session.execute(UPSERT_FEEDBACK_SQL, params)
+    mem_session.commit()
 
 def _settings_dict() -> Dict[str, Any]:
     keys = [
@@ -592,78 +617,28 @@ def rate() -> Any:
         "final_sql": {"sql": final_sql_to_run, "size": len(final_sql_to_run)},
     }
 
-    default_status = "approved" if rating >= 4 else "pending"
-    status = normalize_status(payload.get("status"), default=default_status) or default_status
+    status = "approved" if rating >= 4 else "pending"
     feedback_meta = None
     if inquiry_id is not None:
-        try:
-            db_conn = request.environ.get("db")  # type: ignore[assignment]
-        except Exception:
-            db_conn = None
-        try:
-            engine = get_memory_engine() if db_conn is None else None
-        except Exception:  # pragma: no cover - defensive logging only
-            logger.warning("failed to acquire memory engine", exc_info=True)
-            engine = None
         intent_payload = json.dumps(intent, default=str) if intent else None
         binds_payload = json.dumps(binds, default=str) if binds else None
-        params = {
-            "inquiry_id": inquiry_id,
-            "auth_email": auth_email,
-            "rating": rating,
-            "comment": comment or None,
-            "intent_json": intent_payload,
-            "resolved_sql": final_sql_to_run,
-            "binds_json": binds_payload,
-            "status": status,
-        }
-        row = None
         try:
-            if db_conn is not None:
-                with db_conn.begin() as cn:
-                    logger.info(
-                        {
-                            "event": "rate.db.upsert",
-                            "inquiry_id": inquiry_id,
-                            "status": status,
-                            "trace_id": trace_id,
-                        }
-                    )
-                    row = cn.execute(UPSERT_FEEDBACK_SQL, params).mappings().first()
-            elif engine is not None:
-                with engine.begin() as cn:
-                    logger.info(
-                        {
-                            "event": "rate.db.upsert",
-                            "inquiry_id": inquiry_id,
-                            "status": status,
-                            "trace_id": trace_id,
-                        }
-                    )
-                    row = cn.execute(UPSERT_FEEDBACK_SQL, params).mappings().first()
+            with get_memory_session() as mem_session:
+                logger.info({"event": "rate.persist.begin", "inquiry_id": inquiry_id})
+                persist_feedback(
+                    mem_session,
+                    inquiry_id=inquiry_id,
+                    auth_email=auth_email or "",
+                    rating=rating,
+                    comment=comment,
+                    intent_json=intent_payload,
+                    resolved_sql=final_sql_to_run,
+                    binds_json=binds_payload,
+                    status=status,
+                )
+                logger.info({"event": "rate.persist.done", "inquiry_id": inquiry_id})
         except Exception:  # pragma: no cover - defensive logging only
-            logger.warning("failed to upsert dw_feedback", exc_info=True)
-        else:
-            if row:
-                mapping = getattr(row, "_mapping", row)
-                feedback_id = mapping.get("id") if hasattr(mapping, "get") else mapping["id"]
-                was_insert = bool(
-                    mapping.get("was_insert") if hasattr(mapping, "get") else mapping["was_insert"]
-                )
-                action = "insert" if was_insert else "update"
-                feedback_meta = {
-                    "id": feedback_id,
-                    "action": action,
-                    "status": mapping.get("status") if hasattr(mapping, "get") else mapping["status"],
-                }
-                logger.info(
-                    {
-                        "event": f"rate.db.{action}",
-                        "feedback_id": feedback_id,
-                        "status": feedback_meta["status"],
-                        "trace_id": trace_id,
-                    }
-                )
+            logger.error("failed to persist dw_feedback", exc_info=True)
 
     meta = {
         "attempt_no": 1,

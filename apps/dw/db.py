@@ -8,12 +8,14 @@ from typing import Any, Dict, List, Optional
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
+from sqlalchemy.orm import Session, sessionmaker
 
 from apps.settings import get_setting
 
 _MEMORY_ENGINE: Engine | None = None
 _MEMORY_URL: str | None = None
 _MEMORY_LOCK = threading.Lock()
+_MEMORY_SESSION_FACTORY: sessionmaker[Session] | None = None
 
 _APP_ENGINES: Dict[str, Engine] = {}
 _APP_URLS: Dict[str, str] = {}
@@ -54,6 +56,19 @@ def get_memory_engine() -> Engine:
         _MEMORY_ENGINE = engine
         _MEMORY_URL = url
         return engine
+
+
+def get_memory_session() -> Session:
+    """Return a new SQLAlchemy ``Session`` bound to the memory datasource."""
+
+    global _MEMORY_SESSION_FACTORY
+    engine = get_memory_engine()
+    factory = _MEMORY_SESSION_FACTORY
+    bound_engine = getattr(factory, "kw", {}).get("bind") if factory is not None else None
+    if factory is None or bound_engine is not engine:
+        factory = sessionmaker(bind=engine, future=True)
+        _MEMORY_SESSION_FACTORY = factory
+    return factory()
 
 
 def _resolve_app_url(namespace: str = "dw::common") -> str:
@@ -116,4 +131,10 @@ def fetch_rows(sql: Any, binds: Dict[str, Any] | None = None) -> List[Dict[str, 
         return [dict(zip(columns, row)) for row in result.fetchall()]
 
 
-__all__ = ["fetch_rows", "get_app_engine", "get_engine", "get_memory_engine"]
+__all__ = [
+    "fetch_rows",
+    "get_app_engine",
+    "get_engine",
+    "get_memory_engine",
+    "get_memory_session",
+]

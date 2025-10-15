@@ -10,12 +10,25 @@ from flask import Blueprint, abort, jsonify, request
 from sqlalchemy import text
 from sqlalchemy.engine import Connection
 
-from apps.dw.db import get_memory_engine
-from apps.dw.feedback import normalize_status
+from apps.dw.db import get_memory_engine, get_memory_session
 
 bp = Blueprint("dw_admin", __name__)
 
 eng = get_memory_engine()
+
+
+STATUS_MAP = {
+    "": "",
+    None: "",
+    "pending": "pending",
+    "pend": "pending",
+    "approved": "approved",
+    "approve": "approved",
+    "appr": "approved",
+    "rejected": "rejected",
+    "reject": "rejected",
+    "rej": "rejected",
+}
 
 
 APPROVE_FEEDBACK_SQL = text(
@@ -141,38 +154,34 @@ def _extract_ids(payload) -> list[int]:
 
 @bp.get("/feedback")
 def list_feedback():
-    status = normalize_status(request.args.get("status"), default="")
-    limit = _coerce_positive_int(request.args.get("limit"), 50)
-    offset = _coerce_positive_int(request.args.get("offset"), 0)
-    with eng.begin() as conn:
+    status_raw = (request.args.get("status", "") or "").strip().lower()
+    status = STATUS_MAP.get(status_raw, "")
+    try:
+        limit = int(request.args.get("limit", "50"))
+    except (TypeError, ValueError):
+        limit = 50
+    if limit <= 0:
+        limit = 50
+    limit = min(limit, 500)
+
+    sql = text(
+        """
+        SELECT id, inquiry_id, auth_email, rating, comment,
+               intent_json, resolved_sql, binds_json,
+               status, approver_email, admin_note, rejected_reason,
+               created_at, updated_at
+          FROM dw_feedback
+         WHERE (:status = '' OR LOWER(status) = :status)
+         ORDER BY created_at DESC
+         LIMIT :limit
+        """
+    )
+
+    with get_memory_session() as mem_session:
+        conn = mem_session.connection()
         _require_admin(conn)
-        rows = conn.execute(
-            text(
-                """
-                SELECT
-                  f.id,
-                  f.inquiry_id,
-                  COALESCE(f.auth_email, i.auth_email) AS auth_email,
-                  f.rating,
-                  f.comment,
-                  f.intent_json,
-                  f.resolved_sql,
-                  f.binds_json,
-                  COALESCE(NULLIF(f.status,''), 'pending') AS status,
-                  f.approver_email,
-                  f.admin_note,
-                  f.rejected_reason,
-                  f.created_at,
-                  f.updated_at
-                FROM dw_feedback f
-                LEFT JOIN mem_inquiries i ON i.id = f.inquiry_id
-                WHERE (:status = '' OR LOWER(COALESCE(f.status,'')) = :status)
-                ORDER BY f.created_at DESC
-                LIMIT :limit OFFSET :offset
-                """
-            ),
-            {"status": status, "limit": limit, "offset": offset},
-        ).mappings().all()
+        rows = mem_session.execute(sql, {"status": status, "limit": limit}).mappings().all()
+
     dict_rows = [_row_to_dict(r) for r in rows]
     return jsonify({"ok": True, "rows": dict_rows, "count": len(dict_rows)})
 
