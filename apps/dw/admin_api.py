@@ -17,20 +17,6 @@ bp = Blueprint("dw_admin", __name__)
 eng = get_memory_engine()
 
 
-STATUS_MAP = {
-    "": "",
-    None: "",
-    "pending": "pending",
-    "pend": "pending",
-    "approved": "approved",
-    "approve": "approved",
-    "appr": "approved",
-    "rejected": "rejected",
-    "reject": "rejected",
-    "rej": "rejected",
-}
-
-
 APPROVE_FEEDBACK_SQL = text(
     """
     UPDATE dw_feedback
@@ -119,43 +105,11 @@ def _row_to_dict(row):
     return dict(row)
 
 
-def _coerce_positive_int(value, default):
-    try:
-        result = int(value)
-        if result < 0:
-            return default
-        return result
-    except (TypeError, ValueError):
-        return default
-
-
-def _extract_ids(payload) -> list[int]:
-    if isinstance(payload, dict):
-        raw_ids = payload.get("ids")
-        if raw_ids is None:
-            single = payload.get("id")
-            raw_ids = [single] if single is not None else []
-    else:
-        raw_ids = []
-
-    if not isinstance(raw_ids, (list, tuple, set)):
-        raw_ids = [raw_ids]
-
-    ids: list[int] = []
-    for raw in raw_ids:
-        try:
-            if raw is None:
-                continue
-            ids.append(int(raw))
-        except (TypeError, ValueError):
-            continue
-    return ids
-
-
 @bp.get("/feedback")
-def list_feedback():
-    status_raw = (request.args.get("status", "") or "").strip().lower()
-    status = STATUS_MAP.get(status_raw, "")
+def admin_list_feedback():
+    status = (request.args.get("status") or "").strip().lower()
+    if status == "all":
+        status = ""
     try:
         limit = int(request.args.get("limit", "50"))
     except (TypeError, ValueError):
@@ -166,56 +120,73 @@ def list_feedback():
 
     sql = text(
         """
-        SELECT id, inquiry_id, auth_email, rating, comment,
-               intent_json, resolved_sql, binds_json,
-               status, approver_email, admin_note, rejected_reason,
-               created_at, updated_at
-          FROM dw_feedback
-         WHERE (:status = '' OR LOWER(status) = :status)
-         ORDER BY created_at DESC
-         LIMIT :limit
+          SELECT id, inquiry_id, auth_email, rating, comment,
+                 intent_json, resolved_sql, binds_json,
+                 status, approver_email, admin_note, rejected_reason,
+                 created_at, updated_at
+            FROM dw_feedback
+           WHERE (:status = '' OR LOWER(status) = :status)
+           ORDER BY created_at DESC
+           LIMIT :limit
         """
     )
 
     with get_memory_session() as mem_session:
         conn = mem_session.connection()
         _require_admin(conn)
-        rows = mem_session.execute(sql, {"status": status, "limit": limit}).mappings().all()
+        rows = (
+            mem_session.execute(sql, {"status": status, "limit": limit})
+            .mappings()
+            .all()
+        )
 
-    dict_rows = [_row_to_dict(r) for r in rows]
-    return jsonify({"ok": True, "rows": dict_rows, "count": len(dict_rows)})
+    return jsonify([_row_to_dict(r) for r in rows])
 
 
-@bp.post("/feedback/approve")
-def approve_feedback_bulk():
-    payload = request.get_json(force=True) or {}
-    ids = _extract_ids(payload)
-    if not ids:
-        abort(400, description="No feedback ids supplied")
-    note = (payload.get("admin_note") or "").strip()
-    with eng.begin() as conn:
+@bp.post("/feedback/<int:inquiry_id>/approve")
+def admin_approve_feedback(inquiry_id: int):
+    note = ((request.get_json(silent=True) or {}).get("admin_note") or "").strip()
+    with get_memory_session() as mem_session:
+        conn = mem_session.connection()
         admin_email = _require_admin(conn)
-        result = conn.execute(
-            APPROVE_FEEDBACK_SQL,
-            {"ids": ids, "admin_email": admin_email, "note": note},
-        ).mappings().all()
-    return jsonify({"ok": True, "approved": [row["id"] for row in result]})
+        mem_session.execute(
+            text(
+                """
+                  UPDATE dw_feedback
+                     SET status='approved',
+                         approver_email=:user,
+                         admin_note=:note,
+                         updated_at=now()
+                   WHERE inquiry_id=:inq
+                """
+            ),
+            {"user": admin_email, "note": note, "inq": inquiry_id},
+        )
+        mem_session.commit()
+    return jsonify({"ok": True})
 
 
-@bp.post("/feedback/reject")
-def reject_feedback_bulk():
-    payload = request.get_json(force=True) or {}
-    ids = _extract_ids(payload)
-    if not ids:
-        abort(400, description="No feedback ids supplied")
-    reason = (payload.get("reason") or "").strip()
-    with eng.begin() as conn:
+@bp.post("/feedback/<int:inquiry_id>/reject")
+def admin_reject_feedback(inquiry_id: int):
+    reason = ((request.get_json(silent=True) or {}).get("rejected_reason") or "").strip()
+    with get_memory_session() as mem_session:
+        conn = mem_session.connection()
         admin_email = _require_admin(conn)
-        result = conn.execute(
-            REJECT_FEEDBACK_SQL,
-            {"ids": ids, "admin_email": admin_email, "reason": reason},
-        ).mappings().all()
-    return jsonify({"ok": True, "rejected": [row["id"] for row in result]})
+        mem_session.execute(
+            text(
+                """
+                  UPDATE dw_feedback
+                     SET status='rejected',
+                         approver_email=:user,
+                         rejected_reason=:reason,
+                         updated_at=now()
+                   WHERE inquiry_id=:inq
+                """
+            ),
+            {"user": admin_email, "reason": reason, "inq": inquiry_id},
+        )
+        mem_session.commit()
+    return jsonify({"ok": True})
 
 
 @bp.get("/feedback/<int:fid>")

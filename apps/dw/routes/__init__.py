@@ -35,56 +35,62 @@ bp = Blueprint("dw", __name__)
 
 logger = logging.getLogger("dw.routes")
 
-UPSERT_FEEDBACK_SQL = text(
-    """
-    INSERT INTO dw_feedback (
-      inquiry_id, auth_email, rating, comment,
-      intent_json, resolved_sql, binds_json,
-      status, created_at, updated_at
-    ) VALUES (
-      :inquiry_id, :auth_email, :rating, :comment,
-      :intent_json::jsonb, :resolved_sql, :binds_json::jsonb,
-      :status, NOW(), NOW()
-    )
-    ON CONFLICT (inquiry_id) DO UPDATE SET
-      rating       = EXCLUDED.rating,
-      comment      = EXCLUDED.comment,
-      intent_json  = COALESCE(EXCLUDED.intent_json, dw_feedback.intent_json),
-      resolved_sql = EXCLUDED.resolved_sql,
-      binds_json   = COALESCE(EXCLUDED.binds_json, dw_feedback.binds_json),
-      status       = CASE WHEN dw_feedback.status='rejected' THEN 'rejected'
-                          ELSE EXCLUDED.status END,
-      auth_email   = CASE WHEN EXCLUDED.auth_email <> '' THEN EXCLUDED.auth_email
-                          ELSE dw_feedback.auth_email END,
-      updated_at   = NOW();
-    """
-)
-
-
-def persist_feedback(
-    mem_session,
+def upsert_feedback(
+    db_session,
     *,
     inquiry_id: int,
-    auth_email: str,
     rating: int,
     comment: str,
-    intent_json,
+    intent,
     resolved_sql: str,
-    binds_json,
-    status: str = "pending",
+    binds,
+    auth_email_hint: str | None = None,
 ):
-    params = {
-        "inquiry_id": inquiry_id,
-        "auth_email": auth_email or "",
-        "rating": rating,
-        "comment": comment or "",
-        "intent_json": intent_json or None,
-        "resolved_sql": resolved_sql or "",
-        "binds_json": binds_json or None,
-        "status": status or "pending",
-    }
-    mem_session.execute(UPSERT_FEEDBACK_SQL, params)
-    mem_session.commit()
+    row = db_session.execute(
+        text(
+            """
+            SELECT COALESCE(mi.auth_email, dr.auth_email, '') AS auth_email
+              FROM mem_inquiries mi
+              LEFT JOIN dw_runs dr ON dr.inquiry_id = mi.id
+             WHERE mi.id = :inq
+             ORDER BY dr.created_at DESC
+             LIMIT 1
+            """
+        ),
+        {"inq": inquiry_id},
+    ).mappings().first()
+    auth_email = auth_email_hint or (row["auth_email"] if row else "")
+
+    db_session.execute(
+        text(
+            """
+            INSERT INTO dw_feedback (
+                inquiry_id, auth_email, rating, comment,
+                intent_json, resolved_sql, binds_json, status, created_at, updated_at
+            ) VALUES (
+                :inquiry_id, :auth_email, :rating, :comment,
+                :intent::jsonb, :resolved_sql, :binds::jsonb, 'pending', now(), now()
+            )
+            ON CONFLICT (inquiry_id) DO UPDATE
+               SET rating       = EXCLUDED.rating,
+                   comment      = EXCLUDED.comment,
+                   intent_json  = EXCLUDED.intent_json,
+                   resolved_sql = EXCLUDED.resolved_sql,
+                   binds_json   = EXCLUDED.binds_json,
+                   updated_at   = now()
+            """
+        ),
+        {
+            "inquiry_id": inquiry_id,
+            "auth_email": auth_email,
+            "rating": int(rating or 0),
+            "comment": (comment or "").strip(),
+            "intent": json.dumps(intent or {}, default=str, ensure_ascii=False),
+            "resolved_sql": resolved_sql or "",
+            "binds": json.dumps(binds or {}, default=str, ensure_ascii=False),
+        },
+    )
+    db_session.commit()
 
 def _settings_dict() -> Dict[str, Any]:
     keys = [
@@ -617,24 +623,19 @@ def rate() -> Any:
         "final_sql": {"sql": final_sql_to_run, "size": len(final_sql_to_run)},
     }
 
-    status = "approved" if rating >= 4 else "pending"
-    feedback_meta = None
     if inquiry_id is not None:
-        intent_payload = json.dumps(intent, default=str) if intent else None
-        binds_payload = json.dumps(binds, default=str) if binds else None
         try:
             with get_memory_session() as mem_session:
                 logger.info({"event": "rate.persist.begin", "inquiry_id": inquiry_id})
-                persist_feedback(
+                upsert_feedback(
                     mem_session,
                     inquiry_id=inquiry_id,
-                    auth_email=auth_email or "",
                     rating=rating,
                     comment=comment,
-                    intent_json=intent_payload,
+                    intent=intent,
                     resolved_sql=final_sql_to_run,
-                    binds_json=binds_payload,
-                    status=status,
+                    binds=binds,
+                    auth_email_hint=auth_email,
                 )
                 logger.info({"event": "rate.persist.done", "inquiry_id": inquiry_id})
         except Exception:  # pragma: no cover - defensive logging only
@@ -656,9 +657,6 @@ def rate() -> Any:
         "trace_id": trace_id,
         "rowcount": rowcount,
     }
-    if feedback_meta:
-        meta["feedback"] = feedback_meta
-
     response = {
         "ok": True,
         "inquiry_id": inquiry_id,
@@ -668,8 +666,6 @@ def rate() -> Any:
         "rows": rows,
         "retry": False,
     }
-    if feedback_meta:
-        response["feedback"] = feedback_meta
     return jsonify(response)
 
 
