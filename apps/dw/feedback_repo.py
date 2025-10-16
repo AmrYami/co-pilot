@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any, Dict, Optional
 
 from sqlalchemy import text
 
-from apps.common.db import get_mem_engine
+from apps.dw.db import get_memory_engine
+
+
+log = logging.getLogger("dw")
 
 
 def persist_feedback(
@@ -23,8 +27,8 @@ def persist_feedback(
 ) -> int:
     """Insert or update a ``dw_feedback`` row and return its identifier."""
 
-    intent_json = json.dumps(intent or {}, ensure_ascii=False)
-    binds_json = json.dumps(binds or {}, ensure_ascii=False)
+    intent_json = json.dumps(intent or {}, ensure_ascii=False, separators=(",", ":"))
+    binds_json = json.dumps(binds or {}, ensure_ascii=False, separators=(",", ":"))
 
     sql = text(
         """
@@ -49,7 +53,7 @@ def persist_feedback(
         """
     )
 
-    engine = get_mem_engine()
+    engine = get_memory_engine()
     with engine.begin() as conn:
         row = conn.execute(
             sql,
@@ -59,7 +63,7 @@ def persist_feedback(
                 "rating": rating,
                 "comment": (comment or "").strip(),
                 "intent_json": intent_json,
-                "resolved_sql": resolved_sql,
+                "resolved_sql": resolved_sql or "",
                 "binds_json": binds_json,
                 "status": status,
             },
@@ -68,7 +72,18 @@ def persist_feedback(
     if not row:
         raise RuntimeError("dw_feedback upsert did not return an identifier")
 
-    return int(row[0])
+    feedback_id = int(row[0])
+
+    log.info(
+        {
+            "event": "dw.feedback.upsert",
+            "inquiry_id": inquiry_id,
+            "feedback_id": feedback_id,
+            "status": "ok",
+        }
+    )
+
+    return feedback_id
 
 
 __all__ = ["persist_feedback"]
