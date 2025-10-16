@@ -3,8 +3,7 @@ from typing import Any, Dict, List, Optional
 
 from flask import Blueprint, current_app, jsonify, request
 
-from apps.dw.dal import upsert_feedback
-from apps.dw.db import get_memory_session
+from apps.dw.feedback_store import persist_feedback
 from apps.dw.sql_builder import build_rate_sql
 from apps.dw.settings import get_setting, get_settings, load_settings
 from apps.dw.learning import record_feedback, to_patch_from_comment
@@ -326,52 +325,38 @@ def rate():
         }
     )
 
-    should_persist = True
+    resp["binds"] = binds
+    resp.setdefault("debug", {}).setdefault("final_sql", {}).setdefault("binds", binds)
+
     try:
-        rating_int = int(rating) if rating is not None else 0
+        settings = get_settings()
+    except Exception:
+        settings = {}
+
+    auth_email = _get_auth_email_from_ctx_or_default(request, settings)
+
+    try:
+        inquiry_id_value = int(inquiry_id) if inquiry_id is not None else None
     except (TypeError, ValueError):
-        rating_int = 0
+        inquiry_id_value = None
 
-    if should_persist and inquiry_id is not None:
-        try:
-            settings = get_settings()
-        except Exception:
-            settings = {}
+    persist_result = persist_feedback(
+        inquiry_id_value,
+        auth_email,
+        rating,
+        comment,
+        resp,
+    )
+    resp.setdefault("debug", {}).setdefault("persist", persist_result)
 
-        auth_email = _get_auth_email_from_ctx_or_default(request, settings)
-        session = None
-        try:
-            session = get_memory_session()
-            upsert_feedback(
-                session=session,
-                inquiry_id=int(inquiry_id),
-                rating=rating_int,
-                comment=comment,
-                intent_obj=debug_payload.get("intent") if isinstance(debug_payload, dict) else {},
-                resolved_sql=final_sql,
-                binds_obj=binds,
-                auth_email=auth_email,
-            )
-            session.commit()
-            current_app.logger.info(
-                {
-                    "event": "rate.persisted",
-                    "inquiry_id": inquiry_id,
-                    "status": "pending",
-                }
-            )
-        except Exception as exc:
-            if session is not None:
-                session.rollback()
-            current_app.logger.exception(
-                {
-                    "event": "rate.persist.error",
-                    "inquiry_id": inquiry_id,
-                    "error": str(exc),
-                }
-            )
-        finally:
-            if session is not None:
-                session.close()
+    current_app.logger.info(
+        {
+            "event": "rate.persist",
+            "inquiry_id": inquiry_id_value,
+            "rating": rating,
+            "ok": persist_result.get("ok"),
+            "error": persist_result.get("error"),
+        }
+    )
 
     return jsonify(resp), 200
