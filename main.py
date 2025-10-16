@@ -3,6 +3,7 @@ from flask import Flask, jsonify
 from apps.common.admin import admin_bp as admin_common_bp
 from apps.dw.app import create_dw_blueprint
 from apps.dw.admin_api import bp as dw_admin_bp
+from apps.dw.routes import debug_bp
 from apps.dw.tests.routes import golden_bp
 from core.admin_api import admin_bp as core_admin_bp
 from core.logging_utils import get_logger, log_event, setup_logging
@@ -44,6 +45,7 @@ def create_app():
     dw_bp = create_dw_blueprint(settings=settings, pipeline=pipeline)
 
     app.register_blueprint(dw_bp, url_prefix="/dw")
+    app.register_blueprint(debug_bp)
     app.register_blueprint(dw_admin_bp, url_prefix="/dw/admin")
     app.register_blueprint(golden_bp)
     app.register_blueprint(core_admin_bp, url_prefix="/admin")

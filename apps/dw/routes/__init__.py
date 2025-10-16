@@ -10,8 +10,9 @@ import uuid
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from flask import Blueprint, jsonify, request
+from sqlalchemy import text
 
-from apps.dw.db import fetch_rows, get_memory_engine
+from apps.dw.db import fetch_rows, get_app_engine, get_memory_engine
 from apps.dw.eq_parser import extract_eq_filters_from_natural_text, strip_eq_from_text
 from apps.dw.search import resolve_engine
 from apps.dw.settings_access import DWSettings
@@ -26,7 +27,7 @@ from apps.dw.logs import scrub_binds
 from apps.dw.utils import env_flag
 from apps.settings import get_setting
 
-from apps.dw.feedback_repo import persist_feedback
+from apps.dw.persist import upsert_feedback
 
 try:  # pragma: no cover - lightweight fallback for tests without settings backend
     from apps.dw.settings_util import get_setting as _get_setting
@@ -35,9 +36,46 @@ except Exception:  # pragma: no cover
         return default
 
 bp = Blueprint("dw", __name__)
+debug_bp = Blueprint("dw_debug", __name__)
 
 logger = logging.getLogger("dw.routes")
 log = logging.getLogger("dw")
+
+
+def _mask_url(url):
+    try:
+        url_str = str(url)
+        if getattr(url, "password", None):
+            return url_str.replace(url.password or "", "*****")
+        return url_str
+    except Exception:  # pragma: no cover - defensive fallback
+        return "<hidden>"
+
+
+@debug_bp.get("/dw/debug/which-db")
+def dw_debug_which_db():
+    app_engine = get_app_engine()
+    mem_engine = get_memory_engine()
+    out: Dict[str, Any] = {}
+    with app_engine.connect() as conn:
+        db, schema = conn.execute(text("select current_database(), current_schema()")).one()
+        out["app_db"] = {
+            "database": db,
+            "schema": schema,
+            "url": _mask_url(app_engine.url),
+        }
+    with mem_engine.connect() as conn:
+        db, schema = conn.execute(text("select current_database(), current_schema()")).one()
+        out["mem_db"] = {
+            "database": db,
+            "schema": schema,
+            "url": _mask_url(mem_engine.url),
+        }
+    out["env"] = {
+        "ACTIVE_APP": os.getenv("ACTIVE_APP"),
+        "MEMORY_DB_URL_env": os.getenv("MEMORY_DB_URL"),
+    }
+    return jsonify(out)
 
 
 def get_auth_email_from_ctx() -> str:
@@ -450,6 +488,8 @@ def _resolve_auth_email(body: Dict[str, Any]) -> str:
     candidate = (body or {}).get("auth_email") or ""
     auth_email = candidate.strip() if isinstance(candidate, str) else str(candidate or "").strip()
     if not auth_email:
+        auth_email = (request.headers.get("X-Auth-Email") or "").strip()
+    if not auth_email:
         auth_email = os.getenv("AUTH_EMAIL", "").strip()
     if not auth_email:
         try:
@@ -645,14 +685,32 @@ def rate() -> Any:
     feedback_id = None
     if ok_to_persist and inquiry_id is not None:
         try:
-            feedback_id = persist_feedback(
+            mem_engine = get_memory_engine()
+            resolved_auth = (payload.get("auth_email") or "").strip()
+            if not resolved_auth:
+                resolved_auth = (request.headers.get("X-Auth-Email") or "").strip()
+            if not resolved_auth:
+                resolved_auth = (auth_email or "").strip()
+            if not resolved_auth:
+                with mem_engine.connect() as conn:
+                    row = conn.execute(
+                        text("select auth_email from dw_runs where id=:i"),
+                        {"i": inquiry_id},
+                    ).fetchone()
+                    if row and row[0]:
+                        resolved_auth = str(row[0]).strip()
+            resolved_auth = resolved_auth or ""
+            feedback_id = upsert_feedback(
+                mem_engine,
                 inquiry_id=inquiry_id,
-                auth_email=auth_email,
-                rating=int(rating or 0),
+                auth_email=resolved_auth or auth_email,
+                rating=rating,
                 comment=comment,
-                intent=intent,
-                final_sql=final_sql_to_run,
-                binds=binds,
+                intent_dict=intent,
+                sql_text=final_sql_to_run,
+                binds_dict=binds,
+                status="pending",
+                logger=log,
             )
         except Exception as exc:  # pragma: no cover - defensive logging only
             log.exception(
@@ -700,4 +758,4 @@ def rate() -> Any:
     return jsonify(response), 200
 
 
-__all__ = ["bp", "answer", "rate"]
+__all__ = ["bp", "answer", "rate", "debug_bp"]
