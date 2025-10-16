@@ -540,6 +540,21 @@ def _should_persist(rating: Optional[int], comment: str) -> Tuple[bool, str]:
 @bp.route("/dw/rate", methods=["POST"])
 def rate() -> Any:
     payload = request.get_json(force=True, silent=True) or {}
+    mem_engine = None
+    try:
+        mem_engine = get_common_mem_engine()
+    except Exception as exc:  # pragma: no cover - defensive logging only
+        log.exception(
+            "rate.persist.target.err",
+            extra={"err": str(exc)},
+        )
+    else:
+        log.info(
+            {
+                "event": "rate.persist.target",
+                "mem_engine": str(mem_engine.url),
+            }
+        )
     try:
         inquiry_id = int(payload.get("inquiry_id"))
     except (TypeError, ValueError):
@@ -707,7 +722,8 @@ def rate() -> Any:
     persist_warning: Optional[str] = None
     if ok_to_persist and inquiry_id is not None:
         try:
-            mem_engine = get_common_mem_engine()
+            if mem_engine is None:
+                raise RuntimeError("Memory engine unavailable")
             resolved_auth = (payload.get("auth_email") or "").strip()
             if not resolved_auth:
                 resolved_auth = (request.headers.get("X-Auth-Email") or "").strip()
