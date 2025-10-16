@@ -1,10 +1,13 @@
+import json
 from datetime import date, datetime
 from typing import Any, Dict, List, Optional
 
 from flask import Blueprint, current_app, jsonify, request
+from sqlalchemy import text
 
+from apps.dw.db import get_memory_engine
 from apps.dw.sql_builder import build_rate_sql
-from apps.dw.settings import get_setting, load_settings
+from apps.dw.settings import get_setting, get_settings, load_settings
 from apps.dw.learning import record_feedback, to_patch_from_comment
 from apps.dw.search import (
     build_fulltext_where,
@@ -18,6 +21,95 @@ from apps.dw.sql.builder import build_eq_boolean_groups_where, normalize_order_b
 from apps.dw.rate_dates import build_date_clause
 
 rate_bp = Blueprint("rate", __name__)
+
+
+def _get_auth_email_from_ctx_or_default(req, settings):
+    payload: Dict[str, Any] = {}
+    try:
+        payload = req.get_json(force=True, silent=True) or {}
+    except Exception:
+        payload = {}
+
+    auth_email = payload.get("auth_email")
+    if auth_email:
+        return str(auth_email)
+
+    header_email = req.headers.get("X-Auth-Email")
+    if header_email:
+        return header_email
+
+    fallback_settings = settings or {}
+    return str(fallback_settings.get("AUTH_EMAIL", ""))
+
+
+def _persist_feedback(mem_engine, payload, resolved, auth_email: str) -> None:
+    intent_json = (
+        resolved.get("debug", {}).get("intent")
+        or resolved.get("intent")
+        or {}
+    )
+    final_sql = (
+        (resolved.get("debug", {}).get("final_sql") or {}).get("sql")
+        or resolved.get("sql")
+        or ""
+    )
+    binds_json = (
+        (resolved.get("debug", {}).get("validation") or {}).get("binds")
+        or resolved.get("binds")
+        or {}
+    )
+
+    try:
+        rating_value = int(payload.get("rating", 0))
+    except (TypeError, ValueError):
+        rating_value = 0
+
+    status = "pending" if rating_value <= 3 else "approved"
+
+    query = text(
+        """
+        INSERT INTO dw_feedback
+            (inquiry_id, auth_email, rating, comment, intent_json, resolved_sql, binds_json, status, created_at, updated_at)
+        VALUES
+            (:inquiry_id, :auth_email, :rating, :comment, CAST(:intent_json AS JSONB), :resolved_sql, CAST(:binds_json AS JSONB), :status, now(), now())
+        ON CONFLICT (inquiry_id) DO UPDATE
+            SET rating       = EXCLUDED.rating,
+                comment      = EXCLUDED.comment,
+                intent_json  = EXCLUDED.intent_json,
+                resolved_sql = EXCLUDED.resolved_sql,
+                binds_json   = EXCLUDED.binds_json,
+                status       = CASE WHEN dw_feedback.status = 'approved' THEN 'approved' ELSE EXCLUDED.status END,
+                updated_at   = now();
+        """
+    )
+
+    params = {
+        "inquiry_id": int(payload["inquiry_id"]),
+        "auth_email": auth_email or "",
+        "rating": rating_value,
+        "comment": payload.get("comment", ""),
+        "intent_json": json.dumps(intent_json, ensure_ascii=False),
+        "resolved_sql": final_sql,
+        "binds_json": json.dumps(binds_json, ensure_ascii=False),
+        "status": status,
+    }
+
+    with mem_engine.begin() as connection:
+        result = connection.execute(query, params)
+
+    try:
+        rows = result.rowcount
+    except Exception:
+        rows = None
+
+    current_app.logger.info(
+        {
+            "event": "rate.persisted",
+            "inquiry_id": payload["inquiry_id"],
+            "status": status,
+            "rowcount": rows,
+        }
+    )
 
 
 @rate_bp.route("/dw/rate", methods=["POST"])
@@ -304,4 +396,50 @@ def rate():
             },
         }
     )
+
+    should_persist = True
+    try:
+        rating_int = int(rating) if rating is not None else 0
+    except (TypeError, ValueError):
+        rating_int = 0
+
+    if should_persist and inquiry_id is not None:
+        try:
+            settings = get_settings()
+        except Exception:
+            settings = {}
+
+        auth_email = _get_auth_email_from_ctx_or_default(request, settings)
+
+        try:
+            memory_engine = get_memory_engine()
+        except Exception as exc:
+            current_app.logger.exception(
+                {
+                    "event": "rate.persist.engine_error",
+                    "inquiry_id": inquiry_id,
+                    "error": str(exc),
+                }
+            )
+        else:
+            try:
+                _persist_feedback(
+                    memory_engine,
+                    {
+                        "inquiry_id": inquiry_id,
+                        "rating": rating_int,
+                        "comment": comment,
+                    },
+                    resp,
+                    auth_email,
+                )
+            except Exception as exc:
+                current_app.logger.exception(
+                    {
+                        "event": "rate.persist.error",
+                        "inquiry_id": inquiry_id,
+                        "error": str(exc),
+                    }
+                )
+
     return jsonify(resp), 200
