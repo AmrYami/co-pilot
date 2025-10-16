@@ -70,8 +70,8 @@ from apps.dw.settings_utils import load_explicit_filter_columns
 from apps.dw.tables.contracts import build_contract_sql
 from apps.mem.kv import get_settings_for_namespace
 from apps.dw.online_learning import load_recent_hints
-from apps.dw.learning import load_rules_for_question
 from apps.dw.builder import _where_from_eq_filters
+from apps.dw.db import get_memory_session
 from apps.dw.learning_store import (
     DWExample,
     DWPatch,
@@ -94,6 +94,126 @@ from .tests.golden_runner_rate import golden_rate_bp
 LOGGER = logging.getLogger("dw.app")
 
 
+def _normalize_question_text(value: Any) -> str:
+    text_value = "" if value is None else str(value)
+    return " ".join(text_value.strip().lower().split())
+
+
+def load_persisted_rules(session, limit: int = 50) -> List[Dict[str, Any]]:
+    try:
+        rows = (
+            session.execute(
+                text(
+                    """
+                    SELECT id, rule_kind,
+                           COALESCE(rule_payload, '{}'::jsonb) AS rule_payload,
+                           enabled
+                      FROM dw_rules
+                     WHERE enabled = TRUE
+                     ORDER BY id DESC
+                     LIMIT :limit
+                    """
+                ),
+                {"limit": limit},
+            )
+            .mappings()
+            .all()
+        )
+    except Exception as exc:
+        LOGGER.warning("[dw] rules loader fell back: %s", exc)
+        return []
+
+    loaded: List[Dict[str, Any]] = []
+    for row in rows:
+        payload = row.get("rule_payload")
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except json.JSONDecodeError:
+                payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        loaded.append(
+            {
+                "id": row.get("id"),
+                "kind": row.get("rule_kind"),
+                "payload": payload,
+            }
+        )
+    return loaded
+
+
+def _load_rate_hint_seed(question: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    normalized_question = _normalize_question_text(question)
+    if not normalized_question:
+        return {}, {}
+
+    try:
+        session = get_memory_session()
+    except Exception as exc:
+        LOGGER.warning("[dw] unable to open memory session for rate hints: %s", exc)
+        return {}, {}
+
+    try:
+        rules = load_persisted_rules(session)
+        hints: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+        origin_ids: List[int] = []
+        for entry in rules:
+            if (entry.get("kind") or "").strip().lower() != "rate_hint":
+                continue
+            payload = entry.get("payload") or {}
+            if not isinstance(payload, dict):
+                continue
+            payload_copy = dict(payload)
+            meta = {"rule_id": entry.get("id")}
+            hints.append((payload_copy, meta))
+            origin_candidate = payload.get("origin_inquiry_id")
+            try:
+                origin_id = int(origin_candidate) if origin_candidate is not None else None
+            except (TypeError, ValueError):
+                origin_id = None
+            if origin_id is not None:
+                origin_ids.append(origin_id)
+
+        if not hints:
+            return {}, {}
+
+        id_to_norm: Dict[int, str] = {}
+        if origin_ids:
+            rows = (
+                session.execute(
+                    text(
+                        """
+                        SELECT id,
+                               COALESCE(NULLIF(q_norm, ''), LOWER(TRIM(question))) AS norm
+                          FROM mem_inquiries
+                         WHERE id = ANY(:ids)
+                        """
+                    ),
+                    {"ids": origin_ids},
+                )
+                .mappings()
+                .all()
+            )
+            for row in rows:
+                norm = row.get("norm")
+                if isinstance(norm, str):
+                    id_to_norm[int(row.get("id"))] = _normalize_question_text(norm)
+
+        for payload, meta in hints:
+            origin_candidate = payload.get("origin_inquiry_id")
+            try:
+                origin_id = int(origin_candidate) if origin_candidate is not None else None
+            except (TypeError, ValueError):
+                origin_id = None
+            if origin_id is None:
+                continue
+            if id_to_norm.get(origin_id) == normalized_question:
+                return payload, meta
+
+        return {}, {}
+    finally:
+        session.close()
 dw_bp = Blueprint("dw", __name__)
 init_db()
 dw_bp.register_blueprint(rate_bp, url_prefix="")
@@ -1398,13 +1518,27 @@ def answer():
     online_intent: Dict[str, Any] = {}
     online_hints_applied = 0
     pipeline = _get_pipeline()
-    mem_engine = getattr(pipeline, "mem_engine", None) if pipeline else None
-    learned_hints = {}
+    seed_payload: Dict[str, Any] = {}
+    seed_meta: Dict[str, Any] = {}
+    seed_sql: str = ""
+    seed_binds: Dict[str, Any] = {}
     try:
-        learned_hints = load_rules_for_question(mem_engine, question)
-        if learned_hints:
-            apply_rate_hints(online_intent, learned_hints, settings)
-            online_hints_applied += 1
+        seed_payload, seed_meta = _load_rate_hint_seed(question)
+        if seed_payload:
+            seed_intent = seed_payload.get("intent")
+            if isinstance(seed_intent, dict) and seed_intent:
+                online_intent.update(seed_intent)
+                online_hints_applied += 1
+            raw_sql = seed_payload.get("resolved_sql")
+            if isinstance(raw_sql, str):
+                seed_sql = raw_sql.strip()
+            elif raw_sql is not None:
+                seed_sql = str(raw_sql)
+            raw_binds = seed_payload.get("binds")
+            if isinstance(raw_binds, dict):
+                seed_binds = raw_binds
+            if seed_sql:
+                online_hints_applied = max(online_hints_applied, 1)
     except Exception as exc:
         LOGGER.warning("[dw] failed to load persisted rules: %s", exc)
     try:
@@ -1414,7 +1548,7 @@ def answer():
             apply_rate_hints(online_intent, hint, settings)
     except Exception as exc:
         LOGGER.warning("[dw] failed to load online hints: %s", exc)
-        online_hints_applied = 1 if learned_hints else 0
+        online_hints_applied = 1 if seed_payload else 0
 
     prefixes = _coerce_prefixes(payload.get("prefixes"))
     auth_email = payload.get("auth_email") or None
@@ -1539,6 +1673,49 @@ def answer():
         if response["meta"].get("online_learning", {}).get("fts"):
             response["meta"]["fts"] = response["meta"]["online_learning"]["fts"]
         return _respond(payload, response)
+
+    if seed_sql:
+        try:
+            seeded_binds = _coerce_bind_dates(dict(seed_binds or {}))
+            rows, cols, exec_meta = _execute_oracle(seed_sql, seeded_binds)
+            inquiry_id = _log_inquiry(
+                question,
+                auth_email,
+                status="answered",
+                rows=len(rows),
+                prefixes=prefixes,
+                payload=payload,
+            )
+            duration_ms = int((time.time() - t0) * 1000)
+            seed_learning: Dict[str, Any] = {
+                "hints": max(online_hints_applied, 1),
+                "seed_rule_id": seed_meta.get("rule_id"),
+            }
+            if seed_payload.get("intent"):
+                seed_learning["seed_intent"] = seed_payload.get("intent")
+            if seeded_binds:
+                seed_learning["seed_bind_keys"] = list(seeded_binds.keys())
+            response = {
+                "ok": True,
+                "inquiry_id": inquiry_id,
+                "rows": rows,
+                "columns": cols,
+                "sql": seed_sql,
+                "meta": {
+                    "strategy": "rate_hint_seed",
+                    "binds": _json_safe_binds(seeded_binds),
+                    **exec_meta,
+                    "duration_ms": duration_ms,
+                    "online_learning": seed_learning,
+                },
+                "debug": {
+                    "seed_rule_id": seed_meta.get("rule_id"),
+                    "online_learning": seed_learning,
+                },
+            }
+            return _respond(payload, response)
+        except Exception as exc:
+            LOGGER.warning("[dw] failed to execute seed SQL: %s", exc)
 
     like_response = _attempt_like_eq_fallback(
         question=question,
