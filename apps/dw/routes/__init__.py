@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import uuid
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from flask import Blueprint, jsonify, request
 
@@ -36,6 +37,7 @@ except Exception:  # pragma: no cover
 bp = Blueprint("dw", __name__)
 
 logger = logging.getLogger("dw.routes")
+log = logging.getLogger("dw")
 
 
 def get_auth_email_from_ctx() -> str:
@@ -442,6 +444,38 @@ def answer() -> Any:
     return jsonify(response)
 
 
+def _resolve_auth_email(body: Dict[str, Any]) -> str:
+    """Resolve the auth email from request body, environment, or settings."""
+
+    candidate = (body or {}).get("auth_email") or ""
+    auth_email = candidate.strip() if isinstance(candidate, str) else str(candidate or "").strip()
+    if not auth_email:
+        auth_email = os.getenv("AUTH_EMAIL", "").strip()
+    if not auth_email:
+        try:
+            auth_email = get_setting("AUTH_EMAIL", namespace="dw::common", default="") or ""
+            auth_email = auth_email.strip()
+        except Exception:  # pragma: no cover - optional settings backend
+            auth_email = ""
+    return auth_email
+
+
+def _should_persist(rating: Optional[int], comment: str) -> Tuple[bool, str]:
+    """Determine whether feedback should be persisted and why."""
+
+    if rating is None:
+        return False, "no_rating"
+    try:
+        rating_value = int(rating)
+    except (TypeError, ValueError):
+        return False, "invalid_rating"
+    if rating_value <= 3:
+        return True, "low_rating"
+    if (comment or "").strip():
+        return True, "has_comment"
+    return False, "positive_without_comment"
+
+
 @bp.route("/dw/rate", methods=["POST"])
 def rate() -> Any:
     payload = request.get_json(force=True, silent=True) or {}
@@ -450,10 +484,11 @@ def rate() -> Any:
     except (TypeError, ValueError):
         inquiry_id = None
     comment = (payload.get("comment") or "").strip()
+    raw_rating = payload.get("rating")
     try:
-        rating = int(payload.get("rating"))
+        rating: Optional[int] = int(raw_rating)
     except (TypeError, ValueError):
-        rating = 0
+        rating = None
 
     settings = _load_dw_settings()
     raw_settings: Dict[str, Any] = dict(settings.global_ns)
@@ -593,40 +628,45 @@ def rate() -> Any:
         "final_sql": {"sql": final_sql_to_run, "size": len(final_sql_to_run)},
     }
 
-    auth_email = (payload.get("auth_email") or "").strip() or (
-        get_setting("AUTH_EMAIL", namespace="dw::common", default="") or ""
+    auth_email = _resolve_auth_email(payload)
+    ok_to_persist, decision_reason = _should_persist(rating, comment)
+    if inquiry_id is None:
+        ok_to_persist = False
+        decision_reason = "missing_inquiry_id"
+    log.info(
+        {
+            "event": "rate.persist.decision",
+            "inquiry_id": inquiry_id,
+            "ok": ok_to_persist,
+            "reason": decision_reason,
+        }
     )
+
     feedback_id = None
-    if inquiry_id is not None:
+    if ok_to_persist and inquiry_id is not None:
         try:
-            if rating <= 3 or comment:
-                feedback_id = persist_feedback(
-                    inquiry_id=inquiry_id,
-                    auth_email=auth_email,
-                    rating=rating,
-                    comment=comment,
-                    intent=intent,
-                    resolved_sql=final_sql_to_run,
-                    binds=binds,
-                    status="pending",
-                )
-                logger.info(
-                    {
-                        "event": "feedback.upsert.ok",
-                        "inquiry_id": inquiry_id,
-                        "feedback_id": feedback_id,
-                    }
-                )
-            else:
-                logger.info(
-                    {
-                        "event": "feedback.skip",
-                        "reason": "rating>3 and empty comment",
-                        "inquiry_id": inquiry_id,
-                    }
-                )
-        except Exception:  # pragma: no cover - defensive logging only
-            logger.exception("[dw.feedback] persist failed")
+            feedback_id = persist_feedback(
+                inquiry_id=inquiry_id,
+                auth_email=auth_email,
+                rating=int(rating or 0),
+                comment=comment,
+                intent=intent,
+                final_sql=final_sql_to_run,
+                binds=binds,
+            )
+        except Exception as exc:  # pragma: no cover - defensive logging only
+            log.exception(
+                "rate.persist.err",
+                extra={"inquiry_id": inquiry_id, "err": str(exc)},
+            )
+    else:
+        log.info(
+            {
+                "event": "rate.persist.skip",
+                "inquiry_id": inquiry_id,
+                "reason": decision_reason,
+            }
+        )
 
     debug["feedback_id"] = feedback_id
 
@@ -654,8 +694,10 @@ def rate() -> Any:
         "meta": meta,
         "rows": rows,
         "retry": False,
+        "stored_to_feedback": bool(feedback_id),
+        "feedback_id": feedback_id,
     }
-    return jsonify(response)
+    return jsonify(response), 200
 
 
 __all__ = ["bp", "answer", "rate"]
