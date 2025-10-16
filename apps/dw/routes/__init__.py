@@ -29,7 +29,7 @@ from apps.dw.logs import scrub_binds
 from apps.dw.utils import env_flag
 from apps.settings import get_setting
 
-from apps.dw.repo import feedback_repo
+from apps.core.memdb import persist_feedback as persist_feedback_to_mem
 
 try:  # pragma: no cover - lightweight fallback for tests without settings backend
     from apps.dw.settings_util import get_setting as _get_setting
@@ -758,9 +758,9 @@ def rate() -> Any:
         }
     )
 
-    feedback_id = None
+    feedback_id: Optional[int] = None
     persist_warning: Optional[str] = None
-    feedback_result = None
+    feedback_result: Optional[Dict[str, Any]] = None
     if ok_to_persist and inquiry_id is not None:
         try:
             if mem_engine is None:
@@ -779,26 +779,29 @@ def rate() -> Any:
                     if row and row[0]:
                         resolved_auth = str(row[0]).strip()
             resolved_auth = resolved_auth or ""
-            feedback_result = feedback_repo.upsert_feedback(
-                engine=mem_engine,
-                inquiry_id=inquiry_id,
-                auth_email=resolved_auth or auth_email or "",
-                rating=int(rating or 0) if rating is not None else 0,
-                comment=comment or "",
-                intent_json=intent or {},
-                resolved_sql=final_sql_to_run or "",
-                binds_json=binds or {},
-                status="pending",
-            )
-            current_app.logger.info(
-                {
-                    "event": "feedback.persist.done",
+            persist_payload: Dict[str, Any] = {
+                "inquiry_id": inquiry_id,
+                "auth_email": resolved_auth or auth_email or "",
+                "rating": int(rating or 0) if rating is not None else 0,
+                "comment": comment or "",
+                "intent": intent or {},
+                "resolved_sql": final_sql_to_run or "",
+                "binds": binds or {},
+            }
+            feedback_result = persist_feedback_to_mem(mem_engine, persist_payload)
+            log.info(
+                "rate.persist.feedback",
+                extra={
                     "inquiry_id": inquiry_id,
-                    "rowcount": getattr(feedback_result, "rowcount", None),
-                    "inserted_id": getattr(feedback_result, "inserted_id", None),
-                }
+                    "ok": feedback_result.get("ok"),
+                    "msg": feedback_result.get("msg"),
+                    "rows": rowcount,
+                },
             )
-            feedback_id = getattr(feedback_result, "inserted_id", None)
+            if feedback_result.get("ok"):
+                feedback_id = feedback_result.get("feedback_id")
+            else:
+                persist_warning = feedback_result.get("error") or "persist_failed"
         except Exception as exc:  # pragma: no cover - defensive logging only
             log.exception(
                 "rate.persist.err",
@@ -814,10 +817,9 @@ def rate() -> Any:
             }
         )
 
-    if feedback_result is not None and feedback_id is None:
-        feedback_id = getattr(feedback_result, "inserted_id", None)
-
     debug["feedback_id"] = feedback_id
+    if feedback_result is not None:
+        debug["persist"] = feedback_result
 
     meta = {
         "attempt_no": 1,
