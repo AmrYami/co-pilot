@@ -341,11 +341,9 @@ def rate():
         inquiry_id_value = None
 
     persist_result: Dict[str, Any]
-    mem_engine = getattr(current_app, "mem_engine", None) or current_app.config.get("MEM_ENGINE")
-    if mem_engine and inquiry_id_value:
+    if inquiry_id_value:
         try:
             persist_feedback_id = persist_feedback(
-                mem_engine,
                 inquiry_id=inquiry_id_value,
                 auth_email=auth_email,
                 rating=int(rating or 0) if rating is not None else 0,
@@ -355,11 +353,11 @@ def rate():
                 or resp.get("debug", {}).get("final_sql", {}).get("sql"),
                 binds=resp.get("binds") or {},
             )
-            persist_result: Dict[str, Any] = {"ok": True, "feedback_id": persist_feedback_id}
+            persist_result = {"ok": True, "feedback_id": persist_feedback_id}
         except Exception as exc:
             persist_result = {"ok": False, "error": str(exc)}
     else:
-        persist_result = {"ok": False, "error": "memory_engine_unavailable"}
+        persist_result = {"ok": False, "error": "missing_inquiry_id"}
     resp.setdefault("debug", {}).setdefault("persist", persist_result)
 
     current_app.logger.info(

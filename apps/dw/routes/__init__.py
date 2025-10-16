@@ -13,10 +13,10 @@ from flask import Blueprint, current_app, jsonify, request
 from sqlalchemy import text
 
 from apps.common.db import get_app_engine as get_common_app_engine
-from apps.common.db import get_mem_engine as get_common_mem_engine
 from apps.dw.db import fetch_rows
 from apps.dw.eq_parser import extract_eq_filters_from_natural_text, strip_eq_from_text
 from apps.dw.feedback_store import persist_feedback
+from apps.dw.memory_db import get_mem_engine as get_memdb_engine
 from apps.dw.search import resolve_engine
 from apps.dw.settings_access import DWSettings
 from apps.dw.settings_defaults import DEFAULT_EXPLICIT_FILTER_COLUMNS
@@ -83,7 +83,7 @@ def _probe(conn) -> Dict[str, Any]:
 @debug_bp.get("/dw/debug/which-db")
 def dw_debug_which_db():
     app_engine = get_common_app_engine()
-    mem_engine = get_common_mem_engine()
+    mem_engine = get_memdb_engine()
     out: Dict[str, Any] = {}
     with app_engine.connect() as conn:
         out["app_db"] = _probe(conn)
@@ -544,7 +544,7 @@ def _get_memory_engine():
             pass
         return config_engine
 
-    mem_engine = get_common_mem_engine()
+    mem_engine = get_memdb_engine()
     try:
         setattr(current_app, "memory_engine", mem_engine)
     except Exception:  # pragma: no cover - attribute assignment best effort
@@ -582,7 +582,6 @@ def rate_ping():
 
     try:
         feedback_id = persist_feedback(
-            mem_engine,
             inquiry_id=inquiry_id or 777777,
             auth_email="debug@local",
             rating=1,
@@ -607,11 +606,11 @@ def _should_persist(rating: Optional[int], comment: str) -> Tuple[bool, str]:
         rating_value = int(rating)
     except (TypeError, ValueError):
         return False, "invalid_rating"
-    if rating_value <= 2:
-        return True, "low_rating"
-    if (comment or "").strip():
-        return True, "has_comment"
-    return False, "positive_without_comment"
+
+    if rating_value <= 0 and not (comment or "").strip():
+        return False, "nonpositive_without_comment"
+
+    return True, "rating_present"
 
 
 @bp.route("/dw/rate", methods=["POST"])
@@ -812,14 +811,12 @@ def rate() -> Any:
     feedback_result: Optional[Dict[str, Any]] = None
     if ok_to_persist and inquiry_id is not None:
         try:
-            if mem_engine is None:
-                raise RuntimeError("Memory engine unavailable")
             resolved_auth = (payload.get("auth_email") or "").strip()
             if not resolved_auth:
                 resolved_auth = (request.headers.get("X-Auth-Email") or "").strip()
             if not resolved_auth:
                 resolved_auth = (auth_email or "").strip()
-            if not resolved_auth:
+            if not resolved_auth and mem_engine is not None:
                 with mem_engine.connect() as conn:
                     row = conn.execute(
                         text("select auth_email from dw_runs where id=:i"),
@@ -830,7 +827,6 @@ def rate() -> Any:
             resolved_auth = resolved_auth or ""
 
             feedback_id = persist_feedback(
-                mem_engine,
                 inquiry_id=inquiry_id,
                 auth_email=resolved_auth or auth_email or "",
                 rating=int(rating or 0) if rating is not None else 0,
@@ -845,7 +841,11 @@ def rate() -> Any:
                     "event": "rate.persist.feedback",
                     "inquiry_id": inquiry_id,
                     "feedback_id": feedback_id,
-                    "mem_engine": mem_engine.url.render_as_string(hide_password=True),
+                    "mem_engine": (
+                        mem_engine.url.render_as_string(hide_password=True)
+                        if mem_engine is not None
+                        else None
+                    ),
                     "rows": rowcount,
                 }
             )
