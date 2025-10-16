@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any, Dict
 
 from sqlalchemy import text
-from sqlalchemy.engine import Engine
+
+from apps.dw.memory_db import get_mem_engine
+
+log = logging.getLogger("dw")
 
 UPSERT_SQL = text(
     """
@@ -20,6 +24,7 @@ INSERT INTO dw_feedback (
   'pending', NOW(), NOW()
 )
 ON CONFLICT (inquiry_id) DO UPDATE SET
+  auth_email    = EXCLUDED.auth_email,
   rating        = EXCLUDED.rating,
   comment       = EXCLUDED.comment,
   intent_json   = EXCLUDED.intent_json,
@@ -53,7 +58,6 @@ def _coerce_payload(
 
 
 def persist_feedback(
-    mem_engine: Engine,
     *,
     inquiry_id: int,
     auth_email: str,
@@ -65,10 +69,10 @@ def persist_feedback(
 ) -> int:
     """Insert or update a ``dw_feedback`` record and return its identifier."""
 
-    if mem_engine is None:
-        raise RuntimeError("Memory engine must be provided")
     if not inquiry_id:
         raise ValueError("inquiry_id is required for feedback persistence")
+
+    engine = get_mem_engine()
 
     payload = _coerce_payload(
         inquiry_id=inquiry_id,
@@ -80,11 +84,28 @@ def persist_feedback(
         binds=binds,
     )
 
-    with mem_engine.begin() as conn:
-        result = conn.execute(UPSERT_SQL, payload)
-        feedback_id = result.scalar_one()
+    log.info(
+        {
+            "event": "rate.persist.attempt",
+            "inquiry_id": inquiry_id,
+            "auth_email": payload["auth_email"],
+            "rating": payload["rating"],
+        }
+    )
 
-    return int(feedback_id)
+    with engine.begin() as conn:
+        result = conn.execute(UPSERT_SQL, payload)
+        feedback_id = int(result.scalar_one())
+
+    log.info(
+        {
+            "event": "rate.persist.ok",
+            "inquiry_id": inquiry_id,
+            "feedback_id": feedback_id,
+        }
+    )
+
+    return feedback_id
 
 
 __all__ = ["persist_feedback", "UPSERT_SQL"]
