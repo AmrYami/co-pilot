@@ -9,7 +9,7 @@ import re
 import uuid
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, current_app, jsonify, request
 from sqlalchemy import text
 
 from apps.common.db import get_app_engine as get_common_app_engine
@@ -29,7 +29,7 @@ from apps.dw.logs import scrub_binds
 from apps.dw.utils import env_flag
 from apps.settings import get_setting
 
-from apps.dw.persist import persist_feedback_to_mem
+from apps.dw.repo import feedback_repo
 
 try:  # pragma: no cover - lightweight fallback for tests without settings backend
     from apps.dw.settings_util import get_setting as _get_setting
@@ -504,21 +504,49 @@ def answer() -> Any:
 
 
 def _resolve_auth_email(body: Dict[str, Any]) -> str:
-    """Resolve the auth email from request body, environment, or settings."""
+    """Resolve the auth email from request context or settings."""
+
+    header_email = (request.headers.get("X-Auth-Email") or "").strip()
+    if header_email:
+        return header_email.lower()
 
     candidate = (body or {}).get("auth_email") or ""
     auth_email = candidate.strip() if isinstance(candidate, str) else str(candidate or "").strip()
-    if not auth_email:
-        auth_email = (request.headers.get("X-Auth-Email") or "").strip()
-    if not auth_email:
-        auth_email = os.getenv("AUTH_EMAIL", "").strip()
-    if not auth_email:
+    if auth_email:
+        return auth_email.lower()
+
+    env_email = os.getenv("AUTH_EMAIL", "").strip()
+    if env_email:
+        return env_email.lower()
+
+    try:
+        setting_email = get_setting("AUTH_EMAIL", namespace="dw::common", default="") or ""
+    except Exception:  # pragma: no cover - optional settings backend
+        setting_email = ""
+    return setting_email.strip().lower()
+
+
+def _get_memory_engine():
+    """Return the configured memory engine, caching it on the Flask app."""
+
+    mem_engine = getattr(current_app, "memory_engine", None)
+    if mem_engine is not None:
+        return mem_engine
+
+    config_engine = current_app.config.get("MEM_ENGINE")
+    if config_engine is not None:
         try:
-            auth_email = get_setting("AUTH_EMAIL", namespace="dw::common", default="") or ""
-            auth_email = auth_email.strip()
-        except Exception:  # pragma: no cover - optional settings backend
-            auth_email = ""
-    return auth_email
+            setattr(current_app, "memory_engine", config_engine)
+        except Exception:  # pragma: no cover - attribute assignment best effort
+            pass
+        return config_engine
+
+    mem_engine = get_common_mem_engine()
+    try:
+        setattr(current_app, "memory_engine", mem_engine)
+    except Exception:  # pragma: no cover - attribute assignment best effort
+        pass
+    return mem_engine
 
 
 def _should_persist(rating: Optional[int], comment: str) -> Tuple[bool, str]:
@@ -542,19 +570,20 @@ def rate() -> Any:
     payload = request.get_json(force=True, silent=True) or {}
     mem_engine = None
     try:
-        mem_engine = get_common_mem_engine()
+        mem_engine = _get_memory_engine()
     except Exception as exc:  # pragma: no cover - defensive logging only
         log.exception(
             "rate.persist.target.err",
             extra={"err": str(exc)},
         )
     else:
-        log.info(
-            {
-                "event": "rate.persist.target",
-                "mem_engine": str(mem_engine.url),
-            }
-        )
+        if mem_engine is not None:
+            log.info(
+                {
+                    "event": "rate.persist.target",
+                    "mem_engine": str(mem_engine.url),
+                }
+            )
     try:
         inquiry_id = int(payload.get("inquiry_id"))
     except (TypeError, ValueError):
@@ -705,6 +734,17 @@ def rate() -> Any:
     }
 
     auth_email = _resolve_auth_email(payload)
+    current_app.logger.info(
+        {
+            "event": "feedback.persist.intent",
+            "inquiry_id": inquiry_id,
+            "auth_email": auth_email,
+            "rating": rating,
+            "has_intent": intent is not None,
+            "has_sql": bool(final_sql_to_run),
+            "binds_keys": list((binds or {}).keys()),
+        }
+    )
     ok_to_persist, decision_reason = _should_persist(rating, comment)
     if inquiry_id is None:
         ok_to_persist = False
@@ -720,6 +760,7 @@ def rate() -> Any:
 
     feedback_id = None
     persist_warning: Optional[str] = None
+    feedback_result = None
     if ok_to_persist and inquiry_id is not None:
         try:
             if mem_engine is None:
@@ -738,16 +779,26 @@ def rate() -> Any:
                     if row and row[0]:
                         resolved_auth = str(row[0]).strip()
             resolved_auth = resolved_auth or ""
-            feedback_id = persist_feedback_to_mem(
-                mem_engine,
+            feedback_result = feedback_repo.upsert_feedback(
+                engine=mem_engine,
                 inquiry_id=inquiry_id,
                 auth_email=resolved_auth or auth_email or "",
-                rating=int(rating or 0),
+                rating=int(rating or 0) if rating is not None else 0,
                 comment=comment or "",
-                intent=intent,
-                final_sql=final_sql_to_run,
-                binds=binds,
+                intent_json=intent or {},
+                resolved_sql=final_sql_to_run or "",
+                binds_json=binds or {},
+                status="pending",
             )
+            current_app.logger.info(
+                {
+                    "event": "feedback.persist.done",
+                    "inquiry_id": inquiry_id,
+                    "rowcount": getattr(feedback_result, "rowcount", None),
+                    "inserted_id": getattr(feedback_result, "inserted_id", None),
+                }
+            )
+            feedback_id = getattr(feedback_result, "inserted_id", None)
         except Exception as exc:  # pragma: no cover - defensive logging only
             log.exception(
                 "rate.persist.err",
@@ -762,6 +813,9 @@ def rate() -> Any:
                 "reason": decision_reason,
             }
         )
+
+    if feedback_result is not None and feedback_id is None:
+        feedback_id = getattr(feedback_result, "inserted_id", None)
 
     debug["feedback_id"] = feedback_id
 
