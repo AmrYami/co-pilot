@@ -16,6 +16,7 @@ from apps.common.db import get_app_engine as get_common_app_engine
 from apps.common.db import get_mem_engine as get_common_mem_engine
 from apps.dw.db import fetch_rows
 from apps.dw.eq_parser import extract_eq_filters_from_natural_text, strip_eq_from_text
+from apps.dw.feedback_store import persist_feedback
 from apps.dw.search import resolve_engine
 from apps.dw.settings_access import DWSettings
 from apps.dw.settings_defaults import DEFAULT_EXPLICIT_FILTER_COLUMNS
@@ -28,8 +29,6 @@ from apps.dw.sqlbuilder import (
 from apps.dw.logs import scrub_binds
 from apps.dw.utils import env_flag
 from apps.settings import get_setting
-
-from apps.core.memdb import persist_feedback as persist_feedback_to_mem
 
 try:  # pragma: no cover - lightweight fallback for tests without settings backend
     from apps.dw.settings_util import get_setting as _get_setting
@@ -529,6 +528,10 @@ def _resolve_auth_email(body: Dict[str, Any]) -> str:
 def _get_memory_engine():
     """Return the configured memory engine, caching it on the Flask app."""
 
+    mem_engine = getattr(current_app, "mem_engine", None)
+    if mem_engine is not None:
+        return mem_engine
+
     mem_engine = getattr(current_app, "memory_engine", None)
     if mem_engine is not None:
         return mem_engine
@@ -549,6 +552,52 @@ def _get_memory_engine():
     return mem_engine
 
 
+@debug_bp.route("/dw/debug/rate-ping", methods=["POST"])
+def rate_ping():
+    payload = request.get_json(force=True, silent=True) or {}
+    try:
+        inquiry_id = int(payload.get("inquiry_id") or 0)
+    except (TypeError, ValueError):
+        inquiry_id = 0
+
+    try:
+        mem_engine = _get_memory_engine()
+    except Exception:
+        mem_engine = None
+
+    current_app.logger.info(
+        {
+            "event": "debug.rate-ping",
+            "inquiry_id": inquiry_id,
+            "mem_engine": (
+                mem_engine.url.render_as_string(hide_password=True)
+                if mem_engine is not None
+                else None
+            ),
+        }
+    )
+
+    if mem_engine is None:
+        return jsonify({"ok": False, "error": "memory_engine_unavailable"}), 503
+
+    try:
+        feedback_id = persist_feedback(
+            mem_engine,
+            inquiry_id=inquiry_id or 777777,
+            auth_email="debug@local",
+            rating=1,
+            comment="ping",
+            intent={"debug": True},
+            resolved_sql="SELECT 1",
+            binds={},
+        )
+    except Exception as exc:  # pragma: no cover - diagnostic helper
+        current_app.logger.exception("debug.rate-ping.failed")
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+    return jsonify({"ok": True, "feedback_id": feedback_id})
+
+
 def _should_persist(rating: Optional[int], comment: str) -> Tuple[bool, str]:
     """Determine whether feedback should be persisted and why."""
 
@@ -558,7 +607,7 @@ def _should_persist(rating: Optional[int], comment: str) -> Tuple[bool, str]:
         rating_value = int(rating)
     except (TypeError, ValueError):
         return False, "invalid_rating"
-    if rating_value <= 3:
+    if rating_value <= 2:
         return True, "low_rating"
     if (comment or "").strip():
         return True, "has_comment"
@@ -581,7 +630,7 @@ def rate() -> Any:
             log.info(
                 {
                     "event": "rate.persist.target",
-                    "mem_engine": str(mem_engine.url),
+                    "mem_engine": mem_engine.url.render_as_string(hide_password=True),
                 }
             )
     try:
@@ -779,35 +828,34 @@ def rate() -> Any:
                     if row and row[0]:
                         resolved_auth = str(row[0]).strip()
             resolved_auth = resolved_auth or ""
-            persist_payload: Dict[str, Any] = {
-                "inquiry_id": inquiry_id,
-                "auth_email": resolved_auth or auth_email or "",
-                "rating": int(rating or 0) if rating is not None else 0,
-                "comment": comment or "",
-                "intent": intent or {},
-                "resolved_sql": final_sql_to_run or "",
-                "binds": binds or {},
-            }
-            feedback_result = persist_feedback_to_mem(mem_engine, persist_payload)
-            log.info(
-                "rate.persist.feedback",
-                extra={
-                    "inquiry_id": inquiry_id,
-                    "ok": feedback_result.get("ok"),
-                    "msg": feedback_result.get("msg"),
-                    "rows": rowcount,
-                },
+
+            feedback_id = persist_feedback(
+                mem_engine,
+                inquiry_id=inquiry_id,
+                auth_email=resolved_auth or auth_email or "",
+                rating=int(rating or 0) if rating is not None else 0,
+                comment=comment,
+                intent=intent,
+                resolved_sql=final_sql_to_run,
+                binds=binds,
             )
-            if feedback_result.get("ok"):
-                feedback_id = feedback_result.get("feedback_id")
-            else:
-                persist_warning = feedback_result.get("error") or "persist_failed"
+            feedback_result = {"ok": True, "feedback_id": feedback_id}
+            log.info(
+                {
+                    "event": "rate.persist.feedback",
+                    "inquiry_id": inquiry_id,
+                    "feedback_id": feedback_id,
+                    "mem_engine": mem_engine.url.render_as_string(hide_password=True),
+                    "rows": rowcount,
+                }
+            )
         except Exception as exc:  # pragma: no cover - defensive logging only
             log.exception(
                 "rate.persist.err",
                 extra={"inquiry_id": inquiry_id, "err": str(exc)},
             )
             persist_warning = f"Persist failed: {exc}"
+            feedback_result = {"ok": False, "error": str(exc)}
     else:
         log.info(
             {

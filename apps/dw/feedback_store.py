@@ -1,83 +1,90 @@
+"""Utilities for persisting DocuWare feedback to the memory database."""
+
+from __future__ import annotations
+
 import json
-from datetime import date, datetime
-from decimal import Decimal
+from typing import Any, Dict
+
 from sqlalchemy import text
+from sqlalchemy.engine import Engine
 
-from apps.common.db_mem import get_mem_engine
+UPSERT_SQL = text(
+    """
+INSERT INTO dw_feedback (
+  inquiry_id, auth_email, rating, comment,
+  intent_json, resolved_sql, binds_json,
+  status, created_at, updated_at
+) VALUES (
+  :inquiry_id, :auth_email, :rating, :comment,
+  CAST(:intent_json AS JSONB), :resolved_sql, CAST(:binds_json AS JSONB),
+  'pending', NOW(), NOW()
+)
+ON CONFLICT (inquiry_id) DO UPDATE SET
+  rating        = EXCLUDED.rating,
+  comment       = EXCLUDED.comment,
+  intent_json   = EXCLUDED.intent_json,
+  resolved_sql  = EXCLUDED.resolved_sql,
+  binds_json    = EXCLUDED.binds_json,
+  updated_at    = NOW()
+RETURNING id
+    """
+)
 
 
-def _json_default(value):
-    if isinstance(value, (datetime, date)):
-        return value.isoformat()
-    if isinstance(value, Decimal):
-        return float(value)
-    return value
-
-
-def persist_feedback(
+def _coerce_payload(
+    *,
     inquiry_id: int,
     auth_email: str,
     rating: int,
     comment: str,
-    resp: dict,
-) -> dict:
-    """
-    Upsert into dw_feedback keyed by (inquiry_id).
-    Stores intent, sql and binds so admin can approve later.
-    Returns {"ok": True} or {"ok": False, "error": "..."} for debug.
-    """
-
-    if not inquiry_id:
-        return {"ok": False, "error": "missing_inquiry_id"}
-
-    resolved_sql = resp.get("sql")
-    if not resolved_sql:
-        resolved_sql = resp.get("debug", {}).get("final_sql", {}).get("sql")
-
-    binds_json = resp.get("binds") or resp.get("debug", {}).get("final_sql", {}).get("binds") or {}
-    intent_json = resp.get("debug", {}).get("intent") or {}
-
-    row = {
-        "inquiry_id": inquiry_id,
+    intent: Dict[str, Any] | None,
+    resolved_sql: str | None,
+    binds: Dict[str, Any] | None,
+) -> Dict[str, Any]:
+    return {
+        "inquiry_id": int(inquiry_id or 0),
         "auth_email": (auth_email or "").strip(),
         "rating": int(rating or 0),
         "comment": (comment or "").strip(),
-        "intent_json": json.dumps(intent_json, default=_json_default),
+        "intent_json": json.dumps(intent or {}, ensure_ascii=False),
         "resolved_sql": resolved_sql or "",
-        "binds_json": json.dumps(binds_json, default=_json_default),
-        "status": "pending" if int(rating or 0) <= 3 else "auto-accepted",
+        "binds_json": json.dumps(binds or {}, ensure_ascii=False),
     }
 
-    sql = text(
-        """
-        INSERT INTO dw_feedback (
-            inquiry_id, auth_email, rating, comment,
-            intent_json, resolved_sql, binds_json,
-            status, created_at, updated_at
-        )
-        VALUES (
-            :inquiry_id, :auth_email, :rating, :comment,
-            CAST(:intent_json AS jsonb), :resolved_sql, CAST(:binds_json AS jsonb),
-            :status, NOW(), NOW()
-        )
-        ON CONFLICT (inquiry_id) DO UPDATE SET
-            auth_email   = EXCLUDED.auth_email,
-            rating       = EXCLUDED.rating,
-            comment      = EXCLUDED.comment,
-            intent_json  = EXCLUDED.intent_json,
-            resolved_sql = EXCLUDED.resolved_sql,
-            binds_json   = EXCLUDED.binds_json,
-            -- keep 'rejected' if admin already rejected it
-            status       = CASE WHEN dw_feedback.status='rejected'
-                                THEN 'rejected' ELSE EXCLUDED.status END,
-            updated_at   = NOW()
-    """
+
+def persist_feedback(
+    mem_engine: Engine,
+    *,
+    inquiry_id: int,
+    auth_email: str,
+    rating: int,
+    comment: str,
+    intent: Dict[str, Any] | None,
+    resolved_sql: str | None,
+    binds: Dict[str, Any] | None,
+) -> int:
+    """Insert or update a ``dw_feedback`` record and return its identifier."""
+
+    if mem_engine is None:
+        raise RuntimeError("Memory engine must be provided")
+    if not inquiry_id:
+        raise ValueError("inquiry_id is required for feedback persistence")
+
+    payload = _coerce_payload(
+        inquiry_id=inquiry_id,
+        auth_email=auth_email,
+        rating=rating,
+        comment=comment,
+        intent=intent,
+        resolved_sql=resolved_sql,
+        binds=binds,
     )
 
-    eng = get_mem_engine()
-    try:
-        with eng.begin() as cx:
-            cx.execute(sql, row)
-        return {"ok": True}
-    except Exception as e:
-        return {"ok": False, "error": str(e), "engine": str(eng.url)}
+    with mem_engine.begin() as conn:
+        result = conn.execute(UPSERT_SQL, payload)
+        feedback_id = result.scalar_one()
+
+    return int(feedback_id)
+
+
+__all__ = ["persist_feedback", "UPSERT_SQL"]
