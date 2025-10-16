@@ -17,32 +17,6 @@ bp = Blueprint("dw_admin", __name__)
 eng = get_memory_engine()
 
 
-APPROVE_FEEDBACK_SQL = text(
-    """
-    UPDATE dw_feedback
-       SET status='approved',
-           approver_email=:admin_email,
-           admin_note=:note,
-           updated_at=NOW()
-     WHERE id = ANY(:ids)
-    RETURNING id
-    """
-)
-
-
-REJECT_FEEDBACK_SQL = text(
-    """
-    UPDATE dw_feedback
-       SET status='rejected',
-           approver_email=:admin_email,
-           rejected_reason=:reason,
-           updated_at=NOW()
-     WHERE id = ANY(:ids)
-    RETURNING id
-    """
-)
-
-
 def _get_admin_emails(conn: Connection) -> set[str]:
     """Load ADMIN_EMAILS from mem_settings."""
     row = conn.execute(
@@ -143,52 +117,6 @@ def admin_list_feedback():
     return jsonify([_row_to_dict(r) for r in rows])
 
 
-@bp.post("/feedback/<int:inquiry_id>/approve")
-def admin_approve_feedback(inquiry_id: int):
-    note = ((request.get_json(silent=True) or {}).get("admin_note") or "").strip()
-    with get_memory_session() as mem_session:
-        conn = mem_session.connection()
-        admin_email = _require_admin(conn)
-        mem_session.execute(
-            text(
-                """
-                  UPDATE dw_feedback
-                     SET status='approved',
-                         approver_email=:user,
-                         admin_note=:note,
-                         updated_at=now()
-                   WHERE inquiry_id=:inq
-                """
-            ),
-            {"user": admin_email, "note": note, "inq": inquiry_id},
-        )
-        mem_session.commit()
-    return jsonify({"ok": True})
-
-
-@bp.post("/feedback/<int:inquiry_id>/reject")
-def admin_reject_feedback(inquiry_id: int):
-    reason = ((request.get_json(silent=True) or {}).get("rejected_reason") or "").strip()
-    with get_memory_session() as mem_session:
-        conn = mem_session.connection()
-        admin_email = _require_admin(conn)
-        mem_session.execute(
-            text(
-                """
-                  UPDATE dw_feedback
-                     SET status='rejected',
-                         approver_email=:user,
-                         rejected_reason=:reason,
-                         updated_at=now()
-                   WHERE inquiry_id=:inq
-                """
-            ),
-            {"user": admin_email, "reason": reason, "inq": inquiry_id},
-        )
-        mem_session.commit()
-    return jsonify({"ok": True})
-
-
 @bp.get("/feedback/<int:fid>")
 def get_feedback(fid: int):
     with eng.begin() as conn:
@@ -227,60 +155,112 @@ def get_feedback(fid: int):
 def approve_feedback(fid: int):
     body = request.get_json(silent=True) or {}
     admin_note = (body.get("admin_note") or "").strip()
-    apply_patch = bool(body.get("apply_patch") or False)
-    with eng.begin() as conn:
+    with get_memory_session() as mem_session:
+        conn = mem_session.connection()
         approver = _require_admin(conn)
-        result = conn.execute(
-            APPROVE_FEEDBACK_SQL,
-            {"ids": [fid], "admin_email": approver, "note": admin_note},
-        ).mappings().all()
-        if not result:
-            abort(404, description="feedback not found")
-
-        if apply_patch:
-            row = conn.execute(
+        row = (
+            mem_session.execute(
                 text(
                     """
-                    SELECT f.inquiry_id, f.resolved_sql, f.intent_json, i.q_norm, i.question
-                      FROM dw_feedback f
-                      LEFT JOIN mem_inquiries i ON i.id = f.inquiry_id
-                     WHERE f.id=:id
+                    SELECT id, inquiry_id, intent_json, resolved_sql, binds_json
+                      FROM dw_feedback
+                     WHERE id = :id
                     """
                 ),
                 {"id": fid},
-            ).first()
-            if row and row.resolved_sql:
-                mapping = row._mapping if hasattr(row, "_mapping") else row
-                q_norm = mapping.get("q_norm") or (mapping.get("question") or "").strip().lower()
-                if q_norm:
-                    conn.execute(
-                        text(
-                            """
-                            INSERT INTO dw_examples (q_norm, sql, success_count, created_at)
-                            VALUES (:q, :s, 1, NOW())
-                            ON CONFLICT (q_norm) DO UPDATE
-                              SET sql=EXCLUDED.sql,
-                                  success_count=dw_examples.success_count + 1
-                            """
-                        ),
-                        {"q": q_norm, "s": mapping.get("resolved_sql")},
-                    )
+            )
+            .mappings()
+            .first()
+        )
+        if not row:
+            abort(404, description="feedback not found")
 
-    return jsonify({"ok": True, "id": fid, "status": "approved", "applied": apply_patch})
+        intent_payload = row.get("intent_json")
+        if isinstance(intent_payload, dict):
+            intent_json = json.dumps(intent_payload, ensure_ascii=False)
+        else:
+            intent_json = intent_payload or "{}"
+
+        binds_payload = row.get("binds_json")
+        if isinstance(binds_payload, dict):
+            binds_json = json.dumps(binds_payload, ensure_ascii=False)
+        else:
+            binds_json = binds_payload or "{}"
+
+        resolved_sql = row.get("resolved_sql") or ""
+        inquiry_id = row.get("inquiry_id")
+
+        mem_session.execute(
+            text(
+                """
+                INSERT INTO dw_rules (
+                    rule_kind, rule_payload, enabled, source, created_at, updated_at
+                )
+                VALUES (
+                    'rate_hint',
+                    jsonb_build_object(
+                        'origin_inquiry_id', :inq,
+                        'intent', COALESCE(:intent::jsonb, '{}'::jsonb),
+                        'resolved_sql', COALESCE(:sql, ''),
+                        'binds', COALESCE(:binds::jsonb, '{}'::jsonb)
+                    ),
+                    TRUE,
+                    'admin',
+                    NOW(),
+                    NOW()
+                )
+                """
+            ),
+            {
+                "inq": inquiry_id,
+                "intent": intent_json,
+                "sql": resolved_sql,
+                "binds": binds_json,
+            },
+        )
+
+        mem_session.execute(
+            text(
+                """
+                UPDATE dw_feedback
+                   SET status='approved',
+                       approver_email=:who,
+                       admin_note=:note,
+                       updated_at=NOW()
+                 WHERE id=:id
+                """
+            ),
+            {"id": fid, "who": approver, "note": admin_note},
+        )
+        mem_session.commit()
+
+    return jsonify({"ok": True, "id": fid, "status": "approved"})
 
 
 @bp.post("/feedback/<int:fid>/reject")
 def reject_feedback(fid: int):
     body = request.get_json(silent=True) or {}
     reason = (body.get("reason") or "").strip()
-    with eng.begin() as conn:
+    with get_memory_session() as mem_session:
+        conn = mem_session.connection()
         approver = _require_admin(conn)
-        result = conn.execute(
-            REJECT_FEEDBACK_SQL,
-            {"ids": [fid], "admin_email": approver, "reason": reason},
-        ).mappings().all()
-        if not result:
+        result = mem_session.execute(
+            text(
+                """
+                UPDATE dw_feedback
+                   SET status='rejected',
+                       rejected_reason=:reason,
+                       approver_email=:who,
+                       updated_at=NOW()
+                 WHERE id=:id
+                """
+            ),
+            {"id": fid, "who": approver, "reason": reason},
+        )
+        if result.rowcount is None or result.rowcount == 0:
+            mem_session.rollback()
             abort(404, description="feedback not found")
+        mem_session.commit()
     return jsonify({"ok": True, "id": fid, "status": "rejected"})
 
 

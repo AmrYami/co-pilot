@@ -1,11 +1,10 @@
-import json
 from datetime import date, datetime
 from typing import Any, Dict, List, Optional
 
 from flask import Blueprint, current_app, jsonify, request
-from sqlalchemy import text
 
-from apps.dw.db import get_memory_engine
+from apps.dw.dal import upsert_feedback
+from apps.dw.db import get_memory_session
 from apps.dw.sql_builder import build_rate_sql
 from apps.dw.settings import get_setting, get_settings, load_settings
 from apps.dw.learning import record_feedback, to_patch_from_comment
@@ -40,76 +39,6 @@ def _get_auth_email_from_ctx_or_default(req, settings):
 
     fallback_settings = settings or {}
     return str(fallback_settings.get("AUTH_EMAIL", ""))
-
-
-def _persist_feedback(mem_engine, payload, resolved, auth_email: str) -> None:
-    intent_json = (
-        resolved.get("debug", {}).get("intent")
-        or resolved.get("intent")
-        or {}
-    )
-    final_sql = (
-        (resolved.get("debug", {}).get("final_sql") or {}).get("sql")
-        or resolved.get("sql")
-        or ""
-    )
-    binds_json = (
-        (resolved.get("debug", {}).get("validation") or {}).get("binds")
-        or resolved.get("binds")
-        or {}
-    )
-
-    try:
-        rating_value = int(payload.get("rating", 0))
-    except (TypeError, ValueError):
-        rating_value = 0
-
-    status = "pending" if rating_value <= 3 else "approved"
-
-    query = text(
-        """
-        INSERT INTO dw_feedback
-            (inquiry_id, auth_email, rating, comment, intent_json, resolved_sql, binds_json, status, created_at, updated_at)
-        VALUES
-            (:inquiry_id, :auth_email, :rating, :comment, CAST(:intent_json AS JSONB), :resolved_sql, CAST(:binds_json AS JSONB), :status, now(), now())
-        ON CONFLICT (inquiry_id) DO UPDATE
-            SET rating       = EXCLUDED.rating,
-                comment      = EXCLUDED.comment,
-                intent_json  = EXCLUDED.intent_json,
-                resolved_sql = EXCLUDED.resolved_sql,
-                binds_json   = EXCLUDED.binds_json,
-                status       = CASE WHEN dw_feedback.status = 'approved' THEN 'approved' ELSE EXCLUDED.status END,
-                updated_at   = now();
-        """
-    )
-
-    params = {
-        "inquiry_id": int(payload["inquiry_id"]),
-        "auth_email": auth_email or "",
-        "rating": rating_value,
-        "comment": payload.get("comment", ""),
-        "intent_json": json.dumps(intent_json, ensure_ascii=False),
-        "resolved_sql": final_sql,
-        "binds_json": json.dumps(binds_json, ensure_ascii=False),
-        "status": status,
-    }
-
-    with mem_engine.begin() as connection:
-        result = connection.execute(query, params)
-
-    try:
-        rows = result.rowcount
-    except Exception:
-        rows = None
-
-    current_app.logger.info(
-        {
-            "event": "rate.persisted",
-            "inquiry_id": payload["inquiry_id"],
-            "status": status,
-            "rowcount": rows,
-        }
-    )
 
 
 @rate_bp.route("/dw/rate", methods=["POST"])
@@ -410,36 +339,39 @@ def rate():
             settings = {}
 
         auth_email = _get_auth_email_from_ctx_or_default(request, settings)
-
+        session = None
         try:
-            memory_engine = get_memory_engine()
+            session = get_memory_session()
+            upsert_feedback(
+                session=session,
+                inquiry_id=int(inquiry_id),
+                rating=rating_int,
+                comment=comment,
+                intent_obj=debug_payload.get("intent") if isinstance(debug_payload, dict) else {},
+                resolved_sql=final_sql,
+                binds_obj=binds,
+                auth_email=auth_email,
+            )
+            session.commit()
+            current_app.logger.info(
+                {
+                    "event": "rate.persisted",
+                    "inquiry_id": inquiry_id,
+                    "status": "pending",
+                }
+            )
         except Exception as exc:
+            if session is not None:
+                session.rollback()
             current_app.logger.exception(
                 {
-                    "event": "rate.persist.engine_error",
+                    "event": "rate.persist.error",
                     "inquiry_id": inquiry_id,
                     "error": str(exc),
                 }
             )
-        else:
-            try:
-                _persist_feedback(
-                    memory_engine,
-                    {
-                        "inquiry_id": inquiry_id,
-                        "rating": rating_int,
-                        "comment": comment,
-                    },
-                    resp,
-                    auth_email,
-                )
-            except Exception as exc:
-                current_app.logger.exception(
-                    {
-                        "event": "rate.persist.error",
-                        "inquiry_id": inquiry_id,
-                        "error": str(exc),
-                    }
-                )
+        finally:
+            if session is not None:
+                session.close()
 
     return jsonify(resp), 200
