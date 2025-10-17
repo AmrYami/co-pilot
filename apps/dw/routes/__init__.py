@@ -15,8 +15,9 @@ from sqlalchemy import text
 from apps.common.db import get_app_engine as get_common_app_engine
 from apps.dw.db import fetch_rows
 from apps.dw.eq_parser import extract_eq_filters_from_natural_text, strip_eq_from_text
-from apps.dw.feedback_repo import upsert_feedback
+from apps.dw.feedback import persist_feedback as persist_dw_feedback
 from apps.dw.memory_db import get_mem_engine as get_memdb_engine
+from apps.dw.memory_db import get_memory_engine
 from apps.dw.search import resolve_engine
 from apps.dw.settings_access import DWSettings
 from apps.dw.settings_defaults import DEFAULT_EXPLICIT_FILTER_COLUMNS
@@ -525,6 +526,23 @@ def _resolve_auth_email(body: Dict[str, Any]) -> str:
     return setting_email.strip().lower()
 
 
+def _lookup_auth_email_fallback(inquiry_id: int) -> str:
+    """Best-effort lookup if caller didn't pass auth_email."""
+
+    try:
+        eng = get_memory_engine()
+        with eng.connect() as cx:
+            row = cx.execute(
+                text(
+                    "SELECT COALESCE(auth_email,'') AS auth_email FROM mem_inquiries WHERE id=:id"
+                ),
+                {"id": inquiry_id},
+            ).mappings().first()
+            return (row or {}).get("auth_email") or ""
+    except Exception:
+        return ""
+
+
 def _get_memory_engine():
     """Return the configured memory engine, caching it on the Flask app."""
 
@@ -843,54 +861,44 @@ def rate() -> Any:
     feedback_result: Optional[Dict[str, Any]] = None
     persist_error = False
     if ok_to_persist and inquiry_id is not None:
-        try:
-            resolved_auth = (payload.get("auth_email") or "").strip()
-            if not resolved_auth:
-                resolved_auth = (request.headers.get("X-Auth-Email") or "").strip()
-            if not resolved_auth:
-                resolved_auth = (auth_email or "").strip()
-            target_engine = app_mem_engine or mem_engine
-            if not resolved_auth and target_engine is not None:
-                with target_engine.connect() as conn:
-                    row = conn.execute(
-                        text("select auth_email from dw_runs where id=:i"),
-                        {"i": inquiry_id},
-                    ).fetchone()
-                    if row and row[0]:
-                        resolved_auth = str(row[0]).strip()
-            resolved_auth = resolved_auth or ""
+        auth_email = (auth_email or "").strip() or _lookup_auth_email_fallback(inquiry_id)
+        if not auth_email:
+            auth_email = ""
 
-            engine_for_persist = target_engine
-            if engine_for_persist is None:
-                current_app.logger.warning("rate.persist.skip: no MEM_ENGINE available")
-                persist_warning = "Persist failed: memory engine unavailable"
-                feedback_result = {"ok": False, "error": "memory_engine_unavailable"}
-                persist_error = True
-            else:
-                payload_for_repo = {
+        log.info(
+            {
+                "event": "rate.persist.attempt",
+                "inquiry_id": inquiry_id,
+                "auth_email": auth_email,
+                "rating": int(rating),
+            }
+        )
+        try:
+            fb_id = persist_dw_feedback(
+                inquiry_id=inquiry_id,
+                auth_email=auth_email,
+                rating=int(rating),
+                comment=comment or "",
+                intent=intent,
+                resolved_sql=final_sql_to_run or "",
+                binds=binds or {},
+            )
+            feedback_id = int(fb_id) if fb_id is not None else None
+            feedback_result = {"ok": True, "feedback_id": feedback_id}
+            log.info(
+                {
+                    "event": "rate.persist.ok",
                     "inquiry_id": inquiry_id,
-                    "auth_email": resolved_auth or auth_email or None,
-                    "rating": int(rating or 0) if rating is not None else 0,
-                    "comment": comment or None,
-                    "intent_json": json.dumps(intent, default=str),
-                    "resolved_sql": final_sql_to_run,
-                    "binds_json": json.dumps(binds, default=str),
-                    "status": "pending",
+                    "feedback_id": int(fb_id or 0),
                 }
-                app_logger.info(
-                    "rate.persist.attempt",
-                    extra={"inquiry_id": inquiry_id},
-                )
-                feedback_id = upsert_feedback(engine_for_persist, **payload_for_repo)
-                feedback_result = {"ok": True, "feedback_id": feedback_id}
-                app_logger.info(
-                    "rate.persist.ok",
-                    extra={"inquiry_id": inquiry_id, "id": feedback_id},
-                )
+            )
         except Exception as exc:  # pragma: no cover - defensive logging only
-            app_logger.exception(
-                "rate.persist.fail",
-                extra={"inquiry_id": inquiry_id},
+            log.exception(
+                {
+                    "event": "rate.persist.fail",
+                    "inquiry_id": inquiry_id,
+                    "error": str(exc),
+                }
             )
             persist_warning = f"Persist failed: {exc}"
             feedback_result = {"ok": False, "error": str(exc)}
