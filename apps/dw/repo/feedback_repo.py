@@ -26,6 +26,7 @@ def _coerce_payload(kwargs: Dict[str, Any]) -> Dict[str, Any]:
     payload["status"] = payload.get("status") or "pending"
     payload["intent_json"] = json.dumps(payload.get("intent_json") or {}, default=str)
     payload["binds_json"] = json.dumps(payload.get("binds_json") or {}, default=str)
+    payload["hints_json"] = json.dumps(payload.get("hints_json") or {}, default=str)
     return payload
 
 

@@ -16,11 +16,11 @@ UPSERT_SQL = """
   INSERT INTO dw_feedback(
     inquiry_id, auth_email, rating, comment,
     intent_json, resolved_sql, binds_json, status,
-    created_at, updated_at
+    created_at, updated_at, hints_json
   ) VALUES(
     :inquiry_id, :auth_email, :rating, :comment,
     :intent_json::jsonb, :resolved_sql, :binds_json::jsonb, :status,
-    NOW(), NOW()
+    NOW(), NOW(), :hints_json::jsonb
   )
   ON CONFLICT (inquiry_id) DO UPDATE
     SET rating=EXCLUDED.rating,
@@ -29,6 +29,7 @@ UPSERT_SQL = """
         resolved_sql=EXCLUDED.resolved_sql,
         binds_json=EXCLUDED.binds_json,
         status=EXCLUDED.status,
+        hints_json=EXCLUDED.hints_json,
         auth_email=COALESCE(EXCLUDED.auth_email, dw_feedback.auth_email),
         updated_at=NOW()
   RETURNING id
@@ -38,11 +39,11 @@ UPSERT_SQLITE = """
   INSERT INTO dw_feedback(
     inquiry_id, auth_email, rating, comment,
     intent_json, resolved_sql, binds_json, status,
-    created_at, updated_at
+    created_at, updated_at, hints_json
   ) VALUES(
     :inquiry_id, :auth_email, :rating, :comment,
     :intent_json, :resolved_sql, :binds_json, :status,
-    CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+    CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, :hints_json
   )
   ON CONFLICT(inquiry_id) DO UPDATE SET
     auth_email=COALESCE(:auth_email, dw_feedback.auth_email),
@@ -52,6 +53,7 @@ UPSERT_SQLITE = """
     resolved_sql=:resolved_sql,
     binds_json=:binds_json,
     status=:status,
+    hints_json=:hints_json,
     updated_at=CURRENT_TIMESTAMP
   RETURNING id
 """
@@ -64,8 +66,9 @@ def _coerce_payload(
     rating: Optional[int],
     comment: Optional[str],
     intent: Optional[Dict[str, Any]],
-    final_sql: Optional[str],
+    resolved_sql: Optional[str],
     binds: Optional[Dict[str, Any]],
+    hints: Optional[Dict[str, Any]] = None,
     status: str = "pending",
 ) -> Dict[str, Any]:
     return {
@@ -74,10 +77,33 @@ def _coerce_payload(
         "rating": int(rating or 0),
         "comment": (comment or "").strip() or None,
         "intent_json": json.dumps(intent or {}, default=str, ensure_ascii=False),
-        "resolved_sql": final_sql or None,
+        "resolved_sql": resolved_sql or None,
         "binds_json": json.dumps(binds or {}, default=str, ensure_ascii=False),
+        "hints_json": json.dumps(hints or {}, default=str, ensure_ascii=False),
         "status": status or "pending",
     }
+
+
+def _resolve_auth_email(inquiry_id: int, auth_email: Optional[str]) -> Optional[str]:
+    email = (auth_email or "").strip()
+    if email:
+        return email
+
+    try:
+        from apps.dw.store import load_inquiry
+    except Exception:  # pragma: no cover - optional dependency
+        return None
+
+    try:
+        inquiry = load_inquiry(inquiry_id)
+    except Exception:  # pragma: no cover - defensive
+        return None
+
+    if isinstance(inquiry, dict):
+        candidate = (inquiry.get("auth_email") or inquiry.get("AUTH_EMAIL") or "").strip()
+        if candidate:
+            return candidate
+    return None
 
 
 def upsert_feedback(engine, **kwargs) -> Optional[int]:
@@ -99,12 +125,13 @@ def upsert_feedback(engine, **kwargs) -> Optional[int]:
 def persist_feedback(
     *,
     inquiry_id: int,
-    auth_email: str,
+    auth_email: Optional[str],
     rating: int,
     comment: str,
     intent: Optional[Dict[str, Any]],
-    final_sql: Optional[str],
+    resolved_sql: Optional[str],
     binds: Optional[Dict[str, Any]],
+    hints: Optional[Dict[str, Any]] = None,
     status: str = "pending",
 ) -> Optional[int]:
     """Backwards compatible helper that resolves the engine and UPSERTs."""
@@ -112,12 +139,13 @@ def persist_feedback(
     engine = get_mem_engine()
     payload = _coerce_payload(
         inquiry_id=inquiry_id,
-        auth_email=auth_email,
+        auth_email=_resolve_auth_email(inquiry_id, auth_email),
         rating=rating,
         comment=comment,
         intent=intent,
-        final_sql=final_sql,
+        resolved_sql=resolved_sql,
         binds=binds,
+        hints=hints,
         status=status,
     )
     return upsert_feedback(engine, **payload)

@@ -30,6 +30,44 @@ def rate():
     try:
         result = run_rate(inquiry_id=inquiry_id, rating=rating, comment=comment)
         log.info({"event": "rate.response", "inquiry_id": inquiry_id, "retry": False})
+
+        final_sql_str = result.get("sql") if isinstance(result, dict) else None
+        binds_dict = {}
+        intent_dict = {}
+        if isinstance(result, dict):
+            binds = result.get("binds")
+            if isinstance(binds, dict):
+                binds_dict = dict(binds)
+            debug = result.get("debug") or {}
+            if isinstance(debug, dict):
+                intent = debug.get("intent")
+                if isinstance(intent, dict):
+                    intent_dict = intent
+
+        if inquiry_id is not None:
+            from apps.dw.feedback_repo import persist_feedback as _persist_dw_feedback
+
+            try:
+                log.info({"event": "rate.persist.attempt", "inquiry_id": inquiry_id})
+                _persist_dw_feedback(
+                    inquiry_id=inquiry_id,
+                    auth_email=payload.get("auth_email"),
+                    rating=int(rating),
+                    comment=comment or "",
+                    intent=intent_dict,
+                    resolved_sql=final_sql_str or "",
+                    binds=binds_dict,
+                )
+                log.info({"event": "rate.persist.ok", "inquiry_id": inquiry_id})
+            except Exception as exc:  # pragma: no cover - defensive logging
+                log.exception(
+                    {
+                        "event": "rate.persist.err",
+                        "inquiry_id": inquiry_id,
+                        "err": str(exc),
+                    }
+                )
+
         return jsonify(result), 200
     except Exception as exc:  # pragma: no cover - defensive
         log.exception("rate.failed")
