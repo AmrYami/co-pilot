@@ -8,31 +8,92 @@ from typing import Any, Dict, Optional
 
 from sqlalchemy import text
 
-from apps.dw.memory_db import get_mem_engine
+from apps.dw.memory_db import ensure_feedback_schema, get_mem_engine
 
-log = logging.getLogger("dw")
+logger = logging.getLogger("dw")
 
-UPSERT_SQL = text(
-    """
-INSERT INTO dw_feedback (
-  inquiry_id, auth_email, rating, comment,
-  intent_json, resolved_sql, binds_json, status
-)
-VALUES (
-  :inquiry_id, :auth_email, :rating, :comment,
-  CAST(:intent_json AS JSONB), :resolved_sql, CAST(:binds_json AS JSONB), 'pending'
-)
-ON CONFLICT (inquiry_id) DO UPDATE SET
-  auth_email   = EXCLUDED.auth_email,
-  rating       = EXCLUDED.rating,
-  comment      = EXCLUDED.comment,
-  intent_json  = EXCLUDED.intent_json,
-  resolved_sql = EXCLUDED.resolved_sql,
-  binds_json   = EXCLUDED.binds_json,
-  updated_at   = now()
-RETURNING id
-    """
-)
+UPSERT_SQL = """
+  INSERT INTO dw_feedback(
+    inquiry_id, auth_email, rating, comment,
+    intent_json, resolved_sql, binds_json, status,
+    created_at, updated_at
+  ) VALUES(
+    :inquiry_id, :auth_email, :rating, :comment,
+    :intent_json::jsonb, :resolved_sql, :binds_json::jsonb, :status,
+    NOW(), NOW()
+  )
+  ON CONFLICT (inquiry_id) DO UPDATE
+    SET rating=EXCLUDED.rating,
+        comment=EXCLUDED.comment,
+        intent_json=EXCLUDED.intent_json,
+        resolved_sql=EXCLUDED.resolved_sql,
+        binds_json=EXCLUDED.binds_json,
+        status=EXCLUDED.status,
+        auth_email=COALESCE(EXCLUDED.auth_email, dw_feedback.auth_email),
+        updated_at=NOW()
+  RETURNING id
+"""
+
+UPSERT_SQLITE = """
+  INSERT INTO dw_feedback(
+    inquiry_id, auth_email, rating, comment,
+    intent_json, resolved_sql, binds_json, status,
+    created_at, updated_at
+  ) VALUES(
+    :inquiry_id, :auth_email, :rating, :comment,
+    :intent_json, :resolved_sql, :binds_json, :status,
+    CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+  )
+  ON CONFLICT(inquiry_id) DO UPDATE SET
+    auth_email=COALESCE(:auth_email, dw_feedback.auth_email),
+    rating=:rating,
+    comment=:comment,
+    intent_json=:intent_json,
+    resolved_sql=:resolved_sql,
+    binds_json=:binds_json,
+    status=:status,
+    updated_at=CURRENT_TIMESTAMP
+  RETURNING id
+"""
+
+
+def _coerce_payload(
+    *,
+    inquiry_id: int,
+    auth_email: Optional[str],
+    rating: Optional[int],
+    comment: Optional[str],
+    intent: Optional[Dict[str, Any]],
+    final_sql: Optional[str],
+    binds: Optional[Dict[str, Any]],
+    status: str = "pending",
+) -> Dict[str, Any]:
+    return {
+        "inquiry_id": int(inquiry_id or 0),
+        "auth_email": (auth_email or "").strip() or None,
+        "rating": int(rating or 0),
+        "comment": (comment or "").strip() or None,
+        "intent_json": json.dumps(intent or {}, default=str, ensure_ascii=False),
+        "resolved_sql": final_sql or None,
+        "binds_json": json.dumps(binds or {}, default=str, ensure_ascii=False),
+        "status": status or "pending",
+    }
+
+
+def upsert_feedback(engine, **kwargs) -> Optional[int]:
+    """Execute the canonical UPSERT for ``dw_feedback`` using ``inquiry_id``."""
+
+    logger.info(
+        "rate.repo.upsert",
+        extra={"inquiry_id": kwargs.get("inquiry_id")},
+    )
+    ensure_feedback_schema(engine)
+    dialect = getattr(engine, "dialect", None)
+    name = getattr(dialect, "name", "") if dialect is not None else ""
+    sql = UPSERT_SQLITE if name.startswith("sqlite") else UPSERT_SQL
+    with engine.begin() as cn:
+        row = cn.execute(text(sql), kwargs).fetchone()
+    return int(row[0]) if row and row[0] is not None else None
 
 
 def persist_feedback(
@@ -44,43 +105,22 @@ def persist_feedback(
     intent: Optional[Dict[str, Any]],
     final_sql: Optional[str],
     binds: Optional[Dict[str, Any]],
+    status: str = "pending",
 ) -> Optional[int]:
-    """Insert or update a ``dw_feedback`` row and return its identifier."""
+    """Backwards compatible helper that resolves the engine and UPSERTs."""
 
     engine = get_mem_engine()
-    intent_json = json.dumps(intent or {})
-    binds_json = json.dumps(binds or {})
-
-    params = {
-        "inquiry_id": inquiry_id,
-        "auth_email": auth_email or "",
-        "rating": int(rating or 0),
-        "comment": comment or "",
-        "intent_json": intent_json,
-        "resolved_sql": final_sql or None,
-        "binds_json": binds_json,
-    }
-
-    log.info(
-        {
-            "event": "rate.persist.attempt",
-            "inquiry_id": inquiry_id,
-            "auth_email": auth_email,
-            "rating": rating,
-        }
+    payload = _coerce_payload(
+        inquiry_id=inquiry_id,
+        auth_email=auth_email,
+        rating=rating,
+        comment=comment,
+        intent=intent,
+        final_sql=final_sql,
+        binds=binds,
+        status=status,
     )
-
-    with engine.begin() as conn:
-        row = conn.execute(UPSERT_SQL, params).fetchone()
-        feedback_id = int(row[0]) if row and row[0] is not None else None
-        log.info(
-            {
-                "event": "rate.persist.ok",
-                "inquiry_id": inquiry_id,
-                "feedback_id": feedback_id,
-            }
-        )
-        return feedback_id
+    return upsert_feedback(engine, **payload)
 
 
-__all__ = ["persist_feedback"]
+__all__ = ["persist_feedback", "upsert_feedback", "UPSERT_SQL"]

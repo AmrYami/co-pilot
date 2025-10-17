@@ -15,7 +15,7 @@ from sqlalchemy import text
 from apps.common.db import get_app_engine as get_common_app_engine
 from apps.dw.db import fetch_rows
 from apps.dw.eq_parser import extract_eq_filters_from_natural_text, strip_eq_from_text
-from apps.dw.feedback_store import persist_feedback
+from apps.dw.feedback_repo import upsert_feedback
 from apps.dw.memory_db import get_mem_engine as get_memdb_engine
 from apps.dw.search import resolve_engine
 from apps.dw.settings_access import DWSettings
@@ -581,15 +581,17 @@ def rate_ping():
         return jsonify({"ok": False, "error": "memory_engine_unavailable"}), 503
 
     try:
-        feedback_id = persist_feedback(
-            inquiry_id=inquiry_id or 777777,
-            auth_email="debug@local",
-            rating=1,
-            comment="ping",
-            intent={"debug": True},
-            resolved_sql="SELECT 1",
-            binds={},
-        )
+        payload = {
+            "inquiry_id": inquiry_id or 777777,
+            "auth_email": "debug@local",
+            "rating": 1,
+            "comment": "ping",
+            "intent_json": json.dumps({"debug": True}, default=str),
+            "resolved_sql": "SELECT 1",
+            "binds_json": json.dumps({}, default=str),
+            "status": "pending",
+        }
+        feedback_id = upsert_feedback(mem_engine, **payload)
     except Exception as exc:  # pragma: no cover - diagnostic helper
         current_app.logger.exception("debug.rate-ping.failed")
         return jsonify({"ok": False, "error": str(exc)}), 500
@@ -653,6 +655,16 @@ def rate() -> Any:
         rating: Optional[int] = int(raw_rating)
     except (TypeError, ValueError):
         rating = None
+
+    app_logger = current_app.logger
+    app_logger.info(
+        "rate.receive",
+        extra={
+            "inquiry_id": inquiry_id,
+            "rating": rating,
+            "comment_len": len(comment or ""),
+        },
+    )
 
     settings = _load_dw_settings()
     raw_settings: Dict[str, Any] = dict(settings.global_ns)
@@ -736,6 +748,15 @@ def rate() -> Any:
 
     final_sql, binds = qb.compile()
     final_sql_to_run = final_sql
+    binds_count = len(binds or {})
+    app_logger.info(
+        "rate.sql.exec",
+        extra={
+            "inquiry_id": inquiry_id,
+            "sql_preview": (final_sql_to_run or "")[:160],
+            "binds_count": binds_count,
+        },
+    )
 
     trace_id = request.headers.get("X-Trace-Id") or uuid.uuid4().hex
     logger.info({"event": "rate.primary.start", "trace_id": trace_id})
@@ -820,6 +841,7 @@ def rate() -> Any:
     feedback_id: Optional[int] = None
     persist_warning: Optional[str] = None
     feedback_result: Optional[Dict[str, Any]] = None
+    persist_error = False
     if ok_to_persist and inquiry_id is not None:
         try:
             resolved_auth = (payload.get("auth_email") or "").strip()
@@ -843,65 +865,36 @@ def rate() -> Any:
                 current_app.logger.warning("rate.persist.skip: no MEM_ENGINE available")
                 persist_warning = "Persist failed: memory engine unavailable"
                 feedback_result = {"ok": False, "error": "memory_engine_unavailable"}
+                persist_error = True
             else:
-                intent_payload = json.dumps(intent, default=str)
-                binds_payload = json.dumps(binds, default=str)
-                upsert_sql = text(
-                    """
-                    INSERT INTO dw_feedback(
-                      inquiry_id, auth_email, rating, comment,
-                      intent_json, binds_json, resolved_sql, status,
-                      created_at, updated_at
-                    )
-                    VALUES(
-                      :inq, :email, :rating, :comment,
-                      CAST(:intent AS JSONB), CAST(:binds AS JSONB), :sql, 'pending',
-                      NOW(), NOW()
-                    )
-                    ON CONFLICT (inquiry_id) DO UPDATE SET
-                      auth_email   = EXCLUDED.auth_email,
-                      rating       = EXCLUDED.rating,
-                      comment      = EXCLUDED.comment,
-                      intent_json  = EXCLUDED.intent_json,
-                      binds_json   = EXCLUDED.binds_json,
-                      resolved_sql = EXCLUDED.resolved_sql,
-                      status       = 'pending',
-                      updated_at   = NOW()
-                    RETURNING id
-                    """
-                )
-                params = {
-                    "inq": inquiry_id,
-                    "email": resolved_auth or auth_email or "",
+                payload_for_repo = {
+                    "inquiry_id": inquiry_id,
+                    "auth_email": resolved_auth or auth_email or None,
                     "rating": int(rating or 0) if rating is not None else 0,
                     "comment": comment or None,
-                    "intent": intent_payload,
-                    "binds": binds_payload,
-                    "sql": final_sql_to_run,
+                    "intent_json": json.dumps(intent, default=str),
+                    "resolved_sql": final_sql_to_run,
+                    "binds_json": json.dumps(binds, default=str),
+                    "status": "pending",
                 }
-                with engine_for_persist.begin() as conn:
-                    result = conn.execute(upsert_sql, params)
-                    row = result.first()
-                feedback_id = int(row[0]) if row and row[0] is not None else None
-                feedback_result = {"ok": True, "feedback_id": feedback_id}
-                log.info(
-                    {
-                        "event": "rate.persist.feedback",
-                        "inquiry_id": inquiry_id,
-                        "feedback_id": feedback_id,
-                        "mem_engine": engine_for_persist.url.render_as_string(
-                            hide_password=True
-                        ),
-                        "rows": rowcount,
-                    }
+                app_logger.info(
+                    "rate.persist.attempt",
+                    extra={"inquiry_id": inquiry_id},
                 )
-                current_app.logger.info("rate.persist.ok inquiry_id=%s", inquiry_id)
+                feedback_id = upsert_feedback(engine_for_persist, **payload_for_repo)
+                feedback_result = {"ok": True, "feedback_id": feedback_id}
+                app_logger.info(
+                    "rate.persist.ok",
+                    extra={"inquiry_id": inquiry_id, "id": feedback_id},
+                )
         except Exception as exc:  # pragma: no cover - defensive logging only
-            current_app.logger.exception(
-                "rate.persist.fail inquiry_id=%s err=%s", inquiry_id, exc
+            app_logger.exception(
+                "rate.persist.fail",
+                extra={"inquiry_id": inquiry_id},
             )
             persist_warning = f"Persist failed: {exc}"
             feedback_result = {"ok": False, "error": str(exc)}
+            persist_error = True
     else:
         log.info(
             {
@@ -931,6 +924,8 @@ def rate() -> Any:
         "trace_id": trace_id,
         "rowcount": rowcount,
     }
+    if persist_error:
+        meta["persist_error"] = True
     response = {
         "ok": True,
         "inquiry_id": inquiry_id,
@@ -944,6 +939,10 @@ def rate() -> Any:
     }
     if persist_warning:
         response["warning"] = persist_warning
+    app_logger.info(
+        "rate.response",
+        extra={"inquiry_id": inquiry_id, "retry": False},
+    )
     return jsonify(response), 200
 
 
