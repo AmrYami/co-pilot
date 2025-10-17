@@ -19,19 +19,19 @@ UPSERT_SQL = """
     created_at, updated_at, hints_json
   ) VALUES(
     :inquiry_id, :auth_email, :rating, :comment,
-    :intent_json::jsonb, :resolved_sql, :binds_json::jsonb, :status,
-    NOW(), NOW(), :hints_json::jsonb
+    CAST(:intent_json AS JSONB), :resolved_sql, CAST(:binds_json AS JSONB), :status,
+    NOW(), NOW(), CAST(:hints_json AS JSONB)
   )
-  ON CONFLICT (inquiry_id) DO UPDATE
-    SET rating=EXCLUDED.rating,
-        comment=EXCLUDED.comment,
-        intent_json=EXCLUDED.intent_json,
-        resolved_sql=EXCLUDED.resolved_sql,
-        binds_json=EXCLUDED.binds_json,
-        status=EXCLUDED.status,
-        hints_json=EXCLUDED.hints_json,
-        auth_email=COALESCE(EXCLUDED.auth_email, dw_feedback.auth_email),
-        updated_at=NOW()
+  ON CONFLICT (inquiry_id) DO UPDATE SET
+    rating       = EXCLUDED.rating,
+    comment      = EXCLUDED.comment,
+    intent_json  = EXCLUDED.intent_json,
+    resolved_sql = EXCLUDED.resolved_sql,
+    binds_json   = EXCLUDED.binds_json,
+    status       = EXCLUDED.status,
+    hints_json   = EXCLUDED.hints_json,
+    auth_email   = COALESCE(EXCLUDED.auth_email, dw_feedback.auth_email),
+    updated_at   = NOW()
   RETURNING id
 """
 
@@ -106,6 +106,34 @@ def _resolve_auth_email(inquiry_id: int, auth_email: Optional[str]) -> Optional[
     return None
 
 
+def _ensure_payload(kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize payload values so the UPSERT always receives expected keys."""
+
+    payload: Dict[str, Any] = dict(kwargs)
+
+    payload["inquiry_id"] = int(payload.get("inquiry_id") or 0)
+    payload["rating"] = int(payload.get("rating") or 0)
+    payload["auth_email"] = (payload.get("auth_email") or "").strip() or None
+    payload["comment"] = (payload.get("comment") or "").strip() or None
+    payload["resolved_sql"] = payload.get("resolved_sql") or None
+    payload["status"] = (payload.get("status") or "pending").strip() or "pending"
+
+    def _json_field(name: str, alt: str) -> None:
+        raw = payload.get(name)
+        if raw is None:
+            raw = payload.get(alt)
+        if isinstance(raw, str):
+            payload[name] = raw
+        else:
+            payload[name] = json.dumps(raw or {}, default=str, ensure_ascii=False)
+
+    _json_field("intent_json", "intent")
+    _json_field("binds_json", "binds")
+    _json_field("hints_json", "hints")
+
+    return payload
+
+
 def upsert_feedback(engine, **kwargs) -> Optional[int]:
     """Execute the canonical UPSERT for ``dw_feedback`` using ``inquiry_id``."""
 
@@ -117,8 +145,9 @@ def upsert_feedback(engine, **kwargs) -> Optional[int]:
     dialect = getattr(engine, "dialect", None)
     name = getattr(dialect, "name", "") if dialect is not None else ""
     sql = UPSERT_SQLITE if name.startswith("sqlite") else UPSERT_SQL
+    payload = _ensure_payload(kwargs)
     with engine.begin() as cn:
-        row = cn.execute(text(sql), kwargs).fetchone()
+        row = cn.execute(text(sql), payload).fetchone()
     return int(row[0]) if row and row[0] is not None else None
 
 
