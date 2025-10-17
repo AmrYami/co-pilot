@@ -632,6 +632,17 @@ def rate() -> Any:
                     "mem_engine": mem_engine.url.render_as_string(hide_password=True),
                 }
             )
+
+    app_mem_engine = None
+    try:
+        from core.memdb import get_mem_engine
+
+        app_mem_engine = get_mem_engine(current_app)
+    except Exception as exc:  # pragma: no cover - defensive logging only
+        current_app.logger.exception("rate.mem_engine.resolve.fail err=%s", exc)
+
+    if mem_engine is None and app_mem_engine is not None:
+        mem_engine = app_mem_engine
     try:
         inquiry_id = int(payload.get("inquiry_id"))
     except (TypeError, ValueError):
@@ -816,8 +827,9 @@ def rate() -> Any:
                 resolved_auth = (request.headers.get("X-Auth-Email") or "").strip()
             if not resolved_auth:
                 resolved_auth = (auth_email or "").strip()
-            if not resolved_auth and mem_engine is not None:
-                with mem_engine.connect() as conn:
+            target_engine = app_mem_engine or mem_engine
+            if not resolved_auth and target_engine is not None:
+                with target_engine.connect() as conn:
                     row = conn.execute(
                         text("select auth_email from dw_runs where id=:i"),
                         {"i": inquiry_id},
@@ -826,33 +838,67 @@ def rate() -> Any:
                         resolved_auth = str(row[0]).strip()
             resolved_auth = resolved_auth or ""
 
-            feedback_id = persist_feedback(
-                inquiry_id=inquiry_id,
-                auth_email=resolved_auth or auth_email or "",
-                rating=int(rating or 0) if rating is not None else 0,
-                comment=comment,
-                intent=intent,
-                resolved_sql=final_sql_to_run,
-                binds=binds,
-            )
-            feedback_result = {"ok": True, "feedback_id": feedback_id}
-            log.info(
-                {
-                    "event": "rate.persist.feedback",
-                    "inquiry_id": inquiry_id,
-                    "feedback_id": feedback_id,
-                    "mem_engine": (
-                        mem_engine.url.render_as_string(hide_password=True)
-                        if mem_engine is not None
-                        else None
-                    ),
-                    "rows": rowcount,
+            engine_for_persist = target_engine
+            if engine_for_persist is None:
+                current_app.logger.warning("rate.persist.skip: no MEM_ENGINE available")
+                persist_warning = "Persist failed: memory engine unavailable"
+                feedback_result = {"ok": False, "error": "memory_engine_unavailable"}
+            else:
+                intent_payload = json.dumps(intent, default=str)
+                binds_payload = json.dumps(binds, default=str)
+                upsert_sql = text(
+                    """
+                    INSERT INTO dw_feedback(
+                      inquiry_id, auth_email, rating, comment,
+                      intent_json, binds_json, resolved_sql, status,
+                      created_at, updated_at
+                    )
+                    VALUES(
+                      :inq, :email, :rating, :comment,
+                      CAST(:intent AS JSONB), CAST(:binds AS JSONB), :sql, 'pending',
+                      NOW(), NOW()
+                    )
+                    ON CONFLICT (inquiry_id) DO UPDATE SET
+                      auth_email   = EXCLUDED.auth_email,
+                      rating       = EXCLUDED.rating,
+                      comment      = EXCLUDED.comment,
+                      intent_json  = EXCLUDED.intent_json,
+                      binds_json   = EXCLUDED.binds_json,
+                      resolved_sql = EXCLUDED.resolved_sql,
+                      status       = 'pending',
+                      updated_at   = NOW()
+                    RETURNING id
+                    """
+                )
+                params = {
+                    "inq": inquiry_id,
+                    "email": resolved_auth or auth_email or "",
+                    "rating": int(rating or 0) if rating is not None else 0,
+                    "comment": comment or None,
+                    "intent": intent_payload,
+                    "binds": binds_payload,
+                    "sql": final_sql_to_run,
                 }
-            )
+                with engine_for_persist.begin() as conn:
+                    result = conn.execute(upsert_sql, params)
+                    row = result.first()
+                feedback_id = int(row[0]) if row and row[0] is not None else None
+                feedback_result = {"ok": True, "feedback_id": feedback_id}
+                log.info(
+                    {
+                        "event": "rate.persist.feedback",
+                        "inquiry_id": inquiry_id,
+                        "feedback_id": feedback_id,
+                        "mem_engine": engine_for_persist.url.render_as_string(
+                            hide_password=True
+                        ),
+                        "rows": rowcount,
+                    }
+                )
+                current_app.logger.info("rate.persist.ok inquiry_id=%s", inquiry_id)
         except Exception as exc:  # pragma: no cover - defensive logging only
-            log.exception(
-                "rate.persist.err",
-                extra={"inquiry_id": inquiry_id, "err": str(exc)},
+            current_app.logger.exception(
+                "rate.persist.fail inquiry_id=%s err=%s", inquiry_id, exc
             )
             persist_warning = f"Persist failed: {exc}"
             feedback_result = {"ok": False, "error": str(exc)}
