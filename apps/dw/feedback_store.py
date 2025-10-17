@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 from apps.dw.feedback_repo import UPSERT_SQL, persist_feedback as _persist_feedback
 
@@ -10,7 +10,7 @@ from apps.dw.feedback_repo import UPSERT_SQL, persist_feedback as _persist_feedb
 def persist_feedback(
     *,
     inquiry_id: int,
-    auth_email: str,
+    auth_email: Optional[str],
     rating: int,
     comment: str,
     intent: Dict[str, Any] | None,
@@ -26,7 +26,7 @@ def persist_feedback(
         rating=rating,
         comment=comment,
         intent=intent,
-        final_sql=resolved_sql,
+        resolved_sql=resolved_sql,
         binds=binds,
         status=status,
     )

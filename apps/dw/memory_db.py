@@ -45,6 +45,7 @@ def ensure_feedback_schema(engine: Engine | None) -> None:
                       intent_json TEXT,
                       binds_json TEXT,
                       resolved_sql TEXT,
+                      hints_json TEXT,
                       status TEXT DEFAULT 'pending',
                       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                       updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -71,6 +72,8 @@ def ensure_feedback_schema(engine: Engine | None) -> None:
                 alterations.append("ALTER TABLE dw_feedback ADD COLUMN binds_json TEXT")
             if "resolved_sql" not in cols:
                 alterations.append("ALTER TABLE dw_feedback ADD COLUMN resolved_sql TEXT")
+            if "hints_json" not in cols:
+                alterations.append("ALTER TABLE dw_feedback ADD COLUMN hints_json TEXT")
             if "status" not in cols:
                 alterations.append(
                     "ALTER TABLE dw_feedback ADD COLUMN status TEXT DEFAULT 'pending'"
@@ -98,6 +101,7 @@ def ensure_feedback_schema(engine: Engine | None) -> None:
                       intent_json JSONB,
                       binds_json JSONB,
                       resolved_sql TEXT,
+                      hints_json JSONB,
                       status TEXT DEFAULT 'pending',
                       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -111,6 +115,11 @@ def ensure_feedback_schema(engine: Engine | None) -> None:
                     CREATE UNIQUE INDEX IF NOT EXISTS ux_dw_feedback_inquiry_id
                       ON dw_feedback(inquiry_id)
                     """
+                )
+            )
+            cn.execute(
+                text(
+                    "ALTER TABLE dw_feedback ADD COLUMN IF NOT EXISTS hints_json JSONB"
                 )
             )
 
