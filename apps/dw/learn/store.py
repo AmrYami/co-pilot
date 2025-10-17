@@ -1,76 +1,48 @@
-# -*- coding: utf-8 -*-
-"""Lightweight feedback store for /dw/rate overrides."""
+"""Compat helpers delegating to :mod:`apps.dw.feedback_repo`."""
+
 from __future__ import annotations
 
-import json
-import os
-from typing import Any, Dict
+import logging
+from typing import Any, Dict, Optional
 
-from sqlalchemy import create_engine, text
+from apps.dw.feedback_repo import persist_feedback as _persist_feedback
+from apps.dw.memory_db import ensure_feedback_schema, get_mem_engine
 
-
-def _get_env(name: str, default: str | None = None) -> str | None:
-    return os.environ.get(name, default)
-
-
-def _db_url() -> str:
-    return _get_env("MEMORY_DB_URL") or "sqlite:////tmp/copilot_mem_dev.sqlite"
+log = logging.getLogger("dw")
 
 
 def ensure_schema() -> None:
-    """Create feedback tables when they do not exist."""
-    engine = create_engine(_db_url())
-    with engine.begin() as cx:
-        cx.execute(
-            text(
-                """
-        CREATE TABLE IF NOT EXISTS dw_feedback (
-            id SERIAL PRIMARY KEY,
-            inquiry_id BIGINT,
-            rating INT,
-            comment TEXT,
-            hints_json TEXT,
-            created_at TIMESTAMP DEFAULT NOW()
-        )
-        """
-            )
-        )
-        cx.execute(
-            text(
-                """
-        CREATE TABLE IF NOT EXISTS dw_patches (
-            id SERIAL PRIMARY KEY,
-            inquiry_id BIGINT,
-            kind VARCHAR(50),
-            payload_json TEXT,
-            created_at TIMESTAMP DEFAULT NOW(),
-            approved BOOLEAN DEFAULT FALSE
-        )
-        """
-            )
-        )
+    """Ensure the ``dw_feedback`` schema exists in the memory database."""
+
+    ensure_feedback_schema(get_mem_engine())
 
 
-def save_feedback(inquiry_id: int, rating: int, comment: str, hints_payload: Dict[str, Any]) -> None:
-    """Persist a feedback row for later governance."""
+def save_feedback(
+    inquiry_id: int,
+    rating: int,
+    comment: Optional[str],
+    hints_payload: Optional[Dict[str, Any]] = None,
+    *,
+    auth_email: Optional[str] = None,
+    binds_payload: Optional[Dict[str, Any]] = None,
+    resolved_sql: Optional[str] = None,
+    status: str = "pending",
+) -> Optional[int]:
+    """Persist feedback rows via the unified repository implementation."""
+
     ensure_schema()
-    engine = create_engine(_db_url())
-    payload = json.dumps(hints_payload, ensure_ascii=False)
-    with engine.begin() as cx:
-        cx.execute(
-            text(
-                """
-        INSERT INTO dw_feedback (inquiry_id, rating, comment, hints_json)
-        VALUES (:iid, :rating, :comment, :payload)
-        """
-            ),
-            {
-                "iid": inquiry_id,
-                "rating": rating,
-                "comment": comment,
-                "payload": payload,
-            },
-        )
+    log.info({"event": "rate.persist.compat", "inquiry_id": inquiry_id})
+    return _persist_feedback(
+        inquiry_id=inquiry_id,
+        auth_email=auth_email,
+        rating=rating,
+        comment=comment or "",
+        intent=hints_payload or {},
+        resolved_sql=resolved_sql,
+        binds=binds_payload,
+        hints=hints_payload,
+        status=status,
+    )
 
 
 __all__ = ["ensure_schema", "save_feedback"]

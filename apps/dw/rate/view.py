@@ -3,8 +3,9 @@ from typing import Any, Dict, List, Optional
 
 from flask import Blueprint, current_app, jsonify, request
 
+from apps.dw.feedback_store import persist_feedback
 from apps.dw.sql_builder import build_rate_sql
-from apps.dw.settings import get_setting, load_settings
+from apps.dw.settings import get_setting, get_settings, load_settings
 from apps.dw.learning import record_feedback, to_patch_from_comment
 from apps.dw.search import (
     build_fulltext_where,
@@ -18,6 +19,25 @@ from apps.dw.sql.builder import build_eq_boolean_groups_where, normalize_order_b
 from apps.dw.rate_dates import build_date_clause
 
 rate_bp = Blueprint("rate", __name__)
+
+
+def _get_auth_email_from_ctx_or_default(req, settings):
+    payload: Dict[str, Any] = {}
+    try:
+        payload = req.get_json(force=True, silent=True) or {}
+    except Exception:
+        payload = {}
+
+    auth_email = payload.get("auth_email")
+    if auth_email:
+        return str(auth_email)
+
+    header_email = req.headers.get("X-Auth-Email")
+    if header_email:
+        return header_email
+
+    fallback_settings = settings or {}
+    return str(fallback_settings.get("AUTH_EMAIL", ""))
 
 
 @rate_bp.route("/dw/rate", methods=["POST"])
@@ -304,4 +324,50 @@ def rate():
             },
         }
     )
+
+    resp["binds"] = binds
+    resp.setdefault("debug", {}).setdefault("final_sql", {}).setdefault("binds", binds)
+
+    try:
+        settings = get_settings()
+    except Exception:
+        settings = {}
+
+    auth_email = _get_auth_email_from_ctx_or_default(request, settings)
+
+    try:
+        inquiry_id_value = int(inquiry_id) if inquiry_id is not None else None
+    except (TypeError, ValueError):
+        inquiry_id_value = None
+
+    persist_result: Dict[str, Any]
+    if inquiry_id_value:
+        try:
+            persist_feedback_id = persist_feedback(
+                inquiry_id=inquiry_id_value,
+                auth_email=auth_email,
+                rating=int(rating or 0) if rating is not None else 0,
+                comment=comment,
+                intent=resp.get("debug", {}).get("intent") or intent,
+                resolved_sql=resp.get("sql")
+                or resp.get("debug", {}).get("final_sql", {}).get("sql"),
+                binds=resp.get("binds") or {},
+            )
+            persist_result = {"ok": True, "feedback_id": persist_feedback_id}
+        except Exception as exc:
+            persist_result = {"ok": False, "error": str(exc)}
+    else:
+        persist_result = {"ok": False, "error": "missing_inquiry_id"}
+    resp.setdefault("debug", {}).setdefault("persist", persist_result)
+
+    current_app.logger.info(
+        {
+            "event": "rate.persist",
+            "inquiry_id": inquiry_id_value,
+            "rating": rating,
+            "ok": persist_result.get("ok"),
+            "error": persist_result.get("error"),
+        }
+    )
+
     return jsonify(resp), 200

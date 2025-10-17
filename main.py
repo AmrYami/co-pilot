@@ -1,13 +1,74 @@
+import os
+
 from flask import Flask, jsonify
+from sqlalchemy import create_engine
 
 from apps.common.admin import admin_bp as admin_common_bp
 from apps.dw.app import create_dw_blueprint
+from apps.dw.admin_api import bp as dw_admin_bp
+from apps.dw.routes import debug_bp
 from apps.dw.tests.routes import golden_bp
 from core.admin_api import admin_bp as core_admin_bp
 from core.logging_utils import get_logger, log_event, setup_logging
+from core.memdb import ensure_dw_feedback_schema, get_mem_engine
 from core.model_loader import ensure_model, model_info
 from core.pipeline import Pipeline
 from core.settings import Settings
+
+
+def make_engine(url: str, echo_env: str):
+    """Create a SQLAlchemy engine honouring environment echo toggles."""
+
+    if not url:
+        raise RuntimeError("Database URL must be provided")
+
+    echo = str(os.getenv(echo_env, "false")).lower() in {"1", "true", "yes", "y"}
+    return create_engine(url, pool_pre_ping=True, future=True, echo=echo)
+
+
+def boot_app(app: Flask, settings: Settings, pipeline: Pipeline | None = None) -> None:
+    """Initialise database engines and attach them to the Flask app."""
+
+    app_db_url = app.config.get("APP_DB_URL") or settings.get_app_db_url(namespace="dw::common")
+    if not app_db_url:
+        raise RuntimeError("APP_DB_URL must be configured before booting the app")
+
+    memory_url = (
+        os.getenv("MEMORY_DB_URL")
+        or app.config.get("MEMORY_DB_URL")
+        or settings.get("MEMORY_DB_URL", scope="global")
+    )
+    if not memory_url:
+        raise RuntimeError("MEMORY_DB_URL must be configured before booting the app")
+
+    app_engine = make_engine(app_db_url, "APP_SQL_ECHO")
+
+    mem_engine = None
+    if pipeline is not None:
+        existing = getattr(pipeline, "mem_engine", None)
+        if existing is not None:
+            existing_url = existing.url.render_as_string(hide_password=False)
+            if existing_url == memory_url:
+                mem_engine = existing
+
+    if mem_engine is None:
+        mem_engine = make_engine(memory_url, "MEM_SQL_ECHO")
+        if pipeline is not None:
+            setattr(pipeline, "mem_engine", mem_engine)
+
+    app.app_engine = app_engine
+    app.mem_engine = mem_engine
+
+    app.config["APP_ENGINE"] = app_engine
+    app.config["MEM_ENGINE"] = mem_engine
+
+    app.logger.info(
+        {
+            "event": "boot.db_urls",
+            "app_db": str(app_db_url).split("://")[0],
+            "mem_db": str(memory_url).split("://")[0],
+        }
+    )
 
 def create_app():
     settings = Settings()
@@ -37,15 +98,30 @@ def create_app():
 
     app.config["SETTINGS"] = settings
     app.config["PIPELINE"] = pipeline
-    app.config["MEM_ENGINE"] = pipeline.mem_engine
+
+    app.config["APP_DB_URL"] = settings.get_app_db_url(namespace="dw::common")
+    app.config["MEMORY_DB_URL"] = (
+        os.getenv("MEMORY_DB_URL") or settings.get("MEMORY_DB_URL", scope="global")
+    )
+
+    boot_app(app, settings, pipeline)
+
     app.config["pipeline"] = pipeline  # backwards compatibility
 
     dw_bp = create_dw_blueprint(settings=settings, pipeline=pipeline)
 
     app.register_blueprint(dw_bp, url_prefix="/dw")
+    app.register_blueprint(debug_bp)
+    app.register_blueprint(dw_admin_bp, url_prefix="/dw/admin")
     app.register_blueprint(golden_bp)
     app.register_blueprint(core_admin_bp, url_prefix="/admin")
     app.register_blueprint(admin_common_bp)
+
+    try:
+        mem_engine = get_mem_engine(app)
+        ensure_dw_feedback_schema(mem_engine)
+    except Exception as exc:  # pragma: no cover - defensive logging
+        app.logger.exception("memdb.bootstrap.fail: %s", exc)
 
     @app.get("/health")
     def health():

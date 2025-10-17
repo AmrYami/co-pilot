@@ -66,6 +66,34 @@ def _post_rate(client, comment: str):
     return client.post("/dw/rate", data=json.dumps(payload), content_type="application/json")
 
 
+def test_rate_persists_feedback(monkeypatch, client):
+    captured = {}
+
+    def _capture(**kwargs):
+        captured.update(kwargs)
+        return 123
+
+    monkeypatch.setattr("apps.dw.feedback_repo.persist_feedback", lambda **kw: _capture(**kw))
+
+    resp = client.post(
+        "/dw/rate",
+        data=json.dumps(
+            {
+                "inquiry_id": 5,
+                "rating": 1,
+                "comment": "fts: it or home care; order_by: REQUEST_DATE desc;",
+            }
+        ),
+        content_type="application/json",
+    )
+
+    assert resp.status_code == 200
+    assert captured.get("inquiry_id") == 5
+    assert isinstance(captured.get("binds"), dict)
+    assert isinstance(captured.get("intent"), dict)
+    assert "resolved_sql" in captured
+
+
 def test_rate_eq_request_type(client):
     resp = _post_rate(client, "eq: REQUEST_TYPE = Renewal;")
     assert resp.status_code == 200

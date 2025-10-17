@@ -146,6 +146,23 @@ def main():
     with open(os.path.join(args.out, "patches_export.json"), "w") as fp:
       json.dump(patches, fp, indent=2, default=str)
 
+    # --- FEEDBACK export (admin review) ---
+    if table_exists(eng, "dw_feedback"):
+        feedback = dump(eng, """
+      SELECT id, inquiry_id, auth_email, rating, comment,
+             intent_json, resolved_sql, binds_json,
+             status, approver_email, admin_note, rejected_reason,
+             created_at, updated_at
+      FROM dw_feedback
+      ORDER BY created_at DESC
+      LIMIT 500
+    """)
+    else:
+        feedback = {"warning": "dw_feedback not found"}
+
+    with open(os.path.join(args.out, "feedback_export.json"), "w") as fp:
+        json.dump(feedback, fp, indent=2, default=str)
+
     # runs metrics 24h
     if table_exists(eng, "dw_runs"):
         r_cols = table_columns(eng, "dw_runs")

@@ -4,14 +4,20 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import uuid
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, current_app, jsonify, request
+from sqlalchemy import text
 
+from apps.common.db import get_app_engine as get_common_app_engine
 from apps.dw.db import fetch_rows
 from apps.dw.eq_parser import extract_eq_filters_from_natural_text, strip_eq_from_text
+from apps.dw.feedback import persist_feedback as persist_dw_feedback
+from apps.dw.memory_db import get_mem_engine as get_memdb_engine
+from apps.dw.memory_db import get_memory_engine
 from apps.dw.search import resolve_engine
 from apps.dw.settings_access import DWSettings
 from apps.dw.settings_defaults import DEFAULT_EXPLICIT_FILTER_COLUMNS
@@ -23,6 +29,7 @@ from apps.dw.sqlbuilder import (
 )
 from apps.dw.logs import scrub_binds
 from apps.dw.utils import env_flag
+from apps.settings import get_setting
 
 try:  # pragma: no cover - lightweight fallback for tests without settings backend
     from apps.dw.settings_util import get_setting as _get_setting
@@ -31,8 +38,95 @@ except Exception:  # pragma: no cover
         return default
 
 bp = Blueprint("dw", __name__)
+debug_bp = Blueprint("dw_debug", __name__)
 
 logger = logging.getLogger("dw.routes")
+log = logging.getLogger("dw")
+
+
+def redact(url: str | None) -> str | None:
+    if not url:
+        return url
+    password_pg = os.getenv("POSTGRES_PASSWORD", "123456789")
+    password_oracle = os.getenv("ORACLE_PASSWORD", "Strong#Pass1")
+    return str(url).replace(password_pg, "****").replace(password_oracle, "****")
+
+
+def _probe(conn) -> Dict[str, Any]:
+    dialect = str(getattr(conn.engine.dialect, "name", ""))
+    details: Dict[str, Any] = {"dialect": dialect}
+    if dialect.startswith("oracle"):
+        details["database"] = (
+            conn.execute(text("SELECT ora_database_name AS db FROM dual")).scalar() or "?"
+        )
+        details["schema"] = (
+            conn.execute(
+                text("SELECT sys_context('userenv','current_schema') FROM dual")
+            ).scalar()
+            or "?"
+        )
+    elif dialect.startswith("postgres"):
+        row = (
+            conn.execute(
+                text("SELECT current_database() AS db, current_schema() AS sch")
+            )
+            .mappings()
+            .first()
+        )
+        details["database"] = (row or {}).get("db") or "?"
+        details["schema"] = (row or {}).get("sch") or "public"
+    else:
+        details["database"] = "n/a"
+        details["schema"] = "n/a"
+    return details
+
+
+@debug_bp.get("/dw/debug/which-db")
+def dw_debug_which_db():
+    app_engine = get_common_app_engine()
+    mem_engine = get_memdb_engine()
+    out: Dict[str, Any] = {}
+    with app_engine.connect() as conn:
+        out["app_db"] = _probe(conn)
+        out["app_db"]["url"] = redact(str(app_engine.url))
+    with mem_engine.connect() as conn:
+        out["memory_db"] = _probe(conn)
+        out["memory_db"]["url"] = redact(str(mem_engine.url))
+    out["env"] = {
+        "ACTIVE_APP": os.getenv("ACTIVE_APP"),
+        "MEMORY_DB_URL_env": os.getenv("MEMORY_DB_URL"),
+    }
+    return jsonify(out)
+
+
+def get_auth_email_from_ctx() -> str:
+    """Extract the authenticated email from the current request context."""
+
+    try:
+        payload = request.get_json(silent=True)
+    except Exception:  # pragma: no cover - defensive: Flask may raise on bad JSON
+        payload = None
+
+    if not isinstance(payload, dict):
+        payload = {}
+
+    auth_email = (payload.get("auth_email") or "").strip()
+    if not auth_email:
+        auth_email = (request.headers.get("X-Auth-Email") or "").strip()
+    if not auth_email:
+        try:
+            auth_email = (
+                get_setting(
+                    "AUTH_EMAIL",
+                    default="",
+                    scope="global",
+                    namespace="global",
+                )
+                or ""
+            ).strip()
+        except Exception:  # pragma: no cover - settings backend optional in tests
+            auth_email = ""
+    return auth_email.lower()
 
 
 def _settings_dict() -> Dict[str, Any]:
@@ -409,11 +503,186 @@ def answer() -> Any:
     return jsonify(response)
 
 
+def _resolve_auth_email(body: Dict[str, Any]) -> str:
+    """Resolve the auth email from request context or settings."""
+
+    header_email = (request.headers.get("X-Auth-Email") or "").strip()
+    if header_email:
+        return header_email.lower()
+
+    candidate = (body or {}).get("auth_email") or ""
+    auth_email = candidate.strip() if isinstance(candidate, str) else str(candidate or "").strip()
+    if auth_email:
+        return auth_email.lower()
+
+    env_email = os.getenv("AUTH_EMAIL", "").strip()
+    if env_email:
+        return env_email.lower()
+
+    try:
+        setting_email = get_setting("AUTH_EMAIL", namespace="dw::common", default="") or ""
+    except Exception:  # pragma: no cover - optional settings backend
+        setting_email = ""
+    return setting_email.strip().lower()
+
+
+def _lookup_auth_email_fallback(inquiry_id: int) -> str:
+    """Best-effort lookup if caller didn't pass auth_email."""
+
+    try:
+        eng = get_memory_engine()
+        with eng.connect() as cx:
+            row = cx.execute(
+                text(
+                    "SELECT COALESCE(auth_email,'') AS auth_email FROM mem_inquiries WHERE id=:id"
+                ),
+                {"id": inquiry_id},
+            ).mappings().first()
+            return (row or {}).get("auth_email") or ""
+    except Exception:
+        return ""
+
+
+def _get_memory_engine():
+    """Return the configured memory engine, caching it on the Flask app."""
+
+    mem_engine = getattr(current_app, "mem_engine", None)
+    if mem_engine is not None:
+        return mem_engine
+
+    mem_engine = getattr(current_app, "memory_engine", None)
+    if mem_engine is not None:
+        return mem_engine
+
+    config_engine = current_app.config.get("MEM_ENGINE")
+    if config_engine is not None:
+        try:
+            setattr(current_app, "memory_engine", config_engine)
+        except Exception:  # pragma: no cover - attribute assignment best effort
+            pass
+        return config_engine
+
+    mem_engine = get_memdb_engine()
+    try:
+        setattr(current_app, "memory_engine", mem_engine)
+    except Exception:  # pragma: no cover - attribute assignment best effort
+        pass
+    return mem_engine
+
+
+@debug_bp.route("/dw/debug/rate-ping", methods=["POST"])
+def rate_ping():
+    payload = request.get_json(force=True, silent=True) or {}
+    try:
+        inquiry_id = int(payload.get("inquiry_id") or 0)
+    except (TypeError, ValueError):
+        inquiry_id = 0
+
+    try:
+        mem_engine = _get_memory_engine()
+    except Exception:
+        mem_engine = None
+
+    current_app.logger.info(
+        {
+            "event": "debug.rate-ping",
+            "inquiry_id": inquiry_id,
+            "mem_engine": (
+                mem_engine.url.render_as_string(hide_password=True)
+                if mem_engine is not None
+                else None
+            ),
+        }
+    )
+
+    if mem_engine is None:
+        return jsonify({"ok": False, "error": "memory_engine_unavailable"}), 503
+
+    try:
+        payload = {
+            "inquiry_id": inquiry_id or 777777,
+            "auth_email": "debug@local",
+            "rating": 1,
+            "comment": "ping",
+            "intent_json": json.dumps({"debug": True}, default=str),
+            "resolved_sql": "SELECT 1",
+            "binds_json": json.dumps({}, default=str),
+            "status": "pending",
+        }
+        feedback_id = upsert_feedback(mem_engine, **payload)
+    except Exception as exc:  # pragma: no cover - diagnostic helper
+        current_app.logger.exception("debug.rate-ping.failed")
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+    return jsonify({"ok": True, "feedback_id": feedback_id})
+
+
+def _should_persist(rating: Optional[int], comment: str) -> Tuple[bool, str]:
+    """Determine whether feedback should be persisted and why."""
+
+    if rating is None:
+        return False, "no_rating"
+    try:
+        rating_value = int(rating)
+    except (TypeError, ValueError):
+        return False, "invalid_rating"
+
+    if rating_value <= 0 and not (comment or "").strip():
+        return False, "nonpositive_without_comment"
+
+    return True, "rating_present"
+
+
 @bp.route("/dw/rate", methods=["POST"])
 def rate() -> Any:
     payload = request.get_json(force=True, silent=True) or {}
-    inquiry_id = payload.get("inquiry_id")
+    mem_engine = None
+    try:
+        mem_engine = _get_memory_engine()
+    except Exception as exc:  # pragma: no cover - defensive logging only
+        log.exception(
+            "rate.persist.target.err",
+            extra={"err": str(exc)},
+        )
+    else:
+        if mem_engine is not None:
+            log.info(
+                {
+                    "event": "rate.persist.target",
+                    "mem_engine": mem_engine.url.render_as_string(hide_password=True),
+                }
+            )
+
+    app_mem_engine = None
+    try:
+        from core.memdb import get_mem_engine
+
+        app_mem_engine = get_mem_engine(current_app)
+    except Exception as exc:  # pragma: no cover - defensive logging only
+        current_app.logger.exception("rate.mem_engine.resolve.fail err=%s", exc)
+
+    if mem_engine is None and app_mem_engine is not None:
+        mem_engine = app_mem_engine
+    try:
+        inquiry_id = int(payload.get("inquiry_id"))
+    except (TypeError, ValueError):
+        inquiry_id = None
     comment = (payload.get("comment") or "").strip()
+    raw_rating = payload.get("rating")
+    try:
+        rating: Optional[int] = int(raw_rating)
+    except (TypeError, ValueError):
+        rating = None
+
+    app_logger = current_app.logger
+    app_logger.info(
+        "rate.receive",
+        extra={
+            "inquiry_id": inquiry_id,
+            "rating": rating,
+            "comment_len": len(comment or ""),
+        },
+    )
 
     settings = _load_dw_settings()
     raw_settings: Dict[str, Any] = dict(settings.global_ns)
@@ -497,6 +766,15 @@ def rate() -> Any:
 
     final_sql, binds = qb.compile()
     final_sql_to_run = final_sql
+    binds_count = len(binds or {})
+    app_logger.info(
+        "rate.sql.exec",
+        extra={
+            "inquiry_id": inquiry_id,
+            "sql_preview": (final_sql_to_run or "")[:160],
+            "binds_count": binds_count,
+        },
+    )
 
     trace_id = request.headers.get("X-Trace-Id") or uuid.uuid4().hex
     logger.info({"event": "rate.primary.start", "trace_id": trace_id})
@@ -540,7 +818,7 @@ def rate() -> Any:
         "validation": {
             "ok": True,
             "bind_names": list(binds.keys()),
-            "binds": list(binds.keys()),
+            "binds": binds,
             "errors": [],
         },
         "rate_hints": {
@@ -552,6 +830,91 @@ def rate() -> Any:
         "builder_notes": builder_notes,
         "final_sql": {"sql": final_sql_to_run, "size": len(final_sql_to_run)},
     }
+
+    auth_email = _resolve_auth_email(payload)
+    current_app.logger.info(
+        {
+            "event": "feedback.persist.intent",
+            "inquiry_id": inquiry_id,
+            "auth_email": auth_email,
+            "rating": rating,
+            "has_intent": intent is not None,
+            "has_sql": bool(final_sql_to_run),
+            "binds_keys": list((binds or {}).keys()),
+        }
+    )
+    ok_to_persist, decision_reason = _should_persist(rating, comment)
+    if inquiry_id is None:
+        ok_to_persist = False
+        decision_reason = "missing_inquiry_id"
+    log.info(
+        {
+            "event": "rate.persist.decision",
+            "inquiry_id": inquiry_id,
+            "ok": ok_to_persist,
+            "reason": decision_reason,
+        }
+    )
+
+    feedback_id: Optional[int] = None
+    persist_warning: Optional[str] = None
+    feedback_result: Optional[Dict[str, Any]] = None
+    persist_error = False
+    if ok_to_persist and inquiry_id is not None:
+        auth_email = (auth_email or "").strip() or _lookup_auth_email_fallback(inquiry_id)
+        if not auth_email:
+            auth_email = ""
+
+        log.info(
+            {
+                "event": "rate.persist.attempt",
+                "inquiry_id": inquiry_id,
+                "auth_email": auth_email,
+                "rating": int(rating),
+            }
+        )
+        try:
+            fb_id = persist_dw_feedback(
+                inquiry_id=inquiry_id,
+                auth_email=auth_email,
+                rating=int(rating),
+                comment=comment or "",
+                intent=intent,
+                resolved_sql=final_sql_to_run or "",
+                binds=binds or {},
+            )
+            feedback_id = int(fb_id) if fb_id is not None else None
+            feedback_result = {"ok": True, "feedback_id": feedback_id}
+            log.info(
+                {
+                    "event": "rate.persist.ok",
+                    "inquiry_id": inquiry_id,
+                    "feedback_id": int(fb_id or 0),
+                }
+            )
+        except Exception as exc:  # pragma: no cover - defensive logging only
+            log.exception(
+                {
+                    "event": "rate.persist.fail",
+                    "inquiry_id": inquiry_id,
+                    "error": str(exc),
+                }
+            )
+            persist_warning = f"Persist failed: {exc}"
+            feedback_result = {"ok": False, "error": str(exc)}
+            persist_error = True
+    else:
+        log.info(
+            {
+                "event": "rate.persist.skip",
+                "inquiry_id": inquiry_id,
+                "reason": decision_reason,
+            }
+        )
+
+    debug["feedback_id"] = feedback_id
+    if feedback_result is not None:
+        debug["persist"] = feedback_result
 
     meta = {
         "attempt_no": 1,
@@ -569,7 +932,8 @@ def rate() -> Any:
         "trace_id": trace_id,
         "rowcount": rowcount,
     }
-
+    if persist_error:
+        meta["persist_error"] = True
     response = {
         "ok": True,
         "inquiry_id": inquiry_id,
@@ -578,8 +942,16 @@ def rate() -> Any:
         "meta": meta,
         "rows": rows,
         "retry": False,
+        "stored_to_feedback": bool(feedback_id),
+        "feedback_id": feedback_id,
     }
-    return jsonify(response)
+    if persist_warning:
+        response["warning"] = persist_warning
+    app_logger.info(
+        "rate.response",
+        extra={"inquiry_id": inquiry_id, "retry": False},
+    )
+    return jsonify(response), 200
 
 
-__all__ = ["bp", "answer", "rate"]
+__all__ = ["bp", "answer", "rate", "debug_bp"]
