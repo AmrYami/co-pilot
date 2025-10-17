@@ -10,6 +10,7 @@ from apps.dw.routes import debug_bp
 from apps.dw.tests.routes import golden_bp
 from core.admin_api import admin_bp as core_admin_bp
 from core.logging_utils import get_logger, log_event, setup_logging
+from core.memdb import ensure_dw_feedback_schema, get_mem_engine
 from core.model_loader import ensure_model, model_info
 from core.pipeline import Pipeline
 from core.settings import Settings
@@ -115,6 +116,12 @@ def create_app():
     app.register_blueprint(golden_bp)
     app.register_blueprint(core_admin_bp, url_prefix="/admin")
     app.register_blueprint(admin_common_bp)
+
+    try:
+        mem_engine = get_mem_engine(app)
+        ensure_dw_feedback_schema(mem_engine)
+    except Exception as exc:  # pragma: no cover - defensive logging
+        app.logger.exception("memdb.bootstrap.fail: %s", exc)
 
     @app.get("/health")
     def health():
