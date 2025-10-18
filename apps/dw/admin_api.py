@@ -11,12 +11,22 @@ from flask import Blueprint, abort, jsonify, request
 from sqlalchemy import text
 from sqlalchemy.engine import Connection
 
-from apps.dw.db import get_memory_engine, get_memory_session
+from apps.dw.db import get_memory_session
+from apps.dw.learning import save_positive_rule
+from apps.dw.memory_db import get_memory_engine
 from apps.dw.order_utils import normalize_order_hint
 
 bp = Blueprint("dw_admin", __name__)
 
 eng = get_memory_engine()
+
+
+def _flatten_fts_groups(intent: dict) -> list[str]:
+    groups = intent.get("fts_groups") or []
+    tokens: list[str] = []
+    for group in groups:
+        tokens.extend([token for token in (group or []) if token])
+    return tokens
 
 
 def _get_admin_emails(conn: Connection) -> set[str]:
@@ -216,6 +226,27 @@ def approve_feedback(fid: int):
                 normalized_intent.pop("sort_desc", None)
             else:
                 normalized_intent["sort_desc"] = sort_desc
+
+            inquiry_id = row.get("inquiry_id")
+            question = ""
+            if inquiry_id:
+                question_row = (
+                    mem_session.execute(
+                        text(
+                            """
+                            SELECT question
+                              FROM mem_inquiries
+                             WHERE id = :id
+                             LIMIT 1
+                            """
+                        ),
+                        {"id": inquiry_id},
+                    )
+                    .mappings()
+                    .first()
+                )
+                if question_row:
+                    question = (question_row.get("question") or "").strip()
             intent_json = json.dumps(normalized_intent, ensure_ascii=False)
 
             binds_payload = row.get("binds_json")
@@ -257,6 +288,16 @@ def approve_feedback(fid: int):
                     "resolved_sql": resolved_sql,
                     "binds_json": binds_json,
                 }
+                applied_hints = {
+                    "fts_tokens": _flatten_fts_groups(normalized_intent),
+                    "fts_operator": "OR",
+                    "eq_filters": normalized_intent.get("eq_filters") or [],
+                    "sort_by": normalized_intent.get("sort_by"),
+                    "sort_desc": normalized_intent.get("sort_desc"),
+                }
+                if question:
+                    engine = get_memory_engine()
+                    save_positive_rule(engine, question, applied_hints)
                 mem_session.execute(
                     text(
                         """
