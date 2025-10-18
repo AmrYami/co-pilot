@@ -64,10 +64,18 @@ def run_golden_rate():
             sql = ((body.get("debug") or {}).get("final_sql") or {}).get("sql", "")
 
             sql_contains = []
+            must_contain = []
+            must_not_contain = []
             if isinstance(expect, dict):
                 sql_contains = expect.get("sql_contains", []) or expect.get("sql_contains_all", [])
-            for needle in sql_contains:
+                must_contain = expect.get("must_contain", [])
+                must_not_contain = expect.get("must_not_contain", [])
+            for needle in [*sql_contains, *must_contain]:
                 if needle not in sql:
+                    ok = False
+
+            for needle in must_not_contain:
+                if needle and needle in sql:
                     ok = False
 
             binds = body.get("binds") or {}

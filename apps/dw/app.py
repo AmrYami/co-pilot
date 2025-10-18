@@ -64,6 +64,7 @@ from apps.dw.rate_hints import (
     parse_rate_hints,
     replace_or_add_order_by,
 )
+from apps.dw.order_utils import normalize_order_hint
 from apps.dw.fts_utils import DEFAULT_CONTRACT_FTS_COLUMNS
 from apps.dw.settings_defaults import DEFAULT_EXPLICIT_FILTER_COLUMNS
 from apps.dw.settings_utils import load_explicit_filter_columns
@@ -1012,9 +1013,13 @@ def _apply_online_rate_hints(
             meta["gross"] = bool(gross_flag)
 
     sort_by = intent.get("sort_by")
-    if isinstance(sort_by, str) and sort_by.strip():
-        sort_desc = _coerce_bool_flag(intent.get("sort_desc"), default=True)
-        clause = f"ORDER BY {sort_by.strip()} {'DESC' if sort_desc else 'ASC'}"
+    sort_desc_flag = intent.get("sort_desc")
+    norm_sort_by, norm_sort_desc = normalize_order_hint(sort_by, sort_desc_flag)
+    if norm_sort_by:
+        intent["sort_by"] = norm_sort_by
+        intent["sort_desc"] = norm_sort_desc
+        effective_desc = True if norm_sort_desc is None else bool(norm_sort_desc)
+        clause = f"ORDER BY {norm_sort_by} {'DESC' if effective_desc else 'ASC'}"
         sql = replace_or_add_order_by(sql, clause)
         meta["order_by"] = clause
 

@@ -5,13 +5,14 @@ from __future__ import annotations
 import json
 import logging
 import os
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from flask import Blueprint, abort, jsonify, request
 from sqlalchemy import text
 from sqlalchemy.engine import Connection
 
 from apps.dw.db import get_memory_engine, get_memory_session
+from apps.dw.order_utils import normalize_order_hint
 
 bp = Blueprint("dw_admin", __name__)
 
@@ -191,12 +192,31 @@ def approve_feedback(fid: int):
                 abort(404, description="feedback not found")
 
             intent_payload = row.get("intent_json")
+            raw_intent: Dict[str, Any]
             if isinstance(intent_payload, dict):
-                intent_json = json.dumps(intent_payload, ensure_ascii=False)
+                raw_intent = dict(intent_payload)
             elif isinstance(intent_payload, str) and intent_payload.strip():
-                intent_json = intent_payload
+                try:
+                    parsed = json.loads(intent_payload)
+                except json.JSONDecodeError:
+                    parsed = {}
+                raw_intent = dict(parsed) if isinstance(parsed, dict) else {}
             else:
-                intent_json = json.dumps(intent_payload or {}, ensure_ascii=False)
+                raw_intent = {}
+
+            sort_by, sort_desc = normalize_order_hint(
+                raw_intent.get("sort_by"), raw_intent.get("sort_desc")
+            )
+            normalized_intent = dict(raw_intent)
+            if sort_by:
+                normalized_intent["sort_by"] = sort_by
+            else:
+                normalized_intent.pop("sort_by", None)
+            if sort_desc is None:
+                normalized_intent.pop("sort_desc", None)
+            else:
+                normalized_intent["sort_desc"] = sort_desc
+            intent_json = json.dumps(normalized_intent, ensure_ascii=False)
 
             binds_payload = row.get("binds_json")
             if isinstance(binds_payload, dict):
