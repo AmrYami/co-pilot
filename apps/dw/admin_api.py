@@ -25,7 +25,12 @@ def _flatten_fts_groups(intent: dict) -> list[str]:
     groups = intent.get("fts_groups") or []
     tokens: list[str] = []
     for group in groups:
-        tokens.extend([token for token in (group or []) if token])
+        if isinstance(group, (list, tuple)):
+            tokens.extend([token for token in group if token])
+        elif isinstance(group, str):
+            token = group.strip()
+            if token:
+                tokens.append(token)
     return tokens
 
 
@@ -247,18 +252,6 @@ def approve_feedback(fid: int):
                 )
                 if question_row:
                     question = (question_row.get("question") or "").strip()
-            intent_json = json.dumps(normalized_intent, ensure_ascii=False)
-
-            binds_payload = row.get("binds_json")
-            if isinstance(binds_payload, dict):
-                binds_json = json.dumps(binds_payload, ensure_ascii=False)
-            elif isinstance(binds_payload, str) and binds_payload.strip():
-                binds_json = binds_payload
-            else:
-                binds_json = json.dumps(binds_payload or {}, ensure_ascii=False)
-
-            resolved_sql = row.get("resolved_sql") or ""
-
             result = mem_session.execute(
                 text(
                     """
@@ -282,45 +275,83 @@ def approve_feedback(fid: int):
 
             make_rule = create_rule or apply_patch
             if make_rule:
-                params = {
-                    "inq": int(row.get("inquiry_id")) if row.get("inquiry_id") else None,
-                    "intent_json": intent_json,
-                    "resolved_sql": resolved_sql,
-                    "binds_json": binds_json,
-                }
+                intent = (
+                    normalized_intent
+                    if isinstance(normalized_intent, dict)
+                    else {}
+                )
+                sort_candidate = intent.get("sort_by")
+                if isinstance(sort_candidate, str):
+                    sort_by = sort_candidate.strip().upper()
+                elif sort_candidate is None:
+                    sort_by = ""
+                else:
+                    sort_by = str(sort_candidate).strip().upper()
+                sort_by = sort_by or "REQUEST_DATE"
+
+                sort_desc_value = intent.get("sort_desc")
+                if isinstance(sort_desc_value, str):
+                    lowered = sort_desc_value.strip().lower()
+                    sort_desc = lowered not in {"false", "0", "no", "off"}
+                elif sort_desc_value is None:
+                    sort_desc = True
+                else:
+                    sort_desc = bool(sort_desc_value)
+
+                eq_filters_value = intent.get("eq_filters") or []
+                if isinstance(eq_filters_value, (list, tuple)):
+                    eq_filters = [item for item in eq_filters_value if item is not None]
+                else:
+                    eq_filters = []
+
+                def _json(value: Any) -> str:
+                    return json.dumps(value, ensure_ascii=False)
+
+                tokens = _flatten_fts_groups(intent)
+
                 applied_hints = {
-                    "fts_tokens": _flatten_fts_groups(normalized_intent),
+                    "fts_tokens": tokens,
                     "fts_operator": "OR",
-                    "eq_filters": normalized_intent.get("eq_filters") or [],
-                    "sort_by": normalized_intent.get("sort_by"),
-                    "sort_desc": normalized_intent.get("sort_desc"),
+                    "eq_filters": eq_filters,
+                    "sort_by": sort_by,
+                    "sort_desc": sort_desc,
                 }
                 if question:
                     engine = get_memory_engine()
                     save_positive_rule(engine, question, applied_hints)
+
+                if tokens:
+                    mem_session.execute(
+                        text(
+                            """
+                            INSERT INTO dw_rules (rule_kind, rule_payload, enabled, source, created_at, updated_at)
+                            VALUES ('fts', CAST(:payload AS JSONB), TRUE, 'admin', NOW(), NOW())
+                            """
+                        ),
+                        {"payload": _json({"tokens": tokens, "operator": "OR"})},
+                    )
+
                 mem_session.execute(
                     text(
                         """
-                        INSERT INTO dw_rules (
-                            rule_kind, rule_payload, enabled, source, created_at, updated_at
-                        )
-                        VALUES (
-                            'rate_hint',
-                            jsonb_build_object(
-                                'origin_inquiry_id', :inq,
-                                'intent', CAST(:intent_json AS JSONB),
-                                'resolved_sql', COALESCE(:resolved_sql, ''),
-                                'binds', CAST(:binds_json AS JSONB)
-                            ),
-                            TRUE,
-                            'admin',
-                            NOW(),
-                            NOW()
-                        )
+                        INSERT INTO dw_rules (rule_kind, rule_payload, enabled, source, created_at, updated_at)
+                        VALUES ('order_by', CAST(:payload AS JSONB), TRUE, 'admin', NOW(), NOW())
                         """
                     ),
-                    params,
+                    {"payload": _json({"sort_by": sort_by, "sort_desc": sort_desc})},
                 )
+
+                if eq_filters:
+                    mem_session.execute(
+                        text(
+                            """
+                            INSERT INTO dw_rules (rule_kind, rule_payload, enabled, source, created_at, updated_at)
+                            VALUES ('eq', CAST(:payload AS JSONB), TRUE, 'admin', NOW(), NOW())
+                            """
+                        ),
+                        {"payload": _json({"eq_filters": eq_filters})},
+                    )
+
                 rule_created = True
                 logger.info(
                     "admin.approve.rule.ok",
