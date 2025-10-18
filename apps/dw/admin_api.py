@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from typing import Optional
 
@@ -151,90 +152,140 @@ def get_feedback(fid: int):
     return jsonify(_row_to_dict(row))
 
 
+logger = logging.getLogger(__name__)
+
+
 @bp.post("/feedback/<int:fid>/approve")
 def approve_feedback(fid: int):
     body = request.get_json(silent=True) or {}
     admin_note = (body.get("admin_note") or "").strip()
+    create_rule = bool(body.get("create_rule"))
+    apply_patch = bool(body.get("apply_patch"))
+
     with get_memory_session() as mem_session:
         conn = mem_session.connection()
         approver = _require_admin(conn)
-        row = (
-            mem_session.execute(
+        logger.info(
+            "admin.approve.attempt",
+            extra={"feedback_id": fid, "approver": approver},
+        )
+        rule_created = False
+        try:
+            row = (
+                mem_session.execute(
+                    text(
+                        """
+                        SELECT id, inquiry_id, intent_json, resolved_sql, binds_json
+                          FROM dw_feedback
+                         WHERE id = :id
+                         LIMIT 1
+                        """
+                    ),
+                    {"id": fid},
+                )
+                .mappings()
+                .first()
+            )
+            if not row:
+                mem_session.rollback()
+                abort(404, description="feedback not found")
+
+            intent_payload = row.get("intent_json")
+            if isinstance(intent_payload, dict):
+                intent_json = json.dumps(intent_payload, ensure_ascii=False)
+            elif isinstance(intent_payload, str) and intent_payload.strip():
+                intent_json = intent_payload
+            else:
+                intent_json = json.dumps(intent_payload or {}, ensure_ascii=False)
+
+            binds_payload = row.get("binds_json")
+            if isinstance(binds_payload, dict):
+                binds_json = json.dumps(binds_payload, ensure_ascii=False)
+            elif isinstance(binds_payload, str) and binds_payload.strip():
+                binds_json = binds_payload
+            else:
+                binds_json = json.dumps(binds_payload or {}, ensure_ascii=False)
+
+            resolved_sql = row.get("resolved_sql") or ""
+
+            result = mem_session.execute(
                 text(
                     """
-                    SELECT id, inquiry_id, intent_json, resolved_sql, binds_json
-                      FROM dw_feedback
-                     WHERE id = :id
+                    UPDATE dw_feedback
+                       SET status='approved',
+                           approver_email=:who,
+                           admin_note=:note,
+                           updated_at=NOW()
+                     WHERE id=:id
                     """
                 ),
-                {"id": fid},
+                {"id": fid, "who": approver, "note": admin_note},
             )
-            .mappings()
-            .first()
-        )
-        if not row:
-            abort(404, description="feedback not found")
+            if result.rowcount is None or result.rowcount == 0:
+                mem_session.rollback()
+                abort(404, description="feedback not found")
+            logger.info(
+                "admin.approve.update.ok",
+                extra={"feedback_id": fid, "approver": approver},
+            )
 
-        intent_payload = row.get("intent_json")
-        if isinstance(intent_payload, dict):
-            intent_json = json.dumps(intent_payload, ensure_ascii=False)
-        else:
-            intent_json = intent_payload or "{}"
-
-        binds_payload = row.get("binds_json")
-        if isinstance(binds_payload, dict):
-            binds_json = json.dumps(binds_payload, ensure_ascii=False)
-        else:
-            binds_json = binds_payload or "{}"
-
-        resolved_sql = row.get("resolved_sql") or ""
-        inquiry_id = row.get("inquiry_id")
-
-        mem_session.execute(
-            text(
-                """
-                INSERT INTO dw_rules (
-                    rule_kind, rule_payload, enabled, source, created_at, updated_at
-                )
-                VALUES (
-                    'rate_hint',
-                    jsonb_build_object(
-                        'origin_inquiry_id', :inq,
-                        'intent', COALESCE(:intent::jsonb, '{}'::jsonb),
-                        'resolved_sql', COALESCE(:sql, ''),
-                        'binds', COALESCE(:binds::jsonb, '{}'::jsonb)
+            make_rule = create_rule or apply_patch
+            if make_rule:
+                params = {
+                    "inq": int(row.get("inquiry_id")) if row.get("inquiry_id") else None,
+                    "intent_json": intent_json,
+                    "resolved_sql": resolved_sql,
+                    "binds_json": binds_json,
+                }
+                mem_session.execute(
+                    text(
+                        """
+                        INSERT INTO dw_rules (
+                            rule_kind, rule_payload, enabled, source, created_at, updated_at
+                        )
+                        VALUES (
+                            'rate_hint',
+                            jsonb_build_object(
+                                'origin_inquiry_id', :inq,
+                                'intent', CAST(:intent_json AS JSONB),
+                                'resolved_sql', COALESCE(:resolved_sql, ''),
+                                'binds', CAST(:binds_json AS JSONB)
+                            ),
+                            TRUE,
+                            'admin',
+                            NOW(),
+                            NOW()
+                        )
+                        """
                     ),
-                    TRUE,
-                    'admin',
-                    NOW(),
-                    NOW()
+                    params,
                 )
-                """
-            ),
+                rule_created = True
+                logger.info(
+                    "admin.approve.rule.ok",
+                    extra={"feedback_id": fid, "approver": approver},
+                )
+
+            mem_session.commit()
+        except Exception:
+            mem_session.rollback()
+            logger.exception(
+                "admin.approve.fail",
+                extra={"feedback_id": fid, "approver": approver},
+            )
+            raise
+
+    return (
+        jsonify(
             {
-                "inq": inquiry_id,
-                "intent": intent_json,
-                "sql": resolved_sql,
-                "binds": binds_json,
-            },
-        )
-
-        mem_session.execute(
-            text(
-                """
-                UPDATE dw_feedback
-                   SET status='approved',
-                       approver_email=:who,
-                       admin_note=:note,
-                       updated_at=NOW()
-                 WHERE id=:id
-                """
-            ),
-            {"id": fid, "who": approver, "note": admin_note},
-        )
-        mem_session.commit()
-
-    return jsonify({"ok": True, "id": fid, "status": "approved"})
+                "ok": True,
+                "id": fid,
+                "status": "approved",
+                "rule_created": rule_created,
+            }
+        ),
+        200,
+    )
 
 
 @bp.post("/feedback/<int:fid>/reject")
