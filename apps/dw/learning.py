@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from typing import Any, Dict, Optional, List
 
@@ -10,6 +11,8 @@ from sqlalchemy import text
 import sqlalchemy as sa
 
 from apps.dw.settings import get_setting
+
+log = logging.getLogger("dw")
 
 _DDL_STATEMENTS = (
     """
@@ -52,6 +55,13 @@ _DDL_STATEMENTS = (
 
 _INITIALIZED_ENGINES: set[int] = set()
 
+_MIGRATIONS = (
+    "ALTER TABLE dw_rules ADD COLUMN IF NOT EXISTS question_norm TEXT",
+    "ALTER TABLE dw_rules ADD COLUMN IF NOT EXISTS enabled BOOLEAN NOT NULL DEFAULT TRUE",
+    "ALTER TABLE dw_rules ADD COLUMN IF NOT EXISTS scope TEXT NOT NULL DEFAULT 'namespace'",
+    "CREATE INDEX IF NOT EXISTS idx_dw_rules_enabled ON dw_rules (enabled)",
+)
+
 
 def _ensure_tables(engine) -> None:
     if engine is None:
@@ -62,6 +72,11 @@ def _ensure_tables(engine) -> None:
     with engine.begin() as cx:
         for stmt in _DDL_STATEMENTS:
             cx.execute(text(stmt))
+        for stmt in _MIGRATIONS:
+            try:
+                cx.execute(text(stmt))
+            except Exception as e:  # defensive
+                log.warning("rules.migration.skip", extra={"err": str(e)})
     _INITIALIZED_ENGINES.add(key)
 
 
@@ -177,6 +192,7 @@ def load_rules_for_question(engine, question: str) -> Dict[str, Any]:
         return {}
     _ensure_tables(engine)
     merged: Dict[str, Any] = {}
+    norm = _norm_question(question)
     with engine.connect() as cx:
         rows = cx.execute(
             text(
@@ -184,10 +200,12 @@ def load_rules_for_question(engine, question: str) -> Dict[str, Any]:
                 SELECT rule_kind, rule_payload
                   FROM dw_rules
                  WHERE enabled = TRUE
+                   AND (COALESCE(question_norm, '') = '' OR question_norm = :q)
                  ORDER BY id DESC
-                 LIMIT 20
+                 LIMIT 50
                 """
-            )
+            ),
+            {"q": norm},
         )
         for row in rows:
             kind = row[0] if isinstance(row, tuple) else row["rule_kind"]
@@ -223,36 +241,40 @@ def load_rules_for_question(engine, question: str) -> Dict[str, Any]:
                 if payload.get("sort_desc") is not None:
                     merged["sort_desc"] = bool(payload.get("sort_desc"))
             elif kind == "rate_hint":
-                # backward-compat: extract legacy intent payloads
-                intent_payload = payload.get("intent") or {}
-                if isinstance(intent_payload, str):
+                # Backward-compat: map legacy payload to unified hints
+                intent = payload.get("intent") or {}
+                if isinstance(intent, str):
                     try:
-                        intent_payload = json.loads(intent_payload)
+                        intent = json.loads(intent)
                     except json.JSONDecodeError:
-                        intent_payload = {}
-                if isinstance(intent_payload, dict):
-                    groups = intent_payload.get("fts_groups") or []
-                    tokens: list[str] = []
-                    for group in groups:
-                        if isinstance(group, (list, tuple)):
-                            tokens.extend([token for token in group if token])
-                        elif isinstance(group, str):
-                            token = group.strip()
-                            if token:
-                                tokens.append(token)
-                    if tokens:
-                        merged["fts_tokens"] = tokens
-                        merged["fts_operator"] = "OR"
-                    eq_payload = intent_payload.get("eq_filters") or []
-                    if eq_payload:
-                        existing = merged.setdefault("eq_filters", [])
-                        for item in eq_payload:
-                            if item not in existing:
-                                existing.append(item)
-                    if intent_payload.get("sort_by"):
-                        merged["sort_by"] = intent_payload.get("sort_by")
-                    if intent_payload.get("sort_desc") is not None:
-                        merged["sort_desc"] = bool(intent_payload.get("sort_desc"))
+                        intent = {}
+                if not isinstance(intent, dict):
+                    intent = {}
+
+                fts_groups = intent.get("fts_groups") or []
+                tokens: list[str] = []
+                for group in fts_groups:
+                    if isinstance(group, (list, tuple)):
+                        tokens.extend([str(token) for token in group if token])
+                    elif isinstance(group, str):
+                        token = group.strip()
+                        if token:
+                            tokens.append(token)
+                if tokens:
+                    merged["fts_tokens"] = tokens
+                    merged["fts_operator"] = "OR"
+
+                eq_payload = intent.get("eq_filters") or []
+                if isinstance(eq_payload, list) and eq_payload:
+                    existing = merged.setdefault("eq_filters", [])
+                    for item in eq_payload:
+                        if item not in existing:
+                            existing.append(item)
+
+                if intent.get("sort_by"):
+                    merged["sort_by"] = intent.get("sort_by")
+                if intent.get("sort_desc") is not None:
+                    merged["sort_desc"] = bool(intent.get("sort_desc"))
     if merged:
         merged.setdefault("full_text_search", bool(merged.get("fts_tokens")))
     return merged

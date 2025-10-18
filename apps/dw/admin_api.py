@@ -239,7 +239,7 @@ def approve_feedback(fid: int):
                     mem_session.execute(
                         text(
                             """
-                            SELECT question
+                            SELECT COALESCE(NULLIF(q_norm,''), LOWER(TRIM(question))) AS q
                               FROM mem_inquiries
                              WHERE id = :id
                              LIMIT 1
@@ -251,7 +251,7 @@ def approve_feedback(fid: int):
                     .first()
                 )
                 if question_row:
-                    question = (question_row.get("question") or "").strip()
+                    question = (question_row.get("q") or "").strip()
             result = mem_session.execute(
                 text(
                     """
@@ -280,83 +280,47 @@ def approve_feedback(fid: int):
                     if isinstance(normalized_intent, dict)
                     else {}
                 )
-                sort_candidate = intent.get("sort_by")
-                if isinstance(sort_candidate, str):
-                    sort_by = sort_candidate.strip().upper()
-                elif sort_candidate is None:
-                    sort_by = ""
-                else:
-                    sort_by = str(sort_candidate).strip().upper()
-                sort_by = sort_by or "REQUEST_DATE"
-
-                sort_desc_value = intent.get("sort_desc")
-                if isinstance(sort_desc_value, str):
-                    lowered = sort_desc_value.strip().lower()
-                    sort_desc = lowered not in {"false", "0", "no", "off"}
-                elif sort_desc_value is None:
-                    sort_desc = True
-                else:
-                    sort_desc = bool(sort_desc_value)
-
-                eq_filters_value = intent.get("eq_filters") or []
-                if isinstance(eq_filters_value, (list, tuple)):
-                    eq_filters = [item for item in eq_filters_value if item is not None]
+                eq_filters_val = intent.get("eq_filters") or []
+                if isinstance(eq_filters_val, list):
+                    eq_filters = [item for item in eq_filters_val if item is not None]
                 else:
                     eq_filters = []
 
-                def _json(value: Any) -> str:
-                    return json.dumps(value, ensure_ascii=False)
-
-                tokens = _flatten_fts_groups(intent)
-
                 applied_hints = {
-                    "fts_tokens": tokens,
-                    "fts_operator": "OR",
+                    "group_by": intent.get("group_by"),
+                    "gross": intent.get("gross"),
+                    "fts_tokens": _flatten_fts_groups(intent),
                     "eq_filters": eq_filters,
-                    "sort_by": sort_by,
-                    "sort_desc": sort_desc,
+                    "sort_by": intent.get("sort_by"),
+                    "sort_desc": bool(intent.get("sort_desc"))
+                    if intent.get("sort_desc") is not None
+                    else None,
                 }
-                if question:
+
+                has_rule = any(
+                    (
+                        applied_hints.get("group_by"),
+                        applied_hints.get("gross") is not None,
+                        applied_hints.get("fts_tokens"),
+                        applied_hints.get("eq_filters"),
+                        applied_hints.get("sort_by"),
+                        applied_hints.get("sort_desc") is not None,
+                    )
+                )
+
+                if question and has_rule:
                     engine = get_memory_engine()
                     save_positive_rule(engine, question, applied_hints)
-
-                if tokens:
-                    mem_session.execute(
-                        text(
-                            """
-                            INSERT INTO dw_rules (rule_kind, rule_payload, enabled, source, created_at, updated_at)
-                            VALUES ('fts', CAST(:payload AS JSONB), TRUE, 'admin', NOW(), NOW())
-                            """
-                        ),
-                        {"payload": _json({"tokens": tokens, "operator": "OR"})},
+                    rule_created = True
+                    logger.info(
+                        "admin.approve.rule.ok",
+                        extra={"feedback_id": fid, "approver": approver},
                     )
-
-                mem_session.execute(
-                    text(
-                        """
-                        INSERT INTO dw_rules (rule_kind, rule_payload, enabled, source, created_at, updated_at)
-                        VALUES ('order_by', CAST(:payload AS JSONB), TRUE, 'admin', NOW(), NOW())
-                        """
-                    ),
-                    {"payload": _json({"sort_by": sort_by, "sort_desc": sort_desc})},
-                )
-
-                if eq_filters:
-                    mem_session.execute(
-                        text(
-                            """
-                            INSERT INTO dw_rules (rule_kind, rule_payload, enabled, source, created_at, updated_at)
-                            VALUES ('eq', CAST(:payload AS JSONB), TRUE, 'admin', NOW(), NOW())
-                            """
-                        ),
-                        {"payload": _json({"eq_filters": eq_filters})},
+                else:
+                    logger.info(
+                        "admin.approve.rule.skip",
+                        extra={"feedback_id": fid, "approver": approver},
                     )
-
-                rule_created = True
-                logger.info(
-                    "admin.approve.rule.ok",
-                    extra={"feedback_id": fid, "approver": approver},
-                )
 
             mem_session.commit()
         except Exception:
