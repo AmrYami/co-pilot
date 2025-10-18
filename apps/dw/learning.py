@@ -108,7 +108,21 @@ def save_positive_rule(engine, question: str, applied_hints: Dict[str, Any]) -> 
             )
         )
 
+    # Accept both legacy 'fts_tokens' and new 'fts_groups'
     tokens = applied_hints.get("fts_tokens") or []
+    if not tokens:
+        groups = applied_hints.get("fts_groups") or []
+        tokens = []
+        for group in groups:
+            if isinstance(group, (list, tuple)):
+                for token in group:
+                    text_token = str(token).strip()
+                    if text_token:
+                        tokens.append(text_token)
+            elif isinstance(group, str):
+                token = group.strip()
+                if token:
+                    tokens.append(token)
     if tokens:
         rows.append(
             (
