@@ -48,6 +48,9 @@ cases:
   - name: mix_fts_eq_order
     rate_comment: "fts: it or home care; eq: REQUEST_TYPE = renewal; order_by: REQUEST_DATE desc;"
     expect:
-      sql_contains:
-        - "ORDER BY REQUEST_DATE desc"
+      must_contain:
+        - "ORDER BY REQUEST_DATE DESC"
+      must_not_contain:
+        - "ORDER BY REQUEST_DATE desc DESC"
+        - "ORDER BY REQUEST_DATE DESC DESC"
       rows_min: 1

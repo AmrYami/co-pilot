@@ -3,6 +3,7 @@ from __future__ import annotations
 from flask import Blueprint, jsonify, request
 
 from apps.dw.logger import log
+from apps.dw.order_utils import normalize_order_hint
 from apps.dw.rate_pipeline import run_rate
 
 rate_bp = Blueprint("rate_bp", __name__)
@@ -42,7 +43,20 @@ def rate():
             if isinstance(debug, dict):
                 intent = debug.get("intent")
                 if isinstance(intent, dict):
-                    intent_dict = intent
+                    normalized_intent = dict(intent)
+                    sort_by, sort_desc = normalize_order_hint(
+                        normalized_intent.get("sort_by"), normalized_intent.get("sort_desc")
+                    )
+                    if sort_by:
+                        normalized_intent["sort_by"] = sort_by
+                    else:
+                        normalized_intent.pop("sort_by", None)
+                    if sort_desc is None:
+                        normalized_intent.pop("sort_desc", None)
+                    else:
+                        normalized_intent["sort_desc"] = sort_desc
+                    debug["intent"] = normalized_intent
+                    intent_dict = normalized_intent
 
         if inquiry_id is not None:
             from apps.dw.feedback_repo import persist_feedback as _persist_dw_feedback
