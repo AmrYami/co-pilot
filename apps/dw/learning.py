@@ -222,6 +222,37 @@ def load_rules_for_question(engine, question: str) -> Dict[str, Any]:
                     merged["sort_by"] = payload.get("sort_by")
                 if payload.get("sort_desc") is not None:
                     merged["sort_desc"] = bool(payload.get("sort_desc"))
+            elif kind == "rate_hint":
+                # backward-compat: extract legacy intent payloads
+                intent_payload = payload.get("intent") or {}
+                if isinstance(intent_payload, str):
+                    try:
+                        intent_payload = json.loads(intent_payload)
+                    except json.JSONDecodeError:
+                        intent_payload = {}
+                if isinstance(intent_payload, dict):
+                    groups = intent_payload.get("fts_groups") or []
+                    tokens: list[str] = []
+                    for group in groups:
+                        if isinstance(group, (list, tuple)):
+                            tokens.extend([token for token in group if token])
+                        elif isinstance(group, str):
+                            token = group.strip()
+                            if token:
+                                tokens.append(token)
+                    if tokens:
+                        merged["fts_tokens"] = tokens
+                        merged["fts_operator"] = "OR"
+                    eq_payload = intent_payload.get("eq_filters") or []
+                    if eq_payload:
+                        existing = merged.setdefault("eq_filters", [])
+                        for item in eq_payload:
+                            if item not in existing:
+                                existing.append(item)
+                    if intent_payload.get("sort_by"):
+                        merged["sort_by"] = intent_payload.get("sort_by")
+                    if intent_payload.get("sort_desc") is not None:
+                        merged["sort_desc"] = bool(intent_payload.get("sort_desc"))
     if merged:
         merged.setdefault("full_text_search", bool(merged.get("fts_tokens")))
     return merged
