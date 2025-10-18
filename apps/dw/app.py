@@ -71,7 +71,7 @@ from apps.dw.tables.contracts import build_contract_sql
 from apps.mem.kv import get_settings_for_namespace
 from apps.dw.online_learning import load_recent_hints
 from apps.dw.builder import _where_from_eq_filters
-from apps.dw.db import get_memory_session
+from apps.dw.db import get_memory_engine, get_memory_session
 from apps.dw.learning_store import (
     DWExample,
     DWPatch,
@@ -180,16 +180,59 @@ def _load_rate_hint_seed(question: str) -> Tuple[Dict[str, Any], Dict[str, Any]]
 
         id_to_norm: Dict[int, str] = {}
         if origin_ids:
+            try:
+                mem_bind = session.get_bind()
+            except Exception:
+                mem_bind = None
+            if mem_bind is None:
+                try:
+                    mem_bind = get_memory_engine()
+                except Exception:
+                    mem_bind = None
+
+            has_q_norm = False
+            if mem_bind is not None:
+                try:
+                    with mem_bind.connect() as cx:
+                        has_q_norm = (
+                            cx.execute(
+                                text(
+                                    """
+                                    SELECT 1
+                                      FROM information_schema.columns
+                                     WHERE table_name = 'mem_inquiries'
+                                       AND column_name = 'q_norm'
+                                     LIMIT 1
+                                    """
+                                )
+                            ).first()
+                            is not None
+                        )
+                except Exception:
+                    has_q_norm = False
+
+            sql_norm = (
+                text(
+                    """
+                    SELECT id,
+                           COALESCE(NULLIF(q_norm, ''), LOWER(TRIM(question))) AS norm
+                      FROM mem_inquiries
+                     WHERE id = ANY(:ids)
+                    """
+                )
+                if has_q_norm
+                else text(
+                    """
+                    SELECT id, LOWER(TRIM(question)) AS norm
+                      FROM mem_inquiries
+                     WHERE id = ANY(:ids)
+                    """
+                )
+            )
+
             rows = (
                 session.execute(
-                    text(
-                        """
-                        SELECT id,
-                               COALESCE(NULLIF(q_norm, ''), LOWER(TRIM(question))) AS norm
-                          FROM mem_inquiries
-                         WHERE id = ANY(:ids)
-                        """
-                    ),
+                    sql_norm,
                     {"ids": origin_ids},
                 )
                 .mappings()
