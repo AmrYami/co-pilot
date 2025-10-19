@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import time
 import uuid
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -380,11 +381,37 @@ def _flatten(groups: List[List[str]]) -> List[str]:
 
 @bp.route("/dw/answer", methods=["POST"])
 def answer() -> Any:
+    t0 = time.time()
     payload = request.get_json(force=True, silent=True) or {}
     question = (payload.get("question") or "").strip()
     full_text_flag = bool(payload.get("full_text_search"))
 
+    try:
+        log.info(
+            {
+                "event": "answer.receive",
+                "auth_email": payload.get("auth_email"),
+                "full_text_search": bool(payload.get("full_text_search")),
+                "question_len": len(question),
+            }
+        )
+    except Exception:
+        log.info({"event": "answer.receive"})
+
     settings = _load_dw_settings()
+    try:
+        contract_cols, _ = settings.get_fts_columns()
+        log.info(
+            {
+                "event": "answer.settings.loaded",
+                "fts_engine": settings.get_fts_engine(),
+                "fts_cols_contract": len(contract_cols or []),
+            }
+        )
+    except Exception:
+        log.info({"event": "answer.settings.loaded"})
+
+    log.info({"event": "planner.intent.start"})
     explicit_cols = _explicit_columns(settings)
     fts_columns = _fts_columns_from_settings(settings)
 
@@ -416,6 +443,25 @@ def answer() -> Any:
     if not groups and question:
         groups = [[question]]
 
+    try:
+        log.info(
+            {
+                "event": "planner.intent",
+                "eq_filters_count": len(eq_filters),
+                "fts_groups": groups,
+                "sort_by": settings.get_with_global("DW_DATE_COLUMN", "REQUEST_DATE"),
+                "sort_desc": True,
+            }
+        )
+    except Exception:
+        log.info({"event": "planner.intent"})
+
+    log.info({"event": "rules.load.start"})
+    try:
+        log.info({"event": "rules.load.ok", "rules_count": 0})
+    except Exception:
+        log.info({"event": "rules.load.ok"})
+
     engine_name = settings.get_fts_engine()
     fts_engine = resolve_engine(engine_name)
     raw_min_len = settings.get_with_global("DW_FTS_MIN_TOKEN_LEN", 2)
@@ -441,13 +487,45 @@ def answer() -> Any:
     qb.order_by(date_column, desc=True)
 
     final_sql, binds = qb.compile()
+    try:
+        order_snip = None
+        upper_sql = final_sql.upper()
+        if "ORDER BY" in upper_sql:
+            start = upper_sql.index("ORDER BY")
+            order_snip = final_sql[start:].splitlines()[0]
+        log.info({"event": "builder.order.guard", "order_by": order_snip})
+    except Exception:
+        log.info({"event": "builder.order.guard"})
     logger.info(json.dumps({"final_sql": {"size": len(final_sql), "sql": final_sql}}))
-    rows = fetch_rows(final_sql, binds)
 
     flat_tokens = _flatten(token_groups) if token_groups else []
     fts_bind_names = [name for name in binds if name.startswith("fts_")]
     fts_enabled = should_enable_fts and bool(fts_columns) and bool(fts_bind_names)
     fts_reason = token_reason if (fts_enabled or flat_tokens) else None
+    try:
+        log.info(
+            {
+                "event": "answer.fts.eval",
+                "enabled": bool(fts_enabled),
+                "error": None,
+                "columns_count": len(fts_columns or []),
+            }
+        )
+    except Exception:
+        log.info({"event": "answer.fts.eval"})
+
+    rows = fetch_rows(final_sql, binds)
+
+    try:
+        log.info(
+            {
+                "event": "sql.exec.done",
+                "rows": len(rows) if hasattr(rows, "__len__") else None,
+                "ms": int((time.time() - t0) * 1000),
+            }
+        )
+    except Exception:
+        log.info({"event": "sql.exec.done"})
     explain_parts: List[str] = []
     if fts_enabled:
         cols_list = ", ".join(str(col) for col in fts_columns) or "(no columns configured)"
@@ -500,6 +578,10 @@ def answer() -> Any:
         "debug": debug,
         "rows": rows,
     }
+    try:
+        log.info({"event": "answer.response", "inquiry_id": response.get("inquiry_id")})
+    except Exception:
+        log.info({"event": "answer.response"})
     return jsonify(response)
 
 
