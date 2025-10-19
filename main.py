@@ -1,6 +1,6 @@
 import os
 
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 from sqlalchemy import create_engine
 
 from apps.common.admin import admin_bp as admin_common_bp
@@ -9,7 +9,8 @@ from apps.dw.admin_api import bp as dw_admin_bp
 from apps.dw.routes import debug_bp
 from apps.dw.tests.routes import golden_bp
 from core.admin_api import admin_bp as core_admin_bp
-from core.logging_utils import get_logger, log_event, setup_logging
+from core.logging_setup import set_corr_id, setup_logging
+from core.logging_utils import get_logger, log_event
 from core.memdb import ensure_dw_feedback_schema, get_mem_engine
 from core.model_loader import ensure_model, model_info
 from core.pipeline import Pipeline
@@ -71,8 +72,9 @@ def boot_app(app: Flask, settings: Settings, pipeline: Pipeline | None = None) -
     )
 
 def create_app():
+    debug = os.getenv("COPILOT_DEBUG", "0") in {"1", "true", "True"}
+    setup_logging(debug=debug)
     settings = Settings()
-    setup_logging(settings)
     log = get_logger("main")
 
     app = Flask(__name__)
@@ -81,6 +83,14 @@ def create_app():
         app.logger.propagate = True
     except Exception:  # pragma: no cover - defensive
         pass
+
+    @app.before_request
+    def _inject_corr_id():
+        try:
+            iid = request.json.get("inquiry_id") if request.is_json else None
+        except Exception:
+            iid = None
+        set_corr_id(f"inq:{iid}" if iid else None)
 
     log_event(log, "boot", "app_boot", {"message": "registering blueprints"})
 

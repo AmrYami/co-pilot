@@ -6,11 +6,51 @@ import json
 import logging
 import os
 import re
+import time
 import uuid
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from flask import Blueprint, current_app, jsonify, request
-from sqlalchemy import text
+try:  # pragma: no cover - allow usage without Flask dependency
+    from flask import Blueprint, current_app, jsonify, request
+except Exception:  # pragma: no cover - lightweight stubs for tests
+    current_app = None  # type: ignore[assignment]
+
+    class _StubBlueprint:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def route(self, *args, **kwargs):
+            def decorator(fn):
+                return fn
+
+            return decorator
+
+        def get(self, *args, **kwargs):
+            def decorator(fn):
+                return fn
+
+            return decorator
+
+        def post(self, *args, **kwargs):
+            def decorator(fn):
+                return fn
+
+            return decorator
+
+        def register_blueprint(self, *args, **kwargs):
+            return None
+
+    def jsonify(*args, **kwargs):  # pragma: no cover - stub
+        return {}
+
+    request = type("_StubRequest", (), {"headers": {}, "args": {}, "get_json": lambda *a, **k: {}})()
+    Blueprint = _StubBlueprint  # type: ignore[assignment]
+
+try:  # pragma: no cover - optional dependency during tests
+    from sqlalchemy import text
+except Exception:  # pragma: no cover - fallback for tests
+    def text(sql: str):  # type: ignore
+        return sql
 
 from apps.common.db import get_app_engine as get_common_app_engine
 from apps.dw.db import fetch_rows
@@ -42,6 +82,20 @@ debug_bp = Blueprint("dw_debug", __name__)
 
 logger = logging.getLogger("dw.routes")
 log = logging.getLogger("dw")
+
+
+_ORDER_DUP_RE = re.compile(r"(ORDER BY\s+[^\n]+?)(?:\s+DESC){2,}\b", re.IGNORECASE)
+
+
+def _normalize_order_clause(sql: str) -> tuple[str, bool, str | None]:
+    match = _ORDER_DUP_RE.search(sql)
+    if not match:
+        return sql, False, None
+    clause = match.group(1).rstrip()
+    normalized = f"{clause} DESC"
+    start, end = match.span()
+    updated = sql[:start] + normalized + sql[end:]
+    return updated, True, normalized.strip()
 
 
 def redact(url: str | None) -> str | None:
@@ -380,14 +434,40 @@ def _flatten(groups: List[List[str]]) -> List[str]:
 
 @bp.route("/dw/answer", methods=["POST"])
 def answer() -> Any:
+    t0 = time.time()
     payload = request.get_json(force=True, silent=True) or {}
     question = (payload.get("question") or "").strip()
     full_text_flag = bool(payload.get("full_text_search"))
 
+    log.info(
+        "answer.receive",
+        extra={
+            "payload": {
+                "question": question[:160],
+                "full_text_search": full_text_flag,
+                "auth_email": payload.get("auth_email"),
+            }
+        },
+    )
+
     settings = _load_dw_settings()
+    namespace = (payload.get("namespace") or "dw::common").strip() or "dw::common"
     explicit_cols = _explicit_columns(settings)
     fts_columns = _fts_columns_from_settings(settings)
 
+    log.info(
+        "answer.settings.load.ok",
+        extra={
+            "payload": {
+                "namespace": namespace,
+                "DW_FTS_ENGINE": settings.get_fts_engine(),
+                "fts_contract_cols": len(fts_columns),
+                "active_app": os.getenv("ACTIVE_APP"),
+            }
+        },
+    )
+
+    log.info("rules.load.start")
     raw_eq_pairs = extract_eq_filters_from_natural_text(question, explicit_cols)
     eq_pairs = [
         (str(col).strip().upper().replace(" ", "_"), val)
@@ -410,6 +490,23 @@ def answer() -> Any:
         else:
             eq_filters.append({"col": col, "val": val})
 
+    synonyms_map = settings.get_request_type_synonyms()
+    merged_kinds = []
+    if eq_pairs:
+        merged_kinds.append("eq_filters")
+    if synonyms_map:
+        merged_kinds.append("request_type_synonyms")
+    log.info(
+        "rules.load.ok",
+        extra={
+            "payload": {
+                "q_rules": len(eq_pairs),
+                "global_rules": len(synonyms_map or {}),
+                "merged_kinds": sorted(merged_kinds),
+            }
+        },
+    )
+
     token_groups, token_operator, token_reason = _extract_fts_groups(question, explicit_cols)
     should_enable_fts = full_text_flag or bool(token_groups)
     groups = token_groups
@@ -430,7 +527,34 @@ def answer() -> Any:
     qb = QueryBuilder(table=contract_table, date_col=date_column)
     qb.wants_all_columns(True)
 
+    intent_eq_summary = [
+        {"col": item.get("col"), "op": item.get("op", "eq")}
+        for item in eq_filters
+        if isinstance(item, dict)
+    ]
+
+    log.info(
+        "planner.intent",
+        extra={
+            "payload": {
+                "fts_groups": groups,
+                "eq_filters": intent_eq_summary,
+                "sort_by": date_column,
+                "sort_desc": True,
+            }
+        },
+    )
+
     if should_enable_fts and fts_columns:
+        log.info(
+            "fts.plan.enabled",
+            extra={
+                "payload": {
+                    "engine": settings.get_fts_engine(),
+                    "columns_count": len(fts_columns),
+                }
+            },
+        )
         qb.use_fts(engine=fts_engine, columns=fts_columns, min_token_len=min_token_len)
         for group in groups:
             qb.add_fts_group(group, op=token_operator)
@@ -440,9 +564,47 @@ def answer() -> Any:
 
     qb.order_by(date_column, desc=True)
 
+    if not fts_columns:
+        log.warning(
+            "fts.plan.disabled",
+            extra={
+                "payload": {
+                    "engine": settings.get_fts_engine(),
+                    "columns_count": 0,
+                    "reason": "no_columns",
+                }
+            },
+        )
+
     final_sql, binds = qb.compile()
-    logger.info(json.dumps({"final_sql": {"size": len(final_sql), "sql": final_sql}}))
+    final_sql, order_guard_applied, order_clause = _normalize_order_clause(final_sql)
+    if order_guard_applied:
+        log.info(
+            "builder.order.guard",
+            extra={"payload": {"applied": True, "final_clause": order_clause}},
+        )
+
+    log.info(
+        "sql.rendered",
+        extra={
+            "payload": {
+                "size": len(final_sql),
+                "has_fts": bool(should_enable_fts and fts_columns),
+            }
+        },
+    )
+
     rows = fetch_rows(final_sql, binds)
+    duration_ms = int((time.time() - t0) * 1000)
+    log.info(
+        "sql.exec.done",
+        extra={
+            "payload": {
+                "duration_ms": duration_ms,
+                "rows": len(rows),
+            }
+        },
+    )
 
     flat_tokens = _flatten(token_groups) if token_groups else []
     fts_bind_names = [name for name in binds if name.startswith("fts_")]
@@ -500,6 +662,15 @@ def answer() -> Any:
         "debug": debug,
         "rows": rows,
     }
+    log.info(
+        "answer.response",
+        extra={
+            "payload": {
+                "ok": True,
+                "inquiry_id": payload.get("inquiry_id"),
+            }
+        },
+    )
     return jsonify(response)
 
 
@@ -731,6 +902,22 @@ def rate() -> Any:
         "direction_hint": direction_hint,
         "wants_all_columns": True,
     }
+
+    log.info(
+        "rate.intent.parsed",
+        extra={
+            "payload": {
+                "fts_groups": tokens,
+                "eq_filters": [
+                    {"col": f.get("col"), "op": f.get("op", "eq")}
+                    for f in (eq_filters or [])
+                    if isinstance(f, dict)
+                ],
+                "sort_by": intent.get("sort_by"),
+                "sort_desc": intent.get("sort_desc"),
+            }
+        },
+    )
 
     qb = QueryBuilder(table=contract_table, date_col=date_column)
     qb.wants_all_columns(True)

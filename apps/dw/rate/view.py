@@ -1,4 +1,5 @@
 from datetime import date, datetime
+import logging
 from typing import Any, Dict, List, Optional
 
 from flask import Blueprint, current_app, jsonify, request
@@ -19,6 +20,8 @@ from apps.dw.sql.builder import build_eq_boolean_groups_where, normalize_order_b
 from apps.dw.rate_dates import build_date_clause
 
 rate_bp = Blueprint("rate", __name__)
+
+log = logging.getLogger("dw")
 
 
 def _get_auth_email_from_ctx_or_default(req, settings):
@@ -167,6 +170,22 @@ def rate():
 
     alias_map = alias_map_raw if isinstance(alias_map_raw, dict) else {}
     eq_filters: List[Dict[str, Any]] = intent.get("eq_filters") or []
+
+    log.info(
+        "rate.intent.parsed",
+        extra={
+            "payload": {
+                "fts_groups": filtered_groups,
+                "eq_filters": [
+                    {"col": f.get("col"), "op": f.get("op", "eq")}
+                    for f in (eq_filters or [])
+                    if isinstance(f, dict)
+                ],
+                "sort_by": intent.get("sort_by"),
+                "sort_desc": intent.get("sort_desc"),
+            }
+        },
+    )
     request_type_synonyms = enum_synonyms_setting.get("Contract.REQUEST_TYPE", {})
     eq_sql, eq_binds, _ = build_eq_where(
         eq_filters,

@@ -310,6 +310,22 @@ def approve_feedback(fid: int):
 
                 if question and has_rule:
                     engine = get_memory_engine()
+                    active_keys = [
+                        key
+                        for key, value in applied_hints.items()
+                        if value not in (None, [], "")
+                    ]
+                    payload_sizes = [len(json.dumps(applied_hints, default=str))]
+                    logger.info(
+                        "admin.approve.rule.payload",
+                        extra={
+                            "payload": {
+                                "question_norm": question,
+                                "kinds": sorted(active_keys),
+                                "payload_sizes": payload_sizes,
+                            }
+                        },
+                    )
                     save_positive_rule(engine, question, applied_hints)
                     rule_created = True
                     logger.info(
