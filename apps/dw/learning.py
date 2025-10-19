@@ -246,6 +246,54 @@ def load_rules_for_question(engine, question: str) -> Dict[str, Any]:
                     payload = {}
             if not isinstance(payload, dict):
                 continue
+            kind = str(kind or "").lower()
+
+            if kind == "rate_hint":
+                # Back-compat: payload = {"intent": {...}, "binds": {...}, "resolved_sql": "..."}
+                intent = (payload or {}).get("intent") if isinstance(payload, dict) else {}
+                if isinstance(intent, str):
+                    try:
+                        intent = json.loads(intent)
+                    except json.JSONDecodeError:
+                        intent = {}
+                if not isinstance(intent, dict):
+                    continue
+
+                ft_tokens = _flatten_fts_groups(intent)
+                if not ft_tokens:
+                    tokens_from_intent = intent.get("fts_tokens") or []
+                    if isinstance(tokens_from_intent, list):
+                        ft_tokens = [
+                            str(token).strip()
+                            for token in tokens_from_intent
+                            if isinstance(token, str) and str(token).strip()
+                        ]
+                if ft_tokens:
+                    merged["fts_tokens"] = ft_tokens
+                    merged["fts_operator"] = intent.get("fts_operator", "OR")
+                    if intent.get("fts_columns"):
+                        merged["fts_columns"] = intent.get("fts_columns")
+
+                eq_payload = intent.get("eq_filters")
+                if isinstance(eq_payload, list) and eq_payload:
+                    existing = merged.setdefault("eq_filters", [])
+                    for item in eq_payload:
+                        if item not in existing:
+                            existing.append(item)
+
+                sort_by = intent.get("sort_by")
+                if isinstance(sort_by, str) and sort_by.strip():
+                    merged["sort_by"] = sort_by.strip()
+                if intent.get("sort_desc") is not None:
+                    merged["sort_desc"] = bool(intent.get("sort_desc"))
+
+                group_by = intent.get("group_by")
+                if group_by:
+                    merged["group_by"] = group_by
+                if intent.get("gross") is not None:
+                    merged["gross"] = bool(intent.get("gross"))
+                continue
+
             if kind == "group_by":
                 if payload.get("group_by"):
                     merged["group_by"] = payload.get("group_by")
@@ -269,41 +317,8 @@ def load_rules_for_question(engine, question: str) -> Dict[str, Any]:
                     merged["sort_by"] = payload.get("sort_by")
                 if payload.get("sort_desc") is not None:
                     merged["sort_desc"] = bool(payload.get("sort_desc"))
-            elif kind == "rate_hint":
-                # Back-compat: payload = {"intent": {...}, "binds": {...}, "resolved_sql": "..."}
-                intent = (payload or {}).get("intent") if isinstance(payload, dict) else {}
-                if isinstance(intent, str):
-                    try:
-                        intent = json.loads(intent)
-                    except json.JSONDecodeError:
-                        intent = {}
-                if not isinstance(intent, dict):
-                    continue
-
-                ft_tokens = _flatten_fts_groups(intent)
-                if ft_tokens:
-                    merged["fts_tokens"] = ft_tokens
-                    merged["fts_operator"] = intent.get("fts_operator", "OR")
-
-                eq_payload = intent.get("eq_filters")
-                if isinstance(eq_payload, list) and eq_payload:
-                    existing = merged.setdefault("eq_filters", [])
-                    for item in eq_payload:
-                        if item not in existing:
-                            existing.append(item)
-
-                sort_token = intent.get("sort_by")
-                if isinstance(sort_token, str) and sort_token.strip():
-                    parts = sort_token.strip().split()
-                    merged["sort_by"] = parts[0].upper()
-                    if len(parts) > 1:
-                        merged["sort_desc"] = parts[1].lower() == "desc"
-                    elif intent.get("sort_desc") is not None:
-                        merged["sort_desc"] = bool(intent.get("sort_desc"))
-                elif intent.get("sort_desc") is not None:
-                    merged["sort_desc"] = bool(intent.get("sort_desc"))
-    if merged:
-        merged.setdefault("full_text_search", bool(merged.get("fts_tokens")))
+            if merged:
+                merged.setdefault("full_text_search", bool(merged.get("fts_tokens")))
     return merged
 
 
