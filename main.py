@@ -1,6 +1,8 @@
+import logging
 import os
+import time
 
-from flask import Flask, jsonify
+from flask import Flask, jsonify, g, request
 from sqlalchemy import create_engine
 
 from apps.common.admin import admin_bp as admin_common_bp
@@ -117,6 +119,9 @@ def create_app():
     app.register_blueprint(core_admin_bp, url_prefix="/admin")
     app.register_blueprint(admin_common_bp)
 
+    _install_dw_answer_trace(app)
+    _log_dw_answer_binding(app)
+
     try:
         mem_engine = get_mem_engine(app)
         ensure_dw_feedback_schema(mem_engine)
@@ -145,6 +150,77 @@ def create_app():
         return {"routes": rows}
 
     return app
+
+
+def _install_dw_answer_trace(app: Flask) -> None:
+    logger = logging.getLogger("dw")
+
+    @app.before_request
+    def _dw_answer_trace_before():  # pragma: no cover - request hooks
+        if request.path == "/dw/answer" and request.method == "POST":
+            g._dw_answer_t0 = time.time()
+            payload = request.get_json(silent=True) or {}
+            try:
+                logger.info(
+                    {
+                        "event": "answer.receive",
+                        "auth_email": payload.get("auth_email"),
+                        "full_text_search": bool(payload.get("full_text_search")),
+                        "question_len": len((payload.get("question") or "").strip()),
+                    }
+                )
+            except Exception:  # pragma: no cover - defensive logging
+                logger.info({"event": "answer.receive"})
+
+    @app.after_request
+    def _dw_answer_trace_after(resp):  # pragma: no cover - request hooks
+        if request.path == "/dw/answer" and request.method == "POST":
+            try:
+                ms = int((time.time() - g.get("_dw_answer_t0", time.time())) * 1000)
+            except Exception:  # pragma: no cover - defensive logging
+                ms = None
+            try:
+                data = resp.get_json(silent=True)
+            except Exception:  # pragma: no cover - defensive logging
+                data = None
+            inq_id = (data or {}).get("inquiry_id") if isinstance(data, dict) else None
+            fts_enabled = None
+            try:
+                meta = (data or {}).get("meta") or {}
+                fts_enabled = (meta.get("fts") or {}).get("enabled")
+            except Exception:  # pragma: no cover - defensive logging
+                pass
+            try:
+                logger.info(
+                    {
+                        "event": "answer.response",
+                        "inquiry_id": inq_id,
+                        "fts_enabled": fts_enabled,
+                        "ms": ms,
+                    }
+                )
+            except Exception:  # pragma: no cover - defensive logging
+                logger.info({"event": "answer.response"})
+        return resp
+
+
+def _log_dw_answer_binding(app: Flask) -> None:
+    logger = logging.getLogger("dw")
+    try:  # pragma: no cover - boot logging only
+        for rule in app.url_map.iter_rules():
+            if rule.rule == "/dw/answer" and "POST" in (rule.methods or set()):
+                fn = app.view_functions.get(rule.endpoint)
+                logger.info(
+                    {
+                        "event": "boot.answer.endpoint",
+                        "endpoint": rule.endpoint,
+                        "module": getattr(fn, "__module__", None),
+                        "qualname": getattr(fn, "__qualname__", None),
+                    }
+                )
+                break
+    except Exception:  # pragma: no cover - defensive logging
+        logger.info({"event": "boot.answer.endpoint"})
 
 
 app = create_app()
