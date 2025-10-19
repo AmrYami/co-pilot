@@ -1,29 +1,61 @@
 from __future__ import annotations
+
 import json
 import logging
-from typing import Any, Optional
+import os
+import sys
+import time
+import uuid
+from contextvars import ContextVar
+from logging.handlers import RotatingFileHandler
 
-from core.logging_utils import log_event, setup_logging
-
-
-def init_logging(app=None, settings: Optional[Any] = None) -> None:
-    """Ensure the root logger is configured and Flask logs propagate once."""
-
-    setup_logging(settings)
-
-    if app is not None:
-        try:
-            app.logger.handlers.clear()
-            app.logger.setLevel(logging.getLogger().level)
-            app.logger.propagate = True
-        except Exception:  # pragma: no cover - defensive
-            pass
+_corr_id: ContextVar[str] = ContextVar("_corr_id", default=None)
 
 
-def log_kv(logger, tag, payload) -> None:
-    data = payload if isinstance(payload, dict) else {"value": payload}
-    try:
-        # Preserve legacy behaviour but route through structured logging
-        log_event(logger, "kv", tag, json.loads(json.dumps(data, default=str)))
-    except Exception:  # pragma: no cover - defensive
-        logger.info("%s: %r", tag, payload)
+def set_corr_id(value: str | None = None) -> str:
+    cid = value or str(uuid.uuid4())
+    _corr_id.set(cid)
+    return cid
+
+
+def get_corr_id() -> str | None:
+    return _corr_id.get()
+
+
+class JsonFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        base = {
+            "ts": int(time.time() * 1000),
+            "level": record.levelname,
+            "logger": record.name,
+            "msg": record.getMessage(),
+            "corr_id": get_corr_id(),
+        }
+        if isinstance(record.args, dict):
+            base.update(record.args)
+        return json.dumps(base, ensure_ascii=False)
+
+
+def setup_logging(debug: bool = False):
+    root = logging.getLogger()
+    root.setLevel(logging.DEBUG if debug else logging.INFO)
+
+    # Console JSON
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setFormatter(JsonFormatter())
+    root.handlers[:] = [sh]
+
+    # Optional file logs (export LOG_FILE=/var/log/copilot.log)
+    log_file = os.getenv("LOG_FILE")
+    if log_file:
+        fh = RotatingFileHandler(log_file, maxBytes=10_000_000, backupCount=3)
+        fh.setFormatter(JsonFormatter())
+        root.addHandler(fh)
+
+    # Reduce noise
+    logging.getLogger("sqlalchemy.engine").setLevel(logging.INFO)
+    logging.getLogger("werkzeug").setLevel(logging.INFO)
+
+    # App loggers
+    logging.getLogger("dw").setLevel(logging.DEBUG if debug else logging.INFO)
+    logging.getLogger("apps.dw").setLevel(logging.DEBUG if debug else logging.INFO)
