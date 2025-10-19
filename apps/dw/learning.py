@@ -10,7 +10,7 @@ from typing import Any, Dict, Optional, List
 from sqlalchemy import text
 import sqlalchemy as sa
 
-from apps.dw.settings import get_setting
+from apps.dw.memory_db import get_mem_engine
 
 log = logging.getLogger("dw")
 
@@ -72,6 +72,14 @@ def _ensure_tables(engine) -> None:
     with engine.begin() as cx:
         for stmt in _DDL_STATEMENTS:
             cx.execute(text(stmt))
+        cx.execute(text("ALTER TABLE dw_rules ADD COLUMN IF NOT EXISTS question_norm TEXT"))
+        cx.execute(
+            text(
+                "ALTER TABLE dw_rules ADD COLUMN IF NOT EXISTS enabled BOOLEAN NOT NULL DEFAULT TRUE"
+            )
+        )
+        cx.execute(text("ALTER TABLE dw_rules ADD COLUMN IF NOT EXISTS rule_kind TEXT"))
+        cx.execute(text("ALTER TABLE dw_rules ADD COLUMN IF NOT EXISTS rule_payload JSONB"))
         for stmt in _MIGRATIONS:
             try:
                 cx.execute(text(stmt))
@@ -86,6 +94,26 @@ def _norm_question(question: str) -> str:
 
 def _as_json(payload: Any) -> str:
     return json.dumps(payload or {})
+
+
+def _flatten_fts_groups(hints: dict) -> list[str]:
+    groups = []
+    if isinstance(hints, dict):
+        groups = hints.get("fts_groups") or []
+    tokens: list[str] = []
+    for group in groups:
+        if isinstance(group, (list, tuple)):
+            for token in group:
+                if not isinstance(token, str):
+                    continue
+                text_token = token.strip()
+                if text_token and text_token not in tokens:
+                    tokens.append(text_token)
+        elif isinstance(group, str):
+            text_token = group.strip()
+            if text_token and text_token not in tokens:
+                tokens.append(text_token)
+    return tokens
 
 
 def save_positive_rule(engine, question: str, applied_hints: Dict[str, Any]) -> None:
@@ -109,20 +137,7 @@ def save_positive_rule(engine, question: str, applied_hints: Dict[str, Any]) -> 
         )
 
     # Accept both legacy 'fts_tokens' and new 'fts_groups'
-    tokens = applied_hints.get("fts_tokens") or []
-    if not tokens:
-        groups = applied_hints.get("fts_groups") or []
-        tokens = []
-        for group in groups:
-            if isinstance(group, (list, tuple)):
-                for token in group:
-                    text_token = str(token).strip()
-                    if text_token:
-                        tokens.append(text_token)
-            elif isinstance(group, str):
-                token = group.strip()
-                if token:
-                    tokens.append(token)
+    tokens = applied_hints.get("fts_tokens") or _flatten_fts_groups(applied_hints)
     if tokens:
         rows.append(
             (
@@ -255,39 +270,37 @@ def load_rules_for_question(engine, question: str) -> Dict[str, Any]:
                 if payload.get("sort_desc") is not None:
                     merged["sort_desc"] = bool(payload.get("sort_desc"))
             elif kind == "rate_hint":
-                # Backward-compat: map legacy payload to unified hints
-                intent = payload.get("intent") or {}
+                # Back-compat: payload = {"intent": {...}, "binds": {...}, "resolved_sql": "..."}
+                intent = (payload or {}).get("intent") if isinstance(payload, dict) else {}
                 if isinstance(intent, str):
                     try:
                         intent = json.loads(intent)
                     except json.JSONDecodeError:
                         intent = {}
                 if not isinstance(intent, dict):
-                    intent = {}
+                    continue
 
-                fts_groups = intent.get("fts_groups") or []
-                tokens: list[str] = []
-                for group in fts_groups:
-                    if isinstance(group, (list, tuple)):
-                        tokens.extend([str(token) for token in group if token])
-                    elif isinstance(group, str):
-                        token = group.strip()
-                        if token:
-                            tokens.append(token)
-                if tokens:
-                    merged["fts_tokens"] = tokens
-                    merged["fts_operator"] = "OR"
+                ft_tokens = _flatten_fts_groups(intent)
+                if ft_tokens:
+                    merged["fts_tokens"] = ft_tokens
+                    merged["fts_operator"] = intent.get("fts_operator", "OR")
 
-                eq_payload = intent.get("eq_filters") or []
+                eq_payload = intent.get("eq_filters")
                 if isinstance(eq_payload, list) and eq_payload:
                     existing = merged.setdefault("eq_filters", [])
                     for item in eq_payload:
                         if item not in existing:
                             existing.append(item)
 
-                if intent.get("sort_by"):
-                    merged["sort_by"] = intent.get("sort_by")
-                if intent.get("sort_desc") is not None:
+                sort_token = intent.get("sort_by")
+                if isinstance(sort_token, str) and sort_token.strip():
+                    parts = sort_token.strip().split()
+                    merged["sort_by"] = parts[0].upper()
+                    if len(parts) > 1:
+                        merged["sort_desc"] = parts[1].lower() == "desc"
+                    elif intent.get("sort_desc") is not None:
+                        merged["sort_desc"] = bool(intent.get("sort_desc"))
+                elif intent.get("sort_desc") is not None:
                     merged["sort_desc"] = bool(intent.get("sort_desc"))
     if merged:
         merged.setdefault("full_text_search", bool(merged.get("fts_tokens")))
@@ -310,10 +323,10 @@ _ENGINE: Optional[sa.Engine] = None
 def _engine() -> Optional[sa.Engine]:
     global _ENGINE
     if _ENGINE is None:
-        url = get_setting("MEMORY_DB_URL", scope="global")
-        if not url:
+        try:
+            _ENGINE = get_mem_engine()
+        except Exception:
             return None
-        _ENGINE = sa.create_engine(url, pool_pre_ping=True, future=True)
         _ensure_tables(_ENGINE)
     return _ENGINE
 

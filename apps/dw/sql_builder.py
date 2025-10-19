@@ -411,6 +411,29 @@ def apply_order_by(sql: str, col: str, desc: bool) -> str:
     return f"{sql_no_ob}\nORDER BY {col} {direction}"
 
 
+def _apply_order_by_once(plan: Dict[str, Any], col: str, desc: bool) -> None:
+    """Persist a single ORDER BY decision on the given plan container."""
+
+    if not isinstance(plan, dict):
+        return
+    column = str(col or "").strip().upper()
+    if not column:
+        return
+    plan["order"] = (column, bool(desc))
+
+
+def _apply_plan_order(sql: str, plan: Dict[str, Any]) -> str:
+    if not isinstance(plan, dict):
+        return sql
+    order = plan.get("order")
+    if isinstance(order, tuple) and len(order) == 2:
+        column, desc = order
+        normalized = str(column or "").strip().upper()
+        if normalized:
+            return apply_order_by(sql, normalized, bool(desc))
+    return sql
+
+
 def _normalize_order_hint(col: Optional[str], desc: bool) -> Tuple[str, bool]:
     if not col:
         return col or "", desc
@@ -447,6 +470,8 @@ def build_sql(intent: Dict[str, Any], settings, *, table: str = "Contract") -> T
     it = intent
     meta: Dict[str, Any] = {}
     binds: Dict[str, Any] = {}
+    order_plan: Dict[str, Any] = {}
+    meta["order_plan"] = order_plan
 
     wants_all = bool(it.get("wants_all_columns", True))
     measure = it.get("measure_sql") or "NVL(CONTRACT_VALUE_NET_OF_VAT,0)"
@@ -667,13 +692,14 @@ def build_sql(intent: Dict[str, Any], settings, *, table: str = "Contract") -> T
         if where_expr:
             lines.append(f"WHERE {where_expr}")
         lines.append(f"GROUP BY {group_by}")
-        sql = "\n".join(lines)
+        base_sql = "\n".join(lines)
         order_col, order_desc = _normalize_order_hint(order_col, order_desc)
-        sql = apply_order_by(sql, order_col, order_desc)
+        _apply_order_by_once(order_plan, order_col, order_desc)
+        sql = _apply_plan_order(base_sql, order_plan)
         sql = _ensure_single_order_by(sql)
         if top_n:
             binds["top_n"] = top_n
-            sql += "\nFETCH FIRST :top_n ROWS ONLY"
+            sql = f"{sql}\nFETCH FIRST :top_n ROWS ONLY"
         return sql, binds, {"pattern": "generic_agg"}
 
     # Non-aggregated (top contracts by value, overlap or request_date)
@@ -682,7 +708,7 @@ def build_sql(intent: Dict[str, Any], settings, *, table: str = "Contract") -> T
     lines = [f"SELECT {sel} FROM \"{table}\""]
     if where_expr:
         lines.append(f"WHERE {where_expr}")
-    sql = "\n".join(lines)
+    base_sql = "\n".join(lines)
     eq_filters_present = bool(it.get("eq_filters"))
 
     if sort_by:
@@ -698,11 +724,12 @@ def build_sql(intent: Dict[str, Any], settings, *, table: str = "Contract") -> T
         order_col = measure
         order_desc = sort_desc
     order_col, order_desc = _normalize_order_hint(order_col, order_desc)
-    sql = apply_order_by(sql, order_col, order_desc)
+    _apply_order_by_once(order_plan, order_col, order_desc)
+    sql = _apply_plan_order(base_sql, order_plan)
     sql = _ensure_single_order_by(sql)
     if top_n:
         binds["top_n"] = top_n
-        sql += "\nFETCH FIRST :top_n ROWS ONLY"
+        sql = f"{sql}\nFETCH FIRST :top_n ROWS ONLY"
     return sql, binds, {"pattern": "generic_non_agg"}
 
 
