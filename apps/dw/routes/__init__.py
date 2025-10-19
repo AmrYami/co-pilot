@@ -45,6 +45,19 @@ logger = logging.getLogger("dw.routes")
 log = logging.getLogger("dw")
 
 
+def _log_answer(event: str, **extra: Any) -> None:
+    """Best-effort structured logging for /dw/answer events."""
+
+    if str(os.getenv("DW_LOG_ANSWER", "1")).lower() not in {"1", "true", "yes"}:
+        return
+
+    try:
+        log.info({"event": f"answer.{event}", **extra})
+    except Exception:
+        # Logging is best-effort; never let it break request handling.
+        pass
+
+
 def redact(url: str | None) -> str | None:
     if not url:
         return url
@@ -386,32 +399,24 @@ def answer() -> Any:
     question = (payload.get("question") or "").strip()
     full_text_flag = bool(payload.get("full_text_search"))
 
-    try:
-        log.info(
-            {
-                "event": "answer.receive",
-                "auth_email": payload.get("auth_email"),
-                "full_text_search": bool(payload.get("full_text_search")),
-                "question_len": len(question),
-            }
-        )
-    except Exception:
-        log.info({"event": "answer.receive"})
+    _log_answer(
+        "receive",
+        auth_email=payload.get("auth_email"),
+        full_text_search=bool(payload.get("full_text_search")),
+        q_len=len(question),
+    )
 
     settings = _load_dw_settings()
     try:
         contract_cols, _ = settings.get_fts_columns()
-        log.info(
-            {
-                "event": "answer.settings.loaded",
-                "fts_engine": settings.get_fts_engine(),
-                "fts_cols_contract": len(contract_cols or []),
-            }
+        _log_answer(
+            "settings.loaded",
+            fts_engine=settings.get_fts_engine(),
+            fts_cols_contract=len(contract_cols or []),
         )
     except Exception:
-        log.info({"event": "answer.settings.loaded"})
+        _log_answer("settings.loaded")
 
-    log.info({"event": "planner.intent.start"})
     explicit_cols = _explicit_columns(settings)
     fts_columns = _fts_columns_from_settings(settings)
 
@@ -443,24 +448,16 @@ def answer() -> Any:
     if not groups and question:
         groups = [[question]]
 
-    try:
-        log.info(
-            {
-                "event": "planner.intent",
-                "eq_filters_count": len(eq_filters),
-                "fts_groups": groups,
-                "sort_by": settings.get_with_global("DW_DATE_COLUMN", "REQUEST_DATE"),
-                "sort_desc": True,
-            }
-        )
-    except Exception:
-        log.info({"event": "planner.intent"})
+    _log_answer(
+        "planner",
+        eq_filters_count=len(eq_filters),
+        fts_groups=groups,
+        sort_by=settings.get_with_global("DW_DATE_COLUMN", "REQUEST_DATE"),
+        sort_desc=True,
+    )
 
-    log.info({"event": "rules.load.start"})
-    try:
-        log.info({"event": "rules.load.ok", "rules_count": 0})
-    except Exception:
-        log.info({"event": "rules.load.ok"})
+    _log_answer("rules.load.start")
+    _log_answer("rules.load.ok", rules_count=0)
 
     engine_name = settings.get_fts_engine()
     fts_engine = resolve_engine(engine_name)
@@ -502,30 +499,23 @@ def answer() -> Any:
     fts_bind_names = [name for name in binds if name.startswith("fts_")]
     fts_enabled = should_enable_fts and bool(fts_columns) and bool(fts_bind_names)
     fts_reason = token_reason if (fts_enabled or flat_tokens) else None
-    try:
-        log.info(
-            {
-                "event": "answer.fts.eval",
-                "enabled": bool(fts_enabled),
-                "error": None,
-                "columns_count": len(fts_columns or []),
-            }
-        )
-    except Exception:
-        log.info({"event": "answer.fts.eval"})
+    _log_answer(
+        "fts.eval",
+        enabled=bool(fts_enabled),
+        error=None,
+        columns_count=len(fts_columns or []),
+    )
+
+    preview = final_sql if len(final_sql) <= 500 else f"{final_sql[:500]}…"
+    _log_answer("sql.exec", preview=preview, bind_names=list(binds.keys()))
 
     rows = fetch_rows(final_sql, binds)
 
-    try:
-        log.info(
-            {
-                "event": "sql.exec.done",
-                "rows": len(rows) if hasattr(rows, "__len__") else None,
-                "ms": int((time.time() - t0) * 1000),
-            }
-        )
-    except Exception:
-        log.info({"event": "sql.exec.done"})
+    _log_answer(
+        "sql.done",
+        rows=len(rows) if hasattr(rows, "__len__") else None,
+        ms=int((time.time() - t0) * 1000),
+    )
     explain_parts: List[str] = []
     if fts_enabled:
         cols_list = ", ".join(str(col) for col in fts_columns) or "(no columns configured)"
@@ -578,10 +568,7 @@ def answer() -> Any:
         "debug": debug,
         "rows": rows,
     }
-    try:
-        log.info({"event": "answer.response", "inquiry_id": response.get("inquiry_id")})
-    except Exception:
-        log.info({"event": "answer.response"})
+    _log_answer("response", inquiry_id=response.get("inquiry_id"))
     return jsonify(response)
 
 
