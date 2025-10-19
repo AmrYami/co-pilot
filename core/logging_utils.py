@@ -11,13 +11,9 @@ from core.logging_setup import setup_logging as _setup_structured_logging
 def setup_logging(settings: Optional[Any] = None) -> None:
     """Configure structured logging using environment-aware debug flag."""
 
-    if getattr(logging.getLogger(), "handlers", None):
-        # Root handlers already configured via structured setup.
-        return
-
     debug_env = os.getenv("COPILOT_DEBUG", "0")
     debug = str(debug_env).lower() in {"1", "true", "yes", "on"}
-    _setup_structured_logging(debug=debug)
+    _setup_structured_logging(debug=debug, preserve_handlers=True)
 
 
 def get_logger(name: str) -> logging.Logger:

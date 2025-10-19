@@ -2,10 +2,8 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import sys
 import time
-from logging.handlers import RotatingFileHandler
 
 from core.corr import get_corr_id as corr_get_corr_id, set_corr_id as corr_set_corr_id
 
@@ -23,39 +21,54 @@ def get_corr_id() -> str | None:
 
 
 class JsonFormatter(logging.Formatter):
+    """Format log records as structured JSON with correlation identifiers."""
+
     def format(self, record: logging.LogRecord) -> str:
-        base = {
+        base: dict[str, object] = {
             "ts": int(time.time() * 1000),
             "level": record.levelname,
             "logger": record.name,
-            "msg": record.getMessage(),
             "corr_id": get_corr_id(),
         }
-        if isinstance(record.args, dict):
-            base.update(record.args)
-        return json.dumps(base, ensure_ascii=False)
+
+        channel = getattr(record, "channel", None)
+        if channel:
+            base["channel"] = channel
+
+        if isinstance(record.msg, dict):
+            base.update(record.msg)
+        else:
+            base["message"] = record.getMessage()
+
+        if record.exc_info:
+            base["exc_info"] = self.formatException(record.exc_info)
+        if record.stack_info:
+            base["stack"] = record.stack_info
+
+        return json.dumps(base, ensure_ascii=False, default=str)
 
 
-def setup_logging(debug: bool = False):
+def setup_logging(debug: bool = False, *, preserve_handlers: bool = True) -> None:
+    """Configure root logging while leaving existing handlers untouched."""
+
     root = logging.getLogger()
+
+    if not preserve_handlers and root.handlers:
+        for handler in list(root.handlers):
+            root.removeHandler(handler)
+
+    if not root.handlers:
+        stream = logging.StreamHandler(sys.stdout)
+        stream.setFormatter(JsonFormatter())
+        root.addHandler(stream)
+
     root.setLevel(logging.DEBUG if debug else logging.INFO)
 
-    # Console JSON
-    sh = logging.StreamHandler(sys.stdout)
-    sh.setFormatter(JsonFormatter())
-    root.handlers[:] = [sh]
-
-    # Optional file logs (export LOG_FILE=/var/log/copilot.log)
-    log_file = os.getenv("LOG_FILE")
-    if log_file:
-        fh = RotatingFileHandler(log_file, maxBytes=10_000_000, backupCount=3)
-        fh.setFormatter(JsonFormatter())
-        root.addHandler(fh)
-
-    # Reduce noise
     logging.getLogger("sqlalchemy.engine").setLevel(logging.INFO)
     logging.getLogger("werkzeug").setLevel(logging.INFO)
 
-    # App loggers
-    logging.getLogger("dw").setLevel(logging.DEBUG if debug else logging.INFO)
-    logging.getLogger("apps.dw").setLevel(logging.DEBUG if debug else logging.INFO)
+    for name in ("dw", "apps.dw", "apps.dw.admin_api", "apps.dw.routes"):
+        logger = logging.getLogger(name)
+        logger.setLevel(logging.DEBUG if debug else logging.INFO)
+        logger.propagate = True
+

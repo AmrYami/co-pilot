@@ -74,8 +74,9 @@ def boot_app(app: Flask, settings: Settings, pipeline: Pipeline | None = None) -
     )
 
 def create_app():
-    debug = os.getenv("COPILOT_DEBUG", "0") in {"1", "true", "True"}
-    setup_logging(debug=debug)
+    debug_flag = str(os.getenv("COPILOT_DEBUG", "0")).strip().lower()
+    debug = debug_flag in {"1", "true", "yes", "on"}
+    setup_logging(debug=debug, preserve_handlers=True)
     settings = Settings()
     log = get_logger("main")
 
@@ -101,7 +102,10 @@ def create_app():
 
     @app.before_request
     def _inject_corr_id():
-        payload = request.get_json(silent=True) or {}
+        try:
+            payload = request.get_json(silent=True)
+        except Exception:
+            payload = None
         iid = payload.get("inquiry_id") if isinstance(payload, dict) else None
         set_corr_id(f"inq:{iid}" if iid else None)
 
