@@ -15,6 +15,7 @@ from apps.dw.db import get_memory_session
 from apps.dw.learning import save_positive_rule
 from apps.dw.memory_db import get_memory_engine
 from apps.dw.order_utils import normalize_order_hint
+from core.corr import get_corr_id
 
 bp = Blueprint("dw_admin", __name__)
 
@@ -182,8 +183,12 @@ def approve_feedback(fid: int):
         conn = mem_session.connection()
         approver = _require_admin(conn)
         logger.info(
-            "admin.approve.attempt",
-            extra={"feedback_id": fid, "approver": approver},
+            {
+                "event": "admin.approve.attempt",
+                "corr_id": get_corr_id(),
+                "feedback_id": fid,
+                "approver": approver,
+            }
         )
         rule_created = False
         try:
@@ -269,8 +274,12 @@ def approve_feedback(fid: int):
                 mem_session.rollback()
                 abort(404, description="feedback not found")
             logger.info(
-                "admin.approve.update.ok",
-                extra={"feedback_id": fid, "approver": approver},
+                {
+                    "event": "admin.approve.update.ok",
+                    "corr_id": get_corr_id(),
+                    "feedback_id": fid,
+                    "approver": approver,
+                }
             )
 
             make_rule = create_rule or apply_patch
@@ -317,33 +326,44 @@ def approve_feedback(fid: int):
                     ]
                     payload_sizes = [len(json.dumps(applied_hints, default=str))]
                     logger.info(
-                        "admin.approve.rule.payload",
-                        extra={
-                            "payload": {
-                                "question_norm": question,
-                                "kinds": sorted(active_keys),
-                                "payload_sizes": payload_sizes,
-                            }
-                        },
+                        {
+                            "event": "admin.approve.rule.payload",
+                            "corr_id": get_corr_id(),
+                            "question_norm": question,
+                            "kinds": sorted(active_keys),
+                            "payload_sizes": payload_sizes,
+                        }
                     )
                     save_positive_rule(engine, question, applied_hints)
                     rule_created = True
                     logger.info(
-                        "admin.approve.rule.ok",
-                        extra={"feedback_id": fid, "approver": approver},
+                        {
+                            "event": "admin.approve.rule.ok",
+                            "corr_id": get_corr_id(),
+                            "feedback_id": fid,
+                            "approver": approver,
+                        }
                     )
                 else:
                     logger.info(
-                        "admin.approve.rule.skip",
-                        extra={"feedback_id": fid, "approver": approver},
+                        {
+                            "event": "admin.approve.rule.skip",
+                            "corr_id": get_corr_id(),
+                            "feedback_id": fid,
+                            "approver": approver,
+                        }
                     )
 
             mem_session.commit()
         except Exception:
             mem_session.rollback()
             logger.exception(
-                "admin.approve.fail",
-                extra={"feedback_id": fid, "approver": approver},
+                {
+                    "event": "admin.approve.fail",
+                    "corr_id": get_corr_id(),
+                    "feedback_id": fid,
+                    "approver": approver,
+                }
             )
             raise
 

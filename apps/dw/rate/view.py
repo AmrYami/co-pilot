@@ -17,6 +17,7 @@ from apps.dw.search import (
 from apps.dw.search.filters import build_eq_where
 from apps.dw.fts_utils import DEFAULT_CONTRACT_FTS_COLUMNS
 from apps.dw.sql.builder import build_eq_boolean_groups_where, normalize_order_by
+from core.corr import get_corr_id
 from apps.dw.rate_dates import build_date_clause
 
 rate_bp = Blueprint("rate", __name__)
@@ -172,19 +173,18 @@ def rate():
     eq_filters: List[Dict[str, Any]] = intent.get("eq_filters") or []
 
     log.info(
-        "rate.intent.parsed",
-        extra={
-            "payload": {
-                "fts_groups": filtered_groups,
-                "eq_filters": [
-                    {"col": f.get("col"), "op": f.get("op", "eq")}
-                    for f in (eq_filters or [])
-                    if isinstance(f, dict)
-                ],
-                "sort_by": intent.get("sort_by"),
-                "sort_desc": intent.get("sort_desc"),
-            }
-        },
+        {
+            "event": "rate.intent.parsed",
+            "corr_id": get_corr_id(),
+            "fts_groups": filtered_groups,
+            "eq_filters": [
+                {"col": f.get("col"), "op": f.get("op", "eq")}
+                for f in (eq_filters or [])
+                if isinstance(f, dict)
+            ],
+            "sort_by": intent.get("sort_by"),
+            "sort_desc": intent.get("sort_desc"),
+        }
     )
     request_type_synonyms = enum_synonyms_setting.get("Contract.REQUEST_TYPE", {})
     eq_sql, eq_binds, _ = build_eq_where(

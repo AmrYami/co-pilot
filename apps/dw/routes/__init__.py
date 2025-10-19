@@ -70,6 +70,7 @@ from apps.dw.sqlbuilder import (
 from apps.dw.logs import scrub_binds
 from apps.dw.utils import env_flag
 from apps.settings import get_setting
+from core.corr import get_corr_id
 
 try:  # pragma: no cover - lightweight fallback for tests without settings backend
     from apps.dw.settings_util import get_setting as _get_setting
@@ -440,14 +441,13 @@ def answer() -> Any:
     full_text_flag = bool(payload.get("full_text_search"))
 
     log.info(
-        "answer.receive",
-        extra={
-            "payload": {
-                "question": question[:160],
-                "full_text_search": full_text_flag,
-                "auth_email": payload.get("auth_email"),
-            }
-        },
+        {
+            "event": "answer.receive",
+            "corr_id": get_corr_id(),
+            "question": question[:160],
+            "full_text_search": full_text_flag,
+            "auth_email": payload.get("auth_email"),
+        }
     )
 
     settings = _load_dw_settings()
@@ -456,18 +456,17 @@ def answer() -> Any:
     fts_columns = _fts_columns_from_settings(settings)
 
     log.info(
-        "answer.settings.load.ok",
-        extra={
-            "payload": {
-                "namespace": namespace,
-                "DW_FTS_ENGINE": settings.get_fts_engine(),
-                "fts_contract_cols": len(fts_columns),
-                "active_app": os.getenv("ACTIVE_APP"),
-            }
-        },
+        {
+            "event": "answer.settings.loaded",
+            "corr_id": get_corr_id(),
+            "namespace": namespace,
+            "DW_FTS_ENGINE": settings.get_fts_engine(),
+            "fts_contract_cols": len(fts_columns),
+            "active_app": os.getenv("ACTIVE_APP"),
+        }
     )
 
-    log.info("rules.load.start")
+    log.info({"event": "rules.load.start", "corr_id": get_corr_id()})
     raw_eq_pairs = extract_eq_filters_from_natural_text(question, explicit_cols)
     eq_pairs = [
         (str(col).strip().upper().replace(" ", "_"), val)
@@ -497,14 +496,13 @@ def answer() -> Any:
     if synonyms_map:
         merged_kinds.append("request_type_synonyms")
     log.info(
-        "rules.load.ok",
-        extra={
-            "payload": {
-                "q_rules": len(eq_pairs),
-                "global_rules": len(synonyms_map or {}),
-                "merged_kinds": sorted(merged_kinds),
-            }
-        },
+        {
+            "event": "rules.load.ok",
+            "corr_id": get_corr_id(),
+            "q_rules": len(eq_pairs),
+            "global_rules": len(synonyms_map or {}),
+            "merged_kinds": sorted(merged_kinds),
+        }
     )
 
     token_groups, token_operator, token_reason = _extract_fts_groups(question, explicit_cols)
@@ -534,26 +532,25 @@ def answer() -> Any:
     ]
 
     log.info(
-        "planner.intent",
-        extra={
-            "payload": {
-                "fts_groups": groups,
-                "eq_filters": intent_eq_summary,
-                "sort_by": date_column,
-                "sort_desc": True,
-            }
-        },
+        {
+            "event": "planner.intent",
+            "corr_id": get_corr_id(),
+            "fts_groups": groups,
+            "eq_filters": intent_eq_summary,
+            "sort_by": date_column,
+            "sort_desc": True,
+        }
     )
 
     if should_enable_fts and fts_columns:
         log.info(
-            "fts.plan.enabled",
-            extra={
-                "payload": {
-                    "engine": settings.get_fts_engine(),
-                    "columns_count": len(fts_columns),
-                }
-            },
+            {
+                "event": "answer.fts.eval",
+                "corr_id": get_corr_id(),
+                "enabled": True,
+                "engine": settings.get_fts_engine(),
+                "columns_count": len(fts_columns),
+            }
         )
         qb.use_fts(engine=fts_engine, columns=fts_columns, min_token_len=min_token_len)
         for group in groups:
@@ -566,44 +563,46 @@ def answer() -> Any:
 
     if not fts_columns:
         log.warning(
-            "fts.plan.disabled",
-            extra={
-                "payload": {
-                    "engine": settings.get_fts_engine(),
-                    "columns_count": 0,
-                    "reason": "no_columns",
-                }
-            },
+            {
+                "event": "answer.fts.eval",
+                "corr_id": get_corr_id(),
+                "enabled": False,
+                "engine": settings.get_fts_engine(),
+                "columns_count": 0,
+                "error": "no_columns",
+            }
         )
 
     final_sql, binds = qb.compile()
     final_sql, order_guard_applied, order_clause = _normalize_order_clause(final_sql)
     if order_guard_applied:
         log.info(
-            "builder.order.guard",
-            extra={"payload": {"applied": True, "final_clause": order_clause}},
+            {
+                "event": "builder.order.guard",
+                "corr_id": get_corr_id(),
+                "applied": True,
+                "final_clause": order_clause,
+            }
         )
 
     log.info(
-        "sql.rendered",
-        extra={
-            "payload": {
-                "size": len(final_sql),
-                "has_fts": bool(should_enable_fts and fts_columns),
-            }
-        },
+        {
+            "event": "sql.rendered",
+            "corr_id": get_corr_id(),
+            "size": len(final_sql),
+            "has_fts": bool(should_enable_fts and fts_columns),
+        }
     )
 
     rows = fetch_rows(final_sql, binds)
     duration_ms = int((time.time() - t0) * 1000)
     log.info(
-        "sql.exec.done",
-        extra={
-            "payload": {
-                "duration_ms": duration_ms,
-                "rows": len(rows),
-            }
-        },
+        {
+            "event": "sql.exec.done",
+            "corr_id": get_corr_id(),
+            "duration_ms": duration_ms,
+            "rows": len(rows),
+        }
     )
 
     flat_tokens = _flatten(token_groups) if token_groups else []
@@ -663,13 +662,12 @@ def answer() -> Any:
         "rows": rows,
     }
     log.info(
-        "answer.response",
-        extra={
-            "payload": {
-                "ok": True,
-                "inquiry_id": payload.get("inquiry_id"),
-            }
-        },
+        {
+            "event": "answer.response",
+            "corr_id": get_corr_id(),
+            "ok": True,
+            "inquiry_id": payload.get("inquiry_id"),
+        }
     )
     return jsonify(response)
 

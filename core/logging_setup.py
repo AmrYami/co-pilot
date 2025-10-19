@@ -5,21 +5,21 @@ import logging
 import os
 import sys
 import time
-import uuid
-from contextvars import ContextVar
 from logging.handlers import RotatingFileHandler
 
-_corr_id: ContextVar[str] = ContextVar("_corr_id", default=None)
+from core.corr import get_corr_id as corr_get_corr_id, set_corr_id as corr_set_corr_id
 
 
 def set_corr_id(value: str | None = None) -> str:
-    cid = value or str(uuid.uuid4())
-    _corr_id.set(cid)
-    return cid
+    """Backward compatible proxy to :func:`core.corr.set_corr_id`."""
+
+    return corr_set_corr_id(value)
 
 
 def get_corr_id() -> str | None:
-    return _corr_id.get()
+    """Backward compatible proxy to :func:`core.corr.get_corr_id`."""
+
+    return corr_get_corr_id()
 
 
 class JsonFormatter(logging.Formatter):

@@ -1,3 +1,4 @@
+import logging
 import os
 
 from flask import Flask, jsonify, request
@@ -9,7 +10,8 @@ from apps.dw.admin_api import bp as dw_admin_bp
 from apps.dw.routes import debug_bp
 from apps.dw.tests.routes import golden_bp
 from core.admin_api import admin_bp as core_admin_bp
-from core.logging_setup import set_corr_id, setup_logging
+from core.corr import set_corr_id
+from core.logging_setup import setup_logging
 from core.logging_utils import get_logger, log_event
 from core.memdb import ensure_dw_feedback_schema, get_mem_engine
 from core.model_loader import ensure_model, model_info
@@ -78,6 +80,19 @@ def create_app():
     log = get_logger("main")
 
     app = Flask(__name__)
+
+    logging.getLogger("dw").info(
+        {
+            "event": "boot.settings.snapshot",
+            "env": {
+                "COPILOT_DEBUG": os.getenv("COPILOT_DEBUG"),
+                "DW_INCLUDE_DEBUG": os.getenv("DW_INCLUDE_DEBUG"),
+                "SQL_TRACE": os.getenv("SQL_TRACE"),
+                "ACTIVE_APP": os.getenv("ACTIVE_APP"),
+                "FLASK_APP": os.getenv("FLASK_APP"),
+            },
+        }
+    )
     try:
         app.logger.handlers.clear()
         app.logger.propagate = True
@@ -86,10 +101,8 @@ def create_app():
 
     @app.before_request
     def _inject_corr_id():
-        try:
-            iid = request.json.get("inquiry_id") if request.is_json else None
-        except Exception:
-            iid = None
+        payload = request.get_json(silent=True) or {}
+        iid = payload.get("inquiry_id") if isinstance(payload, dict) else None
         set_corr_id(f"inq:{iid}" if iid else None)
 
     log_event(log, "boot", "app_boot", {"message": "registering blueprints"})
