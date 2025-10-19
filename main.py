@@ -155,9 +155,14 @@ def create_app():
 def _install_dw_answer_trace(app: Flask) -> None:
     logger = logging.getLogger("dw")
 
+    def _should_log() -> bool:
+        return str(os.getenv("DW_LOG_ANSWER", "1")).lower() in {"1", "true", "yes"}
+
     @app.before_request
     def _dw_answer_trace_before():  # pragma: no cover - request hooks
         if request.path == "/dw/answer" and request.method == "POST":
+            if not _should_log():
+                return
             g._dw_answer_t0 = time.time()
             payload = request.get_json(silent=True) or {}
             try:
@@ -175,6 +180,8 @@ def _install_dw_answer_trace(app: Flask) -> None:
     @app.after_request
     def _dw_answer_trace_after(resp):  # pragma: no cover - request hooks
         if request.path == "/dw/answer" and request.method == "POST":
+            if not _should_log():
+                return resp
             try:
                 ms = int((time.time() - g.get("_dw_answer_t0", time.time())) * 1000)
             except Exception:  # pragma: no cover - defensive logging
