@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from apps.dw.sql_utils import pick_measure_sql, resolve_group_by
 
@@ -37,6 +37,22 @@ def _append_where_clauses(where_clauses: List[str]) -> str:
     if not where_clauses:
         return ""
     return "\nWHERE " + "\n  AND ".join(where_clauses)
+
+
+def _parse_sort_hint(value: Any) -> Tuple[str, Optional[bool]]:
+    """Return (column, desc?) extracted from *value* if it carries direction."""
+
+    if not isinstance(value, str):
+        return "", None
+    token = value.strip()
+    if not token:
+        return "", None
+    parts = token.split()
+    if len(parts) >= 2:
+        direction = parts[1].upper()
+        if direction in {"ASC", "DESC"}:
+            return parts[0], direction == "DESC"
+    return token, None
 
 
 def _normalize_sort(sort_by: str, measure_alias: str, group_alias: str) -> str:
@@ -110,8 +126,15 @@ def build_contract_sql(intent: Dict[str, Any], settings: Dict[str, Any]) -> Tupl
             lines.append(where_sql.strip())
         lines.append(f"GROUP BY {group_col}")
 
-        sort_by = str(intent.get("sort_by") or "MEASURE").strip()
-        sort_desc = bool(intent.get("sort_desc", True))
+        sort_by_hint, dir_hint = _parse_sort_hint(intent.get("sort_by"))
+        sort_by = sort_by_hint or "MEASURE"
+        sort_desc = intent.get("sort_desc")
+        if sort_desc is None:
+            sort_desc = dir_hint if dir_hint is not None else True
+        else:
+            sort_desc = bool(sort_desc)
+        if dir_hint is not None:
+            sort_desc = dir_hint
         order_expr = _normalize_sort(sort_by, measure_alias, "GROUP_KEY")
         lines.append(f"ORDER BY {order_expr} {'DESC' if sort_desc else 'ASC'}")
         return "\n".join(lines), binds
@@ -120,8 +143,15 @@ def build_contract_sql(intent: Dict[str, Any], settings: Dict[str, Any]) -> Tupl
     lines = [f"SELECT * FROM {table}"]
     if where_sql:
         lines.append(where_sql.strip())
-    sort_by = str(intent.get("sort_by") or "REQUEST_DATE").strip() or "REQUEST_DATE"
-    sort_desc = bool(intent.get("sort_desc", True))
+    sort_by_hint, dir_hint = _parse_sort_hint(intent.get("sort_by"))
+    sort_by = sort_by_hint or "REQUEST_DATE"
+    sort_desc = intent.get("sort_desc")
+    if sort_desc is None:
+        sort_desc = dir_hint if dir_hint is not None else True
+    else:
+        sort_desc = bool(sort_desc)
+    if dir_hint is not None:
+        sort_desc = dir_hint
     lines.append(f"ORDER BY {sort_by} {'DESC' if sort_desc else 'ASC'}")
     return "\n".join(lines), binds
 
