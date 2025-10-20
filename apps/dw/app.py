@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import os
+import csv
 import logging
 import re
 import time
@@ -94,6 +96,48 @@ from .tests.golden_runner_rate import golden_rate_bp
 
 LOGGER = logging.getLogger("dw.app")
 
+def _bool_env(name: str, default: bool = True) -> bool:
+    """Coerce typical truthy env values."""
+    try:
+        v = os.getenv(name, "1" if default else "0")
+        return str(v).strip().lower() in {"1", "true", "t", "yes", "y", "on"}
+    except Exception:
+        return default
+
+def _ensure_exports_dir() -> str:
+    path = os.getenv("DW_EXPORTS_DIR", "exports")
+    try:
+        os.makedirs(path, exist_ok=True)
+    except Exception:
+        pass
+    return path
+
+def _export_rows_to_csv(rows, columns, *, inquiry_id=None):
+    """Best-effort CSV export for /dw/answer results. Returns relative file path on success."""
+    if not isinstance(rows, (list, tuple)) or not isinstance(columns, (list, tuple)) or not columns:
+        return None
+    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    fname = f"dw_answer_{inquiry_id or ts}.csv"
+    fpath = os.path.join(_ensure_exports_dir(), fname)
+    try:
+        with open(fpath, "w", newline="", encoding="utf-8-sig") as fh:
+            w = csv.writer(fh)
+            w.writerow(list(columns))
+            for r in rows:
+                w.writerow(list(r))
+        logging.getLogger("dw").info(
+            {
+                "event": "answer.export.csv.ok",
+                "file": fpath,
+                "rows": len(rows),
+                "cols": len(columns),
+                "inquiry_id": inquiry_id,
+            }
+        )
+        return fpath
+    except Exception as exc:  # pragma: no cover
+        logging.getLogger("dw").warning({"event": "answer.export.csv.err", "err": str(exc)})
+        return None
 
 def _normalize_question_text(value: Any) -> str:
     text_value = "" if value is None else str(value)
@@ -395,6 +439,11 @@ def _respond(payload: Dict[str, Any], response: Dict[str, Any]):
             rows_count = int(meta.get("rows") or rows_field or 0)
     except Exception:
         rows_count = 0
+    # Expose a lightweight counter alongside meta.rows
+    try:
+        response.setdefault("row_count", rows_count)
+    except Exception:
+        pass
 
     try:
         duration = int(meta.get("duration_ms") or 0)
@@ -414,6 +463,21 @@ def _respond(payload: Dict[str, Any], response: Dict[str, Any]):
             explain=str(response.get("explain") or ""),
             meta=meta,
         )
+    except Exception:
+        pass
+
+    # Optional CSV export (default ON; can be disabled via DW_ANSWER_EXPORT_CSV=0)
+    try:
+        want_csv = (
+            bool((payload or {}).get("export_csv"))
+            or str((payload or {}).get("export") or "").strip().lower() in {"csv", "true", "1", "yes"}
+            or _bool_env("DW_ANSWER_EXPORT_CSV", True)
+        )
+        if want_csv and isinstance(response.get("rows"), list) and isinstance(response.get("columns"), list):
+            csv_path = _export_rows_to_csv(response["rows"], response["columns"], inquiry_id=response.get("inquiry_id"))
+            if csv_path:
+                meta["export_csv"] = csv_path
+                response["export_csv"] = csv_path
     except Exception:
         pass
 
