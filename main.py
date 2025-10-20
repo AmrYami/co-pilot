@@ -121,6 +121,7 @@ def create_app():
 
     _install_dw_answer_trace(app)
     _log_dw_answer_binding(app)
+    _install_dw_answer_trace_wrappers(app)
 
     try:
         mem_engine = get_mem_engine(app)
@@ -191,12 +192,71 @@ def _install_dw_answer_trace(app: Flask) -> None:
             except Exception:  # pragma: no cover - defensive logging
                 data = None
             inq_id = (data or {}).get("inquiry_id") if isinstance(data, dict) else None
+            meta = {}
+            debug = {}
+            fts_meta = {}
+            fts_debug = {}
             fts_enabled = None
+            fts_error = None
+            fts_tokens = []
+            fts_cols = []
+            fts_engine = None
             try:
                 meta = (data or {}).get("meta") or {}
-                fts_enabled = (meta.get("fts") or {}).get("enabled")
+                debug = (data or {}).get("debug") or {}
+                fts_meta = meta.get("fts") or {}
+                fts_debug = (debug.get("fts") or {})
+                fts_enabled = fts_meta.get("enabled")
+                fts_error = fts_meta.get("error") or None
+                fts_tokens = (
+                    fts_meta.get("tokens")
+                    or fts_debug.get("tokens")
+                    or []
+                )
+                fts_cols = fts_meta.get("columns") or []
+                fts_engine = fts_debug.get("engine")
+                logger.info(
+                    {
+                        "event": "answer.meta",
+                        "inquiry_id": inq_id,
+                        "fts": {
+                            "enabled": fts_enabled,
+                            "error": fts_error,
+                            "tokens": fts_tokens,
+                            "columns_count": (
+                                len(fts_cols)
+                                if isinstance(fts_cols, list)
+                                else None
+                            ),
+                            "engine": fts_engine,
+                        },
+                        "rows": meta.get("rows"),
+                        "duration_ms": meta.get("duration_ms"),
+                    }
+                )
             except Exception:  # pragma: no cover - defensive logging
-                pass
+                logger.info({"event": "answer.meta"})
+
+            sql = (data or {}).get("sql")
+            ob = None
+            try:
+                if isinstance(sql, str):
+                    up = sql.upper()
+                    if "ORDER BY" in up:
+                        ob = sql[up.index("ORDER BY") :].splitlines()[0]
+                logger.info(
+                    {
+                        "event": "answer.sql.preview",
+                        "preview": (
+                            (sql[:500] + "…")
+                            if isinstance(sql, str) and len(sql) > 500
+                            else sql
+                        ),
+                        "order_by": ob,
+                    }
+                )
+            except Exception:  # pragma: no cover - defensive logging
+                logger.info({"event": "answer.sql.preview"})
             try:
                 logger.info(
                     {
@@ -228,6 +288,130 @@ def _log_dw_answer_binding(app: Flask) -> None:
                 break
     except Exception:  # pragma: no cover - defensive logging
         logger.info({"event": "boot.answer.endpoint"})
+
+
+def _install_dw_answer_trace_wrappers(app: Flask) -> None:
+    """Best-effort: instrument core functions if available without changing behavior."""
+
+    logger = logging.getLogger("dw")
+
+    def _wrap(mod_name: str, attr_path: str, before=None, after=None) -> None:
+        try:
+            import importlib
+
+            mod = importlib.import_module(mod_name)
+            target = mod
+            parent = mod
+            name = None
+            for part in attr_path.split("."):
+                parent = target
+                target = getattr(target, part)
+                name = part
+            if getattr(target, "_dw_traced", False):
+                return
+
+            def wrapper(*args, **kwargs):
+                if callable(before):
+                    try:
+                        before(args, kwargs)
+                    except Exception:  # pragma: no cover - defensive logging
+                        logger.info(
+                            {
+                                "event": "answer.trace.before",
+                                "fn": f"{mod_name}.{attr_path}",
+                            }
+                        )
+                t0 = time.time()
+                out = target(*args, **kwargs)
+                if callable(after):
+                    try:
+                        after(args, kwargs, out, int((time.time() - t0) * 1000))
+                    except Exception:  # pragma: no cover - defensive logging
+                        logger.info(
+                            {
+                                "event": "answer.trace.after",
+                                "fn": f"{mod_name}.{attr_path}",
+                            }
+                        )
+                return out
+
+            wrapper._dw_traced = True
+            setattr(parent, name, wrapper)
+            logger.info({"event": "boot.answer.trace.wrap", "fn": f"{mod_name}.{attr_path}"})
+        except Exception as exc:  # pragma: no cover - defensive logging
+            logger.info(
+                {
+                    "event": "boot.answer.trace.wrap.skip",
+                    "fn": f"{mod_name}.{attr_path}",
+                    "err": str(exc),
+                }
+            )
+
+    _wrap(
+        "apps.dw.rules_loader",
+        "load_for",
+        before=lambda args, kwargs: logger.info({"event": "rules.load.start"}),
+        after=lambda args, kwargs, out, ms: logger.info(
+            {
+                "event": "rules.load.ok",
+                "rules_count": (len(out) if hasattr(out, "__len__") else None),
+                "ms": ms,
+            }
+        ),
+    )
+
+    _wrap(
+        "apps.dw.engine",
+        "evaluate_fts",
+        before=lambda args, kwargs: None,
+        after=lambda args, kwargs, out, ms: logger.info(
+            {
+                "event": "fts.eval",
+                "enabled": bool((out or {}).get("enabled")),
+                "error": (out or {}).get("error"),
+                "columns_count": len((out or {}).get("columns") or []),
+                "ms": ms,
+            }
+        ),
+    )
+
+    _wrap(
+        "apps.dw.contracts.builder",
+        "build_sql",
+        before=lambda args, kwargs: logger.info({"event": "sql.exec"}),
+        after=lambda args, kwargs, out, ms: (
+            (lambda sql, binds: logger.info(
+                {
+                    "event": "sql.done",
+                    "bind_names": list((binds or {}).keys()),
+                    "preview": (
+                        (sql[:500] + "…")
+                        if isinstance(sql, str) and len(sql) > 500
+                        else sql
+                    ),
+                    "ms": ms,
+                }
+            ))(*out)
+            if isinstance(out, tuple) and len(out) >= 2
+            else logger.info({"event": "sql.done", "ms": ms})
+        ),
+    )
+
+    try:
+        import importlib
+
+        builder_mod = importlib.import_module("apps.dw.contracts.builder")
+        if hasattr(builder_mod, "normalize_order_by"):
+            _wrap(
+                "apps.dw.contracts.builder",
+                "normalize_order_by",
+                before=lambda args, kwargs: None,
+                after=lambda args, kwargs, out, ms: logger.info(
+                    {"event": "builder.order.guard", "order_by": out}
+                ),
+            )
+    except Exception:
+        pass
 
 
 app = create_app()
