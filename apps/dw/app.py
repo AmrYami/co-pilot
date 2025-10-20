@@ -1629,6 +1629,85 @@ def answer():
         LOGGER.warning("[dw] failed to load online hints: %s", exc)
         online_hints_applied = 1 if seed_payload else 0
 
+    # --- Load persisted rules for this question (fts, order_by, eq, group_by) ---
+    # We merge lightweight hints into online_intent so _apply_online_rate_hints()
+    # can append WHERE/ORDER BY safely before executing SQL.
+    try:
+        qnorm = _normalize_question_text(question)
+        kinds_loaded: list[str] = []
+        rows = []
+        with get_memory_session() as s:
+            rows = (
+                s.execute(
+                    text(
+                        """
+                        SELECT rule_kind,
+                               COALESCE(rule_payload, '{}'::jsonb) AS rule_payload
+                          FROM dw_rules
+                         WHERE enabled = TRUE
+                           AND (COALESCE(question_norm, '') = '' OR question_norm = :qnorm)
+                         ORDER BY id ASC
+                        """
+                    ),
+                    {"qnorm": qnorm},
+                )
+                .mappings()
+                .all()
+            )
+        for r in rows:
+            kind = (r.get("rule_kind") or "").strip().lower()
+            payload = r.get("rule_payload") or {}
+            if isinstance(payload, str):
+                try:
+                    import json as _json
+                    payload = _json.loads(payload)
+                except Exception:
+                    payload = {}
+            if not isinstance(payload, dict):
+                continue
+            kinds_loaded.append(kind)
+            if kind == "fts":
+                tokens = payload.get("tokens") or []
+                columns = payload.get("columns") or []
+                operator = str(payload.get("operator") or "OR").upper()
+                if tokens:
+                    online_intent["fts_tokens"] = tokens
+                    online_intent["full_text_search"] = True
+                if columns:
+                    online_intent["fts_columns"] = columns
+                online_intent["fts_operator"] = "AND" if operator == "AND" else "OR"
+            elif kind == "order_by":
+                if payload.get("sort_by"):
+                    online_intent["sort_by"] = payload["sort_by"]
+                if "sort_desc" in payload:
+                    online_intent["sort_desc"] = bool(payload.get("sort_desc"))
+            elif kind == "eq":
+                eq_payload = payload.get("eq_filters") or []
+                if isinstance(eq_payload, list) and eq_payload:
+                    existing = online_intent.setdefault("eq_filters", [])
+                    for item in eq_payload:
+                        if isinstance(item, dict) and item not in existing:
+                            existing.append(dict(item))
+            elif kind == "group_by":
+                if payload.get("group_by"):
+                    online_intent["group_by"] = payload.get("group_by")
+                if payload.get("gross") is not None:
+                    online_intent["gross"] = bool(payload.get("gross"))
+        if rows:
+            online_hints_applied += len(rows)
+        try:
+            logger.info(
+                {
+                    "event": "answer.rules.persisted.loaded",
+                    "count": len(rows),
+                    "kinds": kinds_loaded,
+                }
+            )
+        except Exception:
+            logger.info({"event": "answer.rules.persisted.loaded"})
+    except Exception as exc:
+        LOGGER.warning("[dw] rules loader fell back: %s", exc)
+
     prefixes = _coerce_prefixes(payload.get("prefixes"))
     auth_email = payload.get("auth_email") or None
     full_text_search = bool(payload.get("full_text_search", False))
