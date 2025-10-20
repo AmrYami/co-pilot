@@ -1556,11 +1556,26 @@ def _attempt_like_eq_fallback(
 
 @dw_bp.post("/answer")
 def answer():
+    logger = logging.getLogger("dw")
+    logger.info({"event": "start question"})  # موجودة لديك بالفعل
     t0 = time.time()
     payload = request.get_json(force=True, silent=False) or {}
     question = (payload.get("question") or "").strip()
     if not question:
         return jsonify({"ok": False, "error": "question required"}), 400
+    # LOG: لوج لحالة الطلب الخام
+    try:
+        logger.info(
+            {
+                "event": "answer.payload",
+                "auth_email": payload.get("auth_email"),
+                "full_text_search": bool(payload.get("full_text_search")),
+                "q_len": len(question or ""),
+                "prefixes_len": len(payload.get("prefixes") or []),
+            }
+        )
+    except Exception:
+        logger.info({"event": "answer.payload"})
 
     settings = _get_settings()
     online_intent: Dict[str, Any] = {}
@@ -1577,6 +1592,15 @@ def answer():
             if isinstance(seed_intent, dict) and seed_intent:
                 online_intent.update(seed_intent)
                 online_hints_applied += 1
+            # LOG: وجدنا seed من /dw/rate
+            logger.info(
+                {
+                    "event": "rules.seed.loaded",
+                    "rule_id": seed_meta.get("rule_id"),
+                    "has_intent": bool(seed_payload.get("intent")),
+                    "has_sql": bool(seed_payload.get("resolved_sql")),
+                }
+            )
             raw_sql = seed_payload.get("resolved_sql")
             if isinstance(raw_sql, str):
                 seed_sql = raw_sql.strip()
@@ -1594,6 +1618,13 @@ def answer():
         online_hints_applied += len(recent_hints)
         for hint in recent_hints:
             apply_rate_hints(online_intent, hint, settings)
+        # LOG: تلميحات حديثة (أونلاين)
+        logger.info(
+            {
+                "event": "rules.recent.loaded",
+                "count": len(recent_hints or []),
+            }
+        )
     except Exception as exc:
         LOGGER.warning("[dw] failed to load online hints: %s", exc)
         online_hints_applied = 1 if seed_payload else 0
@@ -1613,8 +1644,31 @@ def answer():
     )
     fts_map_initial = _extract_fts_map(settings, namespace)
     fts_columns_initial = _resolve_fts_columns_from_map(fts_map_initial, table_name)
+    # LOG: ملخص الإعدادات الفعالة
+    try:
+        logger.info(
+            {
+                "event": "answer.settings.loaded",
+                "namespace": namespace,
+                "table": table_name,
+                "fts_engine": fts_engine(),
+                "fts_cols_count": len(fts_columns_initial or []),
+                "allowed_eq_cols": len(allowed_columns_initial or []),
+            }
+        )
+    except Exception:
+        logger.info({"event": "answer.settings.loaded"})
     if full_text_search:
         direct_groups, direct_mode = extract_fts_terms(question, force=False)
+        # LOG: مصطلحات FTS المستخرجة (وضع مباشر/غيره)
+        logger.info(
+            {
+                "event": "answer.fts.terms",
+                "mode": direct_mode,
+                "groups_count": len(direct_groups or []),
+                "columns_count": len(fts_columns_initial or []),
+            }
+        )
         if direct_mode == "explicit" and direct_groups and fts_columns_initial:
             direct_where, direct_binds = build_fts_where_groups(direct_groups, fts_columns_initial)
             if direct_where:
@@ -1635,8 +1689,29 @@ def answer():
                     direct_sql, binds, sanitized_patch
                 )
 
+            # LOG: تنفيذ SQL لمسار FTS المباشر
+            logger.info(
+                {
+                    "event": "answer.sql.exec",
+                    "strategy": "fts_direct",
+                    "preview": (direct_sql[:500] + "…")
+                    if len(direct_sql) > 500
+                    else direct_sql,
+                    "bind_names": list(binds.keys()),
+                }
+            )
+            t_exec = time.time()
             binds = _coerce_bind_dates(binds)
             rows, cols, exec_meta = _execute_oracle(direct_sql, binds)
+            logger.info(
+                {
+                    "event": "answer.sql.done",
+                    "strategy": "fts_direct",
+                    "rows": len(rows or []),
+                    "cols": len(cols or []),
+                    "ms": int((time.time() - t_exec) * 1000),
+                }
+            )
             inquiry_id = _log_inquiry(
                 question,
                 auth_email,
@@ -1675,6 +1750,8 @@ def answer():
             }
             return _respond(payload, response)
 
+    # LOG: بدء تخطيط المسار الحتمي (Contract planner)
+    logger.info({"event": "planner.contract.plan.start"})
     contract_sql, contract_binds, contract_meta = _plan_contract_sql(
         question,
         namespace,
@@ -1682,13 +1759,46 @@ def answer():
         overrides=overrides,
     )
     if contract_sql:
+        # LOG: نجاح التخطيط (ملخص)
+        try:
+            logger.info(
+                {
+                    "event": "planner.contract.plan.ok",
+                    "has_sql": True,
+                    "binds_count": len(contract_binds or {}),
+                    "meta_keys": list((contract_meta or {}).keys()),
+                }
+            )
+        except Exception:
+            logger.info({"event": "planner.contract.plan.ok"})
         binds = _coerce_bind_dates(dict(contract_binds or {}))
         contract_sql, binds, online_meta = _apply_online_rate_hints(
             contract_sql, binds, online_intent
         )
         if ":top_n" in contract_sql and "top_n" not in binds:
             binds["top_n"] = 10
+        # LOG: تنفيذ SQL للمسار الحتمي
+        logger.info(
+            {
+                "event": "answer.sql.exec",
+                "strategy": "contract_deterministic",
+                "preview": (contract_sql[:500] + "…")
+                if len(contract_sql) > 500
+                else contract_sql,
+                "bind_names": list(binds.keys()),
+            }
+        )
+        t_exec = time.time()
         rows, cols, exec_meta = _execute_oracle(contract_sql, binds)
+        logger.info(
+            {
+                "event": "answer.sql.done",
+                "strategy": "contract_deterministic",
+                "rows": len(rows or []),
+                "cols": len(cols or []),
+                "ms": int((time.time() - t_exec) * 1000),
+            }
+        )
         inquiry_id = _log_inquiry(
             question,
             auth_email,
@@ -1725,7 +1835,28 @@ def answer():
     if seed_sql:
         try:
             seeded_binds = _coerce_bind_dates(dict(seed_binds or {}))
+            # LOG: تنفيذ SQL لمسار seed (من /dw/rate)
+            logger.info(
+                {
+                    "event": "answer.sql.exec",
+                    "strategy": "seed_rule",
+                    "preview": (seed_sql[:500] + "…")
+                    if len(seed_sql) > 500
+                    else seed_sql,
+                    "bind_names": list(seeded_binds.keys()),
+                }
+            )
+            t_exec = time.time()
             rows, cols, exec_meta = _execute_oracle(seed_sql, seeded_binds)
+            logger.info(
+                {
+                    "event": "answer.sql.done",
+                    "strategy": "seed_rule",
+                    "rows": len(rows or []),
+                    "cols": len(cols or []),
+                    "ms": int((time.time() - t_exec) * 1000),
+                }
+            )
             inquiry_id = _log_inquiry(
                 question,
                 auth_email,
@@ -1765,6 +1896,8 @@ def answer():
         except Exception as exc:
             LOGGER.warning("[dw] failed to execute seed SQL: %s", exc)
 
+    # LOG: تجربة fallback (LIKE + EQ) عند تعسّر المسارات السابقة
+    logger.info({"event": "answer.like_eq_fallback.try"})
     like_response = _attempt_like_eq_fallback(
         question=question,
         namespace=namespace,
@@ -1781,6 +1914,17 @@ def answer():
         online_intent=online_intent,
     )
     if like_response is not None:
+        try:
+            meta = like_response.get("meta") or {}
+            logger.info(
+                {
+                    "event": "answer.like_eq_fallback.used",
+                    "rows": int(meta.get("rows") or 0),
+                    "duration_ms": int(meta.get("duration_ms") or 0),
+                }
+            )
+        except Exception:
+            logger.info({"event": "answer.like_eq_fallback.used"})
         return _respond(payload, like_response)
 
     namespace = "dw::common"
@@ -1845,8 +1989,27 @@ def answer():
             explain_bits.append(f"Limited to top {int(top_n)} rows.")
 
         LOGGER.info("[dw] explicit_filters_sql: %s", {"size": len(sql), "sql": sql})
+        # LOG: تنفيذ SQL لمسار explicit_filters
+        logger.info(
+            {
+                "event": "answer.sql.exec",
+                "strategy": "explicit_filters",
+                "preview": (sql[:500] + "…") if len(sql) > 500 else sql,
+                "bind_names": list(binds.keys()),
+            }
+        )
+        t_exec = time.time()
         binds = _coerce_bind_dates(binds)
         rows, cols, exec_meta = _execute_oracle(sql, binds)
+        logger.info(
+            {
+                "event": "answer.sql.done",
+                "strategy": "explicit_filters",
+                "rows": len(rows or []),
+                "cols": len(cols or []),
+                "ms": int((time.time() - t_exec) * 1000),
+            }
+        )
 
         inquiry_id = _log_inquiry(
             question,
@@ -1911,9 +2074,28 @@ def answer():
 
     final_sql = sql
     LOGGER.info(json.dumps({"final_sql": {"size": len(final_sql.split()), "sql": final_sql}}))
+    # LOG: تنفيذ SQL للمسار النهائي (planner fallback)
+    logger.info(
+        {
+            "event": "answer.sql.exec",
+            "strategy": "planner_fallback",
+            "preview": (sql[:500] + "…") if len(sql) > 500 else sql,
+            "bind_names": list((binds or {}).keys()),
+        }
+    )
+    t_exec = time.time()
     sql, binds, online_meta = _apply_online_rate_hints(sql, binds or {}, online_intent)
     binds = _coerce_bind_dates(binds or {})
     rows, cols, exec_meta = _execute_oracle(sql, binds)
+    logger.info(
+        {
+            "event": "answer.sql.done",
+            "strategy": "planner_fallback",
+            "rows": len(rows or []),
+            "cols": len(cols or []),
+            "ms": int((time.time() - t_exec) * 1000),
+        }
+    )
 
     inquiry_id = _log_inquiry(
         question,
@@ -2055,6 +2237,18 @@ def answer():
             "hints": online_hints_applied,
             **({} if not online_meta else online_meta),
         }
+    # LOG: نهاية دورة السؤال
+    try:
+        logger.info(
+            {
+                "event": "answer.end",
+                "inquiry_id": inquiry_id,
+                "strategy": response.get("meta", {}).get("strategy"),
+                "duration_ms": int(response.get("meta", {}).get("duration_ms") or 0),
+            }
+        )
+    except Exception:
+        logger.info({"event": "answer.end"})
     return _respond(payload, response)
 
 
