@@ -395,15 +395,15 @@ def _flatten(groups: List[List[str]]) -> List[str]:
 @bp.route("/dw/answer", methods=["POST"])
 def answer() -> Any:
     t0 = time.time()
-    payload = request.get_json(force=True, silent=True) or {}
+    payload = request.get_json(silent=True) or {}
     question = (payload.get("question") or "").strip()
     full_text_flag = bool(payload.get("full_text_search"))
 
     _log_answer(
         "receive",
-        auth_email=payload.get("auth_email"),
-        full_text_search=bool(payload.get("full_text_search")),
+        auth_email=(payload.get("auth_email") or ""),
         q_len=len(question),
+        full_text_search=bool(payload.get("full_text_search")),
     )
 
     settings = _load_dw_settings()
@@ -449,7 +449,7 @@ def answer() -> Any:
         groups = [[question]]
 
     _log_answer(
-        "planner",
+        "planner.intent",
         eq_filters_count=len(eq_filters),
         fts_groups=groups,
         sort_by=settings.get_with_global("DW_DATE_COLUMN", "REQUEST_DATE"),
@@ -457,7 +457,8 @@ def answer() -> Any:
     )
 
     _log_answer("rules.load.start")
-    _log_answer("rules.load.ok", rules_count=0)
+    rules: List[Dict[str, Any]] = []
+    _log_answer("rules.load.ok", rules_count=len(rules))
 
     engine_name = settings.get_fts_engine()
     fts_engine = resolve_engine(engine_name)
@@ -490,20 +491,26 @@ def answer() -> Any:
         if "ORDER BY" in upper_sql:
             start = upper_sql.index("ORDER BY")
             order_snip = final_sql[start:].splitlines()[0]
-        log.info({"event": "builder.order.guard", "order_by": order_snip})
+        _log_answer("builder.order.guard", order_by=order_snip)
     except Exception:
-        log.info({"event": "builder.order.guard"})
+        _log_answer("builder.order.guard")
     logger.info(json.dumps({"final_sql": {"size": len(final_sql), "sql": final_sql}}))
 
     flat_tokens = _flatten(token_groups) if token_groups else []
     fts_bind_names = [name for name in binds if name.startswith("fts_")]
+    columns_count = len(fts_columns or [])
     fts_enabled = should_enable_fts and bool(fts_columns) and bool(fts_bind_names)
+    fts_error: Optional[str] = None
+    if should_enable_fts and not fts_columns:
+        fts_error = "no_columns"
+    elif should_enable_fts and fts_columns and not fts_bind_names:
+        fts_error = "no_tokens"
     fts_reason = token_reason if (fts_enabled or flat_tokens) else None
     _log_answer(
         "fts.eval",
         enabled=bool(fts_enabled),
-        error=None,
-        columns_count=len(fts_columns or []),
+        error=fts_error,
+        columns_count=columns_count,
     )
 
     preview = final_sql if len(final_sql) <= 500 else f"{final_sql[:500]}…"
@@ -514,6 +521,7 @@ def answer() -> Any:
     _log_answer(
         "sql.done",
         rows=len(rows) if hasattr(rows, "__len__") else None,
+        columns_count=(len(rows[0]) if rows and hasattr(rows[0], "__len__") else None),
         ms=int((time.time() - t0) * 1000),
     )
     explain_parts: List[str] = []
@@ -536,6 +544,7 @@ def answer() -> Any:
             "binds": fts_bind_names or None,
             "engine": engine_name,
             "reason": fts_reason,
+            "error": fts_error,
         },
         "intent": {
             "full_text_search": bool(fts_enabled),
@@ -558,6 +567,7 @@ def answer() -> Any:
             "binds": fts_bind_names,
             "engine": engine_name,
             "operator": token_operator if fts_enabled else None,
+            "error": fts_error,
         },
     }
 
@@ -568,7 +578,11 @@ def answer() -> Any:
         "debug": debug,
         "rows": rows,
     }
-    _log_answer("response", inquiry_id=response.get("inquiry_id"))
+    _log_answer(
+        "response",
+        inquiry_id=response.get("inquiry_id"),
+        retry=bool(response.get("retry")),
+    )
     return jsonify(response)
 
 
