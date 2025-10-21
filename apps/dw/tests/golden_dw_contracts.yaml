@@ -850,6 +850,19 @@ cases:
       - "UPPER(TRIM(ENTITY)) = UPPER(TRIM(:eq_0))"
       - "UPPER(TRIM(REPRESENTATIVE_EMAIL)) = UPPER(TRIM(:eq_1))"
       - "ORDER BY REQUEST_DATE DESC"
+  
+  - name: eq_rules_applied_in_contract_deterministic
+    namespace: dw::common
+    question: "list all contracts has it or home care and ENTITY = DSFH and REPRESENTATIVE_EMAIL = samer@procare-sa.com"
+    full_text_search: true
+    expect_sql_contains:
+      - 'LIKE UPPER(:fts_0)'
+      - 'LIKE UPPER(:fts_1)'
+    expect_sql_not_contains:
+      - 'ol_fts_'
+    assert_all_of:
+      - 'UPPER(TRIM(ENTITY)) = UPPER(TRIM(:eq_0))'
+      - 'UPPER(TRIM(REPRESENTATIVE_EMAIL)) = UPPER(TRIM(:eq_1))'
   # --- Patch 2 Golden Adds ------------------------------------------------------
   - question: "Show contracts where REQUEST TYPE = Renewal"
     namespace: "dw::common"

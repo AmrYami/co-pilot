@@ -872,7 +872,7 @@ def _build_rate_fts_where(
     token_groups: List[List[str]],
     *,
     operator: str,
-    bind_prefix: str = "ol_fts",
+    bind_prefix: str = "fts",
 ) -> Tuple[str, Dict[str, Any]]:
     if not columns or not token_groups:
         return "", {}
@@ -1011,7 +1011,7 @@ def _apply_online_rate_hints(
             columns,
             tokens_groups,
             operator=operator,
-            bind_prefix="ol_fts",
+            bind_prefix="fts",
         )
 
     fts_meta = {
@@ -1746,12 +1746,35 @@ def answer():
                 if "sort_desc" in payload:
                     online_intent["sort_desc"] = bool(payload.get("sort_desc"))
             elif kind == "eq":
-                eq_payload = payload.get("eq_filters") or []
-                if isinstance(eq_payload, list) and eq_payload:
+                # Accept both shapes:
+                #   1) [{"col": "ENTITY", "val": "DSFH", "op": "eq", "ci": true, "trim": true}, ...]
+                #   2) [["ENTITY", ["DSFH"]], ["REPRESENTATIVE_EMAIL", ["samer@..."]]]
+                raw = payload.get("eq_filters") or []
+                canon: list[dict] = []
+                if isinstance(raw, list):
+                    for entry in raw:
+                        if isinstance(entry, dict):
+                            # Already canonical
+                            canon.append(dict(entry))
+                        elif isinstance(entry, (list, tuple)) and len(entry) == 2:
+                            col, vals = entry
+                            if not isinstance(col, str):
+                                continue
+                            vals_iter = vals if isinstance(vals, (list, tuple, set)) else [vals]
+                            for v in vals_iter:
+                                # Normalize into the shape expected by _apply_online_rate_hints/_where_from_eq_filters
+                                canon.append({
+                                    "col": col.strip(),
+                                    "val": (v.strip() if isinstance(v, str) else v),
+                                    "op": "eq",
+                                    "ci": True,
+                                    "trim": True,
+                                })
+                if canon:
                     existing = online_intent.setdefault("eq_filters", [])
-                    for item in eq_payload:
-                        if isinstance(item, dict) and item not in existing:
-                            existing.append(dict(item))
+                    for d in canon:
+                        if d not in existing:
+                            existing.append(d)
             elif kind == "group_by":
                 if payload.get("group_by"):
                     online_intent["group_by"] = payload.get("group_by")
