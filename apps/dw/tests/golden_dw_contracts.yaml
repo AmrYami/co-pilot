@@ -518,6 +518,37 @@ cases:
         - 'COUNT(*) AS CNT'
       not_contains:
         - 'SELECT COUNT(*) AS CNT FROM "Contract" WHERE (UPPER(ENTITY_NO) ='
+
+  - id: eq_rules_applied_in_contract_deterministic
+    question: "list all contracts has it or home care and ENTITY = DSFH and REPRESENTATIVE_EMAIL = samer@procare-sa.com"
+    full_text_search: true
+    expect_contains:
+      - 'LIKE UPPER(:fts_0)'
+      - 'LIKE UPPER(:fts_1)'
+      - 'UPPER(TRIM(ENTITY)) IN (UPPER(:'
+      - 'UPPER(TRIM(REPRESENTATIVE_EMAIL)) IN (UPPER(:'
+      - 'ORDER BY REQUEST_DATE DESC'
+    expect_not_contains:
+      - 'ol_fts_'
+
+  - id: multiple_values_same_column_uses_IN
+    question: "list all contracts has it or home care and ENTITY = DSFH and REPRESENTATIVE_EMAIL = samer@procare-sa.com or mmaboumoussa@fakeeh.care"
+    full_text_search: true
+    expect_contains:
+      - 'UPPER(TRIM(REPRESENTATIVE_EMAIL)) IN (UPPER(:'
+    expect_not_contains:
+      - 'UPPER(TRIM(REPRESENTATIVE_EMAIL)) = UPPER(TRIM('
+
+  - id: cross_column_or_email_phone
+    question: "list all contracts has it or home care and ENTITY = DSFH and (REPRESENTATIVE_PHONE = 0500199556 or REPRESENTATIVE_EMAIL = mmaboumoussa@fakeeh.care)"
+    full_text_search: true
+    expect_contains:
+      - 'UPPER(TRIM(REPRESENTATIVE_PHONE)) IN (UPPER(:'
+      - ' OR '
+      - 'UPPER(TRIM(REPRESENTATIVE_EMAIL)) IN (UPPER(:'
+    expect_not_contains:
+      - 'representative_phone ='
+      - 'entity = dsfh'
     assertions:
       group_by: ["CONTRACT_STATUS"]
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from typing import Any, Dict, List, Tuple
+from collections import defaultdict
 
 from apps.dw.filters import build_boolean_groups_where
 from apps.dw.fts import build_fts_clause
@@ -142,6 +143,72 @@ def _where_from_eq_filters(eq_filters: List[dict], binds: Dict[str, Any]) -> str
         clauses.append(_compose(bind, op))
 
     return " AND ".join(clauses)
+
+
+# --- New helpers for IN-based EQ grouping and OR group building ---
+
+def _group_eq_by_col(eq_filters: List[dict]) -> Dict[str, List[Any]]:
+    grouped: Dict[str, List[Any]] = defaultdict(list)
+    for f in eq_filters or []:
+        if not isinstance(f, dict):
+            continue
+        col = f.get("col") or f.get("column")
+        if not isinstance(col, str):
+            continue
+        val = f.get("val") if f.get("val") is not None else f.get("value")
+        grouped[col].append(val)
+    return grouped
+
+
+def _eq_clause_from_filters(eq_filters: List[dict], binds: Dict[str, Any], *, bind_prefix: str = "eq") -> Tuple[str, Dict[str, Any]]:
+    """Build equality clause using IN(...) per column (avoids X=… AND X=…)."""
+    from apps.dw.lib import sql_utils
+
+    clauses: List[str] = []
+    i = len([k for k in binds.keys() if isinstance(k, str) and k.startswith(bind_prefix)])
+    grouped = _group_eq_by_col(eq_filters or [])
+    for raw_col, vals in grouped.items():
+        col = str(raw_col).strip().upper()
+        if not col:
+            continue
+        bind_names: List[str] = []
+        for v in (vals or []):
+            b = f"{bind_prefix}_{i}"
+            i += 1
+            binds[b] = (v.upper() if isinstance(v, str) else v)
+            bind_names.append(b)
+        if bind_names:
+            clauses.append(sql_utils.in_expr(col, bind_names))
+    return (" AND ".join(clauses) if clauses else ""), binds
+
+
+def build_or_group(or_terms: List[dict]) -> Tuple[str, Dict[str, Any]]:
+    """
+    Build an OR group across terms, where each term is a single EQ dict.
+    Returns: ( "(colA IN (:...)) OR (colB IN (:...))", binds )
+    """
+    from apps.dw.lib import sql_utils
+
+    binds: Dict[str, Any] = {}
+    parts: List[str] = []
+    for t in or_terms or []:
+        if not isinstance(t, dict):
+            continue
+        clause, b = _eq_clause_from_filters([t], binds, bind_prefix="eq")
+        if clause:
+            parts.append(clause)
+            binds.update(b)
+    return (sql_utils.or_join(parts) if parts else ""), binds
+
+
+def apply_online_rate_hints(intent: dict, settings: Any) -> Tuple[str, Dict[str, Any]]:
+    """
+    Minimal application of online/rate EQ hints.
+    Returns only the EQ WHERE + binds here; FTS/order handled elsewhere.
+    """
+    eq_filters = intent.get("eq_filters") or []
+    clause, binds = _eq_clause_from_filters(eq_filters, {}, bind_prefix="eq")
+    return clause, binds
 
 
 def build_sql(intent: NLIntent) -> Tuple[str, Dict[str, Any]]:

@@ -628,9 +628,12 @@ def plan_contract_query(
     if eq_filter:
         binds.update(eq_filter["binds"])
 
+    # Group same-column values into IN(...) when multiple EQs appear for the same column
+    from apps.dw.lib import sql_utils
+
     eq_pairs = _eq_pairs(q or "")
     skip_eq_cols = {eq_filter["col"]} if eq_filter else set()
-    eq_predicates: List[str] = []
+    col_to_binds: Dict[str, List[str]] = {}
     for col, val in eq_pairs:
         if col in skip_eq_cols:
             continue
@@ -643,7 +646,12 @@ def plan_contract_query(
             bind_name = f"eq_{base}_{suffix}"
             suffix += 1
         binds[bind_name] = val
-        eq_predicates.append(f"UPPER(TRIM({col})) = UPPER(TRIM(:{bind_name}))")
+        col_to_binds.setdefault(col, []).append(bind_name)
+    eq_predicates: List[str] = []
+    for col, bind_names in col_to_binds.items():
+        if not bind_names:
+            continue
+        eq_predicates.append(sql_utils.in_expr(col, bind_names))
 
     def _attach_fts(meta: Dict[str, Any]) -> Dict[str, Any]:
         enriched = dict(meta)

@@ -37,3 +37,23 @@ def direction_from_words(question: str, fallback: str = "DESC") -> str:
     if any(w in q for w in ["highest", "top", "biggest", "largest"]):
         return "DESC"
     return fallback
+
+
+# --- additions for IN/OR helpers ---
+
+def upper_trim(col: str) -> str:
+    return f"UPPER(TRIM({col}))"
+
+
+def in_expr(col: str, bind_names: List[str]) -> str:
+    if not bind_names:
+        return ""
+    inner = ", ".join(f"UPPER(:{b})" for b in bind_names)
+    return f"{upper_trim(col)} IN ({inner})"
+
+
+def or_join(clauses: List[str]) -> str:
+    parts = [c for c in clauses if c and c.strip()]
+    if not parts:
+        return ""
+    return "(" + " OR ".join(parts) + ")"

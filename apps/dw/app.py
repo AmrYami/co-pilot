@@ -74,6 +74,7 @@ from apps.dw.tables.contracts import build_contract_sql
 from apps.mem.kv import get_settings_for_namespace
 from apps.dw.online_learning import load_recent_hints
 from apps.dw.builder import _where_from_eq_filters
+from apps.dw import builder as _builder_mod
 from apps.dw.db import get_memory_engine, get_memory_session
 from apps.dw.learning_store import (
     DWExample,
@@ -824,6 +825,89 @@ def _coalesce_rate_intent(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     return intent
 
 
+def _sanitize_eq_values(intent: Dict[str, Any], allowed_cols: Sequence[str]) -> None:
+    """
+    - Collapse multi-values per column into flat list of dicts (later grouped via IN).
+    - Move leaked phone digits out of email terms when obvious.
+    - Leave only allowed columns.
+    """
+    eq = intent.get("eq_filters") or []
+    if not isinstance(eq, list) or not eq:
+        return
+    allowed = {str(c).strip().upper() for c in (allowed_cols or []) if str(c).strip()}
+    grouped: Dict[str, List[Any]] = {}
+    for f in eq:
+        if not isinstance(f, dict):
+            continue
+        col = (f.get("col") or f.get("column") or "").strip().upper()
+        if not col or (allowed and col not in allowed):
+            continue
+        val = f.get("val") if f.get("val") is not None else f.get("value")
+        grouped.setdefault(col, []).append(val)
+
+    def _is_email(x: Any) -> bool:
+        return isinstance(x, str) and "@" in x
+
+    def _digits(x: Any) -> str:
+        return "".join(ch for ch in str(x) if ch.isdigit())
+
+    if "REPRESENTATIVE_EMAIL" in grouped and "REPRESENTATIVE_PHONE" in allowed:
+        move_phone: List[str] = []
+        keep_email: List[Any] = []
+        for v in grouped.get("REPRESENTATIVE_EMAIL", []):
+            vs = str(v)
+            d = _digits(vs)
+            if (d and len(d) >= 8) and not _is_email(vs):
+                move_phone.append(d)
+            else:
+                keep_email.append(v)
+        grouped["REPRESENTATIVE_EMAIL"] = keep_email
+        if move_phone:
+            grouped.setdefault("REPRESENTATIVE_PHONE", []).extend(move_phone)
+
+    canon: List[Dict[str, Any]] = []
+    for col, vals in grouped.items():
+        for v in vals:
+            canon.append({"col": col, "val": v, "op": "eq", "ci": True, "trim": True})
+    if canon:
+        intent["eq_filters"] = canon
+
+
+def _extract_or_groups_from_question(question: str, allowed_cols: Sequence[str]) -> List[List[Dict[str, Any]]]:
+    """
+    Detect patterns like 'COL_A = X or COL_B = Y' in the question across allowed columns.
+    Returns list of OR groups, each a list of canonical EQ dicts.
+    """
+    if not question:
+        return []
+    q = " " + question.strip() + " "
+    import re as _re
+    cols_alt = "|".join(_re.escape(str(c).strip().upper()) for c in allowed_cols if str(c).strip())
+    if not cols_alt:
+        return []
+    pat = _re.compile(rf"(?i)\b({cols_alt})\s*=\s*([^()]+?)(?=\s+(?:and|or)\s+\b({cols_alt})\b|\s*$)")
+    conn_pat = _re.compile(r"(?i)\s+(and|or)\s+")
+    matches = list(pat.finditer(q))
+    groups: List[List[Dict[str, Any]]] = []
+    for i, m in enumerate(matches[:-1]):
+        tail = q[m.end() : matches[i + 1].start()]
+        conn = conn_pat.search(tail)
+        if not conn:
+            continue
+        if conn.group(1).lower() == "or":
+            col1 = m.group(1).upper().strip()
+            val1 = m.group(2).strip()
+            col2 = matches[i + 1].group(1).upper().strip()
+            val2 = matches[i + 1].group(2).strip()
+            groups.append(
+                [
+                    {"col": col1, "val": val1, "op": "eq", "ci": True, "trim": True},
+                    {"col": col2, "val": val2, "op": "eq", "ci": True, "trim": True},
+                ]
+            )
+    return groups
+
+
 def _normalize_columns(columns: Sequence[Any]) -> List[str]:
     normalized: List[str] = []
     seen: set[str] = set()
@@ -966,7 +1050,14 @@ def _apply_online_rate_hints(
     eq_applied = False
     if deduped_filters:
         eq_temp_binds: Dict[str, Any] = {}
-        eq_clause = _where_from_eq_filters(deduped_filters, eq_temp_binds)
+        # Prefer IN-grouping per column via builder helper
+        try:
+            eq_clause, eq_temp_binds = _builder_mod._eq_clause_from_filters(deduped_filters, eq_temp_binds, bind_prefix="eq")  # type: ignore[attr-defined]
+            if not eq_clause:
+                # Fallback to legacy per-value predicates
+                eq_clause = _where_from_eq_filters(deduped_filters, eq_temp_binds)
+        except Exception:
+            eq_clause = _where_from_eq_filters(deduped_filters, eq_temp_binds)
         if eq_clause:
             rename_map: Dict[str, str] = {}
             for key in eq_temp_binds.keys():
@@ -983,6 +1074,34 @@ def _apply_online_rate_hints(
             combined_binds.update(renamed_binds)
             where_clauses.append(f"({eq_clause})")
             eq_applied = True
+
+    # OR-groups across different columns from intent
+    try:
+        or_groups = intent.get("or_groups") or []
+    except Exception:
+        or_groups = []
+    if isinstance(or_groups, list) and or_groups:
+        for grp in or_groups:
+            try:
+                grp_clause, grp_binds = _builder_mod.build_or_group(grp)  # type: ignore[attr-defined]
+            except Exception:
+                grp_clause, grp_binds = "", {}
+            if grp_clause:
+                # Ensure bind names don't collide
+                rename_map: Dict[str, str] = {}
+                for key in list(grp_binds.keys()):
+                    base = f"ol_{key}"
+                    new_key = base
+                    suffix = 1
+                    while new_key in binds or new_key in combined_binds or new_key in rename_map.values():
+                        new_key = f"{base}_{suffix}"
+                        suffix += 1
+                    rename_map[key] = new_key
+                for old, new in rename_map.items():
+                    grp_clause = grp_clause.replace(f":{old}", f":{new}")
+                renamed = {rename_map.get(k, k): v for k, v in grp_binds.items()}
+                combined_binds.update(renamed)
+                where_clauses.append(grp_clause)
 
     namespace_hint = intent.get("namespace") or patch.get("namespace")
     namespace = namespace_hint if isinstance(namespace_hint, str) and namespace_hint.strip() else "dw::common"
@@ -1824,6 +1943,15 @@ def answer():
         )
     except Exception:
         logger.info({"event": "answer.settings.loaded"})
+
+    # Sanitize EQ filters and detect cross-column OR groups from the question
+    try:
+        _sanitize_eq_values(online_intent, allowed_columns_initial)
+        or_groups = _extract_or_groups_from_question(question, allowed_columns_initial)
+        if or_groups:
+            online_intent["or_groups"] = or_groups
+    except Exception:
+        pass
     if full_text_search:
         direct_groups, direct_mode = extract_fts_terms(question, force=False)
         # LOG: مصطلحات FTS المستخرجة (وضع مباشر/غيره)
