@@ -432,3 +432,60 @@ def merge_rate_comment_hints(
         merged.sort_desc = first.desc
 
     return merged
+
+
+# --- New: Parse comment into intent with multi-value eq + fts groups ---
+from .rate_parser import parse_eq, build_intent_signature
+
+
+def parse_comment_to_intent(text: str) -> Dict[str, Any]:
+    """
+    Lightweight intent parser for /dw/rate comments supporting:
+      - eq: COL = v1 | v2 | v3  (multi-value)
+      - fts: tok1 | tok2        (OR groups)
+      - group_by: COL1, COL2
+      - order_by: COL asc|desc
+    Returns a dict with eq_filters (pair form), fts_groups, sort/group fields and a 'signature'.
+    """
+    t = (text or "").strip()
+    # 1) eq multi-value
+    eq_map = parse_eq(t)
+    eq_filters: List[List[Any]] = []
+    for col, spec in eq_map.items():
+        eq_filters.append([col, list(spec.get("values") or [])])
+
+    # 2) fts groups via pipes
+    fts_groups: List[List[str]] = []
+    m = re.search(r"(?i)\bfts\s*:\s*([^;]+)", t)
+    if m:
+        rhs = (m.group(1) or "").strip()
+        toks = [frag.strip() for frag in re.split(r"\s*\|\s*", rhs) if frag.strip()]
+        fts_groups = [[tok] for tok in toks]
+
+    # 3) group_by
+    group_by_cols: List[str] = []
+    gm = _BASIC_GBY_RE.search(t)
+    if gm:
+        group_by_cols = [c.strip().upper().replace(" ", "_") for c in (gm.group(1) or "").split(",") if c.strip()]
+
+    # 4) order_by
+    sort_by: Optional[str] = None
+    sort_desc: Optional[bool] = None
+    om = _BASIC_OBY_RE.search(t)
+    if om:
+        sort_by = (om.group(1) or "").strip().upper().replace(" ", "_")
+        dir_token = (om.group(2) or "DESC").strip().lower()
+        sort_desc = dir_token != "asc"
+
+    intent = {
+        "eq_filters": eq_filters,
+        "fts_groups": fts_groups,
+        "sort_by": sort_by,
+        "sort_desc": sort_desc,
+        "group_by": group_by_cols,
+    }
+    try:
+        intent["signature"] = build_intent_signature(intent)
+    except Exception:
+        pass
+    return intent

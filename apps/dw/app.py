@@ -91,6 +91,7 @@ from .contracts.fts import extract_fts_terms, build_fts_where_groups
 from .contracts.filters import parse_explicit_filters
 from .contracts.contract_planner import plan_contract_query
 from .rating import rate_bp
+from .answer.nlu_eq_parser import parse_from_question as parse_eq_inline
 from .tests.rate_suite import rate_tests_bp
 from .tests.routes import tests_bp as rate_builder_tests_bp
 from .tests.golden_runner_rate import golden_rate_bp
@@ -1026,38 +1027,18 @@ def _apply_online_rate_hints(
     where_clauses: List[str] = []
 
     eq_filters_raw = intent.get("eq_filters") or []
-    deduped_filters: List[Dict[str, Any]] = []
-    seen_filters: set[Tuple[Any, ...]] = set()
-    for entry in eq_filters_raw:
-        if not isinstance(entry, dict):
-            continue
-        normalized = dict(entry)
-        key = (
-            (normalized.get("col") or normalized.get("column") or "").strip().upper(),
-            json.dumps(normalized.get("synonyms"), sort_keys=True)
-            if isinstance(normalized.get("synonyms"), dict)
-            else None,
-            normalized.get("val"),
-            normalized.get("op"),
-            bool(normalized.get("ci")),
-            bool(normalized.get("trim")),
-        )
-        if key in seen_filters:
-            continue
-        seen_filters.add(key)
-        deduped_filters.append(normalized)
-
+    # Accept dict and pair shapes; grouping/dedup handled downstream
     eq_applied = False
-    if deduped_filters:
+    if eq_filters_raw:
         eq_temp_binds: Dict[str, Any] = {}
         # Prefer IN-grouping per column via builder helper
         try:
-            eq_clause, eq_temp_binds = _builder_mod._eq_clause_from_filters(deduped_filters, eq_temp_binds, bind_prefix="eq")  # type: ignore[attr-defined]
+            eq_clause, eq_temp_binds = _builder_mod._eq_clause_from_filters(eq_filters_raw, eq_temp_binds, bind_prefix="eq")  # type: ignore[attr-defined]
             if not eq_clause:
                 # Fallback to legacy per-value predicates
-                eq_clause = _where_from_eq_filters(deduped_filters, eq_temp_binds)
+                eq_clause = _where_from_eq_filters(eq_filters_raw, eq_temp_binds)
         except Exception:
-            eq_clause = _where_from_eq_filters(deduped_filters, eq_temp_binds)
+            eq_clause = _where_from_eq_filters(eq_filters_raw, eq_temp_binds)
         if eq_clause:
             rename_map: Dict[str, str] = {}
             for key in eq_temp_binds.keys():
@@ -1950,6 +1931,12 @@ def answer():
         or_groups = _extract_or_groups_from_question(question, allowed_columns_initial)
         if or_groups:
             online_intent["or_groups"] = or_groups
+        # NLU: inline equality from question with multi-value OR per column
+        inline_pairs = parse_eq_inline(question, allowed_columns_initial)
+        if inline_pairs:
+            existing = online_intent.setdefault("eq_filters", [])
+            for col, vals in inline_pairs:
+                existing.append([col, list(vals)])
     except Exception:
         pass
     if full_text_search:

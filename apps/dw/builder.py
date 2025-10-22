@@ -147,20 +147,29 @@ def _where_from_eq_filters(eq_filters: List[dict], binds: Dict[str, Any]) -> str
 
 # --- New helpers for IN-based EQ grouping and OR group building ---
 
-def _group_eq_by_col(eq_filters: List[dict]) -> Dict[str, List[Any]]:
+def _group_eq_by_col(eq_filters) -> Dict[str, List[Any]]:
     grouped: Dict[str, List[Any]] = defaultdict(list)
-    for f in eq_filters or []:
-        if not isinstance(f, dict):
+    for item in eq_filters or []:
+        # dict shape
+        if isinstance(item, dict):
+            col = item.get("col") or item.get("column")
+            if not isinstance(col, str):
+                continue
+            val = item.get("val") if item.get("val") is not None else item.get("value")
+            grouped[col].append(val)
             continue
-        col = f.get("col") or f.get("column")
-        if not isinstance(col, str):
-            continue
-        val = f.get("val") if f.get("val") is not None else f.get("value")
-        grouped[col].append(val)
+        # pair shape: [col, [values]]
+        if isinstance(item, (list, tuple)) and len(item) == 2:
+            col, vals = item
+            if not isinstance(col, (str, bytes)):
+                continue
+            vals_iter = vals if isinstance(vals, (list, tuple, set)) else [vals]
+            for v in vals_iter:
+                grouped[str(col)].append(v)
     return grouped
 
 
-def _eq_clause_from_filters(eq_filters: List[dict], binds: Dict[str, Any], *, bind_prefix: str = "eq") -> Tuple[str, Dict[str, Any]]:
+def _eq_clause_from_filters(eq_filters, binds: Dict[str, Any], *, bind_prefix: str = "eq") -> Tuple[str, Dict[str, Any]]:
     """Build equality clause using IN(...) per column (avoids X=… AND X=…)."""
     from apps.dw.lib import sql_utils
 
@@ -172,7 +181,16 @@ def _eq_clause_from_filters(eq_filters: List[dict], binds: Dict[str, Any], *, bi
         if not col:
             continue
         bind_names: List[str] = []
+        # dedup while preserving order
+        seen: set = set()
+        ordered_vals = []
         for v in (vals or []):
+            key = v.upper() if isinstance(v, str) else v
+            if key in seen:
+                continue
+            seen.add(key)
+            ordered_vals.append(v)
+        for v in ordered_vals:
             b = f"{bind_prefix}_{i}"
             i += 1
             binds[b] = (v.upper() if isinstance(v, str) else v)

@@ -6,6 +6,7 @@ import json
 import logging
 import re
 from typing import Any, Dict, Optional, List
+import hashlib
 
 from sqlalchemy import text
 import sqlalchemy as sa
@@ -60,6 +61,9 @@ _MIGRATIONS = (
     "ALTER TABLE dw_rules ADD COLUMN IF NOT EXISTS enabled BOOLEAN NOT NULL DEFAULT TRUE",
     "ALTER TABLE dw_rules ADD COLUMN IF NOT EXISTS scope TEXT NOT NULL DEFAULT 'namespace'",
     "CREATE INDEX IF NOT EXISTS idx_dw_rules_enabled ON dw_rules (enabled)",
+    "ALTER TABLE dw_rules ADD COLUMN IF NOT EXISTS rule_signature TEXT",
+    "ALTER TABLE dw_rules ADD COLUMN IF NOT EXISTS intent_sig JSONB",
+    "ALTER TABLE dw_rules ADD COLUMN IF NOT EXISTS intent_sha TEXT",
 )
 
 
@@ -116,6 +120,17 @@ def _flatten_fts_groups(hints: dict) -> list[str]:
     return tokens
 
 
+def _json_dumps(obj: Any) -> str:
+    try:
+        return json.dumps(obj or {}, separators=(",", ":"), sort_keys=True)
+    except Exception:
+        return json.dumps(obj or {})
+
+
+def _sha256(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+
 def save_positive_rule(engine, question: str, applied_hints: Dict[str, Any]) -> None:
     """Persist positive feedback (rating >= 4) into ``dw_rules``."""
 
@@ -170,16 +185,76 @@ def save_positive_rule(engine, question: str, applied_hints: Dict[str, Any]) -> 
     if not rows:
         return
 
+    # Build a deterministic signature from either full intent or derived compact intent
+    signature_json: Optional[str] = None
+    try:
+        from apps.dw.rate_parser import build_intent_signature as _build_sig
+
+        src_intent = applied_hints.get("intent")
+        if isinstance(src_intent, dict) and src_intent:
+            signature_json = _build_sig(src_intent)
+        else:
+            # Derive compact intent from hints
+            eq_list = []
+            eq_payload = applied_hints.get("eq_filters") or []
+            by_col: Dict[str, List[str]] = {}
+            for item in eq_payload:
+                if isinstance(item, dict):
+                    col = str((item.get("col") or item.get("column") or "")).upper().strip()
+                    if not col:
+                        continue
+                    val = item.get("val") if item.get("val") is not None else item.get("value")
+                    by_col.setdefault(col, []).append(str(val))
+                    continue
+                if isinstance(item, (list, tuple)) and len(item) == 2:
+                    col = str(item[0] or "").upper().strip()
+                    for v in (item[1] or []):
+                        by_col.setdefault(col, []).append(str(v))
+            for col, vals in by_col.items():
+                seen: set[str] = set()
+                out_vals = [v for v in vals if not (v in seen or seen.add(v))]
+                eq_list.append([col, out_vals])
+
+            tokens = applied_hints.get("fts_tokens") or []
+            fts_groups = [[t] for t in tokens] if isinstance(tokens, list) else []
+            compact_intent = {
+                "eq_filters": eq_list,
+                "fts_groups": fts_groups,
+                "sort_by": applied_hints.get("sort_by"),
+                "sort_desc": applied_hints.get("sort_desc"),
+                "group_by": applied_hints.get("group_by") or [],
+            }
+            signature_json = _build_sig(compact_intent)
+    except Exception:
+        signature_json = None
+
+    intent_sha: Optional[str] = None
+    intent_sig_obj: Optional[Dict[str, Any]] = None
+    if signature_json:
+        try:
+            intent_sha = _sha256(signature_json)
+            intent_sig_obj = json.loads(signature_json)
+        except Exception:
+            intent_sha = None
+            intent_sig_obj = None
+
     with engine.begin() as cx:
         for kind, payload in rows:
             cx.execute(
                 text(
                     """
-                    INSERT INTO dw_rules (question_norm, rule_kind, rule_payload, enabled)
-                    VALUES (:q, :k, :p, TRUE)
+                    INSERT INTO dw_rules (question_norm, rule_kind, rule_payload, enabled, rule_signature, intent_sig, intent_sha)
+                    VALUES (:q, :k, CAST(:p AS JSONB), TRUE, :sig, CAST(:sig_json AS JSONB), :sha)
                     """
                 ),
-                {"q": _norm_question(question), "k": kind, "p": _as_json(payload)},
+                {
+                    "q": _norm_question(question),
+                    "k": kind,
+                    "p": _json_dumps(payload),
+                    "sig": signature_json,
+                    "sig_json": signature_json or "null",
+                    "sha": intent_sha,
+                },
             )
 
 
@@ -214,7 +289,7 @@ def save_patch(
         )
 
 
-def load_rules_for_question(engine, question: str) -> Dict[str, Any]:
+def load_rules_for_question(engine, question: str, intent: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Load merged rule hints for a question from ``dw_rules``."""
 
     if engine is None:
@@ -223,19 +298,41 @@ def load_rules_for_question(engine, question: str) -> Dict[str, Any]:
     merged: Dict[str, Any] = {}
     norm = _norm_question(question)
     with engine.connect() as cx:
-        rows = cx.execute(
-            text(
-                """
-                SELECT rule_kind, rule_payload
-                  FROM dw_rules
-                 WHERE enabled = TRUE
-                   AND (COALESCE(question_norm, '') = '' OR question_norm = :q)
-                 ORDER BY id DESC
-                 LIMIT 50
-                """
-            ),
-            {"q": norm},
-        )
+        rows = []
+        if intent:
+            try:
+                from apps.dw.rate_parser import build_intent_signature as _build_sig
+                sig = _build_sig(intent)
+                sha = _sha256(sig)
+                rows = cx.execute(
+                    text(
+                        """
+                        SELECT rule_kind, rule_payload
+                          FROM dw_rules
+                         WHERE enabled = TRUE
+                           AND intent_sha = :sha
+                         ORDER BY id DESC
+                         LIMIT 50
+                        """
+                    ),
+                    {"sha": sha},
+                ).fetchall()
+            except Exception:
+                rows = []
+        if not rows:
+            rows = cx.execute(
+                text(
+                    """
+                    SELECT rule_kind, rule_payload
+                      FROM dw_rules
+                     WHERE enabled = TRUE
+                       AND (COALESCE(question_norm, '') = '' OR question_norm = :q)
+                     ORDER BY id DESC
+                     LIMIT 50
+                    """
+                ),
+                {"q": norm},
+            )
         for row in rows:
             kind = row[0] if isinstance(row, tuple) else row["rule_kind"]
             payload = row[1] if isinstance(row, tuple) else row["rule_payload"]
@@ -414,4 +511,3 @@ def to_patch_from_comment(comment: str) -> Dict[str, Any]:
         "sort_desc": sort_desc,
         "top_n": top_n,
     }
-

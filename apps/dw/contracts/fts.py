@@ -2,6 +2,19 @@
 from __future__ import annotations
 import re
 from typing import List, Tuple, Dict
+try:
+    # Reuse email/phone detectors to keep FTS tokens clean
+    from apps.dw.rate_parser import is_email, is_phone
+except Exception:  # pragma: no cover - defensive fallback
+    import re as _re
+    _EMAIL = _re.compile(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b")
+    _PHONE = _re.compile(r"\b\+?\d{7,15}\b")
+
+    def is_email(s: str) -> bool:
+        return bool(_EMAIL.search(s or ""))
+
+    def is_phone(s: str) -> bool:
+        return bool(_PHONE.search(s or ""))
 
 OR_SEP = re.compile(r"\s+(?:or|\|)\s+", flags=re.IGNORECASE)
 AND_SEP = re.compile(r"\s+(?:and|&)\s+", flags=re.IGNORECASE)
@@ -29,7 +42,17 @@ def extract_fts_terms(question: str, force: bool = False) -> Tuple[List[List[str
         groups: List[List[str]] = []
         for g in or_groups:
             terms = [t for t in AND_SEP.split(g) if t]
-            groups.append([_norm(t) for t in terms])
+            normalized = []
+            for t in terms:
+                token = _norm(t)
+                if not token:
+                    continue
+                if is_email(token) or is_phone(token):
+                    # push these to EQ filters elsewhere; exclude from FTS
+                    continue
+                normalized.append(token)
+            if normalized:
+                groups.append(normalized)
         return groups, "explicit"
 
     if force:
@@ -39,7 +62,8 @@ def extract_fts_terms(question: str, force: bool = False) -> Tuple[List[List[str
         if not terms:
             candidates = [w for w in re.findall(r"[A-Za-z][A-Za-z0-9_\- ]{2,}", q)]
             terms = [_norm(c) for c in candidates]
-        return [[t] for t in terms], "implicit"
+        cleaned = [t for t in terms if t and not is_email(t) and not is_phone(t)]
+        return [[t] for t in cleaned], "implicit"
 
     return [], "none"
 
