@@ -269,6 +269,38 @@ def save_patch(
         )
 
 
+def _merge_eq_filters_prefer_question(current_eq, rule_eq):
+    """Merge rule eq filters with question eq filters, preferring question values.
+
+    Accepts list-of-lists [["COL", [values...]], ...] or dict items {col/field, val/values}.
+    Returns canonical list-of-lists.
+    """
+    qmap = {str(c).upper(): vs for c, vs in (current_eq or [])}
+    out: List[List[Any]] = []
+
+    def _norm(item):
+        if isinstance(item, (list, tuple)) and len(item) == 2:
+            return str(item[0]).upper(), item[1]
+        if isinstance(item, dict):
+            col = item.get("col") or item.get("field")
+            vals = item.get("val") or item.get("values") or []
+            if vals is not None and not isinstance(vals, (list, tuple, set)):
+                vals = [vals]
+            return str(col).upper(), list(vals)
+        return None, None
+
+    for it in (rule_eq or []):
+        col, rvals = _norm(it)
+        if not col:
+            continue
+        out.append([col, qmap.get(col, rvals or [])])  # prefer question values if present
+    for col, vals in (current_eq or []):
+        c = str(col).upper()
+        if not any(c == x[0] for x in out):
+            out.append([c, vals])
+    return out
+
+
 def load_rules_for_question(
     engine,
     question: str,
@@ -276,173 +308,196 @@ def load_rules_for_question(
     intent_sig: Optional[Dict[str, Any]] = None,
     intent_sha: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Load merged rule hints for a question from ``dw_rules``."""
+    """Load merged rule hints for a question from ``dw_rules``.
+
+    - Prefer signature-first by checking both SHA-1 and SHA-256 variants.
+    - Use mapping rows to avoid tuple-only access errors.
+    - Merge EQ with question values taking precedence.
+    """
 
     if engine is None:
         return {}
     _ensure_tables(engine)
     merged: Dict[str, Any] = {}
     norm = _norm_question(question)
+    eq_from_rules: List[Any] = []
+
     with engine.connect() as cx:
-        rows = []
-        # Prefer explicit artifacts if passed
+        # Helper to execute and return mapping rows
+        def _exec(sql: str, binds: Dict[str, Any]):
+            return (
+                cx.execute(text(sql), binds)
+                .mappings()
+                .all()
+            )
+
+        rows: List[Dict[str, Any]] = []
+
+        # 1) Explicit artifacts
         if intent_sha:
-            rows = cx.execute(
-                text(
-                    """
-                    SELECT rule_kind, rule_payload
-                      FROM dw_rules
-                     WHERE enabled = TRUE
-                       AND intent_sha = :sha
-                     ORDER BY id DESC
-                     LIMIT 50
-                    """
-                ),
-                {"sha": intent_sha},
-            ).fetchall()
+            # Accept both SHA-1 and SHA-256 by probing both slots
+            rows = _exec(
+                """
+                SELECT rule_kind AS rule_kind, rule_payload AS rule_payload
+                  FROM dw_rules
+                 WHERE enabled = TRUE
+                   AND intent_sha IN (:sha1, :sha256)
+                 ORDER BY id DESC
+                 LIMIT 50
+                """,
+                {"sha1": intent_sha, "sha256": intent_sha},
+            )
+
+        # 2) Signature JSON matching
         if not rows and intent_sig:
-            rows = cx.execute(
-                text(
-                    """
-                    SELECT rule_kind, rule_payload
-                      FROM dw_rules
-                     WHERE enabled = TRUE
-                       AND rule_signature = :sig
-                     ORDER BY id DESC
-                     LIMIT 50
-                    """
-                ),
+            rows = _exec(
+                """
+                SELECT rule_kind AS rule_kind, rule_payload AS rule_payload
+                  FROM dw_rules
+                 WHERE enabled = TRUE
+                   AND rule_signature = :sig
+                 ORDER BY id DESC
+                 LIMIT 50
+                """,
                 {"sig": _json_dumps(intent_sig)},
-            ).fetchall()
+            )
+
+        # 3) Build from provided intent (derive both SHA-1 and SHA-256)
         if not rows and intent:
             try:
-                sig_dict, sig_str, sha = build_intent_signature(intent)
-                rows = cx.execute(
-                    text(
-                        """
-                        SELECT rule_kind, rule_payload
-                          FROM dw_rules
-                         WHERE enabled = TRUE
-                           AND intent_sha = :sha
-                         ORDER BY id DESC
-                         LIMIT 50
-                        """
-                    ),
-                    {"sha": sha},
-                ).fetchall()
-                if not rows:
-                    rows = cx.execute(
-                        text(
-                            """
-                            SELECT rule_kind, rule_payload
-                              FROM dw_rules
-                             WHERE enabled = TRUE
-                               AND rule_signature = :sig
-                             ORDER BY id DESC
-                             LIMIT 50
-                            """
-                        ),
-                        {"sig": sig_str},
-                    ).fetchall()
-            except Exception:
-                rows = []
-        if not rows:
-            rows = cx.execute(
-                text(
+                sig_dict, sig_str, sha1 = build_intent_signature(intent)
+                sha256 = _sha256(sig_str)
+                rows = _exec(
                     """
-                    SELECT rule_kind, rule_payload
+                    SELECT rule_kind AS rule_kind, rule_payload AS rule_payload
                       FROM dw_rules
                      WHERE enabled = TRUE
-                       AND (COALESCE(question_norm, '') = '' OR question_norm = :q)
+                       AND intent_sha IN (:sha1, :sha256)
                      ORDER BY id DESC
                      LIMIT 50
-                    """
-                ),
+                    """,
+                    {"sha1": sha1, "sha256": sha256},
+                )
+                if not rows:
+                    rows = _exec(
+                        """
+                        SELECT rule_kind AS rule_kind, rule_payload AS rule_payload
+                          FROM dw_rules
+                         WHERE enabled = TRUE
+                           AND rule_signature = :sig
+                         ORDER BY id DESC
+                         LIMIT 50
+                        """,
+                        {"sig": sig_str},
+                    )
+            except Exception:
+                rows = []
+
+        # 4) Fallback to question_norm + globals
+        if not rows:
+            rows = _exec(
+                """
+                SELECT rule_kind AS rule_kind, rule_payload AS rule_payload
+                  FROM dw_rules
+                 WHERE enabled = TRUE
+                   AND (COALESCE(question_norm, '') = '' OR question_norm = :q)
+                 ORDER BY id DESC
+                 LIMIT 50
+                """,
                 {"q": norm},
             )
-        for row in rows:
-            kind = row[0] if isinstance(row, tuple) else row["rule_kind"]
-            payload = row[1] if isinstance(row, tuple) else row["rule_payload"]
-            if isinstance(payload, str):
+
+    for row in rows:
+        # RowMapping → dict-like access
+        kind = row.get("rule_kind")
+        payload = row.get("rule_payload")
+        if kind is None and "rule_kind" not in row:
+            # Defensive fallback if a different DBAPI returns tuples
+            try:
+                kind, payload = row[0], row[1]  # type: ignore[index]
+            except Exception:
+                continue
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except json.JSONDecodeError:
+                payload = {}
+        if not isinstance(payload, dict):
+            continue
+        k = str(kind or "").lower()
+
+        if k == "rate_hint":
+            # Back-compat: payload = {"intent": {...}, "binds": {...}, "resolved_sql": "..."}
+            inner_intent = (payload or {}).get("intent") if isinstance(payload, dict) else {}
+            if isinstance(inner_intent, str):
                 try:
-                    payload = json.loads(payload)
+                    inner_intent = json.loads(inner_intent)
                 except json.JSONDecodeError:
-                    payload = {}
-            if not isinstance(payload, dict):
-                continue
-            kind = str(kind or "").lower()
-
-            if kind == "rate_hint":
-                # Back-compat: payload = {"intent": {...}, "binds": {...}, "resolved_sql": "..."}
-                intent = (payload or {}).get("intent") if isinstance(payload, dict) else {}
-                if isinstance(intent, str):
-                    try:
-                        intent = json.loads(intent)
-                    except json.JSONDecodeError:
-                        intent = {}
-                if not isinstance(intent, dict):
-                    continue
-
-                ft_tokens = _flatten_fts_groups(intent)
-                if not ft_tokens:
-                    tokens_from_intent = intent.get("fts_tokens") or []
-                    if isinstance(tokens_from_intent, list):
-                        ft_tokens = [
-                            str(token).strip()
-                            for token in tokens_from_intent
-                            if isinstance(token, str) and str(token).strip()
-                        ]
-                if ft_tokens:
-                    merged["fts_tokens"] = ft_tokens
-                    merged["fts_operator"] = intent.get("fts_operator", "OR")
-                    if intent.get("fts_columns"):
-                        merged["fts_columns"] = intent.get("fts_columns")
-
-                eq_payload = intent.get("eq_filters")
-                if isinstance(eq_payload, list) and eq_payload:
-                    existing = merged.setdefault("eq_filters", [])
-                    for item in eq_payload:
-                        if item not in existing:
-                            existing.append(item)
-
-                sort_by = intent.get("sort_by")
-                if isinstance(sort_by, str) and sort_by.strip():
-                    merged["sort_by"] = sort_by.strip()
-                if intent.get("sort_desc") is not None:
-                    merged["sort_desc"] = bool(intent.get("sort_desc"))
-
-                group_by = intent.get("group_by")
-                if group_by:
-                    merged["group_by"] = group_by
-                if intent.get("gross") is not None:
-                    merged["gross"] = bool(intent.get("gross"))
+                    inner_intent = {}
+            if not isinstance(inner_intent, dict):
                 continue
 
-            if kind == "group_by":
-                if payload.get("group_by"):
-                    merged["group_by"] = payload.get("group_by")
-                if payload.get("gross") is not None:
-                    merged["gross"] = payload.get("gross")
-            elif kind == "fts":
-                if payload.get("tokens"):
-                    merged["fts_tokens"] = payload.get("tokens")
-                    merged["fts_operator"] = payload.get("operator", "OR")
-                    if payload.get("columns"):
-                        merged["fts_columns"] = payload.get("columns")
-            elif kind == "eq":
-                eq_payload = payload.get("eq_filters") or []
-                if eq_payload:
-                    existing = merged.setdefault("eq_filters", [])
-                    for item in eq_payload:
-                        if item not in existing:
-                            existing.append(item)
-            elif kind == "order_by":
-                if payload.get("sort_by"):
-                    merged["sort_by"] = payload.get("sort_by")
-                if payload.get("sort_desc") is not None:
-                    merged["sort_desc"] = bool(payload.get("sort_desc"))
-            if merged:
-                merged.setdefault("full_text_search", bool(merged.get("fts_tokens")))
+            ft_tokens = _flatten_fts_groups(inner_intent)
+            if not ft_tokens:
+                tokens_from_intent = inner_intent.get("fts_tokens") or []
+                if isinstance(tokens_from_intent, list):
+                    ft_tokens = [
+                        str(token).strip()
+                        for token in tokens_from_intent
+                        if isinstance(token, str) and str(token).strip()
+                    ]
+            if ft_tokens:
+                merged["fts_tokens"] = ft_tokens
+                merged["fts_operator"] = inner_intent.get("fts_operator", "OR")
+                if inner_intent.get("fts_columns"):
+                    merged["fts_columns"] = inner_intent.get("fts_columns")
+
+            eq_payload = inner_intent.get("eq_filters")
+            if isinstance(eq_payload, list) and eq_payload:
+                eq_from_rules.extend(eq_payload)
+
+            sort_by = inner_intent.get("sort_by")
+            if isinstance(sort_by, str) and sort_by.strip():
+                merged["sort_by"] = sort_by.strip()
+            if inner_intent.get("sort_desc") is not None:
+                merged["sort_desc"] = bool(inner_intent.get("sort_desc"))
+
+            group_by = inner_intent.get("group_by")
+            if group_by:
+                merged["group_by"] = group_by
+            if inner_intent.get("gross") is not None:
+                merged["gross"] = bool(inner_intent.get("gross"))
+            continue
+
+        if k == "group_by":
+            if payload.get("group_by"):
+                merged["group_by"] = payload.get("group_by")
+            if payload.get("gross") is not None:
+                merged["gross"] = payload.get("gross")
+        elif k == "fts":
+            if payload.get("tokens"):
+                merged["fts_tokens"] = payload.get("tokens")
+                merged["fts_operator"] = payload.get("operator", "OR")
+                if payload.get("columns"):
+                    merged["fts_columns"] = payload.get("columns")
+        elif k == "eq":
+            eq_payload = payload.get("eq_filters") or []
+            if eq_payload:
+                eq_from_rules.extend(eq_payload)
+        elif k == "order_by":
+            if payload.get("sort_by"):
+                merged["sort_by"] = payload.get("sort_by")
+            if payload.get("sort_desc") is not None:
+                merged["sort_desc"] = bool(payload.get("sort_desc"))
+
+        if merged:
+            merged.setdefault("full_text_search", bool(merged.get("fts_tokens")))
+
+    # Prefer-question merge for EQ filters
+    if eq_from_rules or (isinstance(intent, dict) and intent.get("eq_filters")):
+        merged["eq_filters"] = _merge_eq_filters_prefer_question(
+            (intent or {}).get("eq_filters"), eq_from_rules
+        )
     return merged
 
 

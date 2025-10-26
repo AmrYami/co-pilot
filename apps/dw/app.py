@@ -2024,10 +2024,22 @@ def answer():
             pass
         try:
             merged = _load_rules_by_sig(mem_engine, qnorm, intent=light_intent)
-        except TypeError:
-            # Legacy signature compatibility: (engine, question, intent)
-            merged = _load_rules_by_sig(mem_engine, question, intent=light_intent)
-        except Exception:
+            try:
+                logger.info(
+                    {
+                        "event": "answer.rules.signature.loaded",
+                        "by": "intent_sha|rule_signature",
+                        "has_eq": bool((merged or {}).get("eq_filters")),
+                        "has_order": bool((merged or {}).get("order") or (merged or {}).get("sort_by")),
+                    }
+                )
+            except Exception:
+                pass
+        except Exception as e:
+            try:
+                logger.warning({"event": "answer.rules.signature.failed", "err": str(e)})
+            except Exception:
+                pass
             merged = {}
         if isinstance(merged, dict) and merged:
             if merged.get("fts_tokens"):
