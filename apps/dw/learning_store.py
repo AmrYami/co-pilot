@@ -19,6 +19,13 @@ from sqlalchemy import (
     create_engine,
 )
 from sqlalchemy.orm import declarative_base, sessionmaker
+from sqlalchemy import text as _sql_text
+import hashlib as _hashlib
+import json as _json
+import re as _re
+import hashlib as _hashlib
+import json as _json
+import re as _re
 
 MEM_URL = os.environ.get("MEMORY_DB_URL") or os.getenv("MEMORY_DB_URL")
 if not MEM_URL:
@@ -238,3 +245,120 @@ def list_metrics_summary(hours: int = 24) -> Dict[str, Any]:
         "p95_ms": _p95(latencies),
     }
 
+
+# --- Signature-first rules loader (fallback implementation) ------------------
+
+_EMAIL_RE = _re.compile(r"(?i)^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$")
+_NUMBER_RE = _re.compile(r"^-?\d+(\.\d+)?$")
+
+
+def _val_type(v: str) -> str:
+    s = (v or "").strip()
+    if _EMAIL_RE.match(s):
+        return "EMAIL"
+    if _NUMBER_RE.match(s):
+        return "NUMBER"
+    return "TEXT"
+
+
+def _intent_shape_only(intent: Dict[str, Any]) -> Dict[str, Any]:
+    eq_shape = dict(intent.get("eq") or {})
+    if not eq_shape and intent.get("eq_filters"):
+        tmp: Dict[str, Any] = {}
+        for col, vals in intent["eq_filters"]:
+            types = sorted({_val_type(v) for v in (vals or [])})
+            tmp[str(col).upper()] = {"op": ("in" if len(vals or []) > 1 else "eq"), "types": types}
+        eq_shape = tmp
+    order = None
+    if intent.get("order", {}).get("col"):
+        order = {
+            "col": str(intent["order"]["col"]).upper(),
+            "desc": bool(intent["order"].get("desc", True)),
+        }
+    return {"eq": eq_shape, "fts": [], "group_by": [], "order": order}
+
+
+def _canon_signature_from_intent(intent: Dict[str, Any]) -> tuple[str, str, str]:
+    sig_json = _json.dumps(_intent_shape_only(intent), separators=(",", ":"), sort_keys=True)
+    sha256 = _hashlib.sha256(sig_json.encode("utf-8")).hexdigest()
+    sha1 = _hashlib.sha1(sig_json.encode("utf-8")).hexdigest()
+    return sha256, sha1, sig_json
+
+
+def _merge_eq_filters_prefer_question(current_eq, rule_eq):
+    """Merge rule eq filters with question eq filters, preferring current question values for same columns.
+
+    Accepts either list-of-lists form [["COL", ["V1","V2"]], ...] or canonical dict items
+    {"col":"COL","val":"V"}. Returns list-of-lists.
+    """
+    qmap = {str(c).upper(): vs for c, vs in (current_eq or [])}
+    out = []
+    for item in (rule_eq or []):
+        if isinstance(item, (list, tuple)) and len(item) == 2:
+            col, rvals = item[0], item[1]
+        elif isinstance(item, dict):
+            col = item.get("col") or item.get("field")
+            rvals = item.get("val") or item.get("values") or []
+            if rvals is not None and not isinstance(rvals, (list, tuple, set)):
+                rvals = [rvals]
+        else:
+            continue
+        col = str(col).upper()
+        out.append([col, qmap.get(col, rvals or [])])
+    for col, vals in (current_eq or []):
+        c = str(col).upper()
+        if not any(c == x[0] for x in out):
+            out.append([c, vals])
+    return out
+
+
+def load_rules_for_question(engine, qnorm: str, intent: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Returns merged hints from dw_rules using precedence:
+      intent_sha -> rule_signature -> question_norm (exact/global)
+    Merges EQ such that question-provided values win for the same columns.
+    """
+    sha256, sha1, sig_text = _canon_signature_from_intent(intent or {})
+    merged: Dict[str, Any] = {}
+    with engine.connect() as cx:  # type: ignore[union-attr]
+        def _fetch(where_sql: str, binds: Dict[str, Any]):
+            sql = _sql_text(
+                f"""
+                SELECT rule_kind, rule_payload
+                  FROM dw_rules
+                 WHERE enabled = TRUE AND {where_sql}
+                 ORDER BY id DESC
+                """
+            )
+            return cx.execute(sql, binds).all()
+
+        rows = _fetch("intent_sha IN (:sha1, :sha256)", {"sha1": sha1, "sha256": sha256})
+        if not rows:
+            rows = _fetch("rule_signature = :sig", {"sig": sig_text})
+        if not rows:
+            rows = _fetch("(question_norm = :q OR COALESCE(question_norm,'') = '')", {"q": qnorm})
+
+    eq_from_rules = []
+    for kind, payload in rows:
+        try:
+            data = payload if isinstance(payload, dict) else _json.loads(payload)
+        except Exception:
+            continue
+        k = (kind or "").strip().lower()
+        if k == "eq":
+            if isinstance(data.get("eq_filters"), list):
+                eq_from_rules.extend(data["eq_filters"])  # type: ignore[index]
+        elif k == "order_by":
+            merged["order"] = {
+                "col": (data.get("sort_by") or "REQUEST_DATE"),
+                "desc": bool(data.get("sort_desc", True)),
+            }
+        elif k == "fts":
+            if data.get("tokens"):
+                merged["fts_tokens"] = data.get("tokens")
+
+    if eq_from_rules or intent.get("eq_filters"):
+        merged["eq_filters"] = _merge_eq_filters_prefer_question(
+            intent.get("eq_filters"), eq_from_rules
+        )
+    return merged

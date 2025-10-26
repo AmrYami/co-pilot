@@ -1,0 +1,19 @@
+- name: eq_signature_email_variation
+  request:
+    question: "list all contracts where ENTITY = DSFH and REPRESENTATIVE_EMAIL = samer@procare-sa1.com or mmaboumoussa@fakeeh.care"
+    full_text_search: false
+  expect:
+    must_contain:
+      - 'WHERE (UPPER(TRIM(ENTITY))'
+      - 'UPPER(TRIM(REPRESENTATIVE_EMAIL)) IN (UPPER(:'
+      - 'ORDER BY REQUEST_DATE DESC'
+    must_not_contain:
+      - 'Fallback listing'
+
+- name: order_by_no_dup_desc
+  request:
+    question: "recent contracts"
+  expect:
+    must_not_contain:
+      - "ORDER BY REQUEST_DATE desc DESC"
+

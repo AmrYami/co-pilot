@@ -7,6 +7,7 @@ import csv
 import logging
 import re
 import time
+from os import getenv
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -95,7 +96,12 @@ from .answer.nlu_eq_parser import parse_from_question as parse_eq_inline
 from .tests.rate_suite import rate_tests_bp
 from .tests.routes import tests_bp as rate_builder_tests_bp
 from .tests.golden_runner_rate import golden_rate_bp
-from apps.dw.learning import load_rules_for_question as _load_rules_by_sig
+try:
+    from apps.dw.learning import load_rules_for_question as _load_rules_by_sig
+    _LOAD_RULES_SRC = "learning"
+except ImportError:  # pragma: no cover - fallback when packaged/renamed
+    from apps.dw.learning_store import load_rules_for_question as _load_rules_by_sig  # type: ignore
+    _LOAD_RULES_SRC = "learning_store"
 
 LOGGER = logging.getLogger("dw.app")
 
@@ -669,11 +675,24 @@ def _execute_oracle(sql: str, binds: Dict[str, Any]):
         return [], [], {"rows": 0}
     # Normalize bind types first (prevents ORA-01861 and removes malformed try/except)
     safe_binds = _coerce_bind_dates(_coerce_oracle_binds(binds or {}))
+    # Guard: collapse duplicate ASC/DESC tokens in ORDER BY
+    try:
+        sql = _normalize_order_by_directions(sql)
+    except Exception:
+        pass
     with engine.connect() as cx:  # type: ignore[union-attr]
         rs = cx.execute(text(sql), safe_binds)
         cols = list(rs.keys()) if hasattr(rs, "keys") else []
         rows = [list(r) for r in rs.fetchall()]
     return rows, cols, {"rows": len(rows)}
+
+
+def _normalize_order_by_directions(sql: str) -> str:
+    """Collapse repeated direction tokens like 'DESC DESC' within ORDER BY clauses."""
+    def _fix(m):
+        clause = m.group(0)
+        return re.sub(r"(?i)\b(DESC|ASC)\s+\1\b", r"\1", clause)
+    return re.sub(r"(?i)ORDER\s+BY\s+[^\n;]+", _fix, sql)
 
 
 def _coerce_prefixes(raw: Any) -> List[str]:
@@ -721,6 +740,64 @@ def _json_safe_binds(binds: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         else:
             safe[key] = value
     return safe
+
+
+# --- Signature-first light intent helpers ------------------------------------
+EMAIL_RE = re.compile(r"(?i)^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$")
+NUMBER_RE = re.compile(r"^-?\d+(\.\d+)?$")
+
+
+def _val_type(v: str) -> str:
+    s = (v or "").strip()
+    if EMAIL_RE.match(s):
+        return "EMAIL"
+    if NUMBER_RE.match(s):
+        return "NUMBER"
+    return "TEXT"
+
+
+def _build_light_intent_from_question(q: str, allowed_cols) -> dict:
+    """
+    Extract EQ patterns defensively from the question: COL = v1 [or v2 ...].
+    Produces a minimal intent with eq_filters and a default order.
+    """
+    eq_filters = []
+    q = q or ""
+    for col in sorted(allowed_cols or []):
+        pat = re.compile(rf"(?i)\\b{re.escape(str(col))}\\s*=\\s*([^;\\n]+)")
+        m = pat.search(q)
+        if not m:
+            continue
+        raw = m.group(1)
+        vals = re.split(r"(?i)\\s*\\bor\\b\\s*|,", raw)
+        vals = [v.strip(" ()'\"") for v in vals if v.strip()]
+        if not vals:
+            continue
+        eq_filters.append([str(col).upper(), vals])
+    eq_shape = {
+        c: {"op": ("in" if len(v) > 1 else "eq"), "types": sorted({_val_type(x) for x in v})}
+        for c, v in eq_filters
+    }
+    return {
+        "eq_filters": eq_filters,
+        "eq": eq_shape,
+        "fts_groups": [],
+        "order": {"col": "REQUEST_DATE", "desc": True},
+    }
+
+
+def _merge_hints(base: Optional[dict], extra: Optional[dict]) -> dict:
+    base = base or {}
+    extra = extra or {}
+    out = dict(base)
+    if extra.get("eq_filters"):
+        out.setdefault("eq_filters", [])
+        out["eq_filters"].extend(extra["eq_filters"])  # type: ignore[index]
+    if extra.get("order"):
+        out["order"] = extra["order"]
+    if extra.get("fts_tokens"):
+        out["fts_tokens"] = (out.get("fts_tokens") or []) + extra["fts_tokens"]
+    return out
 
 
 _GROSS_EXPR = (
@@ -1778,52 +1855,7 @@ def answer():
                 online_hints_applied = max(online_hints_applied, 1)
     except Exception as exc:
         LOGGER.warning("[dw] failed to load persisted rules: %s", exc)
-    # Prefer signature-based rules using a light intent (inline EQ + default order)
-    try:
-        mem_engine = get_memory_engine()
-    except Exception:
-        mem_engine = None
-    try:
-        qnorm = _normalize_question_text(question)
-        allowed_columns_initial = allowed_columns_initial if 'allowed_columns_initial' in locals() else []
-        inline_pairs = parse_eq_inline(question, allowed_columns_initial)
-        intent_hint = {
-            "eq_filters": inline_pairs or [],
-            "group_by": [],
-            "order": {"col": "REQUEST_DATE", "desc": True},
-        }
-        if mem_engine is not None:
-            merged = _load_rules_by_sig(mem_engine, qnorm, intent=intent_hint)
-            if isinstance(merged, dict) and merged:
-                # Merge signature-matched rules into online_intent
-                if merged.get("fts_tokens"):
-                    online_intent["fts_tokens"] = merged.get("fts_tokens")
-                    online_intent["full_text_search"] = True
-                if merged.get("fts_columns"):
-                    online_intent["fts_columns"] = merged.get("fts_columns")
-                if merged.get("fts_operator"):
-                    online_intent["fts_operator"] = merged.get("fts_operator")
-                if merged.get("eq_filters"):
-                    existing = online_intent.setdefault("eq_filters", [])
-                    for item in merged.get("eq_filters"):
-                        if item not in existing:
-                            existing.append(item)
-                if merged.get("sort_by"):
-                    online_intent["sort_by"] = merged.get("sort_by")
-                if merged.get("sort_desc") is not None:
-                    online_intent["sort_desc"] = bool(merged.get("sort_desc"))
-                if merged.get("group_by"):
-                    online_intent["group_by"] = merged.get("group_by")
-                if merged.get("gross") is not None:
-                    online_intent["gross"] = bool(merged.get("gross"))
-                online_hints_applied += 1
-                try:
-                    logger.info({"event": "answer.rules.signature.loaded"})
-                except Exception:
-                    pass
-    except Exception:
-        # signature-based loader is best effort; continue with classic loader
-        pass
+    # Note: signature-first rule loading runs later after settings/columns are resolved
     try:
         recent_hints = load_recent_hints(question, ttl_seconds=900)
         online_hints_applied += len(recent_hints)
@@ -1971,6 +2003,70 @@ def answer():
         )
     except Exception:
         logger.info({"event": "answer.settings.loaded"})
+
+    # Prefer signature-based rules using a light intent (inline EQ + default order)
+    # Signature-first (gated by DW_LEARNING_RULES_MATCH)
+    try:
+        mem_engine = get_memory_engine()
+    except Exception:
+        mem_engine = None
+    try:
+        _mode = (getenv("DW_LEARNING_RULES_MATCH", "question_norm") or "").lower()
+    except Exception:
+        _mode = "question_norm"
+    if mem_engine is not None and _mode.startswith("signature"):
+        qnorm = _normalize_question_text(question)
+        light_intent = _build_light_intent_from_question(question, allowed_columns_initial)
+        try:
+            if globals().get("_LOAD_RULES_SRC") == "learning_store":
+                logger.info({"event": "answer.rules.loader.fallback", "src": _LOAD_RULES_SRC})
+        except Exception:
+            pass
+        try:
+            merged = _load_rules_by_sig(mem_engine, qnorm, intent=light_intent)
+        except TypeError:
+            # Legacy signature compatibility: (engine, question, intent)
+            merged = _load_rules_by_sig(mem_engine, question, intent=light_intent)
+        except Exception:
+            merged = {}
+        if isinstance(merged, dict) and merged:
+            if merged.get("fts_tokens"):
+                online_intent["fts_tokens"] = merged.get("fts_tokens")
+                online_intent["full_text_search"] = True
+            if merged.get("fts_columns"):
+                online_intent["fts_columns"] = merged.get("fts_columns")
+            if merged.get("fts_operator"):
+                online_intent["fts_operator"] = merged.get("fts_operator")
+            if merged.get("eq_filters"):
+                existing = online_intent.setdefault("eq_filters", [])
+                for item in merged.get("eq_filters"):
+                    if item not in existing:
+                        existing.append(item)
+            # Support both merged["order"] or sort_by/sort_desc keys
+            order_obj = merged.get("order") if isinstance(merged.get("order"), dict) else None
+            if order_obj:
+                if order_obj.get("col"):
+                    online_intent["sort_by"] = order_obj.get("col")
+                if "desc" in order_obj:
+                    online_intent["sort_desc"] = bool(order_obj.get("desc"))
+            if merged.get("sort_by"):
+                online_intent["sort_by"] = merged.get("sort_by")
+            if merged.get("sort_desc") is not None:
+                online_intent["sort_desc"] = bool(merged.get("sort_desc"))
+            if merged.get("group_by"):
+                online_intent["group_by"] = merged.get("group_by")
+            if merged.get("gross") is not None:
+                online_intent["gross"] = bool(merged.get("gross"))
+            online_hints_applied += 1
+            try:
+                logger.info(
+                    {
+                        "event": "answer.rules.signature.loaded",
+                        "hints": [k for k in merged.keys() if not str(k).startswith("_")],
+                    }
+                )
+            except Exception:
+                pass
 
     # Sanitize EQ filters and detect cross-column OR groups from the question
     try:

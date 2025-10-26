@@ -66,3 +66,38 @@ def signature_text(sig: Dict[str, Any]) -> str:
 
 def signature_sha(sig: Dict[str, Any]) -> str:
     return hashlib.sha1(signature_text(sig).encode("utf-8")).hexdigest()
+
+
+# --- Minimal eq parser used by rate_grammar ---------------------------------
+
+import re
+
+
+def _norm_val(v: str) -> str:
+    return (v or "").strip()
+
+
+def parse_eq(text: str) -> Dict[str, Dict[str, List[str]]]:
+    """
+    Parse occurrences like:
+      eq: COL = v1 | v2 | v3
+      eq: COL = v1, v2, v3
+    Returns a dict mapping column to {op:'in', values:[...]}
+    """
+    out: Dict[str, Dict[str, List[str]]] = {}
+    if not text:
+        return out
+    pattern = re.compile(r"(?i)\beq\s*:\s*([A-Z0-9_]+)\s*=\s*([^;]+)")
+    for m in pattern.finditer(text):
+        col = (m.group(1) or "").upper().strip()
+        rhs = (m.group(2) or "").strip()
+        parts = re.split(r"\s*\|\s*|,\s*", rhs)
+        vals = [_norm_val(p) for p in parts if _norm_val(p)]
+        if not vals:
+            continue
+        entry = out.setdefault(col, {"op": "in", "values": []})
+        entry["values"].extend(vals)
+        # de-dup while preserving order
+        seen: set[str] = set()
+        entry["values"] = [x for x in entry["values"] if not (x in seen or seen.add(x))]
+    return out

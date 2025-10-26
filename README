@@ -95,8 +95,15 @@ tar -czf dw_answer_stack.tgz \
   core/inquiries.py
 
 # (2) سكيمات Postgres (memory)
-pg_dump --schema-only --table=dw_rules --table=dw_feedback \
-        --table=dw_patches --table=mem_inquiries copilot_mem_dev > mem_schema.sql
+sudo -u postgres pg_dump \
+  -d copilot_mem_dev \
+  --schema-only \
+  -t public.dw_rules \
+  -t public.dw_feedback \
+  -t public.dw_patches \
+  -t public.mem_inquiries \
+  > mem_schema.sql
+
 
 # (3) وصف أعمدة Contract (Oracle)
 sqlplus 'docuware/Strong#Pass1@localhost:1521/FREEPDB1' <<'SQL'
@@ -106,7 +113,7 @@ SELECT column_name, data_type, data_length FROM user_tab_columns
 SQL
 
 
-
+python scripts/export_context.py --out docs/state
 
 
 

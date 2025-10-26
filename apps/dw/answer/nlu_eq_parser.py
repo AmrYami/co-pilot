@@ -7,11 +7,13 @@ def _tok(s: str) -> str:
     return (s or "").strip()
 
 
-def parse_from_question(q: str, allowed_cols: List[str]) -> Tuple[List[Tuple[str, List[str]]], List[List[Tuple[str, List[str]]]]]:
+def parse_from_question(q: str, allowed_cols: List[str]) -> List[Tuple[str, List[str]]]:
     """
-    Returns eq_filters (same-column values aggregated) and or_groups (cross-column OR buckets).
+    Backwards-compatible API: returns only eq_filters (same-column values aggregated).
+    Use parse_with_or() when you also need cross-column OR groups.
     """
-    return parse_with_or(q, allowed_cols)
+    eq, _ = parse_with_or(q, allowed_cols)
+    return eq
 
 
 def parse_with_or(question: str, allowed_cols: List[str]) -> Tuple[List[Tuple[str, List[str]]], List[List[Tuple[str, List[str]]]]]:
