@@ -87,6 +87,7 @@ from apps.dw.learning_store import (
     list_metrics_summary,
     record_run,
 )
+from apps.dw.learning_store import _merge_eq_filters_prefer_question as _merge_eq_prefer_question  # prefer-question EQ merge
 from apps.dw.explain import build_explain
 from .contracts.fts import extract_fts_terms, build_fts_where_groups
 from .contracts.filters import parse_explicit_filters
@@ -757,23 +758,36 @@ def _val_type(v: str) -> str:
 
 
 def _build_light_intent_from_question(q: str, allowed_cols) -> dict:
+    """استخراج EQ من جزء WHERE فقط، مع دعم OR/الفواصل، وأنواع القيم.
+
+    - يجزّئ نص السؤال بعد كلمة WHERE (إن وُجدت) على AND لاستخراج شروط العمود = القيم.
+    - يدعم "A or B" و"A, B" في نفس العمود.
+    - يبني eq_filters وقاموس eq (op/types) ويضبط ترتيب افتراضي.
     """
-    Extract EQ patterns defensively from the question: COL = v1 [or v2 ...].
-    Produces a minimal intent with eq_filters and a default order.
-    """
-    eq_filters = []
     q = q or ""
-    for col in sorted(allowed_cols or []):
-        pat = re.compile(rf"(?i)\\b{re.escape(str(col))}\\s*=\\s*([^;\\n]+)")
-        m = pat.search(q)
-        if not m:
+    # خذ النص بعد WHERE إن وُجد، وإلا استخدم السؤال كله
+    m = re.search(r"(?i)\bwhere\b(.+)", q)
+    where_txt = (m.group(1) if m else q)
+    # مجموعة أعمدة مسموحة للمقارنة
+    colset = {str(c).upper() for c in (allowed_cols or [])}
+    eq_filters = []
+    # جزّئ على AND بين شروط الأعمدة
+    for part in re.split(r"(?i)\band\b", where_txt):
+        part = part.strip().strip("() ")
+        if not part:
             continue
-        raw = m.group(1)
-        vals = re.split(r"(?i)\\s*\\bor\\b\\s*|,", raw)
-        vals = [v.strip(" ()'\"") for v in vals if v.strip()]
-        if not vals:
+        m2 = re.match(r"(?i)^\s*([A-Z_][A-Z0-9_]*)\s*=\s*(.+)$", part)
+        if not m2:
             continue
-        eq_filters.append([str(col).upper(), vals])
+        col = m2.group(1).upper()
+        if col not in colset:
+            continue
+        rhs = m2.group(2).strip()
+        # دعم "A or B" أو "A, B"
+        vals = re.split(r"(?i)\s*\bor\b\s*|,", rhs)
+        vals = [v.strip(" '\"\t()") for v in vals if v.strip()]
+        if vals:
+            eq_filters.append([col, vals])
     eq_shape = {
         c: {"op": ("in" if len(v) > 1 else "eq"), "types": sorted({_val_type(x) for x in v})}
         for c, v in eq_filters
@@ -916,13 +930,25 @@ def _sanitize_eq_values(intent: Dict[str, Any], allowed_cols: Sequence[str]) -> 
     allowed = {str(c).strip().upper() for c in (allowed_cols or []) if str(c).strip()}
     grouped: Dict[str, List[Any]] = {}
     for f in eq:
-        if not isinstance(f, dict):
+        # Accept both dict form and list-of-lists [["COL", [v1,v2,...]], ...]
+        if isinstance(f, dict):
+            col = (f.get("col") or f.get("column") or "").strip().upper()
+            if not col or (allowed and col not in allowed):
+                continue
+            val = f.get("val") if f.get("val") is not None else f.get("value")
+            grouped.setdefault(col, []).append(val)
+        elif isinstance(f, (list, tuple)) and len(f) == 2:
+            col = str(f[0] or "").strip().upper()
+            if not col or (allowed and col not in allowed):
+                continue
+            vals = f[1]
+            if isinstance(vals, (list, tuple, set)):
+                for v in vals:
+                    grouped.setdefault(col, []).append(v)
+            elif vals is not None:
+                grouped.setdefault(col, []).append(vals)
+        else:
             continue
-        col = (f.get("col") or f.get("column") or "").strip().upper()
-        if not col or (allowed and col not in allowed):
-            continue
-        val = f.get("val") if f.get("val") is not None else f.get("value")
-        grouped.setdefault(col, []).append(val)
 
     def _is_email(x: Any) -> bool:
         return isinstance(x, str) and "@" in x
@@ -1105,6 +1131,17 @@ def _apply_online_rate_hints(
     where_clauses: List[str] = []
 
     eq_filters_raw = intent.get("eq_filters") or []
+    try:
+        logging.getLogger("dw").info(
+            {
+                "event": "answer.apply_hints.start",
+                "has_eq": bool(eq_filters_raw),
+                "has_fts": bool(intent.get("fts_tokens") or intent.get("fts_groups")),
+                "has_or_groups": bool(intent.get("or_groups")),
+            }
+        )
+    except Exception:
+        pass
     # Accept dict and pair shapes; grouping/dedup handled downstream
     eq_applied = False
     if eq_filters_raw:
@@ -1119,6 +1156,7 @@ def _apply_online_rate_hints(
             eq_clause = _where_from_eq_filters(eq_filters_raw, eq_temp_binds)
         if eq_clause:
             rename_map: Dict[str, str] = {}
+            _before_eq = set(list(binds.keys()) + list(combined_binds.keys()))
             for key in eq_temp_binds.keys():
                 base = f"ol_{key}"
                 new_key = base
@@ -1133,6 +1171,13 @@ def _apply_online_rate_hints(
             combined_binds.update(renamed_binds)
             where_clauses.append(f"({eq_clause})")
             eq_applied = True
+            try:
+                _added = sorted(set(combined_binds.keys()) - _before_eq)
+                logging.getLogger("dw").info(
+                    {"event": "answer.apply_hints.eq", "applied": True, "bind_names": _added}
+                )
+            except Exception:
+                pass
 
     # OR-groups across different columns from intent
     try:
@@ -1203,6 +1248,7 @@ def _apply_online_rate_hints(
 
     if fts_clause:
         rename_map: Dict[str, str] = {}
+        _before_fts = set(list(binds.keys()) + list(combined_binds.keys()))
         for key in fts_temp_binds.keys():
             new_key = key
             suffix = 1
@@ -1218,6 +1264,13 @@ def _apply_online_rate_hints(
         fts_meta["enabled"] = True
         fts_meta["binds"] = list(renamed.keys())
         fts_meta["error"] = None
+        try:
+            _added = sorted(set(combined_binds.keys()) - _before_fts)
+            logging.getLogger("dw").info(
+                {"event": "answer.apply_hints.fts", "groups": len(tokens_groups or []), "bind_names": _added}
+            )
+        except Exception:
+            pass
 
     if where_clauses:
         sql = append_where(sql, " AND ".join(where_clauses))
@@ -1265,6 +1318,16 @@ def _apply_online_rate_hints(
         sql = replace_or_add_order_by(sql, clause)
         meta["order_by"] = clause
 
+    try:
+        logging.getLogger("dw").info(
+            {
+                "event": "answer.apply_hints.done",
+                "where_count": len(where_clauses),
+                "binds_count": len(binds or {}),
+            }
+        )
+    except Exception:
+        pass
     meta["eq_filters"] = eq_applied
     meta["fts"] = fts_meta
     return sql, binds, meta
@@ -2011,12 +2074,26 @@ def answer():
     except Exception:
         mem_engine = None
     try:
-        _mode = (getenv("DW_LEARNING_RULES_MATCH", "question_norm") or "").lower()
+        raw_mode = getenv("DW_LEARNING_RULES_MATCH", "question_norm")
+        # Be tolerant to quotes/spaces in .env values
+        _mode = str(raw_mode or "").strip().strip('"\'').lower()
     except Exception:
         _mode = "question_norm"
-    if mem_engine is not None and _mode.startswith("signature"):
+    # Attempt signature-first when memory engine is available; fall back gracefully
+    if mem_engine is not None:
         qnorm = _normalize_question_text(question)
         light_intent = _build_light_intent_from_question(question, allowed_columns_initial)
+        try:
+            li_eq = (light_intent or {}).get("eq_filters") if isinstance(light_intent, dict) else []
+            logger.info(
+                {
+                    "event": "answer.intent.light_built",
+                    "eq_cols": len(li_eq or []),
+                    "order": (light_intent or {}).get("order"),
+                }
+            )
+        except Exception:
+            pass
         try:
             if globals().get("_LOAD_RULES_SRC") == "learning_store":
                 logger.info({"event": "answer.rules.loader.fallback", "src": _LOAD_RULES_SRC})
@@ -2049,11 +2126,34 @@ def answer():
                 online_intent["fts_columns"] = merged.get("fts_columns")
             if merged.get("fts_operator"):
                 online_intent["fts_operator"] = merged.get("fts_operator")
-            if merged.get("eq_filters"):
-                existing = online_intent.setdefault("eq_filters", [])
-                for item in merged.get("eq_filters"):
-                    if item not in existing:
-                        existing.append(item)
+            # Merge EQ with preference to question values (light intent) over seed/rule values
+            try:
+                q_eq = (light_intent or {}).get("eq_filters") or []
+                ex_eq = online_intent.get("eq_filters") or []
+                mg_eq = merged.get("eq_filters") or []
+                # First prefer question over existing (seed), then prefer question over merged
+                combined = _merge_eq_prefer_question(q_eq, ex_eq)
+                combined = _merge_eq_prefer_question(q_eq, combined)
+                # Include any merged-only columns as well
+                combined = _merge_eq_prefer_question(q_eq, mg_eq if mg_eq else combined)
+                # Deduplicate by column preserving order
+                seen = set()
+                final_eq = []
+                for col, vals in combined:
+                    cu = str(col).upper()
+                    if cu in seen:
+                        continue
+                    seen.add(cu)
+                    final_eq.append([cu, vals])
+                if final_eq:
+                    online_intent["eq_filters"] = final_eq
+            except Exception:
+                # Fallback to simple extend
+                if merged.get("eq_filters"):
+                    existing = online_intent.setdefault("eq_filters", [])
+                    for item in merged.get("eq_filters"):
+                        if item not in existing:
+                            existing.append(item)
             # Support both merged["order"] or sort_by/sort_desc keys
             order_obj = merged.get("order") if isinstance(merged.get("order"), dict) else None
             if order_obj:
@@ -2080,6 +2180,15 @@ def answer():
             except Exception:
                 pass
 
+    # If no EQ was loaded from rules/seed, fall back to light-intent EQ parsed from the question
+    try:
+        if not online_intent.get("eq_filters"):
+            li_eq = (light_intent or {}).get("eq_filters") if isinstance(light_intent, dict) else None
+            if isinstance(li_eq, list) and li_eq:
+                online_intent["eq_filters"] = li_eq
+    except Exception:
+        pass
+
     # Sanitize EQ filters and detect cross-column OR groups from the question
     try:
         _sanitize_eq_values(online_intent, allowed_columns_initial)
@@ -2089,6 +2198,10 @@ def answer():
         # NLU: inline equality from question with multi-value OR per column
         inline_pairs = parse_eq_inline(question, allowed_columns_initial)
         if inline_pairs:
+            try:
+                logger.info({"event": "answer.inline_eq.parsed", "pairs": len(inline_pairs)})
+            except Exception:
+                pass
             existing = online_intent.setdefault("eq_filters", [])
             for col, vals in inline_pairs:
                 existing.append([col, list(vals)])
@@ -2208,9 +2321,19 @@ def answer():
         except Exception:
             logger.info({"event": "planner.contract.plan.ok"})
         binds = _coerce_bind_dates(dict(contract_binds or {}))
-        contract_sql, binds, online_meta = _apply_online_rate_hints(
-            contract_sql, binds, online_intent
-        )
+        # Final guard: if no EQ present in online intent, fallback to light-intent EQ
+        try:
+            if not online_intent.get("eq_filters"):
+                li_eq = (light_intent or {}).get("eq_filters") if isinstance(light_intent, dict) else None
+                if isinstance(li_eq, list) and li_eq:
+                    online_intent["eq_filters"] = li_eq
+                    try:
+                        logger.info({"event": "answer.intent.eq.fallback_li", "cols": len(li_eq)})
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        contract_sql, binds, online_meta = _apply_online_rate_hints(contract_sql, binds, online_intent)
         if ":top_n" in contract_sql and "top_n" not in binds:
             binds["top_n"] = 10
         # LOG: تنفيذ SQL للمسار الحتمي

@@ -13,6 +13,10 @@ import sqlalchemy as sa
 
 from apps.dw.memory_db import get_mem_engine
 from apps.dw.lib.intent_sig import build_intent_signature
+try:  # prefer the canonical, value-agnostic signature from learning_store
+    from apps.dw.learning_store import _canon_signature_from_intent as _canon_sig  # type: ignore
+except Exception:  # fallback stub; will recompute locally if needed
+    _canon_sig = None  # type: ignore
 
 log = logging.getLogger("dw")
 
@@ -65,6 +69,10 @@ _MIGRATIONS = (
     "ALTER TABLE dw_rules ADD COLUMN IF NOT EXISTS rule_signature TEXT",
     "ALTER TABLE dw_rules ADD COLUMN IF NOT EXISTS intent_sig JSONB",
     "ALTER TABLE dw_rules ADD COLUMN IF NOT EXISTS intent_sha TEXT",
+    # Performance indexes for signature-first lookups
+    "CREATE INDEX IF NOT EXISTS idx_dw_rules_intent_sha ON dw_rules (intent_sha)",
+    "CREATE INDEX IF NOT EXISTS idx_dw_rules_rule_signature ON dw_rules (rule_signature)",
+    "CREATE INDEX IF NOT EXISTS idx_dw_rules_question_norm ON dw_rules (question_norm)",
 )
 
 
@@ -197,25 +205,38 @@ def save_positive_rule(
 
     # Prefer external signature artifacts; else build from provided intent if any
     signature_json: Optional[str] = rule_signature
+    # Prefer value-agnostic signature shape if available
     if signature_json is None and isinstance(intent, dict) and intent:
         try:
-            sig_dict, sig_str, sha = build_intent_signature(intent)
-            signature_json = sig_str
-            if intent_sig is None:
-                intent_sig = sig_dict
-            if intent_sha is None:
-                intent_sha = sha
+            if _canon_sig:
+                sha256, sha1, sig_text = _canon_sig(intent)  # type: ignore[misc]
+                signature_json = sig_text
+                if intent_sig is None:
+                    try:
+                        intent_sig = json.loads(sig_text)
+                    except Exception:
+                        intent_sig = None
+                if intent_sha is None:
+                    intent_sha = sha256
+            else:
+                # Fallback to legacy value-based signature
+                sig_dict, sig_str, sha = build_intent_signature(intent)
+                signature_json = sig_str
+                if intent_sig is None:
+                    intent_sig = sig_dict
+                if intent_sha is None:
+                    intent_sha = _sha256(sig_str)
         except Exception:
             signature_json = None
 
-    intent_sha: Optional[str] = None
+    # Normalize intent_sig object if still a JSON string
     intent_sig_obj: Optional[Dict[str, Any]] = None
-    if signature_json:
+    if isinstance(intent_sig, dict):
+        intent_sig_obj = intent_sig
+    elif signature_json:
         try:
-            intent_sha = _sha256(signature_json)
             intent_sig_obj = json.loads(signature_json)
         except Exception:
-            intent_sha = None
             intent_sig_obj = None
 
     with engine.begin() as cx:
@@ -232,10 +253,22 @@ def save_positive_rule(
                     "k": kind,
                     "p": _json_dumps(payload),
                     "sig": signature_json,
-                    "sig_json": json.dumps(intent_sig) if intent_sig is not None else None,
+                    "sig_json": json.dumps(intent_sig_obj) if intent_sig_obj is not None else None,
                     "sha": intent_sha,
                 },
             )
+    try:
+        log.info(
+            {
+                "event": "rules.save",
+                "question_norm": _norm_question(question),
+                "kinds": [k for k, _ in rows],
+                "has_sig": bool(signature_json),
+                "sig_len": len(signature_json or ""),
+            }
+        )
+    except Exception:
+        pass
 
 
 def save_patch(
@@ -323,6 +356,18 @@ def load_rules_for_question(
     eq_from_rules: List[Any] = []
 
     with engine.connect() as cx:
+        try:
+            sig_for_log = None
+            if intent is not None:
+                if _canon_sig:
+                    sha256, sha1, sig_text = _canon_sig(intent)  # type: ignore[misc]
+                else:
+                    sig_dict, sig_text, sha1 = build_intent_signature(intent)
+                    sha256 = _sha256(sig_text)
+                sig_for_log = {"sha1": sha1, "sha256": sha256, "sig_len": len(sig_text or "")}
+            log.info({"event": "rules.signature.compute", "qnorm": norm, **(sig_for_log or {})})
+        except Exception:
+            pass
         # Helper to execute and return mapping rows
         def _exec(sql: str, binds: Dict[str, Any]):
             return (
@@ -362,11 +407,15 @@ def load_rules_for_question(
                 {"sig": _json_dumps(intent_sig)},
             )
 
-        # 3) Build from provided intent (derive both SHA-1 and SHA-256)
+        # 3) Build from provided intent (derive both SHA-1 and SHA-256) using value-agnostic shape
         if not rows and intent:
             try:
-                sig_dict, sig_str, sha1 = build_intent_signature(intent)
-                sha256 = _sha256(sig_str)
+                if _canon_sig:
+                    sha256, sha1, sig_str = _canon_sig(intent)  # type: ignore[misc]
+                else:
+                    # Fallback to legacy: use value-based signature then convert to both hashes
+                    sig_dict, sig_str, sha1 = build_intent_signature(intent)
+                    sha256 = _sha256(sig_str)
                 rows = _exec(
                     """
                     SELECT rule_kind AS rule_kind, rule_payload AS rule_payload
@@ -406,7 +455,18 @@ def load_rules_for_question(
                 """,
                 {"q": norm},
             )
+        try:
+            log.info(
+                {
+                    "event": "rules.load.summary",
+                    "by_sha": bool(intent_sha),
+                    "rows": len(rows or []),
+                }
+            )
+        except Exception:
+            pass
 
+    kinds_found: List[str] = []
     for row in rows:
         # RowMapping → dict-like access
         kind = row.get("rule_kind")
@@ -425,6 +485,7 @@ def load_rules_for_question(
         if not isinstance(payload, dict):
             continue
         k = str(kind or "").lower()
+        kinds_found.append(k)
 
         if k == "rate_hint":
             # Back-compat: payload = {"intent": {...}, "binds": {...}, "resolved_sql": "..."}
@@ -498,6 +559,18 @@ def load_rules_for_question(
         merged["eq_filters"] = _merge_eq_filters_prefer_question(
             (intent or {}).get("eq_filters"), eq_from_rules
         )
+    try:
+        log.info(
+            {
+                "event": "rules.merged",
+                "kinds": sorted(set(kinds_found)),
+                "has_eq": bool(merged.get("eq_filters")),
+                "has_order": bool(merged.get("sort_by") or merged.get("order")),
+                "has_fts": bool(merged.get("fts_tokens")),
+            }
+        )
+    except Exception:
+        pass
     return merged
 
 
