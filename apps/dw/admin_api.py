@@ -13,6 +13,7 @@ from sqlalchemy.engine import Connection
 
 from apps.dw.db import get_memory_session
 from apps.dw.learning import save_positive_rule
+from apps.dw.rate_parser import build_intent_signature as _build_sig, signature_text as _sig_text, signature_sha as _sig_sha
 from apps.dw.memory_db import get_memory_engine
 from apps.dw.order_utils import normalize_order_hint
 
@@ -275,11 +276,7 @@ def approve_feedback(fid: int):
 
             make_rule = create_rule or apply_patch
             if make_rule:
-                intent = (
-                    normalized_intent
-                    if isinstance(normalized_intent, dict)
-                    else {}
-                )
+                intent = normalized_intent if isinstance(normalized_intent, dict) else {}
                 eq_filters_val = intent.get("eq_filters") or []
                 if isinstance(eq_filters_val, list):
                     eq_filters = [item for item in eq_filters_val if item is not None]
@@ -310,7 +307,21 @@ def approve_feedback(fid: int):
 
                 if question and has_rule:
                     engine = get_memory_engine()
-                    save_positive_rule(engine, question, applied_hints)
+                    # Build signature artifacts from intent when available
+                    try:
+                        sig_obj = _build_sig(intent) if intent else None
+                        sig_txt = _sig_text(sig_obj) if sig_obj else None
+                        sig_sha = _sig_sha(sig_obj) if sig_obj else None
+                    except Exception:
+                        sig_obj, sig_txt, sig_sha = None, None, None
+                    save_positive_rule(
+                        engine,
+                        question,
+                        applied_hints,
+                        rule_signature=sig_txt,
+                        intent_sig=sig_obj,
+                        intent_sha=sig_sha,
+                    )
                     rule_created = True
                     logger.info(
                         "admin.approve.rule.ok",

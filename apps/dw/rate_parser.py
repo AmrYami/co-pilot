@@ -1,113 +1,68 @@
 import json
-import re
 from typing import Dict, List, Tuple, Any
+from apps.dw.lib.sql_utils import is_email, is_phone
+import hashlib
 
-EMAIL_RE = re.compile(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b")
-PHONE_RE = re.compile(r"\b\+?\d{7,15}\b")
-
-
-def is_email(s: str) -> bool:
-    return bool(EMAIL_RE.search(s or ""))
-
-
-def is_phone(s: str) -> bool:
-    return bool(PHONE_RE.search(s or ""))
+VALUE_TEXT = "TEXT"
+VALUE_EMAIL = "EMAIL"
+VALUE_PHONE = "PHONE"
+VALUE_NUMBER = "NUMBER"
 
 
-def _norm_val(v: str) -> str:
-    # Keep original case; SQL side applies UPPER(:bind) when needed
-    return (v or "").strip()
+def _value_type(v: str) -> str:
+    s = (v or "").strip()
+    if is_email(s):
+        return VALUE_EMAIL
+    if is_phone(s):
+        return VALUE_PHONE
+    try:
+        float(s)
+        return VALUE_NUMBER
+    except Exception:
+        return VALUE_TEXT
 
 
-def parse_eq(text: str) -> Dict[str, Dict[str, List[str]]]:
+def build_intent_signature(intent: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Supports multi-value equality hints inside /dw/rate comments.
-      eq: COL = v1 | v2 | v3
-      eq: COL = v1, v2, v3
-    Returns: { "COL": {"op": "in", "values": [..]} }
+    Value-agnostic signature capturing shapes and types only.
+    eq becomes {COL: {op: in|eq, types: [EMAIL|PHONE|NUMBER|TEXT]}}
+    fts drops emails/phones and lowercases tokens.
     """
-    out: Dict[str, Dict[str, List[str]]] = {}
-    for m in re.finditer(r"(?i)\beq\s*:\s*([A-Z0-9_]+)\s*=\s*([^;]+)", text or ""):
-        col = (m.group(1) or "").upper().strip()
-        rhs = (m.group(2) or "").strip()
-        parts = re.split(r"\s*\|\s*|,\s*", rhs)
-        vals = [_norm_val(p) for p in parts if p and _norm_val(p)]
-        if not vals:
-            continue
-        entry = out.setdefault(col, {"op": "in", "values": []})
-        entry["values"].extend(vals)
-        # deduplicate preserving order
-        seen: set[str] = set()
-        entry["values"] = [x for x in entry["values"] if not (x in seen or seen.add(x))]
-    return out
+    sig: Dict[str, Any] = {"eq": {}, "fts": [], "group_by": [], "order": {}}
+    for col, values in intent.get("eq_filters", []) or []:
+        col_u = str(col or "").upper()
+        types = sorted({_value_type(v) for v in (values or [])})
+        sig["eq"][col_u] = {"op": "in" if len(values or []) > 1 else "eq", "types": types}
+
+    cross = intent.get("or_groups") or []
+    if cross:
+        sig["or_groups"] = []
+        for grp in cross:
+            cols = sorted({str(c or "").upper() for c, _ in (grp or [])})
+            if cols:
+                sig["or_groups"].append(cols)
+        sig["or_groups"] = sorted(sig["or_groups"]) if sig.get("or_groups") else []
+
+    toks: List[str] = []
+    for g in intent.get("fts_groups", []) or []:
+        for t in g or []:
+            t0 = (t or "").strip()
+            if not t0 or is_email(t0) or is_phone(t0):
+                continue
+            toks.append(t0.lower())
+    if toks:
+        sig["fts"] = sorted(list(dict.fromkeys(toks)))
+
+    if intent.get("group_by"):
+        sig["group_by"] = [str(c or "").upper() for c in intent.get("group_by") or []]
+    if intent.get("sort_by"):
+        sig["order"] = {"col": intent.get("sort_by"), "desc": bool(intent.get("sort_desc", True))}
+    return sig
 
 
-def parse_or_group(text: str) -> List[Dict[str, Dict[str, List[str]]]]:
-    """
-    or_group: (eq: COL1 = A | B), (eq: COL2 = C | D)
-    Returns a list of group dicts. Each group is OR'd with the next.
-    """
-    groups: List[Dict[str, Dict[str, List[str]]]] = []
-    for g in re.finditer(r"(?is)or_group\s*:\s*\((.*?)\)(?:\s*,\s*\((.*?)\))*", text or ""):
-        whole = g.group(0) or ""
-        inner = re.findall(r"\((.*?)\)", whole)
-        grp: Dict[str, Dict[str, List[str]]] = {}
-        for blob in inner:
-            sub = parse_eq(blob)
-            for c, spec in sub.items():
-                dst = grp.setdefault(c, {"op": "in", "values": []})
-                dst["values"].extend(spec.get("values") or [])
-        for c, spec in list(grp.items()):
-            seen: set[str] = set()
-            vals = spec.get("values") or []
-            grp[c]["values"] = [x for x in vals if not (x in seen or seen.add(x))]
-        if grp:
-            groups.append(grp)
-    return groups
+def signature_text(sig: Dict[str, Any]) -> str:
+    return json.dumps(sig or {}, sort_keys=True, separators=(",", ":"))
 
 
-def build_intent_signature(intent: Dict[str, Any]) -> str:
-    """
-    Deterministic signature JSON for an intent. Sorts lists/keys to ensure stability.
-    Expected subset shape:
-      intent = {
-        "eq_filters": [["ENTITY", ["DSFH"]], ["REPRESENTATIVE_EMAIL", ["a@x","b@y"]]],
-        "fts_groups": [["it"],["home care"]],
-        "sort_by": "REQUEST_DATE", "sort_desc": True,
-        "group_by": ["ENTITY"],
-      }
-    """
-    sig = {"eq": {}, "fts": [], "order": {}, "group_by": []}
-
-    # eq
-    for pair in intent.get("eq_filters", []) or []:
-        try:
-            col, vals = pair[0], pair[1]
-        except Exception:
-            continue
-        col_u = (col or "").upper().strip()
-        vals_n = [_norm_val(v) for v in (vals or []) if _norm_val(v)]
-        sig["eq"][col_u] = sorted(set(vals_n))
-
-    # fts
-    for grp in intent.get("fts_groups", []) or []:
-        toks = [_norm_val(t) for t in (grp or []) if _norm_val(t)]
-        if toks:
-            sig["fts"].append(sorted(set(toks)))
-
-    # order
-    sig["order"] = {
-        "col": (intent.get("sort_by") or "").upper(),
-        "desc": bool(intent.get("sort_desc", True)),
-    }
-
-    # group_by
-    gcols = intent.get("group_by") or []
-    if isinstance(gcols, str):
-        parts = [gcols]
-    else:
-        parts = list(gcols)
-    sig["group_by"] = sorted({(c or "").upper() for c in parts if (c or "").strip()})
-
-    return json.dumps(sig, sort_keys=True, ensure_ascii=False)
-
+def signature_sha(sig: Dict[str, Any]) -> str:
+    return hashlib.sha1(signature_text(sig).encode("utf-8")).hexdigest()

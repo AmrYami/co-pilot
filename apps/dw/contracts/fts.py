@@ -2,6 +2,7 @@
 from __future__ import annotations
 import re
 from typing import List, Tuple, Dict
+from apps.dw.lib.sql_utils import is_email, is_phone
 try:
     # Reuse email/phone detectors to keep FTS tokens clean
     from apps.dw.rate_parser import is_email, is_phone
@@ -169,3 +170,24 @@ def build_fts_where(
 
     where_sql = "(" + " OR ".join(clauses) + ")"
     return where_sql, binds
+
+
+def build_tokens(groups: List[List[str]]) -> List[List[str]]:
+    """Drop email/phone-like and explicit 'col = val' patterns from token groups."""
+    cleaned: List[List[str]] = []
+    for g in groups or []:
+        g2: List[str] = []
+        for t in g or []:
+            s = (t or "").strip()
+            if not s:
+                continue
+            if is_email(s) or is_phone(s):
+                continue
+            if "=" in s:
+                left, _, right = s.partition("=")
+                if left.strip() and right.strip():
+                    continue
+            g2.append(s)
+        if g2:
+            cleaned.append(g2)
+    return cleaned

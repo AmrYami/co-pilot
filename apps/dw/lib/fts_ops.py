@@ -6,11 +6,39 @@ Respects settings:
   - DW_FTS_ENGINE  (currently supports "like"; other values fallback to "like")
 """
 from typing import Dict, List, Tuple
+import re
 
 
 def _normalize_tokens(raw: str) -> str:
     # minimal normalization: trim + collapse spaces
     return " ".join((raw or "").strip().split())
+
+
+# Hygiene: exclude tokens that are clearly EQ-like (emails/phones or explicit
+# left-hand sides for known EQ columns) from FTS handling.
+EMAIL_RE = re.compile(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b")
+PHONE_RE = re.compile(r"\b(?:\+?\d[\d\s\-]{6,})\b")
+EQ_LHS = {"representative_email", "representative_phone", "entity", "entity_no"}
+
+
+def _scrub_eq_like_tokens(groups: List[List[str]]) -> List[List[str]]:
+    cleaned: List[List[str]] = []
+    for grp in groups or []:
+        out: List[str] = []
+        for t in grp or []:
+            s = (t or "").strip()
+            if not s:
+                continue
+            if EMAIL_RE.fullmatch(s) or PHONE_RE.fullmatch(s):
+                continue
+            if "=" in s:
+                left = s.split("=", 1)[0].strip().lower()
+                if left in EQ_LHS:
+                    continue
+            out.append(s)
+        if out:
+            cleaned.append(out)
+    return cleaned
 
 
 def detect_fts_groups(question: str) -> Tuple[List[List[str]], str]:
@@ -83,6 +111,8 @@ def build_fts_where_like(
     binds: Dict[str, str] = {}
     if not columns or not groups:
         return "", binds, {"enabled": False, "error": "no_columns"}
+    # scrub PII/EQ-like tokens from FTS
+    groups = _scrub_eq_like_tokens(groups)
 
     # Each token gets a bind like :fts_0, :fts_1, ...
     bind_list = []

@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 from typing import Dict, List
+import re
 
 
 def gross_expr() -> str:
@@ -57,3 +58,22 @@ def or_join(clauses: List[str]) -> str:
     if not parts:
         return ""
     return "(" + " OR ".join(parts) + ")"
+
+
+# Simple detectors reused by parsers/FTS scrubbers
+EMAIL_RE = re.compile(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b")
+PHONE_RE = re.compile(r"\b(?:\+?\d{7,15})\b")
+
+
+def is_email(text: str) -> bool:
+    try:
+        return bool(EMAIL_RE.fullmatch(str(text).strip()))
+    except Exception:
+        return False
+
+
+def is_phone(text: str) -> bool:
+    try:
+        return bool(PHONE_RE.fullmatch(str(text).strip()))
+    except Exception:
+        return False

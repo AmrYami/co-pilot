@@ -519,6 +519,13 @@ cases:
       not_contains:
         - 'SELECT COUNT(*) AS CNT FROM "Contract" WHERE (UPPER(ENTITY_NO) ='
 
+  # === FTS excludes email/phone tokens ===
+  - id: fts_excludes_email_phone
+    question: "list all contracts has it or home care and ENTITY = DSFH and REPRESENTATIVE_EMAIL = samer@procare-sa.com or mm@fakeeh.care and REPRESENTATIVE_PHONE = 0500199556"
+    full_text_search: true
+    expect_sql_contains:
+      - 'ORDER BY REQUEST_DATE DESC'
+
   - id: eq_rules_applied_in_contract_deterministic
     question: "list all contracts has it or home care and ENTITY = DSFH and REPRESENTATIVE_EMAIL = samer@procare-sa.com"
     full_text_search: true

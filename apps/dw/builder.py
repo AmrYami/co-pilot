@@ -10,6 +10,7 @@ from apps.dw.fts import build_fts_clause
 from .intent import NLIntent
 from .sql_builders import window_predicate
 from .utils import env_flag
+from apps.dw.lib.sql_utils import in_expr, upper_trim, or_join
 
 TABLE = '"Contract"'
 
@@ -227,6 +228,57 @@ def apply_online_rate_hints(intent: dict, settings: Any) -> Tuple[str, Dict[str,
     eq_filters = intent.get("eq_filters") or []
     clause, binds = _eq_clause_from_filters(eq_filters, {}, bind_prefix="eq")
     return clause, binds
+
+
+# Convenience public helpers (deterministic EQ/OR building)
+def eq_clause_from_filters(eq_filters: List[Tuple[str, List[str]]], binds: Dict[str, Any], start_idx: int = 0) -> Tuple[str, int]:
+    """Aggregate same-column values to IN(...). Returns (clause, next_bind_index)."""
+    if not eq_filters:
+        return "", start_idx
+    per_col: Dict[str, List[str]] = {}
+    for col, vals in eq_filters or []:
+        if not col:
+            continue
+        per_col.setdefault(str(col).upper().strip(), []).extend(list(vals or []))
+    clauses: List[str] = []
+    next_idx = start_idx
+    for col, vals in per_col.items():
+        if not vals:
+            continue
+        names: List[str] = []
+        for v in vals:
+            name = f"eq_{next_idx}"
+            next_idx += 1
+            binds[name] = (v.upper() if isinstance(v, str) else v)
+            names.append(name)
+        col_sql = f'"{col}"'
+        if len(names) == 1:
+            clauses.append(f"{upper_trim(col_sql)} IN (UPPER(:{names[0]}))")
+        else:
+            clauses.append(in_expr(col_sql, names))
+    return (" AND ".join(f"({c})" for c in clauses if c), next_idx)
+
+
+def or_groups_clause(or_groups: List[List[Tuple[str, List[str]]]], binds: Dict[str, Any], start_idx: int = 0) -> Tuple[str, int]:
+    """Build (colA IN (...) OR colB IN (...)) groups and return (clause, next_idx)."""
+    idx = start_idx
+    groups_sql: List[str] = []
+    for grp in or_groups or []:
+        parts: List[str] = []
+        for col, vals in grp or []:
+            if not vals:
+                continue
+            names: List[str] = []
+            for v in vals:
+                name = f"eq_{idx}"
+                idx += 1
+                binds[name] = (v.upper() if isinstance(v, str) else v)
+                names.append(name)
+            col_sql = f'"{str(col).upper().strip()}"'
+            parts.append(in_expr(col_sql, names))
+        if parts:
+            groups_sql.append(or_join(parts))
+    return (" AND ".join(f"({g})" for g in groups_sql if g), idx)
 
 
 def build_sql(intent: NLIntent) -> Tuple[str, Dict[str, Any]]:

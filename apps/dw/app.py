@@ -95,6 +95,7 @@ from .answer.nlu_eq_parser import parse_from_question as parse_eq_inline
 from .tests.rate_suite import rate_tests_bp
 from .tests.routes import tests_bp as rate_builder_tests_bp
 from .tests.golden_runner_rate import golden_rate_bp
+from apps.dw.learning import load_rules_for_question as _load_rules_by_sig
 
 LOGGER = logging.getLogger("dw.app")
 
@@ -1777,6 +1778,52 @@ def answer():
                 online_hints_applied = max(online_hints_applied, 1)
     except Exception as exc:
         LOGGER.warning("[dw] failed to load persisted rules: %s", exc)
+    # Prefer signature-based rules using a light intent (inline EQ + default order)
+    try:
+        mem_engine = get_memory_engine()
+    except Exception:
+        mem_engine = None
+    try:
+        qnorm = _normalize_question_text(question)
+        allowed_columns_initial = allowed_columns_initial if 'allowed_columns_initial' in locals() else []
+        inline_pairs = parse_eq_inline(question, allowed_columns_initial)
+        intent_hint = {
+            "eq_filters": inline_pairs or [],
+            "group_by": [],
+            "order": {"col": "REQUEST_DATE", "desc": True},
+        }
+        if mem_engine is not None:
+            merged = _load_rules_by_sig(mem_engine, qnorm, intent=intent_hint)
+            if isinstance(merged, dict) and merged:
+                # Merge signature-matched rules into online_intent
+                if merged.get("fts_tokens"):
+                    online_intent["fts_tokens"] = merged.get("fts_tokens")
+                    online_intent["full_text_search"] = True
+                if merged.get("fts_columns"):
+                    online_intent["fts_columns"] = merged.get("fts_columns")
+                if merged.get("fts_operator"):
+                    online_intent["fts_operator"] = merged.get("fts_operator")
+                if merged.get("eq_filters"):
+                    existing = online_intent.setdefault("eq_filters", [])
+                    for item in merged.get("eq_filters"):
+                        if item not in existing:
+                            existing.append(item)
+                if merged.get("sort_by"):
+                    online_intent["sort_by"] = merged.get("sort_by")
+                if merged.get("sort_desc") is not None:
+                    online_intent["sort_desc"] = bool(merged.get("sort_desc"))
+                if merged.get("group_by"):
+                    online_intent["group_by"] = merged.get("group_by")
+                if merged.get("gross") is not None:
+                    online_intent["gross"] = bool(merged.get("gross"))
+                online_hints_applied += 1
+                try:
+                    logger.info({"event": "answer.rules.signature.loaded"})
+                except Exception:
+                    pass
+    except Exception:
+        # signature-based loader is best effort; continue with classic loader
+        pass
     try:
         recent_hints = load_recent_hints(question, ttl_seconds=900)
         online_hints_applied += len(recent_hints)
