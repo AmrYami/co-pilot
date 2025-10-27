@@ -757,6 +757,51 @@ def _val_type(v: str) -> str:
     return "TEXT"
 
 
+def _augment_light_intent_with_aliases(question: str, light_intent: dict, alias_keys: List[str]) -> None:
+    """Augment light intent with alias-based EQ for signature matching only.
+
+    Scans the question for patterns like "ALIAS = value1 or value2" for any alias
+    key from DW_EQ_ALIAS_COLUMNS and injects a logical EQ on that alias (not the
+    real columns). This is used only to build a stable, value-agnostic signature
+    so signature-first rule matching works even when users vary phrasing/values.
+    """
+    if not question or not isinstance(light_intent, dict) or not alias_keys:
+        return
+    q = question or ""
+    eq_filters = light_intent.setdefault("eq_filters", [])
+    for raw_key in alias_keys:
+        if not isinstance(raw_key, str):
+            continue
+        key = raw_key.strip()
+        if not key:
+            continue
+        try:
+            # Build a case-insensitive regex that tolerates spaces in alias keys
+            pattern = re.compile(rf"(?i)\b{re.escape(key)}\b\s*=\s*([^\n\r;]+)")
+            m = pattern.search(q)
+            if not m:
+                continue
+            rhs = m.group(1).strip()
+            # Split OR/comma separated values (signature uses types only)
+            parts = re.split(r"(?i)\s*\bor\b\s*|,", rhs)
+            vals = [p.strip(" '\"\t()") for p in parts if p and p.strip()]
+            if vals:
+                alias_key_norm = key.upper()
+                # Avoid duplication if an EQ for this alias already exists
+                already = False
+                for it in eq_filters:
+                    if isinstance(it, (list, tuple)) and len(it) == 2 and str(it[0]).upper() == alias_key_norm:
+                        already = True
+                        break
+                    if isinstance(it, dict) and str(it.get("col") or it.get("field") or "").upper() == alias_key_norm:
+                        already = True
+                        break
+                if not already:
+                    eq_filters.append([alias_key_norm, vals])
+        except Exception:
+            continue
+
+
 def _build_light_intent_from_question(q: str, allowed_cols) -> dict:
     """استخراج EQ من جزء WHERE فقط، مع دعم OR/الفواصل، وأنواع القيم.
 
@@ -937,13 +982,19 @@ def _sanitize_eq_values(intent: Dict[str, Any], allowed_cols: Sequence[str]) -> 
         # Accept both dict form and list-of-lists [["COL", [v1,v2,...]], ...]
         if isinstance(f, dict):
             col = (f.get("col") or f.get("column") or "").strip().upper()
-            if not col or (allowed and col not in allowed):
+            if not col:
+                continue
+            # Keep only explicitly allowed columns
+            if allowed and col not in allowed:
                 continue
             val = f.get("val") if f.get("val") is not None else f.get("value")
             grouped.setdefault(col, []).append(val)
         elif isinstance(f, (list, tuple)) and len(f) == 2:
             col = str(f[0] or "").strip().upper()
-            if not col or (allowed and col not in allowed):
+            if not col:
+                continue
+            # Keep only explicitly allowed columns
+            if allowed and col not in allowed:
                 continue
             vals = f[1]
             if isinstance(vals, (list, tuple, set)):
@@ -2087,6 +2138,13 @@ def answer():
     if mem_engine is not None:
         qnorm = _normalize_question_text(question)
         light_intent = _build_light_intent_from_question(question, allowed_columns_initial)
+        # Augment signature intent with alias-based EQ from settings (DW_EQ_ALIAS_COLUMNS)
+        try:
+            alias_map_raw = _get_namespace_mapping(settings, namespace, "DW_EQ_ALIAS_COLUMNS", {}) or {}
+            alias_keys = [str(k).strip() for k in alias_map_raw.keys() if str(k).strip()]
+            _augment_light_intent_with_aliases(question, light_intent, alias_keys)
+        except Exception:
+            pass
         # Alias-aware hint for signature-only: detect "departments = X" and add DEPARTMENT eq for matching
         try:
             m = re.search(r"(?i)\bdepartments?\s*=\s*([^\n\r;]+)", question or "")
@@ -2226,9 +2284,30 @@ def answer():
     except Exception:
         pass
 
-    # Sanitize EQ filters and detect cross-column OR groups from the question
+    # Sanitize EQ filters; expand alias columns into OR groups; detect cross-column OR groups from the question
     try:
         _sanitize_eq_values(online_intent, allowed_columns_initial)
+        # Namespace alias expansion (e.g., DEPARTMENT/OWNER/EMAIL/PHONE etc.) using DW_EQ_ALIAS_COLUMNS
+        try:
+            alias_map_raw = _get_namespace_mapping(settings, namespace, "DW_EQ_ALIAS_COLUMNS", {}) or {}
+            alias_map: Dict[str, List[str]] = {}
+            if isinstance(alias_map_raw, dict):
+                for k, cols in alias_map_raw.items():
+                    if not isinstance(cols, (list, tuple, set)):
+                        continue
+                    bucket: List[str] = []
+                    seen: set[str] = set()
+                    for c in cols:
+                        s = str(c or "").strip().upper()
+                        if s and s not in seen:
+                            seen.add(s)
+                            bucket.append(s)
+                    if bucket:
+                        alias_map[str(k or "").strip().upper()] = bucket
+            if alias_map:
+                _expand_eq_aliases_with_map(online_intent, alias_map)
+        except Exception:
+            pass
         or_groups = _extract_or_groups_from_question(question, allowed_columns_initial)
         if or_groups:
             online_intent["or_groups"] = or_groups

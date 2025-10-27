@@ -74,6 +74,8 @@ _MIGRATIONS = (
     "CREATE INDEX IF NOT EXISTS idx_dw_rules_intent_sha ON dw_rules (intent_sha)",
     "CREATE INDEX IF NOT EXISTS idx_dw_rules_rule_signature ON dw_rules (rule_signature)",
     "CREATE INDEX IF NOT EXISTS idx_dw_rules_question_norm ON dw_rules (question_norm)",
+    # Ensure ON CONFLICT (intent_sha, rule_kind) is valid in Postgres
+    "CREATE UNIQUE INDEX IF NOT EXISTS ux_dw_rules_sha_kind ON dw_rules (intent_sha, rule_kind)",
 )
 
 
@@ -290,6 +292,12 @@ def save_positive_rule(
                     """
                     INSERT INTO dw_rules (question_norm, rule_kind, rule_payload, enabled, rule_signature, intent_sig, intent_sha)
                     VALUES (:q, :k, CAST(:p AS JSONB), TRUE, :sig, CAST(:sig_json AS JSONB), :sha)
+                    ON CONFLICT (intent_sha, rule_kind) DO UPDATE SET
+                        question_norm = EXCLUDED.question_norm,
+                        rule_payload  = EXCLUDED.rule_payload,
+                        rule_signature = EXCLUDED.rule_signature,
+                        intent_sig    = EXCLUDED.intent_sig,
+                        enabled       = TRUE
                     """
                 ),
                 {

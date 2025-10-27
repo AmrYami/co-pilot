@@ -35,21 +35,46 @@ def _flatten_fts_groups(intent: dict) -> list[str]:
     return tokens
 
 
-def _get_admin_emails(conn: Connection) -> set[str]:
-    """Load ADMIN_EMAILS from mem_settings."""
+def _get_admin_emails(conn: Connection, namespace: str | None = None) -> set[str]:
+    """Load ADMIN_EMAILS from mem_settings.
+
+    Preference order:
+    1) namespace-scoped row for the provided namespace
+    2) global-scoped row (any namespace)
+    3) fallback to env ADMIN_EMAILS_CSV
+    """
+    ns = (namespace or "dw::common").strip()
+
+    # 1) Namespace-scoped
     row = conn.execute(
         text(
             """
             SELECT value, value_type
               FROM mem_settings
              WHERE key='ADMIN_EMAILS'
+               AND namespace = :ns
              ORDER BY
                CASE WHEN scope='namespace' THEN 0 ELSE 1 END,
-               key
+               updated_at DESC
              LIMIT 1
             """
-        )
+        ),
+        {"ns": ns},
     ).first()
+    # 2) Global-scoped (if nothing found)
+    if not row:
+        row = conn.execute(
+            text(
+                """
+                SELECT value, value_type
+                  FROM mem_settings
+                 WHERE key='ADMIN_EMAILS' AND scope='global'
+                 ORDER BY updated_at DESC
+                 LIMIT 1
+                """
+            )
+        ).first()
+
     if not row:
         fallback = os.getenv("ADMIN_EMAILS_CSV", "")
         if fallback:
@@ -80,11 +105,13 @@ def _require_admin(conn: Optional[Connection] = None) -> str:
     if not auth_email:
         abort(401, description="Missing X-Auth-Email")
 
+    # Prefer namespace from request for resolving ADMIN_EMAILS row
+    ns_for_admin = request.args.get("namespace") or request.headers.get("X-Namespace") or "dw::common"
     if conn is None:
         with eng.begin() as tmp_conn:
-            admins = _get_admin_emails(tmp_conn)
+            admins = _get_admin_emails(tmp_conn, ns_for_admin)
     else:
-        admins = _get_admin_emails(conn)
+        admins = _get_admin_emails(conn, ns_for_admin)
 
     if auth_email.lower() not in admins:
         abort(403, description="Not in ADMIN_EMAILS")

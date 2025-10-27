@@ -66,7 +66,8 @@ def rate():
                 _persist_dw_feedback(
                     inquiry_id=inquiry_id,
                     auth_email=payload.get("auth_email"),
-                    rating=int(rating),
+                    # Be tolerant to missing/None ratings
+                    rating=int(rating or 0),
                     comment=comment or "",
                     intent=intent_dict,
                     resolved_sql=final_sql_str or "",
