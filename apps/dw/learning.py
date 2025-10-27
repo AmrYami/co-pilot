@@ -12,6 +12,7 @@ from sqlalchemy import text
 import sqlalchemy as sa
 
 from apps.dw.memory_db import get_mem_engine
+from apps.dw.sql_shared import eq_alias_columns
 from apps.dw.lib.intent_sig import build_intent_signature
 try:  # prefer the canonical, value-agnostic signature from learning_store
     from apps.dw.learning_store import _canon_signature_from_intent as _canon_sig  # type: ignore
@@ -183,9 +184,52 @@ def save_positive_rule(
             )
         )
 
-    eq_filters = applied_hints.get("eq_filters") or []
-    if eq_filters:
-        rows.append(("eq", {"eq_filters": eq_filters}))
+    # Persist EQ with optional cross-column OR groups when aliases were used
+    raw_eq = applied_hints.get("eq_filters") or []
+    if raw_eq:
+        alias_map: Dict[str, List[str]] = {}
+        try:
+            alias_map = eq_alias_columns()
+        except Exception:
+            alias_map = {}
+        canon_eq: List[List[Any]] = []
+        or_groups: List[List[Dict[str, Any]]] = []
+        def _norm(it) -> tuple[str, List[Any]] | None:
+            if isinstance(it, (list, tuple)) and len(it) == 2:
+                col = str(it[0] or "").upper().strip()
+                vals = it[1]
+                return col, list(vals) if isinstance(vals, (list, tuple, set)) else [vals]
+            if isinstance(it, dict):
+                col = str(it.get("col") or it.get("field") or "").upper().strip()
+                val = it.get("val") if it.get("val") is not None else it.get("value")
+                return col, [val] if val is not None else []
+            return None
+        for it in raw_eq:
+            norm = _norm(it)
+            if not norm:
+                continue
+            col, vals = norm
+            if not col or not vals:
+                continue
+            targets = alias_map.get(col)
+            if targets:
+                for v in vals:
+                    group = [{"col": t, "val": v, "op": "eq", "ci": True, "trim": True} for t in targets]
+                    if group:
+                        or_groups.append(group)
+                continue
+            canon_eq.append([col, vals])
+        payload: Dict[str, Any] = {}
+        if canon_eq:
+            payload["eq_filters"] = canon_eq
+        if isinstance(applied_hints.get("or_groups"), list) and applied_hints.get("or_groups"):
+            # carry through any existing or_groups
+            payload["or_groups"] = applied_hints.get("or_groups")
+        if or_groups:
+            og = payload.setdefault("or_groups", [])
+            og.extend(or_groups)
+        if payload:
+            rows.append(("eq", payload))
 
     sort_by = applied_hints.get("sort_by")
     sort_desc = applied_hints.get("sort_desc")
@@ -545,6 +589,15 @@ def load_rules_for_question(
             eq_payload = payload.get("eq_filters") or []
             if eq_payload:
                 eq_from_rules.extend(eq_payload)
+            og = payload.get("or_groups") or []
+            if isinstance(og, list) and og:
+                try:
+                    existing_og = merged.setdefault("or_groups", [])
+                    for grp in og:
+                        if isinstance(grp, list) and grp:
+                            existing_og.append(grp)
+                except Exception:
+                    pass
         elif k == "order_by":
             if payload.get("sort_by"):
                 merged["sort_by"] = payload.get("sort_by")

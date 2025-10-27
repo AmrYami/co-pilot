@@ -908,6 +908,10 @@ def _coalesce_rate_intent(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     if tokens and not intent.get("full_text_search"):
         intent["full_text_search"] = True
 
+    if "or_groups" in raw and isinstance(raw.get("or_groups"), list):
+        # Preserve cross-column OR groups from learned hints
+        intent["or_groups"] = [grp for grp in raw.get("or_groups") if isinstance(grp, list) and grp]
+
     if "sort_desc" in intent:
         intent["sort_desc"] = _coerce_bool_flag(intent.get("sort_desc"), default=True)
     if "gross" in intent:
@@ -2083,6 +2087,29 @@ def answer():
     if mem_engine is not None:
         qnorm = _normalize_question_text(question)
         light_intent = _build_light_intent_from_question(question, allowed_columns_initial)
+        # Alias-aware hint for signature-only: detect "departments = X" and add DEPARTMENT eq for matching
+        try:
+            m = re.search(r"(?i)\bdepartments?\s*=\s*([^\n\r;]+)", question or "")
+            if m:
+                val = m.group(1).strip().strip("'\"")
+                if val:
+                    eqs = light_intent.setdefault("eq_filters", [])
+                    has_dep = False
+                    for it in eqs:
+                        if isinstance(it, (list, tuple)) and len(it) == 2 and str(it[0]).upper().strip() == "DEPARTMENT":
+                            has_dep = True
+                            break
+                        if isinstance(it, dict) and str(it.get("col") or it.get("field") or "").upper().strip() == "DEPARTMENT":
+                            has_dep = True
+                            break
+                    if not has_dep:
+                        eqs.append(["DEPARTMENT", [val]])
+                        try:
+                            logger.info({"event": "answer.intent.alias_eq", "col": "DEPARTMENT", "val": val})
+                        except Exception:
+                            pass
+        except Exception:
+            pass
         try:
             li_eq = (light_intent or {}).get("eq_filters") if isinstance(light_intent, dict) else []
             logger.info(
@@ -2154,6 +2181,16 @@ def answer():
                     for item in merged.get("eq_filters"):
                         if item not in existing:
                             existing.append(item)
+            # Carry over learned cross-column OR groups (e.g., alias expansions)
+            try:
+                og = merged.get("or_groups") or []
+                if isinstance(og, list) and og:
+                    existing_og = online_intent.setdefault("or_groups", [])
+                    for grp in og:
+                        if isinstance(grp, list) and grp:
+                            existing_og.append(grp)
+            except Exception:
+                pass
             # Support both merged["order"] or sort_by/sort_desc keys
             order_obj = merged.get("order") if isinstance(merged.get("order"), dict) else None
             if order_obj:
