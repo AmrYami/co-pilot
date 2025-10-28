@@ -233,6 +233,59 @@ def save_positive_rule(
         if payload:
             rows.append(("eq", payload))
 
+        # Optionally persist eq_like shards (alias-aware) as a tolerant backup
+        try:
+            import os
+            want_like = str(os.getenv("DW_EQ_LIKE_RULES", "1")).lower() in {"1", "true", "yes"}
+        except Exception:
+            want_like = True
+        if want_like and alias_map:
+            # Build alias->tokens mapping from raw_eq values
+            like_fragments: Dict[str, List[str]] = {}
+            min_len = 4
+            try:
+                raw_min = os.getenv("DW_EQ_TOKEN_MIN_LEN")
+                if raw_min is not None:
+                    min_len = int(raw_min)
+            except Exception:
+                min_len = 4
+
+            import re as _re
+            def _tokens(v: Any) -> List[str]:
+                parts = [tok for tok in _re.split(r"[^A-Z0-9]+", str(v or "").upper()) if tok]
+                out: List[str] = []
+                seen: set[str] = set()
+                for t in parts:
+                    if len(t) >= min_len and t not in seen:
+                        seen.add(t)
+                        out.append(t)
+                return out[:3]  # cap
+
+            for it in raw_eq:
+                norm = _norm(it)
+                if not norm:
+                    continue
+                col, vals = norm
+                if not col or not vals:
+                    continue
+                if col not in alias_map:
+                    continue
+                toks: List[str] = []
+                for v in vals:
+                    toks.extend(_tokens(v))
+                # de-dup
+                uniq: List[str] = []
+                seen_local: set[str] = set()
+                for t in toks:
+                    if t in seen_local:
+                        continue
+                    seen_local.add(t)
+                    uniq.append(t)
+                if uniq:
+                    like_fragments[col] = uniq
+            if like_fragments:
+                rows.append(("eq_like", {"fragments": like_fragments, "min_len": min_len}))
+
     sort_by = applied_hints.get("sort_by")
     sort_desc = applied_hints.get("sort_desc")
     if sort_by or sort_desc is not None:
@@ -727,3 +780,19 @@ def to_patch_from_comment(comment: str) -> Dict[str, Any]:
         "sort_desc": sort_desc,
         "top_n": top_n,
     }
+        elif k == "eq_like":
+            # Merge alias->tokens fragments
+            fr = payload.get("fragments") if isinstance(payload, dict) else None
+            if isinstance(fr, dict):
+                try:
+                    existing = merged.setdefault("eq_like", {})
+                    for alias, toks in fr.items():
+                        if not isinstance(toks, (list, tuple)):
+                            continue
+                        bucket = existing.setdefault(str(alias).upper(), [])
+                        for t in toks:
+                            s = str(t or "").upper().strip()
+                            if s and s not in bucket:
+                                bucket.append(s)
+                except Exception:
+                    pass

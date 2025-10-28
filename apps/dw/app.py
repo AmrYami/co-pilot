@@ -1262,6 +1262,65 @@ def _apply_online_rate_hints(
                 combined_binds.update(renamed)
                 where_clauses.append(grp_clause)
 
+    # Apply persisted eq_like fragments (alias -> tokens) if present
+    try:
+        eq_like = intent.get("eq_like") if isinstance(intent, dict) else None
+    except Exception:
+        eq_like = None
+    if isinstance(eq_like, dict) and eq_like:
+        try:
+            settings_obj = _get_settings()
+            # Load alias targets
+            try:
+                alias_map_raw = getattr(settings_obj, "get_json", None)
+                if callable(alias_map_raw):
+                    alias_map_raw = settings_obj.get_json("DW_EQ_ALIAS_COLUMNS", scope="namespace", namespace=intent.get("namespace") or "dw::common")
+                else:
+                    alias_map_raw = settings_obj.get("DW_EQ_ALIAS_COLUMNS", scope="namespace", namespace=intent.get("namespace") or "dw::common")
+            except TypeError:
+                alias_map_raw = settings_obj.get("DW_EQ_ALIAS_COLUMNS") if hasattr(settings_obj, "get") else {}
+            alias_map: Dict[str, List[str]] = {}
+            if isinstance(alias_map_raw, dict):
+                for k, cols in alias_map_raw.items():
+                    if not isinstance(cols, (list, tuple, set)):
+                        continue
+                    bucket: List[str] = []
+                    seen: set[str] = set()
+                    for c in cols:
+                        s = str(c or "").strip().upper()
+                        if s and s not in seen:
+                            seen.add(s)
+                            bucket.append(s)
+                    if bucket:
+                        alias_map[str(k or "").strip().upper()] = bucket
+            # Build LIKE across targets (AND within tokens)
+            for alias_key, toks in eq_like.items():
+                targets = alias_map.get(str(alias_key).upper()) or []
+                if not targets:
+                    continue
+                like_groups = [list({str(t).upper().strip() for t in (toks or []) if str(t).strip()})]
+                if not like_groups or not like_groups[0]:
+                    continue
+                like_clause, like_binds = _build_rate_fts_where(targets, like_groups, operator="AND", bind_prefix="eql")
+                if like_clause:
+                    # Ensure bind name uniqueness with ol_ prefix
+                    rename_map: Dict[str, str] = {}
+                    for key in list(like_binds.keys()):
+                        base = f"ol_{key}"
+                        new_key = base
+                        suffix = 1
+                        while new_key in binds or new_key in combined_binds or new_key in rename_map.values():
+                            new_key = f"{base}_{suffix}"
+                            suffix += 1
+                        rename_map[key] = new_key
+                    for old, new in rename_map.items():
+                        like_clause = like_clause.replace(f":{old}", f":{new}")
+                    renamed_like = {rename_map.get(k, k): v for k, v in like_binds.items()}
+                    combined_binds.update(renamed_like)
+                    where_clauses.append(like_clause)
+        except Exception:
+            pass
+
     namespace_hint = intent.get("namespace") or patch.get("namespace")
     namespace = namespace_hint if isinstance(namespace_hint, str) and namespace_hint.strip() else "dw::common"
 

@@ -3,6 +3,15 @@ from __future__ import annotations
 import re
 from typing import List, Tuple, Dict
 from apps.dw.lib.sql_utils import is_email, is_phone
+_get_setting = None
+try:  # pragma: no cover
+    from apps.dw.settings import get_setting as _get_setting  # type: ignore
+except Exception:  # pragma: no cover
+    try:
+        from apps.dw.settings_util import get_setting as _get_setting  # type: ignore
+    except Exception:
+        def _get_setting(*args, **kwargs):  # type: ignore
+            return None
 try:
     # Reuse email/phone detectors to keep FTS tokens clean
     from apps.dw.rate_parser import is_email, is_phone
@@ -23,6 +32,48 @@ AND_SEP = re.compile(r"\s+(?:and|&)\s+", flags=re.IGNORECASE)
 def _norm(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
 
+
+def _eq_alias_keys() -> List[str]:
+    """Return DW_EQ_ALIAS_COLUMNS keys (uppercased) to detect alias EQ tails.
+
+    Be tolerant to different get_setting signatures (with/without scope/namespace).
+    """
+    aliases = {}
+    getter = _get_setting
+    try:
+        if callable(getter):
+            try:
+                aliases = getter("DW_EQ_ALIAS_COLUMNS", scope="namespace", namespace="dw::common") or {}
+            except TypeError:
+                # Older signatures may not accept scope/namespace
+                aliases = getter("DW_EQ_ALIAS_COLUMNS") or {}
+    except Exception:
+        aliases = {}
+    if not isinstance(aliases, dict):
+        aliases = {}
+    keys: List[str] = []
+    for k in aliases.keys():
+        s = str(k or "").strip().upper()
+        if s:
+            keys.append(s)
+    # Fallback defaults if settings missing
+    if not keys:
+        keys = [
+            "DEPARTMENT", "DEPARTMENTS", "OWNER", "EMAIL", "STAKEHOLDER", "STAKEHOLDERS",
+            "OUL", "REQUEST TYPE", "CONTRACT STATUS",
+        ]
+    return keys
+
+
+def _cut_tail_at_alias(s: str, eq_aliases: List[str]) -> str:
+    """Cut FTS tail at first 'AND|OR <ALIAS> (=|IN|LIKE|BETWEEN)' occurrence."""
+    if not s or not eq_aliases:
+        return s
+    alias_pat = r"(?:%s)" % "|".join(map(re.escape, eq_aliases))
+    cut_rx = re.compile(rf"(?i)\b(?:and|or)\s+(?=({alias_pat})\b\s*(?:=|\bin\b|\blike\b|\bbetween\b))")
+    parts = cut_rx.split(s, maxsplit=1)
+    return parts[0] if parts else s
+
 def extract_fts_terms(question: str, force: bool = False) -> Tuple[List[List[str]], str]:
     """
     Extract FTS terms from a natural-language question.
@@ -37,8 +88,29 @@ def extract_fts_terms(question: str, force: bool = False) -> Tuple[List[List[str
     """
     q = question or ""
     ql = f" {q.lower()} "
-    if " has " in ql:
-        tail = _norm(ql.split(" has ", 1)[1])
+    # Treat these cues as explicit FTS triggers
+    # Examples: "has/ have it or home care", "contain/contains maintenance",
+    #           "including/included policy", "about it support", "mentioning warranty"
+    cues = [
+        " has ",
+        " have ",
+        " contain ",
+        " contains ",
+        " including ",
+        " included ",
+        " about ",
+        " mentioning ",
+    ]
+    tail = None
+    for cue in cues:
+        if cue in ql:
+            tail = _norm(ql.split(cue, 1)[1])
+            break
+    if tail is not None:
+        # Cut tail when an alias EQ fragment follows (AND/OR <ALIAS> ...)
+        aliases = _eq_alias_keys()
+        if aliases:
+            tail = _cut_tail_at_alias(tail, aliases)
         or_groups = [g for g in OR_SEP.split(tail) if g]
         groups: List[List[str]] = []
         for g in or_groups:
@@ -51,6 +123,11 @@ def extract_fts_terms(question: str, force: bool = False) -> Tuple[List[List[str
                 if is_email(token) or is_phone(token):
                     # push these to EQ filters elsewhere; exclude from FTS
                     continue
+                # Skip alias assignments like 'DEPARTMENTS = X'
+                if aliases:
+                    alias_pat = r"(?:%s)" % "|".join(map(re.escape, aliases))
+                    if re.match(rf"(?i)^\s*({alias_pat})\b\s*(?:=|\bin\b|\blike\b|\bbetween\b)", token):
+                        continue
                 normalized.append(token)
             if normalized:
                 groups.append(normalized)
