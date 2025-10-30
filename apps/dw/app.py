@@ -120,6 +120,54 @@ def _ensure_exports_dir() -> str:
         os.makedirs(path, exist_ok=True)
     except Exception:
         pass
+
+    # Unconditional alias assignment capture (e.g., DEPARTMENTS = X), independent of inline parser
+    try:
+        alias_map3_raw = _get_namespace_mapping(settings, namespace, "DW_EQ_ALIAS_COLUMNS", {}) or {}
+        alias_map3: Dict[str, List[str]] = {}
+        if isinstance(alias_map3_raw, dict):
+            for k, cols in alias_map3_raw.items():
+                if not isinstance(cols, (list, tuple, set)):
+                    continue
+                bucket: List[str] = []
+                seen3: set[str] = set()
+                for c in cols:
+                    s3 = str(c or "").strip().upper()
+                    if s3 and s3 not in seen3:
+                        seen3.add(s3)
+                        bucket.append(s3)
+                if bucket:
+                    alias_map3[str(k or "").strip().upper()] = bucket
+        if not alias_map3:
+            # conservative defaults when mapping is unavailable
+            targets = [
+                "DEPARTMENT_1","DEPARTMENT_2","DEPARTMENT_3","DEPARTMENT_4",
+                "DEPARTMENT_5","DEPARTMENT_6","DEPARTMENT_7","DEPARTMENT_8",
+                "OWNER_DEPARTMENT",
+            ]
+            alias_map3 = {"DEPARTMENTS": targets, "DEPARTMENT": targets}
+        alias_keys3 = list(alias_map3.keys())
+        if alias_keys3:
+            import re as _re
+            alias_pat3 = r"(?:" + "|".join(_re.escape(a) for a in alias_keys3) + r")"
+            rx3 = _re.compile(rf"(?i)\b({alias_pat3})\s*=\s*([^\n\r;]+)")
+            found3: List[tuple[str,str]] = []
+            for m in rx3.finditer(question or ""):
+                kk = (m.group(1) or "").strip().upper()
+                vv = (m.group(2) or "").strip().strip("'\"")
+                if kk and vv:
+                    found3.append((kk, vv))
+            if found3:
+                eq3 = online_intent.setdefault("eq_filters", [])
+                # avoid duplicates
+                present = {(str(it[0]).upper(), tuple(it[1]) if isinstance(it, (list,tuple)) and len(it)==2 and isinstance(it[1], (list,tuple)) else None) for it in eq3 if isinstance(it,(list,tuple))}
+                for kkey, vval in found3:
+                    candidate = (kkey, (vval,))
+                    if candidate not in present:
+                        eq3.append([kkey, [vval]])
+                _expand_eq_aliases_with_map(online_intent, alias_map3)
+    except Exception:
+        pass
     return path
 
 def _export_rows_to_csv(rows, columns, *, inquiry_id=None):
@@ -152,6 +200,52 @@ def _export_rows_to_csv(rows, columns, *, inquiry_id=None):
 def _normalize_question_text(value: Any) -> str:
     text_value = "" if value is None else str(value)
     return " ".join(text_value.strip().lower().split())
+
+def _get_namespace_mapping(settings_obj, namespace: str, key: str, default=None):
+    """Safely fetch a namespaced JSON mapping setting.
+
+    Tries `get_json(key, scope='namespace', namespace=...)`, then falls back to
+    `get(key, scope='namespace', namespace=...)`, then bare `get(key)`.
+    Returns `default` if nothing suitable is found. Ensures a dict.
+    """
+    try:
+        getter_json = getattr(settings_obj, "get_json", None)
+        if callable(getter_json):
+            try:
+                val = getter_json(key, scope="namespace", namespace=namespace)
+            except TypeError:
+                # older signatures without scope/namespace
+                val = getter_json(key)
+            if isinstance(val, dict):
+                return val
+            if val is not None:
+                try:
+                    obj = json.loads(val)
+                    if isinstance(obj, dict):
+                        return obj
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    try:
+        getter = getattr(settings_obj, "get", None)
+        if callable(getter):
+            try:
+                val = getter(key, scope="namespace", namespace=namespace)
+            except TypeError:
+                val = getter(key)
+            if isinstance(val, dict):
+                return val
+            if val is not None:
+                try:
+                    obj = json.loads(val)
+                    if isinstance(obj, dict):
+                        return obj
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return default if isinstance(default, dict) else {}
 
 
 def load_persisted_rules(session, limit: int = 50) -> List[Dict[str, Any]]:
@@ -547,13 +641,16 @@ def _respond(payload: Dict[str, Any], response: Dict[str, Any]):
             elif isinstance(raw_tokens, str) and raw_tokens.strip():
                 intent_tokens = [raw_tokens.strip()]
         try:
-            question_text = _extract_question_for_debug(payload if isinstance(payload, dict) else {}, response)
+            question_text = _extract_question_for_debug(
+                payload if isinstance(payload, dict) else {}, response
+            )
             fts_columns = _extract_fts_columns_for_debug(response)
-            if isinstance(precomputed_boolean_debug, dict):
-                plan = precomputed_boolean_debug
-            else:
-                plan = build_boolean_debug(question_text, fts_columns)
-            blocks = plan.get("blocks", [])
+            plan = (
+                precomputed_boolean_debug
+                if isinstance(precomputed_boolean_debug, dict)
+                else build_boolean_debug(question_text, fts_columns)
+            )
+            blocks = plan.get("blocks", []) or []
             summary_text = plan.get("summary", "") or ""
             debug_section["boolean_groups"] = blocks
             debug_section["boolean_groups_text"] = summary_text
@@ -565,16 +662,36 @@ def _respond(payload: Dict[str, Any], response: Dict[str, Any]):
                 debug_section["binds_text"] = binds_text
             if blocks and isinstance(blocks[0], dict):
                 first_block = blocks[0]
-                block_fts = first_block.get("fts") if isinstance(first_block.get("fts"), list) else []
+                block_fts = (
+                    first_block.get("fts") if isinstance(first_block.get("fts"), list) else []
+                )
                 if not block_fts and intent_tokens:
                     first_block["fts"] = intent_tokens
                     fts_text = "FTS(" + " OR ".join(intent_tokens) + ")"
                     if summary_text.startswith("(") and len(summary_text) > 1:
-                        debug_section["boolean_groups_text"] = "(" + f"{fts_text} AND " + summary_text[1:]
+                        debug_section["boolean_groups_text"] = (
+                            "(" + f"{fts_text} AND " + summary_text[1:]
+                        )
                     else:
                         debug_section["boolean_groups_text"] = f"({fts_text})"
         except Exception as exc:  # pragma: no cover - debug best-effort
             debug_section["boolean_groups_error"] = str(exc)
+
+    # Log the full response (without rows) for observability
+    try:
+        _logger = logging.getLogger("dw")
+        resp_copy = dict(response)
+        rows_field = resp_copy.get("rows")
+        rows_count = 0
+        try:
+            rows_count = len(rows_field) if isinstance(rows_field, list) else int(rows_field or 0)
+        except Exception:
+            rows_count = 0
+        if "rows" in resp_copy:
+            resp_copy["rows"] = f"omitted({rows_count})"
+        _logger.info({"event": "answer.response.full", "response": resp_copy})
+    except Exception:
+        pass
 
     return jsonify(response)
 
@@ -747,6 +864,73 @@ def _json_safe_binds(binds: Optional[Dict[str, Any]]) -> Dict[str, Any]:
 EMAIL_RE = re.compile(r"(?i)^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$")
 NUMBER_RE = re.compile(r"^-?\d+(\.\d+)?$")
 
+_COMPARISON_TEXT_SYNONYMS: Dict[str, List[str]] = {
+    "gte": [
+        "greater than or equal to",
+        "at least",
+        "not less than",
+    ],
+    "gt": [
+        "greater than",
+        "more than",
+        "over",
+        "above",
+    ],
+    "lte": [
+        "less than or equal to",
+        "at most",
+        "not more than",
+    ],
+    "lt": [
+        "less than",
+        "under",
+        "below",
+    ],
+    "eq": [
+        "equal to",
+        "equals",
+        "equal",
+    ],
+}
+
+_COMPARISON_SYMBOLS: Dict[str, str] = {
+    ">=": "gte",
+    "≥": "gte",
+    ">": "gt",
+    "<=": "lte",
+    "≤": "lte",
+    "<": "lt",
+    "==": "eq",
+    "=": "eq",
+}
+
+_COMPARISON_TRAILING_MARKERS = sorted(
+    {
+        "greater than or equal to",
+        "greater than",
+        "more than",
+        "over",
+        "above",
+        "at least",
+        "less than or equal to",
+        "less than",
+        "under",
+        "below",
+        "at most",
+        "equals",
+        "equal to",
+        "equal",
+        ">=",
+        "<=",
+        ">",
+        "<",
+        "≥",
+        "≤",
+    },
+    key=len,
+    reverse=True,
+)
+
 
 def _val_type(v: str) -> str:
     s = (v or "").strip()
@@ -757,7 +941,13 @@ def _val_type(v: str) -> str:
     return "TEXT"
 
 
-def _augment_light_intent_with_aliases(question: str, light_intent: dict, alias_keys: List[str]) -> None:
+def _augment_light_intent_with_aliases(
+    question: str,
+    light_intent: dict,
+    alias_keys: List[str],
+    column_tokens: List[str],
+    comparison_markers: List[str],
+) -> None:
     """Augment light intent with alias-based EQ for signature matching only.
 
     Scans the question for patterns like "ALIAS = value1 or value2" for any alias
@@ -769,6 +959,39 @@ def _augment_light_intent_with_aliases(question: str, light_intent: dict, alias_
         return
     q = question or ""
     eq_filters = light_intent.setdefault("eq_filters", [])
+    stop_lookahead = r"(?=\s+and\b|[;,]|$)"
+
+    alias_tokens_lower = [str(tok or "").strip().lower() for tok in alias_keys if str(tok or "").strip()]
+    column_tokens_lower: List[str] = []
+    for col in (column_tokens or []):
+        token = str(col or "").strip()
+        if not token:
+            continue
+        token = token.strip('"').strip()
+        if "." in token:
+            token = token.split(".")[-1]
+        token = token.strip()
+        if not token:
+            continue
+        column_tokens_lower.append(token.lower())
+    comparison_tokens_lower = [mk.lower() for mk in comparison_markers or []]
+
+    def _strip_trailing_clause(text: str) -> str:
+        if not text:
+            return text
+        lower = text.lower()
+        idx = lower.find(" and ")
+        while idx != -1:
+            tail = lower[idx + 5 :].strip()
+            if (
+                any(tail.startswith(tok) for tok in alias_tokens_lower)
+                or any(tail.startswith(tok) for tok in column_tokens_lower)
+                or any(tail.startswith(tok) for tok in comparison_tokens_lower)
+            ):
+                return text[:idx].strip()
+            idx = lower.find(" and ", idx + 5)
+        return text.strip()
+
     for raw_key in alias_keys:
         if not isinstance(raw_key, str):
             continue
@@ -776,30 +999,119 @@ def _augment_light_intent_with_aliases(question: str, light_intent: dict, alias_
         if not key:
             continue
         try:
-            # Build a case-insensitive regex that tolerates spaces in alias keys
-            pattern = re.compile(rf"(?i)\b{re.escape(key)}\b\s*=\s*([^\n\r;]+)")
-            m = pattern.search(q)
-            if not m:
-                continue
-            rhs = m.group(1).strip()
-            # Split OR/comma separated values (signature uses types only)
-            parts = re.split(r"(?i)\s*\bor\b\s*|,", rhs)
-            vals = [p.strip(" '\"\t()") for p in parts if p and p.strip()]
-            if vals:
-                alias_key_norm = key.upper()
-                # Avoid duplication if an EQ for this alias already exists
-                already = False
+            alias_norm = key.upper()
+
+            def _already_has_alias() -> bool:
                 for it in eq_filters:
-                    if isinstance(it, (list, tuple)) and len(it) == 2 and str(it[0]).upper() == alias_key_norm:
-                        already = True
-                        break
-                    if isinstance(it, dict) and str(it.get("col") or it.get("field") or "").upper() == alias_key_norm:
-                        already = True
-                        break
-                if not already:
-                    eq_filters.append([alias_key_norm, vals])
+                    if isinstance(it, (list, tuple)) and len(it) == 2 and str(it[0]).upper() == alias_norm:
+                        return True
+                    if isinstance(it, dict) and str(it.get("col") or it.get("field") or "").upper() == alias_norm:
+                        return True
+                return False
+
+            if _already_has_alias():
+                continue
+
+            escaped = re.escape(key)
+            patterns = [
+                re.compile(rf"(?i)\b{escaped}\b\s*=\s*([^\n\r;]+?){stop_lookahead}"),
+                re.compile(rf"(?i)\b{escaped}\b\s+(?:has|contains)\s+([^\n\r;]+?){stop_lookahead}"),
+            ]
+
+            captured_vals: List[str] = []
+            for pat in patterns:
+                for match in pat.finditer(q):
+                    rhs = match.group(1).strip()
+                    if not rhs:
+                        continue
+                    parts = re.split(r"(?i)\s*\bor\b\s*|,", rhs)
+                    vals = [p.strip(" '\"\t()") for p in parts if p and p.strip()]
+                    if vals:
+                        captured_vals.extend(vals)
+                if captured_vals:
+                    break
+
+            if captured_vals:
+                cleaned_vals = []
+                for val in captured_vals:
+                    stripped = _strip_trailing_clause(val)
+                    if stripped:
+                        cleaned_vals.append(stripped)
+                if cleaned_vals:
+                    eq_filters.append([alias_norm, cleaned_vals])
         except Exception:
             continue
+
+
+def _normalize_numeric_value(raw: str) -> Any:
+    if raw is None:
+        return raw
+    text = str(raw).strip()
+    if not text:
+        return text
+    text = text.replace(",", "")
+    text = text.replace("%", "")
+    try:
+        if "." in text:
+            return float(text)
+        return int(text)
+    except ValueError:
+        return text
+
+
+def _extract_comparison_filters(question: str, allowed_cols: Sequence[str]) -> List[Dict[str, Any]]:
+    if not question:
+        return []
+    results: List[Dict[str, Any]] = []
+    seen_spans: set[Tuple[int, int]] = set()
+    text = question
+    sorted_phrases = {
+        op: sorted(phrases, key=len, reverse=True) for op, phrases in _COMPARISON_TEXT_SYNONYMS.items()
+    }
+    for raw_col in (allowed_cols or []):
+        col = str(raw_col or "").strip()
+        if not col:
+            continue
+        col_pat = re.escape(col)
+        symbol_regex = re.compile(rf"(?i)\b{col_pat}\b\s*(>=|<=|==|=|>|<|≥|≤)\s*([-+]?\d+(?:\.\d+)?)")
+        for match in symbol_regex.finditer(text):
+            span = match.span()
+            if span in seen_spans:
+                continue
+            op_symbol = match.group(1)
+            val_text = match.group(2)
+            op = _COMPARISON_SYMBOLS.get(op_symbol, "eq")
+            value = _normalize_numeric_value(val_text)
+            results.append(
+                {
+                    "col": str(col).upper(),
+                    "val": value,
+                    "op": op,
+                    "ci": False,
+                    "trim": False,
+                }
+            )
+            seen_spans.add(span)
+        for op, phrases in sorted_phrases.items():
+            for phrase in phrases:
+                phrase_pat = re.escape(phrase)
+                regex = re.compile(rf"(?i)\b{col_pat}\b\s+{phrase_pat}\s+([-+]?\d+(?:\.\d+)?)")
+                for match in regex.finditer(text):
+                    span = match.span()
+                    if span in seen_spans:
+                        continue
+                    value = _normalize_numeric_value(match.group(1))
+                    results.append(
+                        {
+                            "col": str(col).upper(),
+                            "val": value,
+                            "op": op,
+                            "ci": False,
+                            "trim": False,
+                        }
+                    )
+                    seen_spans.add(span)
+    return results
 
 
 def _build_light_intent_from_question(q: str, allowed_cols) -> dict:
@@ -816,6 +1128,7 @@ def _build_light_intent_from_question(q: str, allowed_cols) -> dict:
     # مجموعة أعمدة مسموحة للمقارنة
     colset = {str(c).upper() for c in (allowed_cols or [])}
     eq_filters = []
+    simple_pairs: List[Tuple[str, List[str]]] = []
     # جزّئ على AND بين شروط الأعمدة
     for part in re.split(r"(?i)\band\b", where_txt):
         part = part.strip().strip("() ")
@@ -832,11 +1145,27 @@ def _build_light_intent_from_question(q: str, allowed_cols) -> dict:
         vals = re.split(r"(?i)\s*\bor\b\s*|,", rhs)
         vals = [v.strip(" '\"\t()") for v in vals if v.strip()]
         if vals:
-            eq_filters.append([col, vals])
-    eq_shape = {
-        c: {"op": ("in" if len(v) > 1 else "eq"), "types": sorted({_val_type(x) for x in v})}
-        for c, v in eq_filters
-    }
+            simple_pairs.append((col, vals))
+
+    comp_filters = _extract_comparison_filters(where_txt, allowed_cols or [])
+
+    for col, vals in simple_pairs:
+        eq_filters.append([col, vals])
+    for comp in comp_filters:
+        eq_filters.append(comp)
+
+    eq_shape: Dict[str, Dict[str, Any]] = {}
+    for col, vals in simple_pairs:
+        types = sorted({_val_type(str(v)) for v in vals})
+        eq_shape[col] = {"op": ("in" if len(vals) > 1 else "eq"), "types": types}
+    for comp in comp_filters:
+        col = str(comp.get("col") or "").upper()
+        val = comp.get("val")
+        eq_shape[col] = {
+            "op": comp.get("op", "eq"),
+            "types": sorted({_val_type(str(val))}),
+        }
+
     return {
         "eq_filters": eq_filters,
         "eq": eq_shape,
@@ -964,6 +1293,77 @@ def _coalesce_rate_intent(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     if "full_text_search" in intent:
         intent["full_text_search"] = _coerce_bool_flag(intent.get("full_text_search"), default=False)
 
+    # Expand alias EQ keys in eq_filters into OR groups here (centralized), so both
+    # direct FTS and deterministic paths get the same overlays.
+    try:
+        eq_fp = intent.get("eq_filters") or []
+        if isinstance(eq_fp, list) and eq_fp:
+            # Build alias map via settings helper on demand (best-effort)
+            alias_map_raw = {}
+            try:
+                settings_obj = get_settings()
+                alias_map_raw = _get_namespace_mapping(settings_obj, _ns(), "DW_EQ_ALIAS_COLUMNS", {}) or {}
+            except Exception:
+                alias_map_raw = {}
+            alias_map: Dict[str, List[str]] = {}
+            if isinstance(alias_map_raw, dict):
+                for k, cols in alias_map_raw.items():
+                    if not isinstance(cols, (list, tuple, set)):
+                        continue
+                    bucket: List[str] = []
+                    seen: set[str] = set()
+                    for c in cols:
+                        s = str(c or "").strip().upper()
+                        if s and s not in seen:
+                            seen.add(s)
+                            bucket.append(s)
+                    if bucket:
+                        alias_map[str(k or "").strip().upper()] = bucket
+            if not alias_map:
+                targets = [
+                    "DEPARTMENT_1","DEPARTMENT_2","DEPARTMENT_3","DEPARTMENT_4",
+                    "DEPARTMENT_5","DEPARTMENT_6","DEPARTMENT_7","DEPARTMENT_8",
+                    "OWNER_DEPARTMENT",
+                ]
+                alias_map = {"DEPARTMENTS": targets, "DEPARTMENT": targets}
+
+            def _norm_pair(it):
+                if isinstance(it, (list, tuple)) and len(it)==2:
+                    col = str(it[0] or "").strip().upper()
+                    vals = it[1]
+                    vals = list(vals) if isinstance(vals, (list,tuple,set)) else [vals]
+                    return col, vals
+                if isinstance(it, dict):
+                    col = str((it.get("col") or it.get("field") or "")).strip().upper()
+                    val = it.get("val") if it.get("val") is not None else it.get("value")
+                    vals = [] if val is None else ([val] if not isinstance(val,(list,tuple,set)) else list(val))
+                    return col, vals
+                return None, None
+
+            keep: List[Any] = []
+            og_new: List[List[Dict[str, Any]]] = []
+            for it in eq_fp:
+                col, vals = _norm_pair(it)
+                if not col:
+                    keep.append(it)
+                    continue
+                targets = alias_map.get(col)
+                if not targets:
+                    keep.append(it)
+                    continue
+                for v in vals or []:
+                    grp = [{"col": t, "val": v, "op":"eq", "ci": True, "trim": True} for t in targets]
+                    if grp:
+                        og_new.append(grp)
+            if og_new:
+                # Dedup existing groups + new ones
+                og = intent.setdefault("or_groups", []) if isinstance(intent.get("or_groups"), list) else intent.setdefault("or_groups", [])
+                for g in og_new:
+                    og.append(g)
+                intent["eq_filters"] = keep
+    except Exception:
+        pass
+
     return intent
 
 
@@ -1032,6 +1432,112 @@ def _sanitize_eq_values(intent: Dict[str, Any], allowed_cols: Sequence[str]) -> 
     if canon:
         intent["eq_filters"] = canon
 
+
+def _expand_eq_aliases_with_map(intent: Dict[str, Any], alias_map: Dict[str, List[str]]) -> None:
+    """Expand alias EQ filters into cross-column OR groups and remove alias entries.
+
+    - Accepts eq_filters in either canonical list form [[COL, [vals...]], ...]
+      or dict entries {col/field, val/values}.
+    - For each alias COL in alias_map, creates an OR group across target columns
+      for each value: [{col: T1, val: v}, {col: T2, val: v}, ...].
+    - Leaves non-alias eq entries untouched.
+    """
+    if not isinstance(intent, dict) or not isinstance(alias_map, dict) or not alias_map:
+        return
+
+    def _norm_item(it) -> tuple[str, List[Any]] | None:
+        if isinstance(it, (list, tuple)) and len(it) == 2:
+            col = str(it[0] or "").strip().upper()
+            vals = it[1]
+            if vals is None:
+                return None
+            vals_list = list(vals) if isinstance(vals, (list, tuple, set)) else [vals]
+            return col, vals_list
+        if isinstance(it, dict):
+            col = str((it.get("col") or it.get("field") or "")).strip().upper()
+            val = it.get("val") if it.get("val") is not None else it.get("value")
+            vals_list = [] if val is None else ([val] if not isinstance(val, (list, tuple, set)) else list(val))
+            return col, vals_list
+        return None
+
+    raw = intent.get("eq_filters") or []
+    if not isinstance(raw, list):
+        return
+
+    # Guard to avoid repeated expansions on the same intent.
+    already_expanded = intent.get("_alias_expanded") is True
+    if already_expanded:
+        pending_alias = False
+        for item in raw:
+            norm = _norm_item(item)
+            if not norm:
+                continue
+            col, _ = norm
+            if alias_map.get(col):
+                pending_alias = True
+                break
+        if not pending_alias:
+            return
+
+    keep: List[Any] = []
+    or_groups: List[List[Dict[str, Any]]] = (
+        intent.setdefault("or_groups", []) if isinstance(intent.get("or_groups"), list) else intent.setdefault("or_groups", [])
+    )
+    expanded_any = False
+
+    for it in list(raw):
+        norm = _norm_item(it)
+        if not norm:
+            keep.append(it)
+            continue
+        col, vals = norm
+        targets = alias_map.get(col)
+        if not targets:
+            keep.append(it)
+            continue
+        # For each value, create an OR-across-targets group
+        for v in vals:
+            group = []
+            for t in targets:
+                group.append({"col": t, "val": v, "op": "eq", "ci": True, "trim": True})
+            if group:
+                or_groups.append(group)
+                expanded_any = True
+        # Do not keep the alias entry itself (expanded)
+
+    intent["eq_filters"] = keep
+
+    # Deduplicate OR groups by (col,val) signature regardless of insertion order
+    try:
+        uniq: List[List[Dict[str, Any]]] = []
+        seen_sigs: set = set()
+        for grp in or_groups:
+            if not isinstance(grp, list) or not grp:
+                continue
+            sig_elems = []
+            ok = True
+            for t in grp:
+                if not isinstance(t, dict):
+                    ok = False
+                    break
+                col = str((t.get("col") or t.get("column") or "")).strip().upper()
+                val = t.get("val") if t.get("val") is not None else t.get("value")
+                sval = str(val).strip().upper() if isinstance(val, str) else val
+                sig_elems.append((col, sval))
+            if not ok:
+                continue
+            sig = tuple(sorted(sig_elems))
+            if sig in seen_sigs:
+                continue
+            seen_sigs.add(sig)
+            uniq.append(grp)
+        if uniq:
+            intent["or_groups"] = uniq
+    except Exception:
+        pass
+    # Mark expanded to prevent duplicates from multiple passes, but only if we actually expanded.
+    if expanded_any:
+        intent["_alias_expanded"] = True
 
 def _extract_or_groups_from_question(question: str, allowed_cols: Sequence[str]) -> List[List[Dict[str, Any]]]:
     """
@@ -2201,7 +2707,21 @@ def answer():
         try:
             alias_map_raw = _get_namespace_mapping(settings, namespace, "DW_EQ_ALIAS_COLUMNS", {}) or {}
             alias_keys = [str(k).strip() for k in alias_map_raw.keys() if str(k).strip()]
-            _augment_light_intent_with_aliases(question, light_intent, alias_keys)
+            comparison_markers = list(_COMPARISON_TRAILING_MARKERS)
+            _augment_light_intent_with_aliases(
+                question,
+                light_intent,
+                alias_keys,
+                list(allowed_columns_initial or []),
+                comparison_markers,
+            )
+        except Exception:
+            pass
+        # Capture FTS groups for signature canonicalization
+        try:
+            sig_groups, _sig_mode = extract_fts_terms(question, force=False)
+            if sig_groups:
+                light_intent["fts_groups"] = sig_groups
         except Exception:
             pass
         # Alias-aware hint for signature-only: detect "departments = X" and add DEPARTMENT eq for matching
@@ -2270,6 +2790,28 @@ def answer():
                 online_intent["fts_columns"] = merged.get("fts_columns")
             if merged.get("fts_operator"):
                 online_intent["fts_operator"] = merged.get("fts_operator")
+            # Carry over learned eq_like fragments (alias -> tokens)
+            try:
+                if isinstance(merged.get("eq_like"), dict) and merged.get("eq_like"):
+                    eq_like_src = merged.get("eq_like") or {}
+                    eq_like_dst = online_intent.setdefault("eq_like", {})
+                    for ak, toks in eq_like_src.items():
+                        key = str(ak or "").strip().upper()
+                        if not key:
+                            continue
+                        src_list = [str(t or "").strip().upper() for t in (toks or []) if str(t or "").strip()]
+                        if not src_list:
+                            continue
+                        if key in eq_like_dst and isinstance(eq_like_dst.get(key), list):
+                            cur = list(eq_like_dst.get(key) or [])
+                            for t in src_list:
+                                if t not in cur:
+                                    cur.append(t)
+                            eq_like_dst[key] = cur
+                        else:
+                            eq_like_dst[key] = src_list
+            except Exception:
+                pass
             # Merge EQ with preference to question values (light intent) over seed/rule values
             try:
                 q_eq = (light_intent or {}).get("eq_filters") or []
@@ -2280,17 +2822,89 @@ def answer():
                 combined = _merge_eq_prefer_question(q_eq, combined)
                 # Include any merged-only columns as well
                 combined = _merge_eq_prefer_question(q_eq, mg_eq if mg_eq else combined)
-                # Deduplicate by column preserving order
-                seen = set()
-                final_eq = []
-                for col, vals in combined:
-                    cu = str(col).upper()
-                    if cu in seen:
+                # Deduplicate by column preserving order and keep comparator metadata
+                dedup: Dict[str, Any] = {}
+                order: List[str] = []
+                for item in combined:
+                    if isinstance(item, dict):
+                        col = item.get("col") or item.get("field")
+                        if not isinstance(col, str):
+                            continue
+                        cu = col.strip().upper()
+                        if not cu:
+                            continue
+                        if cu not in dedup:
+                            canon_item = dict(item)
+                            canon_item["col"] = cu
+                            dedup[cu] = canon_item
+                            order.append(cu)
+                    elif isinstance(item, (list, tuple)) and len(item) == 2:
+                        col = item[0]
+                        if not isinstance(col, (str, bytes)):
+                            continue
+                        cu = str(col).strip().upper()
+                        if not cu:
+                            continue
+                        vals = item[1]
+                        values = []
+                        if isinstance(vals, (list, tuple, set)):
+                            values = list(vals)
+                        elif vals is not None:
+                            values = [vals]
+                        if cu not in dedup:
+                            dedup[cu] = [cu, values]
+                            order.append(cu)
+                    else:
                         continue
-                    seen.add(cu)
-                    final_eq.append([cu, vals])
-                if final_eq:
-                    online_intent["eq_filters"] = final_eq
+                if dedup:
+                    canon_eq: List[Dict[str, Any]] = []
+                    for cu in order:
+                        entry = dedup.get(cu)
+                        if entry is None:
+                            continue
+                        if isinstance(entry, dict):
+                            canon_entry = dict(entry)
+                            canon_entry.setdefault("op", "eq")
+                            if canon_entry.get("ci") is None:
+                                canon_entry["ci"] = True
+                            if canon_entry.get("trim") is None:
+                                canon_entry["trim"] = True
+                            canon_eq.append(canon_entry)
+                        elif isinstance(entry, list) and len(entry) == 2:
+                            _, values = entry
+                            values_seq = values if isinstance(values, (list, tuple, set)) else [values]
+                            for v in values_seq:
+                                canon_eq.append(
+                                    {
+                                        "col": cu,
+                                        "val": v,
+                                        "op": "eq",
+                                        "ci": True,
+                                        "trim": True,
+                                    }
+                                )
+                    if canon_eq:
+                        online_intent["eq_filters"] = canon_eq
+                        try:
+                            alias_map_for_expand = _get_namespace_mapping(settings, namespace, "DW_EQ_ALIAS_COLUMNS", {}) or {}
+                            if isinstance(alias_map_for_expand, dict):
+                                mapped: Dict[str, List[str]] = {}
+                                for ak, cols in alias_map_for_expand.items():
+                                    if not isinstance(cols, (list, tuple, set)):
+                                        continue
+                                    bucket: List[str] = []
+                                    seen_cols: set[str] = set()
+                                    for c in cols:
+                                        s = str(c or "").strip().upper()
+                                        if s and s not in seen_cols:
+                                            seen_cols.add(s)
+                                            bucket.append(s)
+                                    if bucket:
+                                        mapped[str(ak or "").strip().upper()] = bucket
+                                if mapped:
+                                    _expand_eq_aliases_with_map(online_intent, mapped)
+                        except Exception:
+                            pass
             except Exception:
                 # Fallback to simple extend
                 if merged.get("eq_filters"):
@@ -2347,24 +2961,9 @@ def answer():
     try:
         _sanitize_eq_values(online_intent, allowed_columns_initial)
         # Namespace alias expansion (e.g., DEPARTMENT/OWNER/EMAIL/PHONE etc.) using DW_EQ_ALIAS_COLUMNS
+        # Skip early alias expansion here; we expand after inline EQ parsing to avoid duplicates.
         try:
-            alias_map_raw = _get_namespace_mapping(settings, namespace, "DW_EQ_ALIAS_COLUMNS", {}) or {}
-            alias_map: Dict[str, List[str]] = {}
-            if isinstance(alias_map_raw, dict):
-                for k, cols in alias_map_raw.items():
-                    if not isinstance(cols, (list, tuple, set)):
-                        continue
-                    bucket: List[str] = []
-                    seen: set[str] = set()
-                    for c in cols:
-                        s = str(c or "").strip().upper()
-                        if s and s not in seen:
-                            seen.add(s)
-                            bucket.append(s)
-                    if bucket:
-                        alias_map[str(k or "").strip().upper()] = bucket
-            if alias_map:
-                _expand_eq_aliases_with_map(online_intent, alias_map)
+            _ = _get_namespace_mapping(settings, namespace, "DW_EQ_ALIAS_COLUMNS", {})
         except Exception:
             pass
         or_groups = _extract_or_groups_from_question(question, allowed_columns_initial)
@@ -2380,6 +2979,48 @@ def answer():
             existing = online_intent.setdefault("eq_filters", [])
             for col, vals in inline_pairs:
                 existing.append([col, list(vals)])
+            # Re-run alias expansion after adding inline EQ so aliases (e.g., DEPARTMENTS)
+            # are expanded into their target columns before applying rate hints.
+            try:
+                alias_map_raw2 = _get_namespace_mapping(settings, namespace, "DW_EQ_ALIAS_COLUMNS", {}) or {}
+                alias_map2: Dict[str, List[str]] = {}
+                if isinstance(alias_map_raw2, dict):
+                    for k, cols in alias_map_raw2.items():
+                        if not isinstance(cols, (list, tuple, set)):
+                            continue
+                        bucket: List[str] = []
+                        seen2: set[str] = set()
+                        for c in cols:
+                            s2 = str(c or "").strip().upper()
+                            if s2 and s2 not in seen2:
+                                seen2.add(s2)
+                                bucket.append(s2)
+                        if bucket:
+                            alias_map2[str(k or "").strip().upper()] = bucket
+                # Also capture inline alias assignments like 'DEPARTMENTS = X' directly from the question
+                # so we don't depend solely on parse_eq_inline (which only sees allowed base columns).
+                if alias_map2:
+                    try:
+                        alias_keys = list(alias_map2.keys())
+                        if alias_keys:
+                            import re as _re
+                            alias_pat = r"(?:" + "|".join(_re.escape(a) for a in alias_keys) + r")"
+                            rx = _re.compile(rf"(?i)\b({alias_pat})\s*=\s*([^\n\r;]+)")
+                            found = []
+                            for m in rx.finditer(question or ""):
+                                key = (m.group(1) or "").strip().upper()
+                                val = (m.group(2) or "").strip().strip("'\"")
+                                if key and val:
+                                    found.append((key, val))
+                            if found:
+                                existing2 = online_intent.setdefault("eq_filters", [])
+                                for kkey, vval in found:
+                                    existing2.append([kkey, [vval]])
+                    except Exception:
+                        pass
+                    _expand_eq_aliases_with_map(online_intent, alias_map2)
+            except Exception:
+                pass
     except Exception:
         pass
     if full_text_search:
@@ -2393,7 +3034,9 @@ def answer():
                 "columns_count": len(fts_columns_initial or []),
             }
         )
-        if direct_mode == "explicit" and direct_groups and fts_columns_initial:
+        # Prefer direct FTS path whenever groups exist and columns are resolved.
+        # This keeps strategy stable even with minor token changes.
+        if direct_groups and fts_columns_initial:
             direct_where, direct_binds = build_fts_where_groups(direct_groups, fts_columns_initial)
             if direct_where:
                 direct_sql = f'SELECT * FROM "{table_name}"\nWHERE {direct_where}'
@@ -2401,11 +3044,102 @@ def answer():
                 direct_sql = f'SELECT * FROM "{table_name}"'
             direct_sql = _append_order_by(direct_sql, "REQUEST_DATE", descending=True)
 
+            # Observability: log online_intent EQ/OR presence before applying hints
+            try:
+                logger.info(
+                    {
+                        "event": "answer.apply_hints.pre",
+                        "eq_len": len(online_intent.get("eq_filters") or []),
+                        "or_len": len(online_intent.get("or_groups") or []),
+                    }
+                )
+            except Exception:
+                pass
             sanitized_patch = {
                 key: value
                 for key, value in online_intent.items()
                 if key not in {"fts_tokens", "fts_columns", "fts_operator", "fts_op", "full_text_search"}
             }
+            # Ensure alias EQ keys are expanded into OR groups for the direct FTS path
+            try:
+                eq_fp = sanitized_patch.get("eq_filters") or []
+                if isinstance(eq_fp, list) and eq_fp:
+                    alias_map_d_raw = _get_namespace_mapping(settings, namespace, "DW_EQ_ALIAS_COLUMNS", {}) or {}
+                    alias_map_d: Dict[str, List[str]] = {}
+                    if isinstance(alias_map_d_raw, dict):
+                        for k, cols in alias_map_d_raw.items():
+                            if not isinstance(cols, (list, tuple, set)):
+                                continue
+                            bucket: List[str] = []
+                            seen_d: set[str] = set()
+                            for c in cols:
+                                sd = str(c or "").strip().upper()
+                                if sd and sd not in seen_d:
+                                    seen_d.add(sd)
+                                    bucket.append(sd)
+                            if bucket:
+                                alias_map_d[str(k or "").strip().upper()] = bucket
+                    # Fallback targets
+                    if not alias_map_d:
+                        targets = [
+                            "DEPARTMENT_1","DEPARTMENT_2","DEPARTMENT_3","DEPARTMENT_4",
+                            "DEPARTMENT_5","DEPARTMENT_6","DEPARTMENT_7","DEPARTMENT_8",
+                            "OWNER_DEPARTMENT",
+                        ]
+                        alias_map_d = {"DEPARTMENTS": targets, "DEPARTMENT": targets}
+                    produced: List[List[Dict[str, Any]]] = []
+                    keep_eq: List[Any] = []
+                    def _norm_pair(it):
+                        if isinstance(it, (list, tuple)) and len(it)==2:
+                            col = str(it[0] or "").strip().upper()
+                            vals = it[1]
+                            vals = list(vals) if isinstance(vals, (list,tuple,set)) else [vals]
+                            return col, vals
+                        if isinstance(it, dict):
+                            col = str((it.get("col") or it.get("field") or "")).strip().upper()
+                            val = it.get("val") if it.get("val") is not None else it.get("value")
+                            vals = [] if val is None else ([val] if not isinstance(val,(list,tuple,set)) else list(val))
+                            return col, vals
+                        return None, None
+                    for it in eq_fp:
+                        col, vals = _norm_pair(it)
+                        if not col:
+                            keep_eq.append(it)
+                            continue
+                        targets = alias_map_d.get(col)
+                        if not targets:
+                            keep_eq.append(it)
+                            continue
+                        for v in vals or []:
+                            grp = [{"col": t, "val": v, "op":"eq", "ci": True, "trim": True} for t in targets]
+                            if grp:
+                                produced.append(grp)
+                    if produced:
+                        og = sanitized_patch.setdefault("or_groups", [])
+                        for g in produced:
+                            og.append(g)
+                        sanitized_patch["eq_filters"] = keep_eq
+            except Exception:
+                pass
+            # Final fallback: if no OR groups yet, scan the question text for alias assignment
+            try:
+                if not sanitized_patch.get("or_groups"):
+                    import re as _re
+                    alias_targets = [
+                        "DEPARTMENT_1","DEPARTMENT_2","DEPARTMENT_3","DEPARTMENT_4",
+                        "DEPARTMENT_5","DEPARTMENT_6","DEPARTMENT_7","DEPARTMENT_8",
+                        "OWNER_DEPARTMENT",
+                    ]
+                    m = _re.search(r"(?i)\bdepartments?\s*=\s*([^\n\r;]+)", question or "")
+                    if m:
+                        val = m.group(1).strip().strip("'\"")
+                        if val:
+                            grp = [{"col": t, "val": val, "op":"eq", "ci": True, "trim": True} for t in alias_targets]
+                            if grp:
+                                og = sanitized_patch.setdefault("or_groups", [])
+                                og.append(grp)
+            except Exception:
+                pass
             binds = dict(direct_binds)
             online_meta: Dict[str, Any] = {}
             if sanitized_patch:

@@ -106,7 +106,15 @@ def _where_from_eq_filters(eq_filters: List[dict], binds: Dict[str, Any]) -> str
                 rhs_expr = f"UPPER({rhs_expr})"
             if operator == "like":
                 return f"{col_expr} LIKE {rhs_expr}"
-            return f"{col_expr} = {rhs_expr}"
+            op_map = {
+                "eq": "=",
+                "gt": ">",
+                "gte": ">=",
+                "lt": "<",
+                "lte": "<=",
+            }
+            sql_op = op_map.get(operator, "=")
+            return f"{col_expr} {sql_op} {rhs_expr}"
 
         if synonyms:
             equals_vals = [v for v in synonyms.get("equals", []) if v]
@@ -155,6 +163,9 @@ def _group_eq_by_col(eq_filters) -> Dict[str, List[Any]]:
         if isinstance(item, dict):
             col = item.get("col") or item.get("column")
             if not isinstance(col, str):
+                continue
+            op = str(item.get("op") or "eq").lower()
+            if op not in {"eq", "in"}:
                 continue
             val = item.get("val") if item.get("val") is not None else item.get("value")
             grouped[col].append(val)

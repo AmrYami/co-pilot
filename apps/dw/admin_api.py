@@ -13,7 +13,7 @@ from sqlalchemy.engine import Connection
 
 from apps.dw.db import get_memory_session
 from apps.dw.learning import save_positive_rule
-from apps.dw.rate_parser import build_intent_signature as _build_sig, signature_text as _sig_text, signature_sha as _sig_sha
+from apps.dw.learning_store import _canon_signature_from_intent
 from apps.dw.memory_db import get_memory_engine
 from apps.dw.order_utils import normalize_order_hint
 
@@ -336,9 +336,40 @@ def approve_feedback(fid: int):
                     engine = get_memory_engine()
                     # Build signature artifacts from intent when available
                     try:
-                        sig_obj = _build_sig(intent) if intent else None
-                        sig_txt = _sig_text(sig_obj) if sig_obj else None
-                        sig_sha = _sig_sha(sig_obj) if sig_obj else None
+                        if intent:
+                            intent_for_sig = dict(intent)
+                            eq_filters_for_sig = []
+                            for entry in intent.get("eq_filters") or []:
+                                if isinstance(entry, (list, tuple)) and len(entry) == 2:
+                                    eq_filters_for_sig.append([str(entry[0]).upper(), list(entry[1]) if isinstance(entry[1], (list, tuple, set)) else [entry[1]]])
+                                elif isinstance(entry, dict):
+                                    col = str(entry.get("col") or entry.get("field") or "").upper()
+                                    vals = entry.get("val") if entry.get("val") is not None else entry.get("value")
+                                    if vals is None:
+                                        vals_list: list[Any] = []
+                                    elif isinstance(vals, (list, tuple, set)):
+                                        vals_list = list(vals)
+                                    else:
+                                        vals_list = [vals]
+                                    if col:
+                                        eq_filters_for_sig.append([col, vals_list])
+                            if eq_filters_for_sig:
+                                has_departments = any(col == "DEPARTMENTS" for col, _ in eq_filters_for_sig)
+                                has_department = any(col == "DEPARTMENT" for col, _ in eq_filters_for_sig)
+                                if has_departments and not has_department:
+                                    dep_vals = next((vals for col, vals in eq_filters_for_sig if col == "DEPARTMENTS"), [])
+                                    eq_filters_for_sig.append(["DEPARTMENT", list(dep_vals)])
+                                intent_for_sig["eq_filters"] = eq_filters_for_sig
+                            if intent_for_sig.get("sort_by") and not intent_for_sig.get("order"):
+                                intent_for_sig["order"] = {
+                                    "col": intent_for_sig.get("sort_by"),
+                                    "desc": bool(intent_for_sig.get("sort_desc", True)),
+                                }
+                            sha256, _sha1, sig_txt = _canon_signature_from_intent(intent_for_sig)
+                            sig_obj = json.loads(sig_txt)
+                            sig_sha = sha256
+                        else:
+                            sig_obj, sig_txt, sig_sha = None, None, None
                     except Exception:
                         sig_obj, sig_txt, sig_sha = None, None, None
                     save_positive_rule(

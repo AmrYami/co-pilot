@@ -86,8 +86,11 @@ def create_app():
 
     log_event(log, "boot", "app_boot", {"message": "registering blueprints"})
 
-    # Warm up SQL model (already works)
-    ensure_model(role="sql")
+    # Warm up SQL model unless explicitly disabled
+    import os as _os
+    _disable_sql = str(_os.getenv("DISABLE_SQL_MODEL", "0")).strip().lower() in {"1", "true", "yes"}
+    if not _disable_sql:
+        ensure_model(role="sql")
 
     # NEW: warm up clarifier if it isn't explicitly disabled
     # The loader will read CLARIFIER_* from the environment.

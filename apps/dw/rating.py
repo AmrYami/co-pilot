@@ -30,6 +30,20 @@ def rate():
 
     try:
         result = run_rate(inquiry_id=inquiry_id, rating=rating, comment=comment)
+        # Log full response without rows for observability
+        try:
+            if isinstance(result, dict):
+                resp_copy = dict(result)
+                rows_field = resp_copy.get("rows")
+                try:
+                    rows_count = len(rows_field) if isinstance(rows_field, list) else int(rows_field or 0)
+                except Exception:
+                    rows_count = 0
+                if "rows" in resp_copy:
+                    resp_copy["rows"] = f"omitted({rows_count})"
+                log.info({"event": "rate.response.full", "inquiry_id": inquiry_id, "response": resp_copy})
+        except Exception:
+            pass
         log.info({"event": "rate.response", "inquiry_id": inquiry_id, "retry": False})
 
         final_sql_str = result.get("sql") if isinstance(result, dict) else None

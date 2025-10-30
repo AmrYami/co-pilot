@@ -538,6 +538,27 @@ cases:
     expect_not_contains:
       - 'ol_fts_'
 
+  # --- FTS + alias(DEPARTMENTS) overlay robustness (both phrasing variants) ---
+  - id: fts_alias_departments_home_care
+    question: "show contracts where contains maintenance or home care and departments = SUPPORT SERVICES"
+    full_text_search: true
+    expect_sql_contains:
+      - 'LIKE UPPER(:fts_0)'
+      - 'LIKE UPPER(:fts_1)'
+      - 'UPPER(TRIM(DEPARTMENT_1)) IN (UPPER(:ol_eq_'
+      - 'ORDER BY REQUEST_DATE DESC'
+    notes: "Alias DEPARTMENTS must expand to cross-column OR group in direct FTS path."
+
+  - id: fts_alias_departments_home_cares
+    question: "show contracts where contains maintenance or home cares and departments = SUPPORT SERVICES"
+    full_text_search: true
+    expect_sql_contains:
+      - 'LIKE UPPER(:fts_0)'
+      - 'LIKE UPPER(:fts_1)'
+      - 'UPPER(TRIM(DEPARTMENT_1)) IN (UPPER(:ol_eq_'
+      - 'ORDER BY REQUEST_DATE DESC'
+    notes: "Minor token variation should not drop the DEPARTMENTS overlay."
+
   - id: multiple_values_same_column_uses_IN
     question: "list all contracts has it or home care and ENTITY = DSFH and REPRESENTATIVE_EMAIL = samer@procare-sa.com or mmaboumoussa@fakeeh.care"
     full_text_search: true

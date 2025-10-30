@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from typing import Any, Dict, Optional, List
 import hashlib
@@ -20,6 +21,9 @@ except Exception:  # fallback stub; will recompute locally if needed
     _canon_sig = None  # type: ignore
 
 log = logging.getLogger("dw")
+
+_EMAIL_RE = re.compile(r"(?i)^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$")
+_NUMBER_RE = re.compile(r"^-?\d+(\.\d+)?$")
 
 _DDL_STATEMENTS = (
     """
@@ -74,8 +78,8 @@ _MIGRATIONS = (
     "CREATE INDEX IF NOT EXISTS idx_dw_rules_intent_sha ON dw_rules (intent_sha)",
     "CREATE INDEX IF NOT EXISTS idx_dw_rules_rule_signature ON dw_rules (rule_signature)",
     "CREATE INDEX IF NOT EXISTS idx_dw_rules_question_norm ON dw_rules (question_norm)",
-    # Ensure ON CONFLICT (intent_sha, rule_kind) is valid in Postgres
-    "CREATE UNIQUE INDEX IF NOT EXISTS ux_dw_rules_sha_kind ON dw_rules (intent_sha, rule_kind)",
+    # Ensure ON CONFLICT (intent_sha, rule_kind) is valid via named unique index
+    "CREATE UNIQUE INDEX IF NOT EXISTS ux_dw_rules_intent ON dw_rules (intent_sha, rule_kind)",
 )
 
 
@@ -143,6 +147,261 @@ def _sha256(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 
+def _val_type(value: Any) -> str:
+    text = str(value or "").strip()
+    if _EMAIL_RE.match(text):
+        return "EMAIL"
+    if _NUMBER_RE.match(text):
+        return "NUMBER"
+    return "TEXT"
+
+
+def _normalize_value_list(values: List[Any]) -> List[Any]:
+    out: List[Any] = []
+    seen: set[str] = set()
+    for v in values:
+        if v is None:
+            continue
+        if isinstance(v, str):
+            text = v.strip()
+            if not text:
+                continue
+            key = text.upper()
+            value = text
+        else:
+            value = v
+            key = str(v)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(value)
+    return out
+
+
+def _normalize_eq_filters_list(raw: Any) -> List[List[Any]]:
+    if not isinstance(raw, list):
+        return []
+    normalized: List[List[Any]] = []
+    for item in raw:
+        col = ""
+        vals: List[Any] = []
+        if isinstance(item, (list, tuple)) and len(item) == 2:
+            col = str(item[0] or "").strip().upper()
+            candidate = item[1]
+        elif isinstance(item, dict):
+            col = str((item.get("col") or item.get("field") or "")).strip().upper()
+            candidate = (
+                item.get("val")
+                if item.get("val") is not None
+                else item.get("values")
+            )
+        else:
+            continue
+        if not col:
+            continue
+        if isinstance(candidate, (list, tuple, set)):
+            vals = list(candidate)
+        elif candidate is not None:
+            vals = [candidate]
+        else:
+            vals = []
+        clean_vals = _normalize_value_list(vals)
+        if not clean_vals:
+            continue
+        normalized.append([col, clean_vals])
+    return normalized
+
+
+def _build_question_value_map(intent: Optional[Dict[str, Any]]) -> Dict[str, List[Any]]:
+    eq_filters = _normalize_eq_filters_list((intent or {}).get("eq_filters") or [])
+    value_map: Dict[str, List[Any]] = {}
+    for col, values in eq_filters:
+        key = str(col or "").strip().upper()
+        if not key:
+            continue
+        bucket = value_map.setdefault(key, [])
+        for val in values:
+            bucket.append(val)
+        value_map[key] = _normalize_value_list(bucket)
+    return value_map
+
+
+def _apply_eq_shape(
+    shape_items: List[Dict[str, Any]],
+    question_values: Dict[str, List[Any]],
+) -> List[List[Any]]:
+    eq_filters: List[List[Any]] = []
+    for item in shape_items:
+        logical = str(item.get("logical") or "").strip().upper()
+        column = str(item.get("column") or "").strip().upper()
+        targets = item.get("columns") or item.get("targets") or []
+        if isinstance(targets, list):
+            target_list = [str(t or "").strip().upper() for t in targets if str(t or "").strip()]
+        else:
+            target_list = []
+        if logical:
+            values = question_values.get(logical)
+            if not values and target_list:
+                collected: List[Any] = []
+                for target in target_list:
+                    collected.extend(question_values.get(target, []))
+                values = _normalize_value_list(collected)
+            if not values:
+                continue
+            eq_filters.append([logical, list(values)])
+        elif column:
+            values = question_values.get(column)
+            if not values:
+                continue
+            eq_filters.append([column, list(values)])
+        else:
+            continue
+    return eq_filters
+
+
+def _value_policy() -> str:
+    try:
+        policy = (os.getenv("DW_EQ_VALUE_POLICY") or "question_only").strip().lower()
+    except Exception:
+        policy = "question_only"
+    if policy not in {"question_only", "prefer_question"}:
+        policy = "question_only"
+    return policy
+
+
+def _normalize_token_str(token: Any) -> Optional[str]:
+    if token is None:
+        return None
+    text = str(token).strip().lower()
+    if not text:
+        return None
+    base = text
+    if base.endswith("'s") and len(base) > 2:
+        base = base[:-2]
+    elif base.endswith("ies") and len(base) > 3:
+        base = base[:-3] + "y"
+    elif base.endswith(("xes", "zes", "ches", "shes", "sses", "ees")) and len(base) > 3:
+        base = base[:-2]
+    elif base.endswith("s") and len(base) > 3 and not base.endswith("ss"):
+        base = base[:-1]
+    return base
+
+
+def _normalize_token_list(tokens: Any) -> List[str]:
+    result: List[str] = []
+    seen: set[str] = set()
+
+    def _add(value: Any) -> None:
+        normalized = _normalize_token_str(value)
+        if not normalized:
+            return
+        if normalized in seen:
+            return
+        seen.add(normalized)
+        result.append(normalized)
+
+    if isinstance(tokens, (list, tuple, set)):
+        for item in tokens:
+            if isinstance(item, (list, tuple, set)):
+                for sub in item:
+                    _add(sub)
+            else:
+                _add(item)
+    elif tokens is not None:
+        _add(tokens)
+    return result
+
+
+def _normalize_learning_hints(hints: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    src = hints or {}
+    normalized: Dict[str, Any] = {}
+
+    eq_filters = _normalize_eq_filters_list(src.get("eq_filters") or [])
+    if eq_filters:
+        normalized["eq_filters"] = eq_filters
+    if isinstance(src.get("or_groups"), list):
+        normalized["or_groups"] = [grp for grp in src["or_groups"] if isinstance(grp, list) and grp]
+
+    tokens = _normalize_token_list(src.get("fts_tokens"))
+    if tokens:
+        normalized["fts_tokens"] = tokens
+        if src.get("fts_operator"):
+            normalized["fts_operator"] = src.get("fts_operator")
+        if isinstance(src.get("fts_columns"), list):
+            columns = [
+                str(col or "").strip().upper()
+                for col in src.get("fts_columns")
+                if isinstance(col, str) and str(col or "").strip()
+            ]
+            if columns:
+                normalized["fts_columns"] = columns
+
+    if src.get("group_by"):
+        normalized["group_by"] = src.get("group_by")
+    if src.get("gross") is not None:
+        normalized["gross"] = bool(src.get("gross"))
+
+    sort_by = src.get("sort_by")
+    if isinstance(sort_by, str) and sort_by.strip():
+        normalized["sort_by"] = sort_by.strip().upper()
+    if src.get("sort_desc") is not None:
+        normalized["sort_desc"] = bool(src.get("sort_desc"))
+
+    return normalized
+
+
+def _normalize_learning_intent(intent: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    src = intent or {}
+    normalized: Dict[str, Any] = {}
+
+    eq_filters = _normalize_eq_filters_list(src.get("eq_filters") or [])
+    if eq_filters:
+        normalized["eq_filters"] = eq_filters
+
+    if isinstance(src.get("or_groups"), list):
+        normalized["or_groups"] = [grp for grp in src["or_groups"] if isinstance(grp, list) and grp]
+
+    tokens = _normalize_token_list(src.get("fts_tokens"))
+    if not tokens and isinstance(src.get("fts_groups"), list):
+        tokens = _normalize_token_list(src.get("fts_groups"))
+    if tokens:
+        normalized["fts_tokens"] = tokens
+        if src.get("fts_operator"):
+            normalized["fts_operator"] = src.get("fts_operator")
+        if isinstance(src.get("fts_columns"), list):
+            columns = [
+                str(col or "").strip().upper()
+                for col in src.get("fts_columns")
+                if isinstance(col, str) and str(col or "").strip()
+            ]
+            if columns:
+                normalized["fts_columns"] = columns
+
+    if src.get("group_by"):
+        normalized["group_by"] = src.get("group_by")
+    if src.get("gross") is not None:
+        normalized["gross"] = bool(src.get("gross"))
+
+    sort_by = src.get("sort_by") or src.get("order", {}).get("col")
+    if isinstance(sort_by, str) and sort_by.strip():
+        normalized["sort_by"] = sort_by.strip().upper()
+    sort_desc: Optional[bool] = None
+    if src.get("sort_desc") is not None:
+        sort_desc = bool(src.get("sort_desc"))
+    elif isinstance(src.get("order"), dict) and src.get("order", {}).get("desc") is not None:
+        sort_desc = bool(src["order"]["desc"])
+    if sort_desc is not None:
+        normalized["sort_desc"] = sort_desc
+
+    if normalized.get("sort_by") and not isinstance(normalized.get("order"), dict):
+        normalized["order"] = {
+            "col": normalized.get("sort_by"),
+            "desc": bool(normalized.get("sort_desc", True)),
+        }
+
+    return normalized
+
+
 def save_positive_rule(
     engine,
     question: str,
@@ -157,6 +416,8 @@ def save_positive_rule(
 
     if engine is None or not applied_hints:
         return
+    applied_hints = _normalize_learning_hints(applied_hints)
+    intent = _normalize_learning_intent(intent)
     _ensure_tables(engine)
     rows: list[tuple[str, Dict[str, Any]]] = []
 
@@ -194,8 +455,9 @@ def save_positive_rule(
             alias_map = eq_alias_columns()
         except Exception:
             alias_map = {}
-        canon_eq: List[List[Any]] = []
-        or_groups: List[List[Dict[str, Any]]] = []
+
+        shape_items: List[Dict[str, Any]] = []
+
         def _norm(it) -> tuple[str, List[Any]] | None:
             if isinstance(it, (list, tuple)) and len(it) == 2:
                 col = str(it[0] or "").upper().strip()
@@ -204,34 +466,41 @@ def save_positive_rule(
             if isinstance(it, dict):
                 col = str(it.get("col") or it.get("field") or "").upper().strip()
                 val = it.get("val") if it.get("val") is not None else it.get("value")
-                return col, [val] if val is not None else []
+                if val is None:
+                    vals = []
+                elif isinstance(val, (list, tuple, set)):
+                    vals = list(val)
+                else:
+                    vals = [val]
+                return col, vals
             return None
+
         for it in raw_eq:
             norm = _norm(it)
             if not norm:
                 continue
             col, vals = norm
-            if not col or not vals:
+            if not col:
                 continue
+            clean_vals = _normalize_value_list(vals)
+            if not clean_vals:
+                continue
+            entry: Dict[str, Any] = {
+                "op": "in" if len(clean_vals) > 1 else "eq",
+                "types": sorted({_val_type(v) for v in clean_vals}),
+                "ci": True,
+                "trim": True,
+            }
             targets = alias_map.get(col)
             if targets:
-                for v in vals:
-                    group = [{"col": t, "val": v, "op": "eq", "ci": True, "trim": True} for t in targets]
-                    if group:
-                        or_groups.append(group)
-                continue
-            canon_eq.append([col, vals])
-        payload: Dict[str, Any] = {}
-        if canon_eq:
-            payload["eq_filters"] = canon_eq
-        if isinstance(applied_hints.get("or_groups"), list) and applied_hints.get("or_groups"):
-            # carry through any existing or_groups
-            payload["or_groups"] = applied_hints.get("or_groups")
-        if or_groups:
-            og = payload.setdefault("or_groups", [])
-            og.extend(or_groups)
-        if payload:
-            rows.append(("eq", payload))
+                entry["logical"] = col
+                entry["columns"] = targets
+            else:
+                entry["column"] = col
+            shape_items.append(entry)
+
+        if shape_items:
+            rows.append(("eq_shape", {"items": shape_items}))
 
         # Optionally persist eq_like shards (alias-aware) as a tolerant backup
         try:
@@ -459,15 +728,30 @@ def load_rules_for_question(
     merged: Dict[str, Any] = {}
     norm = _norm_question(question)
     eq_from_rules: List[Any] = []
+    shape_rules: List[Dict[str, Any]] = []
+
+    try:
+        alias_map = eq_alias_columns()
+    except Exception:
+        alias_map = {}
+
+    intent_norm: Dict[str, Any] = {}
+    if isinstance(intent, dict):
+        intent_norm = _normalize_learning_intent(intent)
 
     with engine.connect() as cx:
         try:
             sig_for_log = None
-            if intent is not None:
+            if intent_norm:
                 if _canon_sig:
-                    sha256, sha1, sig_text = _canon_sig(intent)  # type: ignore[misc]
+                    sha256, sha1, sig_text = _canon_sig(intent_norm)  # type: ignore[misc]
+                    try:
+                        log.info({"event": "rules.intent.normalized", "intent": intent_norm})
+                        log.info({"event": "rules.intent.signature", "sig_text": sig_text})
+                    except Exception:
+                        pass
                 else:
-                    sig_dict, sig_text, sha1 = build_intent_signature(intent)
+                    sig_dict, sig_text, sha1 = build_intent_signature(intent_norm)
                     sha256 = _sha256(sig_text)
                 sig_for_log = {"sha1": sha1, "sha256": sha256, "sig_len": len(sig_text or "")}
             log.info({"event": "rules.signature.compute", "qnorm": norm, **(sig_for_log or {})})
@@ -513,13 +797,13 @@ def load_rules_for_question(
             )
 
         # 3) Build from provided intent (derive both SHA-1 and SHA-256) using value-agnostic shape
-        if not rows and intent:
+        if not rows and intent_norm:
             try:
                 if _canon_sig:
-                    sha256, sha1, sig_str = _canon_sig(intent)  # type: ignore[misc]
+                    sha256, sha1, sig_str = _canon_sig(intent_norm)  # type: ignore[misc]
                 else:
                     # Fallback to legacy: use value-based signature then convert to both hashes
-                    sig_dict, sig_str, sha1 = build_intent_signature(intent)
+                    sig_dict, sig_str, sha1 = build_intent_signature(intent_norm)
                     sha256 = _sha256(sig_str)
                 rows = _exec(
                     """
@@ -646,6 +930,12 @@ def load_rules_for_question(
                 merged["fts_operator"] = payload.get("operator", "OR")
                 if payload.get("columns"):
                     merged["fts_columns"] = payload.get("columns")
+        elif k == "eq_shape":
+            items = payload.get("items")
+            if isinstance(items, list) and items:
+                for entry in items:
+                    if isinstance(entry, dict):
+                        shape_rules.append(entry)
         elif k == "eq":
             eq_payload = payload.get("eq_filters") or []
             if eq_payload:
@@ -664,15 +954,82 @@ def load_rules_for_question(
                 merged["sort_by"] = payload.get("sort_by")
             if payload.get("sort_desc") is not None:
                 merged["sort_desc"] = bool(payload.get("sort_desc"))
+        elif k == "eq_like":
+            # Merge persisted alias->LIKE fragments as a tolerant backup overlay.
+            # Expected payload shape: { "fragments": { ALIAS: [TOK, ...], ... }, "min_len": int }
+            try:
+                fr = payload.get("fragments") if isinstance(payload, dict) else None
+            except Exception:
+                fr = None
+            if isinstance(fr, dict) and fr:
+                target = merged.setdefault("eq_like", {})
+                for alias, toks in fr.items():
+                    key = str(alias or "").strip().upper()
+                    if not key:
+                        continue
+                    # normalize tokens -> uppercase unique list
+                    vals = []
+                    seen = set()
+                    for t in (toks or []):
+                        s = str(t or "").strip().upper()
+                        if not s or s in seen:
+                            continue
+                        seen.add(s)
+                        vals.append(s)
+                    if not vals:
+                        continue
+                    if key in target and isinstance(target.get(key), list):
+                        # extend de-duplicating
+                        combined = list(target.get(key) or [])
+                        for v in vals:
+                            if v not in combined:
+                                combined.append(v)
+                        target[key] = combined
+                    else:
+                        target[key] = vals
 
         if merged:
             merged.setdefault("full_text_search", bool(merged.get("fts_tokens")))
 
     # Prefer-question merge for EQ filters
-    if eq_from_rules or (isinstance(intent, dict) and intent.get("eq_filters")):
-        merged["eq_filters"] = _merge_eq_filters_prefer_question(
-            (intent or {}).get("eq_filters"), eq_from_rules
-        )
+    question_eq_normalized = _normalize_eq_filters_list(intent_norm.get("eq_filters") or [])
+    question_values = _build_question_value_map(intent_norm)
+    eq_from_shape: List[List[Any]] = []
+    if shape_rules:
+        eq_from_shape = _apply_eq_shape(shape_rules, question_values)
+
+    policy = _value_policy()
+    eq_final: List[List[Any]] = []
+    seen_cols: set[str] = set()
+
+    for col, values in eq_from_shape:
+        col_key = str(col or "").strip().upper()
+        if not col_key:
+            continue
+        clean_vals = _normalize_value_list(values)
+        if not clean_vals:
+            continue
+        eq_final.append([col_key, clean_vals])
+        seen_cols.add(col_key)
+
+    for col, values in question_eq_normalized:
+        col_key = str(col or "").strip().upper()
+        if not col_key or col_key in seen_cols:
+            continue
+        eq_final.append([col_key, values])
+        seen_cols.add(col_key)
+
+    if not eq_final:
+        if eq_from_rules and policy != "question_only":
+            eq_final = _merge_eq_filters_prefer_question(
+                question_eq_normalized,
+                eq_from_rules,
+            )
+        elif question_eq_normalized:
+            eq_final = question_eq_normalized
+
+    if eq_final:
+        merged["eq_filters"] = eq_final
     try:
         log.info(
             {
@@ -780,19 +1137,4 @@ def to_patch_from_comment(comment: str) -> Dict[str, Any]:
         "sort_desc": sort_desc,
         "top_n": top_n,
     }
-        elif k == "eq_like":
-            # Merge alias->tokens fragments
-            fr = payload.get("fragments") if isinstance(payload, dict) else None
-            if isinstance(fr, dict):
-                try:
-                    existing = merged.setdefault("eq_like", {})
-                    for alias, toks in fr.items():
-                        if not isinstance(toks, (list, tuple)):
-                            continue
-                        bucket = existing.setdefault(str(alias).upper(), [])
-                        for t in toks:
-                            s = str(t or "").upper().strip()
-                            if s and s not in bucket:
-                                bucket.append(s)
-                except Exception:
-                    pass
+        

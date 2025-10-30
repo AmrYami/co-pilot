@@ -261,6 +261,49 @@ def _val_type(v: str) -> str:
     return "TEXT"
 
 
+def _normalize_token_str(token: Any) -> Optional[str]:
+    if token is None:
+        return None
+    text = str(token).strip().lower()
+    if not text:
+        return None
+    base = text
+    if base.endswith("'s") and len(base) > 2:
+        base = base[:-2]
+    elif base.endswith("ies") and len(base) > 3:
+        base = base[:-3] + "y"
+    elif base.endswith(("xes", "zes", "ches", "shes", "sses", "ees")) and len(base) > 3:
+        base = base[:-2]
+    elif base.endswith("s") and len(base) > 3 and not base.endswith("ss"):
+        base = base[:-1]
+    return base
+
+
+def _normalize_token_list(tokens: Any) -> List[str]:
+    result: List[str] = []
+    seen: set[str] = set()
+
+    def _add(value: Any) -> None:
+        norm = _normalize_token_str(value)
+        if not norm:
+            return
+        if norm in seen:
+            return
+        seen.add(norm)
+        result.append(norm)
+
+    if isinstance(tokens, (list, tuple, set)):
+        for item in tokens:
+            if isinstance(item, (list, tuple, set)):
+                for sub in item:
+                    _add(sub)
+            else:
+                _add(item)
+    elif tokens is not None:
+        _add(tokens)
+    return result
+
+
 def _intent_shape_only(intent: Dict[str, Any]) -> Dict[str, Any]:
     eq_shape = dict(intent.get("eq") or {})
     if not eq_shape and intent.get("eq_filters"):
@@ -269,13 +312,18 @@ def _intent_shape_only(intent: Dict[str, Any]) -> Dict[str, Any]:
             types = sorted({_val_type(v) for v in (vals or [])})
             tmp[str(col).upper()] = {"op": ("in" if len(vals or []) > 1 else "eq"), "types": types}
         eq_shape = tmp
+
+    fts_tokens = _normalize_token_list(intent.get("fts_tokens"))
+    if not fts_tokens and isinstance(intent.get("fts_groups"), list):
+        fts_tokens = _normalize_token_list(intent.get("fts_groups"))
+
     order = None
     if intent.get("order", {}).get("col"):
         order = {
             "col": str(intent["order"]["col"]).upper(),
             "desc": bool(intent["order"].get("desc", True)),
         }
-    return {"eq": eq_shape, "fts": [], "group_by": [], "order": order}
+    return {"eq": eq_shape, "fts": fts_tokens, "group_by": [], "order": order}
 
 
 def _canon_signature_from_intent(intent: Dict[str, Any]) -> tuple[str, str, str]:
@@ -286,29 +334,66 @@ def _canon_signature_from_intent(intent: Dict[str, Any]) -> tuple[str, str, str]
 
 
 def _merge_eq_filters_prefer_question(current_eq, rule_eq):
-    """Merge rule eq filters with question eq filters, preferring current question values for same columns.
+    """Merge rule eq filters with question eq filters, preferring current question values."""
 
-    Accepts either list-of-lists form [["COL", ["V1","V2"]], ...] or canonical dict items
-    {"col":"COL","val":"V"}. Returns list-of-lists.
-    """
-    qmap = {str(c).upper(): vs for c, vs in (current_eq or [])}
-    out = []
-    for item in (rule_eq or []):
-        if isinstance(item, (list, tuple)) and len(item) == 2:
-            col, rvals = item[0], item[1]
-        elif isinstance(item, dict):
+    def _canonicalize(item: Any) -> Optional[Tuple[str, Any]]:
+        if isinstance(item, dict):
             col = item.get("col") or item.get("field")
-            rvals = item.get("val") or item.get("values") or []
-            if rvals is not None and not isinstance(rvals, (list, tuple, set)):
-                rvals = [rvals]
-        else:
+            if not isinstance(col, str):
+                return None
+            col_norm = col.strip().upper()
+            if not col_norm:
+                return None
+            canon = dict(item)
+            canon["col"] = col_norm
+            return col_norm, canon
+        if isinstance(item, (list, tuple)) and len(item) == 2:
+            col = item[0]
+            if not isinstance(col, (str, bytes)):
+                return None
+            col_norm = str(col).strip().upper()
+            if not col_norm:
+                return None
+            vals = item[1]
+            if isinstance(vals, (list, tuple, set)):
+                values = list(vals)
+            elif vals is None:
+                values = []
+            else:
+                values = [vals]
+            return col_norm, [col_norm, values]
+        return None
+
+    question_map: Dict[str, Any] = {}
+    question_order: List[str] = []
+    for item in current_eq or []:
+        canonical = _canonicalize(item)
+        if not canonical:
             continue
-        col = str(col).upper()
-        out.append([col, qmap.get(col, rvals or [])])
-    for col, vals in (current_eq or []):
-        c = str(col).upper()
-        if not any(c == x[0] for x in out):
-            out.append([c, vals])
+        col_norm, canon_item = canonical
+        question_map[col_norm] = canon_item
+        question_order.append(col_norm)
+
+    out: List[Any] = []
+    used: set[str] = set()
+
+    for item in rule_eq or []:
+        canonical = _canonicalize(item)
+        if not canonical:
+            continue
+        col_norm, canon_item = canonical
+        if col_norm in question_map:
+            if col_norm not in used:
+                out.append(question_map[col_norm])
+                used.add(col_norm)
+        else:
+            out.append(canon_item)
+
+    for col_norm in question_order:
+        if col_norm in question_map and col_norm not in used:
+            out.append(question_map[col_norm])
+            used.add(col_norm)
+
     return out
 
 

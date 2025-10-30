@@ -102,26 +102,60 @@ def extract_fts_terms(question: str, force: bool = False) -> Tuple[List[List[str
         " mentioning ",
     ]
     tail = None
+    cue_match = None
     for cue in cues:
-        if cue in ql:
-            tail = _norm(ql.split(cue, 1)[1])
+        idx = ql.find(cue)
+        if idx != -1:
+            cue_match = cue
             break
-    if tail is not None:
-        # Cut tail when an alias EQ fragment follows (AND/OR <ALIAS> ...)
+    if cue_match is not None:
+        # Extract the original-case tail right after the cue
+        start = q.lower().find(cue_match.strip())
+        if start >= 0:
+            tail_orig = q[start + len(cue_match.strip()):].lstrip()
+        else:
+            # Fallback to lowercase-based split when exact pos not found
+            tail_orig = ql.split(cue_match, 1)[1].strip()
+
+        def _extract_paren_span(s: str) -> Tuple[str, str] | Tuple[None, str]:
+            if not s or not s.startswith("("):
+                return None, s
+            depth = 0
+            for i, ch in enumerate(s):
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0:
+                        # include up to i
+                        return s[1:i], s[i + 1 :]
+            # Unbalanced: treat as no parens
+            return None, s
+
+        # Prefer tokens inside balanced parentheses if present
+        in_parens, rest_after = _extract_paren_span(tail_orig)
+        tokens_source = None
+        if isinstance(in_parens, str):
+            tokens_source = in_parens
+        else:
+            tokens_source = tail_orig
+
+        # If we didn't use parentheses, cut tail at alias assignment to avoid swallowing EQ parts
         aliases = _eq_alias_keys()
-        if aliases:
-            tail = _cut_tail_at_alias(tail, aliases)
-        or_groups = [g for g in OR_SEP.split(tail) if g]
+        if not in_parens and isinstance(tokens_source, str) and aliases:
+            tokens_source = _cut_tail_at_alias(tokens_source, aliases)
+
+        # Split to OR groups first; allow separators: "or", "|", and commas
+        raw_groups = [g for g in re.split(r"\s*\bor\b\s*|\s*\|\s*|,", tokens_source, flags=re.I) if g]
         groups: List[List[str]] = []
-        for g in or_groups:
-            terms = [t for t in AND_SEP.split(g) if t]
-            normalized = []
+        for g in raw_groups:
+            terms = [t for t in re.split(r"\s*\band\b\s*|&", g, flags=re.I) if t]
+            normalized: List[str] = []
             for t in terms:
                 token = _norm(t)
                 if not token:
                     continue
                 if is_email(token) or is_phone(token):
-                    # push these to EQ filters elsewhere; exclude from FTS
                     continue
                 # Skip alias assignments like 'DEPARTMENTS = X'
                 if aliases:

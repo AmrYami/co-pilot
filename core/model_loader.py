@@ -50,6 +50,10 @@ def _resolve_role_config(role: str) -> tuple[str, Optional[str]]:
 
 def _load_sql_model(backend: str, path: Optional[str]) -> Optional[Dict[str, Any]]:
     backend = (backend or "exllama").lower()
+    # Allow disabling the SQL model via backend key
+    if backend in {"off", "none", "disabled"}:
+        _log("[sql] model disabled by config")
+        return None
     path = path or os.getenv("MODEL_PATH")
     if not path:
         raise RuntimeError("MODEL_PATH not set for SQL model")
