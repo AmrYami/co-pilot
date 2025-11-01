@@ -231,6 +231,111 @@ def build_or_group(or_terms: List[dict]) -> Tuple[str, Dict[str, Any]]:
     return (sql_utils.or_join(parts) if parts else ""), binds
 
 
+def _coerce_numeric_literal(value: Any) -> Any:
+    if isinstance(value, (int, float)):
+        return value
+    if isinstance(value, str):
+        text = value.strip().replace(",", "")
+        if text == "":
+            return value
+        try:
+            if "." in text:
+                return float(text)
+            return int(text)
+        except ValueError:
+            return value
+    return value
+
+
+def numeric_clause_from_filters(
+    numeric_filters: List[Any],
+    binds: Dict[str, Any],
+    *,
+    bind_prefix: str = "num",
+) -> Tuple[str, Dict[str, Any]]:
+    """Render numeric predicates without trimming/upper casing."""
+
+    if not numeric_filters:
+        return "", binds
+
+    clauses: List[str] = []
+    counter = 0
+    seen: set[Tuple[str, str, Tuple[Any, ...]]] = set()
+
+    def _slug(col_name: str) -> str:
+        slug = re.sub(r"[^A-Z0-9]+", "_", col_name.upper())
+        return slug.strip("_") or "COL"
+
+    for raw in numeric_filters or []:
+        col = ""
+        op = ""
+        values: List[Any] = []
+        if isinstance(raw, dict):
+            col = str(raw.get("col") or raw.get("column") or "").strip().upper()
+            op = str(raw.get("op") or raw.get("operator") or "").strip().lower()
+            raw_vals = raw.get("values")
+            if raw_vals is None and raw.get("val") is not None:
+                raw_vals = [raw.get("val")]
+        else:
+            raw_vals = None
+            if isinstance(raw, (list, tuple)) and len(raw) >= 2:
+                col = str(raw[0] or "").strip().upper()
+                op = str(raw[1] or "").strip().lower()
+                if len(raw) >= 3:
+                    raw_vals = raw[2]
+
+        if not col or not op:
+            continue
+
+        if isinstance(raw_vals, (list, tuple, set)):
+            values = list(raw_vals)
+        elif raw_vals is None:
+            values = []
+        else:
+            values = [raw_vals]
+
+        normalized_values = tuple(_coerce_numeric_literal(v) for v in values)
+        key = (col, op, normalized_values)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        slug = _slug(col)
+        if op == "between":
+            if len(normalized_values) != 2:
+                continue
+            lhs = f"{bind_prefix}_{slug}_{counter}_lo"
+            rhs = f"{bind_prefix}_{slug}_{counter}_hi"
+            counter += 1
+            binds[lhs] = normalized_values[0]
+            binds[rhs] = normalized_values[1]
+            clauses.append(f"{col} BETWEEN :{lhs} AND :{rhs}")
+            continue
+
+        op_map = {
+            "gt": ">",
+            "gte": ">=",
+            "lt": "<",
+            "lte": "<=",
+            "eq": "=",
+            ">": ">",
+            ">=": ">=",
+            "<": "<",
+            "<=": "<=",
+        }
+        sql_op = op_map.get(op)
+        if sql_op is None:
+            continue
+        if not normalized_values:
+            continue
+        name = f"{bind_prefix}_{slug}_{counter}"
+        counter += 1
+        binds[name] = normalized_values[0]
+        clauses.append(f"{col} {sql_op} :{name}")
+
+    return (" AND ".join(clauses) if clauses else ""), binds
+
+
 def apply_online_rate_hints(intent: dict, settings: Any) -> Tuple[str, Dict[str, Any]]:
     """
     Minimal application of online/rate EQ hints.

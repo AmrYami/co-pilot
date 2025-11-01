@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, List, Tuple, Optional
+import difflib
 
 from apps.dw.sql_shared import (
     and_join,
@@ -24,6 +25,7 @@ class RateIntent:
     neq_filters: List[Tuple[str, List[str]]] = field(default_factory=list)
     contains: List[Tuple[str, List[str]]] = field(default_factory=list)
     not_contains: List[Tuple[str, List[str]]] = field(default_factory=list)
+    numeric: List[Tuple[str, str, List[str]]] = field(default_factory=list)
     empty_any: List[List[str]] = field(default_factory=list)
     empty_all: List[List[str]] = field(default_factory=list)
     empty: List[str] = field(default_factory=list)
@@ -51,9 +53,65 @@ def _parse_eq_block(prefix: str, line: str) -> Tuple[str, List[str]] | None:
     return column, values
 
 
-def parse_structured_comment(comment: str) -> RateIntent:
+_NUM_PATTERN = re.compile(
+    rf"^\s*({_COLNAME})\s*(>=|<=|<>|!=|=|>|<|between)\s*(.+)$",
+    flags=re.IGNORECASE,
+)
+
+
+def _parse_numeric_block(line: str) -> Tuple[str, str, List[str]] | None:
+    """Parse `num:` hints like `num: VAT > 200` or `num: VAT between 100 and 200`."""
+    body = line.split(":", 1)[1].strip() if ":" in line else line
+    match = _NUM_PATTERN.match(body)
+    if not match:
+        return None
+    column = match.group(1).strip().upper()
+    op = match.group(2).strip().lower()
+    rhs = (match.group(3) or "").strip()
+    if not column or not rhs:
+        return None
+    if op == "between":
+        parts = re.split(r"(?i)\band\b", rhs)
+        values = [p.strip() for p in parts if p and p.strip()]
+        if len(values) != 2:
+            return None
+        return column, op, values
+    values = [rhs]
+    return column, op, values
+
+
+def parse_structured_comment(
+    comment: str,
+    *,
+    alias_map: Optional[Dict[str, Iterable[str]]] = None,
+    allowed_columns: Optional[Iterable[str]] = None,
+) -> RateIntent:
     intent = RateIntent()
     segments = [seg.strip() for seg in re.split(r";|\n", comment or "") if seg.strip()]
+
+    alias_map_upper: Dict[str, List[str]] = {}
+    if isinstance(alias_map, dict):
+        for key, cols in alias_map.items():
+            targets = [str(c or "").strip().upper() for c in (cols or []) if str(c or "").strip()]
+            if targets:
+                alias_map_upper[str(key or "").strip().upper()] = targets
+
+    allowed_set = {str(c or "").strip().upper() for c in (allowed_columns or []) if str(c or "").strip()}
+
+    def _resolve_column(token: str) -> str:
+        col = str(token or "").strip().upper()
+        if not col:
+            return col
+        if col in allowed_set or col in alias_map_upper:
+            return col
+        for targets in alias_map_upper.values():
+            if col in targets:
+                return col
+        candidates = list(allowed_set) + list(alias_map_upper.keys())
+        suggestion = difflib.get_close_matches(col, candidates, n=1)
+        hint = f" Did you mean {suggestion[0]}?" if suggestion else ""
+        raise ValueError(f"Unrecognised column '{token}'.{hint}")
+
     for raw in segments:
         lowered = raw.lower()
         if lowered.startswith("fts:"):
@@ -64,36 +122,46 @@ def parse_structured_comment(comment: str) -> RateIntent:
             continue
         eq_block = _parse_eq_block("eq", raw)
         if eq_block:
-            intent.eq_filters.append(eq_block)
+            col, vals = eq_block
+            intent.eq_filters.append((_resolve_column(col), vals))
             continue
         neq_block = _parse_eq_block("neq", raw)
         if neq_block:
-            intent.neq_filters.append(neq_block)
+            col, vals = neq_block
+            intent.neq_filters.append((_resolve_column(col), vals))
             continue
         contains_block = _parse_eq_block("contains", raw)
         if contains_block:
-            intent.contains.append(contains_block)
+            col, vals = contains_block
+            intent.contains.append((_resolve_column(col), vals))
             continue
         not_contains_block = _parse_eq_block("not_contains", raw)
         if not_contains_block:
-            intent.not_contains.append(not_contains_block)
+            col, vals = not_contains_block
+            intent.not_contains.append((_resolve_column(col), vals))
+            continue
+        if lowered.startswith("num:"):
+            numeric_block = _parse_numeric_block(raw)
+            if numeric_block:
+                col, op, values = numeric_block
+                intent.numeric.append((_resolve_column(col), op, values))
             continue
         if lowered.startswith("empty_any:"):
-            cols = [c.strip().upper() for c in raw.split(":", 1)[1].split(",") if c.strip()]
+            cols = [ _resolve_column(c) for c in raw.split(":", 1)[1].split(",") if c.strip() ]
             if cols:
                 intent.empty_any.append(cols)
             continue
         if lowered.startswith("empty_all:"):
-            cols = [c.strip().upper() for c in raw.split(":", 1)[1].split(",") if c.strip()]
+            cols = [ _resolve_column(c) for c in raw.split(":", 1)[1].split(",") if c.strip() ]
             if cols:
                 intent.empty_all.append(cols)
             continue
         if lowered.startswith("empty:"):
-            cols = [c.strip().upper() for c in raw.split(":", 1)[1].split(",") if c.strip()]
+            cols = [ _resolve_column(c) for c in raw.split(":", 1)[1].split(",") if c.strip() ]
             intent.empty.extend(cols)
             continue
         if lowered.startswith("not_empty:"):
-            cols = [c.strip().upper() for c in raw.split(":", 1)[1].split(",") if c.strip()]
+            cols = [ _resolve_column(c) for c in raw.split(":", 1)[1].split(",") if c.strip() ]
             intent.not_empty.extend(cols)
             continue
         if lowered.startswith("order_by:"):
@@ -259,8 +327,59 @@ def build_where_and_binds(table: str, intent: RateIntent) -> Tuple[str, Dict[str
             if group_clauses:
                 clauses.append(or_join(group_clauses))
 
+    for column, op, raw_values in intent.numeric:
+        col = column.upper()
+        values = [v for v in raw_values if isinstance(v, str) and v.strip()]
+        if not values:
+            continue
+        normalized_op = op.lower()
+        if normalized_op == "between":
+            if len(values) != 2:
+                continue
+            left_val = _coerce_numeric(values[0])
+            right_val = _coerce_numeric(values[1])
+            if left_val is None or right_val is None:
+                continue
+            left_name = f"num_{len(binds)}"
+            binds[left_name] = left_val
+            right_name = f"num_{len(binds)}"
+            binds[right_name] = right_val
+            clauses.append(f"{col} BETWEEN :{left_name} AND :{right_name}")
+            continue
+        comparator = {
+            ">": ">",
+            "<": "<",
+            ">=": ">=",
+            "<=": "<=",
+            "=": "=",
+            "==": "=",
+            "!=": "<>",
+            "<>": "<>",
+        }.get(normalized_op)
+        value = _coerce_numeric(values[0])
+        if not comparator or value is None:
+            continue
+        name = f"num_{len(binds)}"
+        binds[name] = value
+        clauses.append(f"{col} {comparator} :{name}")
+
     where_sql = and_join(clauses) if clauses else "(TRUE)"
     return where_sql, binds
+
+
+def _coerce_numeric(value: str) -> Any | None:
+    text = (value or "").strip().replace(",", "")
+    if not text:
+        return None
+    try:
+        if "." in text:
+            return float(text)
+        return int(text)
+    except ValueError:
+        try:
+            return float(text)
+        except ValueError:
+            return None
 
 
 __all__ = [

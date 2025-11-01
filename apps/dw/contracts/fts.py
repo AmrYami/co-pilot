@@ -1,8 +1,13 @@
 # Utilities for Full-Text LIKE search over configured columns.
 from __future__ import annotations
+import os
 import re
 from typing import List, Tuple, Dict
 from apps.dw.lib.sql_utils import is_email, is_phone
+try:
+    from apps.dw.nlp import detect_alias_spans  # type: ignore
+except ImportError:  # pragma: no cover - optional dependency
+    detect_alias_spans = None  # type: ignore
 _get_setting = None
 try:  # pragma: no cover
     from apps.dw.settings import get_setting as _get_setting  # type: ignore
@@ -31,6 +36,79 @@ AND_SEP = re.compile(r"\s+(?:and|&)\s+", flags=re.IGNORECASE)
 
 def _norm(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
+
+
+_COMPARATOR_MARKERS = [
+    "greater than",
+    "greater than or equal",
+    "more than",
+    "over",
+    "above",
+    "less than",
+    "less than or equal",
+    "under",
+    "below",
+    "at least",
+    "at most",
+    "no less than",
+    "no more than",
+    "between",
+    ">=",
+    "<=",
+    ">",
+    "<",
+    "≥",
+    "≤",
+]
+
+
+_NUMBER_WORDS = {
+    "zero",
+    "one",
+    "two",
+    "three",
+    "four",
+    "five",
+    "six",
+    "seven",
+    "eight",
+    "nine",
+    "ten",
+    "eleven",
+    "twelve",
+    "thirteen",
+    "fourteen",
+    "fifteen",
+    "sixteen",
+    "seventeen",
+    "eighteen",
+    "nineteen",
+    "twenty",
+    "thirty",
+    "forty",
+    "fifty",
+    "sixty",
+    "seventy",
+    "eighty",
+    "ninety",
+    "hundred",
+    "thousand",
+    "million",
+    "billion",
+}
+
+
+def _looks_like_numeric_clause(token: str) -> bool:
+    if not token:
+        return False
+    lower = token.lower()
+    if any(marker in lower for marker in _COMPARATOR_MARKERS):
+        # ensure there is some numeric signal (digits or number words)
+        if re.search(r"\d", lower):
+            return True
+        if any(word in lower for word in _NUMBER_WORDS):
+            return True
+    return False
 
 
 def _eq_alias_keys() -> List[str]:
@@ -69,6 +147,18 @@ def _cut_tail_at_alias(s: str, eq_aliases: List[str]) -> str:
     """Cut FTS tail at first 'AND|OR <ALIAS> (=|IN|LIKE|BETWEEN)' occurrence."""
     if not s or not eq_aliases:
         return s
+    use_spacy = str(os.getenv("DW_USE_SPACY_ALIASES", "")).strip().lower() in {"1", "true", "t", "yes", "on"}
+    if use_spacy and detect_alias_spans:
+        try:
+            spans = detect_alias_spans(s, eq_aliases)
+        except Exception:
+            spans = []
+        if spans:
+            for start, _, _ in spans:
+                prefix = s[:start]
+                if re.search(r"(?i)\b(and|or)\s+$", prefix):
+                    return prefix.rstrip()
+        # fall through to regex trim if no connector found
     alias_pat = r"(?:%s)" % "|".join(map(re.escape, eq_aliases))
     cut_rx = re.compile(rf"(?i)\b(?:and|or)\s+(?=({alias_pat})\b\s*(?:=|\bin\b|\blike\b|\bbetween\b))")
     parts = cut_rx.split(s, maxsplit=1)
@@ -101,21 +191,30 @@ def extract_fts_terms(question: str, force: bool = False) -> Tuple[List[List[str
         " about ",
         " mentioning ",
     ]
-    tail = None
-    cue_match = None
+    best_idx: int | None = None
+    best_cue: str | None = None
     for cue in cues:
         idx = ql.find(cue)
-        if idx != -1:
-            cue_match = cue
-            break
-    if cue_match is not None:
-        # Extract the original-case tail right after the cue
-        start = q.lower().find(cue_match.strip())
+        if idx == -1:
+            continue
+        if best_idx is None or idx < best_idx:
+            best_idx = idx
+            best_cue = cue
+    if best_cue is not None:
+        cue_trim = best_cue.strip()
+        # Extract the original-case tail right after the earliest cue
+        start = -1
+        if best_idx is not None:
+            # ql has a leading space, so adjust the index back into q.lower()
+            approx_idx = max(best_idx - 1, 0)
+            start = q.lower().find(cue_trim, approx_idx)
+        if start < 0:
+            start = q.lower().find(cue_trim)
         if start >= 0:
-            tail_orig = q[start + len(cue_match.strip()):].lstrip()
+            tail_orig = q[start + len(cue_trim):].lstrip()
         else:
             # Fallback to lowercase-based split when exact pos not found
-            tail_orig = ql.split(cue_match, 1)[1].strip()
+            tail_orig = ql.split(best_cue, 1)[1].strip()
 
         def _extract_paren_span(s: str) -> Tuple[str, str] | Tuple[None, str]:
             if not s or not s.startswith("("):
@@ -162,6 +261,8 @@ def extract_fts_terms(question: str, force: bool = False) -> Tuple[List[List[str
                     alias_pat = r"(?:%s)" % "|".join(map(re.escape, aliases))
                     if re.match(rf"(?i)^\s*({alias_pat})\b\s*(?:=|\bin\b|\blike\b|\bbetween\b)", token):
                         continue
+                if _looks_like_numeric_clause(token):
+                    continue
                 normalized.append(token)
             if normalized:
                 groups.append(normalized)

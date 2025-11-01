@@ -1,15 +1,26 @@
 """DocuWare DW blueprint backed by a deterministic contract planner."""
 from __future__ import annotations
 
+import copy
 import json
 import os
 import csv
 import logging
 import re
 import time
+from dataclasses import dataclass
+from collections import OrderedDict
 from os import getenv
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+try:  # Ensure emoji compatibility for recognizers-text
+    import emoji  # type: ignore
+
+    if not hasattr(emoji, "UNICODE_EMOJI") and hasattr(emoji, "EMOJI_DATA"):
+        setattr(emoji, "UNICODE_EMOJI", getattr(emoji, "EMOJI_DATA"))
+except Exception:
+    pass
 
 try:  # pragma: no cover - allow unit tests without Flask dependency
     from flask import Blueprint, current_app, jsonify, request
@@ -97,6 +108,7 @@ from .answer.nlu_eq_parser import parse_from_question as parse_eq_inline
 from .tests.rate_suite import rate_tests_bp
 from .tests.routes import tests_bp as rate_builder_tests_bp
 from .tests.golden_runner_rate import golden_rate_bp
+from apps.dw.intent_parser import DwQuestionParser, ParsedIntent
 try:
     from apps.dw.learning import load_rules_for_question as _load_rules_by_sig
     _LOAD_RULES_SRC = "learning"
@@ -931,6 +943,92 @@ _COMPARISON_TRAILING_MARKERS = sorted(
     reverse=True,
 )
 
+_LARK_PARSER: Optional[DwQuestionParser] = None
+_NUM_MODEL: Any = None
+
+
+@dataclass(frozen=True)
+class IntentPipelineConfig:
+    pipeline_version: str
+    parser: str
+    use_lark: bool
+    eq_value_policy: str
+    tail_trim: bool
+    signature_mode: str
+
+    @property
+    def cache_tag(self) -> str:
+        return "|".join(
+            [
+                self.pipeline_version or "legacy",
+                self.parser or "legacy",
+                self.eq_value_policy or "default",
+                "tail" if self.tail_trim else "notail",
+            ]
+        )
+
+
+_INTENT_CACHE_MAX = 256
+_INTENT_CACHE: OrderedDict[Any, Dict[str, Any]] = OrderedDict()
+
+
+def _resolve_intent_pipeline_config() -> IntentPipelineConfig:
+    pipeline = str(os.getenv("DW_INTENT_PIPELINE", "") or "").strip().lower()
+    parser_env = str(os.getenv("DW_PARSER", "") or "").strip().lower()
+    eq_policy = str(os.getenv("DW_EQ_VALUE_POLICY", "") or "").strip().lower() or "question_only"
+    signature_mode = str(os.getenv("DW_LEARNING_RULES_MATCH", "signature_first") or "").strip().lower()
+    tail_trim = _bool_env("DW_FTS_TAIL_TRIM", default=True)
+
+    if not pipeline and _bool_env("DW_USE_LARK_INTENT", default=False):
+        pipeline = "v2"
+    if parser_env not in {"lark", "legacy"}:
+        parser_env = "lark" if pipeline == "v2" else "legacy"
+
+    use_lark = parser_env == "lark" or pipeline == "v2"
+
+    return IntentPipelineConfig(
+        pipeline_version=pipeline or "v1",
+        parser=parser_env,
+        use_lark=use_lark,
+        eq_value_policy=eq_policy or "question_only",
+        tail_trim=tail_trim,
+        signature_mode=signature_mode or "signature_first",
+    )
+
+
+def _intent_cache_get(key: Any) -> Optional[Dict[str, Any]]:
+    cached = _INTENT_CACHE.get(key)
+    if cached is None:
+        return None
+    _INTENT_CACHE.move_to_end(key)
+    return copy.deepcopy(cached)
+
+
+def _intent_cache_put(key: Any, value: Dict[str, Any]) -> None:
+    if key in _INTENT_CACHE:
+        _INTENT_CACHE.move_to_end(key)
+    _INTENT_CACHE[key] = copy.deepcopy(value)
+    while len(_INTENT_CACHE) > _INTENT_CACHE_MAX:
+        _INTENT_CACHE.popitem(last=False)
+
+
+def _filter_fts_groups(groups: Optional[List[List[str]]], *, min_length: int = 2) -> List[List[str]]:
+    if not groups:
+        return []
+    filtered: List[List[str]] = []
+    for group in groups:
+        tokens: List[str] = []
+        for token in group or []:
+            token_text = (token or "").strip()
+            if not token_text:
+                continue
+            if len(token_text) < min_length:
+                continue
+            tokens.append(token_text)
+        if tokens:
+            filtered.append(tokens)
+    return filtered
+
 
 def _val_type(v: str) -> str:
     s = (v or "").strip()
@@ -939,6 +1037,71 @@ def _val_type(v: str) -> str:
     if NUMBER_RE.match(s):
         return "NUMBER"
     return "TEXT"
+
+
+def _normalize_numbers_with_recognizers(text: str) -> str:
+    global _NUM_MODEL
+    if not text:
+        return text
+    if _NUM_MODEL is False:
+        # Retry initialization if recognizers-text became available after first failure.
+        try:
+            import importlib  # noqa: F401
+            import recognizers_text  # type: ignore  # noqa: F401
+        except ImportError:
+            _NUM_MODEL = False
+            return text
+        _NUM_MODEL = None
+    if _NUM_MODEL is None:
+        try:
+            try:
+                import emoji  # type: ignore
+                if not hasattr(emoji, "UNICODE_EMOJI") and hasattr(emoji, "EMOJI_DATA"):
+                    setattr(emoji, "UNICODE_EMOJI", getattr(emoji, "EMOJI_DATA"))
+            except Exception:
+                pass
+            from recognizers_text import Culture  # type: ignore
+            from recognizers_number import NumberRecognizer  # type: ignore
+        except ImportError:
+            _NUM_MODEL = False
+            return text
+        try:
+            recognizer = NumberRecognizer(Culture.English)
+            _NUM_MODEL = recognizer.get_number_model()
+        except Exception:
+            _NUM_MODEL = False
+            return text
+    if not _NUM_MODEL:
+        return text
+    try:
+        results = _NUM_MODEL.parse(text)
+    except Exception:
+        return text
+    if not results:
+        return text
+    updated = text
+    for res in sorted(results, key=lambda r: getattr(r, "start", 0) or 0, reverse=True):
+        start = getattr(res, "start", None)
+        end = getattr(res, "end", None)
+        length = getattr(res, "length", None)
+        resolution = getattr(res, "resolution", {}) or {}
+        if start is None or length is None:
+            if start is None:
+                continue
+            length = len(getattr(res, "text", ""))
+            if not length and end is not None and end > start:
+                length = end - start
+            if length <= 0:
+                continue
+        value = resolution.get("value") if isinstance(resolution, dict) else None
+        if value is None:
+            continue
+        replacement = str(value)
+        try:
+            updated = updated[:start] + replacement + updated[start + length :]
+        except Exception:
+            continue
+    return updated
 
 
 def _augment_light_intent_with_aliases(
@@ -1115,33 +1278,239 @@ def _extract_comparison_filters(question: str, allowed_cols: Sequence[str]) -> L
 
 
 def _build_light_intent_from_question(q: str, allowed_cols) -> dict:
-    """استخراج EQ من جزء WHERE فقط، مع دعم OR/الفواصل، وأنواع القيم.
+    """Build a lightweight intent used for signature + learning overlays."""
+    config = _resolve_intent_pipeline_config()
+    namespace = _ns()
+    normalized_question = _normalize_question_text(q or "")
+    normalized_allowed = tuple(
+        sorted(
+            {
+                str(col or "").strip().strip('"').upper()
+                for col in (allowed_cols or [])
+                if str(col or "").strip()
+            }
+        )
+    )
+    cache_key = (config.cache_tag, namespace, normalized_question, normalized_allowed)
+    cached = _intent_cache_get(cache_key)
+    if cached is not None:
+        return cached
 
-    - يجزّئ نص السؤال بعد كلمة WHERE (إن وُجدت) على AND لاستخراج شروط العمود = القيم.
-    - يدعم "A or B" و"A, B" في نفس العمود.
-    - يبني eq_filters وقاموس eq (op/types) ويضبط ترتيب افتراضي.
-    """
-    q = q or ""
-    # خذ النص بعد WHERE إن وُجد، وإلا استخدم السؤال كله
-    m = re.search(r"(?i)\bwhere\b(.+)", q)
-    where_txt = (m.group(1) if m else q)
-    # مجموعة أعمدة مسموحة للمقارنة
-    colset = {str(c).upper() for c in (allowed_cols or [])}
-    eq_filters = []
-    simple_pairs: List[Tuple[str, List[str]]] = []
-    # جزّئ على AND بين شروط الأعمدة
-    for part in re.split(r"(?i)\band\b", where_txt):
-        part = part.strip().strip("() ")
-        if not part:
+    settings_obj = get_settings()
+    alias_map = _get_namespace_mapping(settings_obj, namespace, "DW_EQ_ALIAS_COLUMNS", {}) or {}
+
+    question_text = q or ""
+    if config.use_lark and str(os.getenv("DW_NUM_EXTRACTOR", "")).strip().lower() == "recognizers_text":
+        question_text = _normalize_numbers_with_recognizers(question_text)
+
+    parser_used = "legacy"
+    try:
+        if config.use_lark:
+            intent = _build_light_intent_via_lark(
+                question_text,
+                allowed_cols,
+                alias_map,
+                config,
+            )
+            parser_used = "lark"
+        else:
+            intent = _build_light_intent_via_regex(question_text, allowed_cols, config)
+    except Exception as exc:
+        logging.getLogger("dw").warning(
+            {"event": "answer.intent.parser.fallback", "parser": "legacy", "err": str(exc)}
+        )
+        intent = _build_light_intent_via_regex(question_text, allowed_cols, config)
+        parser_used = "legacy"
+
+    meta = intent.setdefault("_meta", {})
+    segments = meta.get("segments") or {}
+    meta.update(
+        {
+            "pipeline": config.pipeline_version,
+            "parser": parser_used,
+            "question_norm": normalized_question,
+            "allowed_cols": list(normalized_allowed),
+            "eq_value_policy": config.eq_value_policy,
+            "signature_mode": config.signature_mode,
+        }
+    )
+
+    try:
+        logging.getLogger("dw").info(
+            {
+                "event": "answer.segments.parsed",
+                "parser": parser_used,
+                "pipeline": config.pipeline_version,
+                "segments": segments,
+            }
+        )
+    except Exception:
+        pass
+
+    _intent_cache_put(cache_key, intent)
+    return intent
+
+
+def _get_lark_parser() -> DwQuestionParser:
+    global _LARK_PARSER
+    if _LARK_PARSER is None:
+        _LARK_PARSER = DwQuestionParser()
+    return _LARK_PARSER
+
+
+def _build_light_intent_via_lark(
+    question: str,
+    allowed_cols: Optional[Sequence[str]],
+    alias_map: Optional[Dict[str, Sequence[str]]],
+    config: IntentPipelineConfig,
+) -> dict:
+    parser = _get_lark_parser()
+
+    normalized_alias_map: Dict[str, Sequence[str]] = {}
+    if isinstance(alias_map, dict):
+        for key, cols in alias_map.items():
+            if not isinstance(cols, (list, tuple, set)):
+                continue
+            targets = [str(c or "").strip().upper() for c in cols if str(c or "").strip()]
+            if targets:
+                normalized_alias_map[str(key or "").strip().upper()] = targets
+
+    allowed = []
+    if allowed_cols:
+        for col in allowed_cols:
+            token = str(col or "").strip()
+            if not token:
+                continue
+            token = token.strip('"').strip()
+            if "." in token:
+                token = token.split(".")[-1]
+            token = token.strip()
+            if token:
+                allowed.append(token.upper())
+
+    question_text = question or ""
+    match = re.search(r"(?i)\bwhere\b(.+)", question_text)
+    if match:
+        question_text = match.group(1)
+    question_text = question_text.strip()
+    question_text = re.sub(r"(?i)^and\s+", "", question_text)
+
+    parsed = parser.parse(question_text, alias_map=normalized_alias_map, allowed_columns=allowed)
+
+    eq_filters: List[Any] = []
+    eq_shape: Dict[str, Dict[str, Any]] = {}
+    numeric_filters: List[Dict[str, Any]] = []
+    numeric_shape_ops: Dict[str, set] = {}
+
+    for col, values in parsed.eq_filters:
+        eq_filters.append([col, values])
+        eq_shape[col] = {
+            "op": "in" if len(values) > 1 else "eq",
+            "types": sorted({_val_type(str(v)) for v in values}),
+        }
+
+    for num_filter in getattr(parsed, "num_filters", []) or []:
+        col = num_filter.get("col")
+        op = num_filter.get("op")
+        raw_values = num_filter.get("values")
+        values = list(raw_values or [])
+        if not values and num_filter.get("value") is not None:
+            values = [num_filter["value"]]
+        if col is None or op is None:
             continue
-        m2 = re.match(r"(?i)^\s*([A-Z_][A-Z0-9_]*)\s*=\s*(.+)$", part)
+        col = str(col).strip().upper()
+        op = str(op).strip().lower()
+        if op == "between" and len(values) == 2:
+            eq_filters.append(
+                {
+                    "col": col,
+                    "op": "between",
+                    "val": list(values),
+                    "ci": False,
+                    "trim": False,
+                }
+            )
+            eq_shape[col] = {"op": "range", "types": ["NUMBER"]}
+        else:
+            val = values[0] if values else None
+            eq_filters.append(
+                {
+                    "col": col,
+                    "op": op,
+                    "val": val,
+                    "ci": False,
+                    "trim": False,
+                }
+            )
+            eq_shape[col] = {"op": op, "types": ["NUMBER"]}
+        numeric_filters.append({"col": col, "op": op, "values": list(values)})
+        numeric_shape_ops.setdefault(col, set()).add(op)
+
+    fts_groups = [[token] for token in getattr(parsed, "fts_tokens", []) or []]
+    if config.tail_trim:
+        extracted_groups, _extracted_mode = extract_fts_terms(question, force=False)
+        extracted_groups = _filter_fts_groups(extracted_groups, min_length=2)
+        if extracted_groups:
+            fts_groups = extracted_groups
+    fts_groups = _filter_fts_groups(fts_groups, min_length=2)
+
+    segments = {
+        "eq_filters": len(getattr(parsed, "eq_filters", []) or []),
+        "num_filters": len(numeric_filters),
+        "fts_groups": len(fts_groups),
+        "bool_groups": len(getattr(parsed, "bool_groups", []) or []),
+    }
+
+    numeric_shape = {
+        col: {"ops": sorted(list(ops))}
+        for col, ops in numeric_shape_ops.items()
+    }
+
+    intent = {
+        "eq_filters": eq_filters,
+        "eq": eq_shape,
+        "numeric_filters": numeric_filters,
+        "numeric_shape": numeric_shape,
+        "fts_groups": fts_groups,
+        "order": {"col": "REQUEST_DATE", "desc": True},
+        "pipeline_version": config.pipeline_version,
+        "parser": config.parser,
+        "_meta": {"segments": segments},
+    }
+    if getattr(parsed, "bool_tree", None):
+        intent["boolean_tree"] = parsed.bool_tree
+    if getattr(parsed, "clauses", None):
+        intent["parsed_clauses"] = parsed.clauses
+    return intent
+
+
+def _build_light_intent_via_regex(
+    question: str,
+    allowed_cols: Optional[Sequence[str]],
+    config: IntentPipelineConfig,
+) -> dict:
+    q = question or ""
+    match = re.search(r"(?i)\bwhere\b(.+)", q)
+    where_txt = (match.group(1) if match else q) or ""
+    colset = {str(c or "").strip().strip('"').upper() for c in (allowed_cols or []) if str(c or "").strip()}
+
+    eq_filters: List[Any] = []
+    eq_shape: Dict[str, Dict[str, Any]] = {}
+    numeric_filters: List[Dict[str, Any]] = []
+    numeric_shape_ops: Dict[str, set] = {}
+    simple_pairs: List[Tuple[str, List[str]]] = []
+
+    for part in re.split(r"(?i)\band\b", where_txt):
+        snippet = part.strip().strip("() ")
+        if not snippet:
+            continue
+        m2 = re.match(r"(?i)^\s*([A-Z_][A-Z0-9_]*)\s*=\s*(.+)$", snippet)
         if not m2:
             continue
         col = m2.group(1).upper()
         if col not in colset:
             continue
         rhs = m2.group(2).strip()
-        # دعم "A or B" أو "A, B"
         vals = re.split(r"(?i)\s*\bor\b\s*|,", rhs)
         vals = [v.strip(" '\"\t()") for v in vals if v.strip()]
         if vals:
@@ -1151,27 +1520,58 @@ def _build_light_intent_from_question(q: str, allowed_cols) -> dict:
 
     for col, vals in simple_pairs:
         eq_filters.append([col, vals])
-    for comp in comp_filters:
-        eq_filters.append(comp)
-
-    eq_shape: Dict[str, Dict[str, Any]] = {}
-    for col, vals in simple_pairs:
-        types = sorted({_val_type(str(v)) for v in vals})
-        eq_shape[col] = {"op": ("in" if len(vals) > 1 else "eq"), "types": types}
-    for comp in comp_filters:
-        col = str(comp.get("col") or "").upper()
-        val = comp.get("val")
         eq_shape[col] = {
-            "op": comp.get("op", "eq"),
-            "types": sorted({_val_type(str(val))}),
+            "op": "in" if len(vals) > 1 else "eq",
+            "types": sorted({_val_type(str(v)) for v in vals}),
         }
 
-    return {
+    for comp in comp_filters:
+        col = str(comp.get("col") or "").strip().upper()
+        op = str(comp.get("op") or "eq").strip().lower()
+        value = comp.get("val")
+        eq_filters.append(
+            {
+                "col": col,
+                "op": op,
+                "val": value,
+                "ci": False,
+                "trim": False,
+            }
+        )
+        eq_shape[col] = {"op": op, "types": ["NUMBER"]}
+        numeric_filters.append({"col": col, "op": op, "values": [value]})
+        numeric_shape_ops.setdefault(col, set()).add(op)
+
+    raw_fts_groups, _fts_mode = extract_fts_terms(question, force=False)
+    if config.tail_trim:
+        fts_groups = _filter_fts_groups(raw_fts_groups, min_length=2)
+    else:
+        fts_groups = _filter_fts_groups(raw_fts_groups, min_length=1)
+
+    segments = {
+        "eq_filters": len(simple_pairs),
+        "num_filters": len(numeric_filters),
+        "fts_groups": len(fts_groups),
+        "bool_groups": 0,
+    }
+
+    numeric_shape = {
+        col: {"ops": sorted(list(ops))}
+        for col, ops in numeric_shape_ops.items()
+    }
+
+    intent = {
         "eq_filters": eq_filters,
         "eq": eq_shape,
-        "fts_groups": [],
+        "numeric_filters": numeric_filters,
+        "numeric_shape": numeric_shape,
+        "fts_groups": fts_groups,
         "order": {"col": "REQUEST_DATE", "desc": True},
+        "pipeline_version": config.pipeline_version,
+        "parser": "legacy",
+        "_meta": {"segments": segments},
     }
+    return intent
 
 
 def _merge_hints(base: Optional[dict], extra: Optional[dict]) -> dict:
@@ -1203,11 +1603,14 @@ def _coalesce_rate_intent(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         return {}
 
     sources: List[Dict[str, Any]] = []
+    numeric_sources: List[Dict[str, Any]] = []
 
     def _collect(obj: Optional[Dict[str, Any]]) -> None:
         if not isinstance(obj, dict):
             return
         sources.append(obj)
+        if isinstance(obj.get("numeric_filters"), list):
+            numeric_sources.append(obj)
         for key in ("intent", "rate_hints"):
             candidate = obj.get(key)
             if isinstance(candidate, dict):
@@ -1230,12 +1633,20 @@ def _coalesce_rate_intent(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
 
     intent: Dict[str, Any] = {}
     merged_eq: List[Dict[str, Any]] = []
+    merged_numeric: List[Dict[str, Any]] = []
+    numeric_shape: Optional[Dict[str, Any]] = None
 
     for source in sources:
         if "eq_filters" in source and isinstance(source.get("eq_filters"), list):
             for entry in source["eq_filters"]:
                 if isinstance(entry, dict):
                     merged_eq.append(dict(entry))
+        if "numeric_filters" in source and isinstance(source.get("numeric_filters"), list):
+            for entry in source["numeric_filters"]:
+                if isinstance(entry, dict):
+                    merged_numeric.append(dict(entry))
+        if numeric_shape is None and isinstance(source.get("numeric_shape"), dict):
+            numeric_shape = dict(source.get("numeric_shape") or {})
         for key in (
             "namespace",
             "full_text_search",
@@ -1264,6 +1675,10 @@ def _coalesce_rate_intent(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
 
     if merged_eq:
         intent["eq_filters"] = merged_eq
+    if merged_numeric:
+        intent["numeric_filters"] = merged_numeric
+    if numeric_shape:
+        intent["numeric_shape"] = numeric_shape
 
     for source in sources:
         fts = source.get("fts")
@@ -1377,7 +1792,9 @@ def _sanitize_eq_values(intent: Dict[str, Any], allowed_cols: Sequence[str]) -> 
     if not isinstance(eq, list) or not eq:
         return
     allowed = {str(c).strip().upper() for c in (allowed_cols or []) if str(c).strip()}
-    grouped: Dict[str, List[Any]] = {}
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    comparators: List[Dict[str, Any]] = []
+    order: List[str] = []
     for f in eq:
         # Accept both dict form and list-of-lists [["COL", [v1,v2,...]], ...]
         if isinstance(f, dict):
@@ -1387,8 +1804,28 @@ def _sanitize_eq_values(intent: Dict[str, Any], allowed_cols: Sequence[str]) -> 
             # Keep only explicitly allowed columns
             if allowed and col not in allowed:
                 continue
+            op = str(f.get("op") or "eq").strip().lower()
             val = f.get("val") if f.get("val") is not None else f.get("value")
-            grouped.setdefault(col, []).append(val)
+            entry = {
+                "col": col,
+                "val": val,
+                "op": op,
+                "ci": f.get("ci"),
+                "trim": f.get("trim"),
+                "synonyms": f.get("synonyms") if isinstance(f.get("synonyms"), dict) else None,
+            }
+            if op in {"eq", "in"} and entry["synonyms"] is None:
+                bucket = grouped.setdefault(col, [])
+                bucket.append(entry)
+                if col not in order:
+                    order.append(col)
+            else:
+                # Preserve comparison/like/operators verbatim
+                if entry["ci"] is None:
+                    entry["ci"] = False
+                if entry["trim"] is None:
+                    entry["trim"] = False
+                comparators.append(entry)
         elif isinstance(f, (list, tuple)) and len(f) == 2:
             col = str(f[0] or "").strip().upper()
             if not col:
@@ -1398,10 +1835,17 @@ def _sanitize_eq_values(intent: Dict[str, Any], allowed_cols: Sequence[str]) -> 
                 continue
             vals = f[1]
             if isinstance(vals, (list, tuple, set)):
-                for v in vals:
-                    grouped.setdefault(col, []).append(v)
+                items = list(vals)
             elif vals is not None:
-                grouped.setdefault(col, []).append(vals)
+                items = [vals]
+            else:
+                items = []
+            if items:
+                bucket = grouped.setdefault(col, [])
+                if col not in order:
+                    order.append(col)
+                for v in items:
+                    bucket.append({"col": col, "val": v, "op": "eq", "ci": True, "trim": True, "synonyms": None})
         else:
             continue
 
@@ -1426,9 +1870,38 @@ def _sanitize_eq_values(intent: Dict[str, Any], allowed_cols: Sequence[str]) -> 
             grouped.setdefault("REPRESENTATIVE_PHONE", []).extend(move_phone)
 
     canon: List[Dict[str, Any]] = []
-    for col, vals in grouped.items():
-        for v in vals:
-            canon.append({"col": col, "val": v, "op": "eq", "ci": True, "trim": True})
+    for col in order:
+        vals = grouped.get(col) or []
+        seen_keys: set = set()
+        for entry in vals:
+            val = entry.get("val")
+            key = val.upper() if isinstance(val, str) else val
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            ci = entry.get("ci")
+            trim = entry.get("trim")
+            canon.append(
+                {
+                    "col": col,
+                    "val": val,
+                    "op": "eq",
+                    "ci": True if ci is None else bool(ci),
+                    "trim": True if trim is None else bool(trim),
+                }
+            )
+    if comparators:
+        for entry in comparators:
+            canon.append(
+                {
+                    "col": entry["col"],
+                    "val": entry["val"],
+                    "op": entry["op"],
+                    "ci": bool(entry.get("ci")),
+                    "trim": bool(entry.get("trim")),
+                    "synonyms": entry.get("synonyms"),
+                }
+            )
     if canon:
         intent["eq_filters"] = canon
 
@@ -1692,50 +2165,168 @@ def _apply_online_rate_hints(
     where_clauses: List[str] = []
 
     eq_filters_raw = intent.get("eq_filters") or []
+    numeric_filters_raw = intent.get("numeric_filters") or []
     try:
         logging.getLogger("dw").info(
             {
                 "event": "answer.apply_hints.start",
                 "has_eq": bool(eq_filters_raw),
+                "has_num": bool(numeric_filters_raw),
                 "has_fts": bool(intent.get("fts_tokens") or intent.get("fts_groups")),
                 "has_or_groups": bool(intent.get("or_groups")),
             }
         )
     except Exception:
         pass
+    combined_clause_parts: List[str] = []
+
+    def _append_clause(clause: str, temp: Dict[str, Any]) -> List[str]:
+        if not clause or not isinstance(temp, dict) or not temp:
+            return []
+        rename_map: Dict[str, str] = {}
+        for key in temp.keys():
+            base = f"ol_{key}"
+            new_key = base
+            suffix = 1
+            while new_key in binds or new_key in combined_binds or new_key in rename_map.values():
+                new_key = f"{base}_{suffix}"
+                suffix += 1
+            rename_map[key] = new_key
+        updated = clause
+        for old, new in rename_map.items():
+            updated = updated.replace(f":{old}", f":{new}")
+        renamed = {rename_map[k]: v for k, v in temp.items()}
+        if renamed:
+            combined_binds.update(renamed)
+        combined_clause_parts.append(updated)
+        return list(renamed.keys())
+
     # Accept dict and pair shapes; grouping/dedup handled downstream
     eq_applied = False
+    eq_clause = ""
+    eq_temp_binds: Dict[str, Any] = {}
+    numeric_filters_all: List[Dict[str, Any]] = []
+
     if eq_filters_raw:
-        eq_temp_binds: Dict[str, Any] = {}
-        # Prefer IN-grouping per column via builder helper
+        eq_like: List[Any] = []
+        range_like: List[Dict[str, Any]] = []
+
+        def _extract_op(item: Any) -> str:
+            if isinstance(item, dict):
+                return str(item.get("op") or "eq").strip().lower()
+            return "eq"
+
+        for item in eq_filters_raw:
+            op = _extract_op(item)
+            if op in {"eq", "in"}:
+                eq_like.append(item)
+            else:
+                if isinstance(item, dict):
+                    range_like.append(item)
+
         try:
-            eq_clause, eq_temp_binds = _builder_mod._eq_clause_from_filters(eq_filters_raw, eq_temp_binds, bind_prefix="eq")  # type: ignore[attr-defined]
-            if not eq_clause:
-                # Fallback to legacy per-value predicates
-                eq_clause = _where_from_eq_filters(eq_filters_raw, eq_temp_binds)
+            if eq_like:
+                eq_clause, eq_temp_binds = _builder_mod._eq_clause_from_filters(eq_like, eq_temp_binds, bind_prefix="eq")  # type: ignore[attr-defined]
         except Exception:
-            eq_clause = _where_from_eq_filters(eq_filters_raw, eq_temp_binds)
-        if eq_clause:
-            rename_map: Dict[str, str] = {}
-            _before_eq = set(list(binds.keys()) + list(combined_binds.keys()))
-            for key in eq_temp_binds.keys():
-                base = f"ol_{key}"
-                new_key = base
-                suffix = 1
-                while new_key in binds or new_key in combined_binds or new_key in rename_map.values():
-                    new_key = f"{base}_{suffix}"
-                    suffix += 1
-                rename_map[key] = new_key
-            for old, new in rename_map.items():
-                eq_clause = eq_clause.replace(f":{old}", f":{new}")
-            renamed_binds = {rename_map[k]: v for k, v in eq_temp_binds.items()}
-            combined_binds.update(renamed_binds)
-            where_clauses.append(f"({eq_clause})")
-            eq_applied = True
+            eq_clause = ""
+            eq_temp_binds = {}
+
+        for item in range_like:
+            if not isinstance(item, dict):
+                continue
+            col = str(item.get("col") or item.get("column") or "").strip().upper()
+            op = str(item.get("op") or item.get("operator") or "").strip().lower()
+            if not col or not op:
+                continue
+            values = item.get("values")
+            if values is None:
+                candidate = item.get("val") if item.get("val") is not None else item.get("value")
+                if isinstance(candidate, (list, tuple, set)):
+                    values = list(candidate)
+                elif candidate is not None:
+                    values = [candidate]
+            numeric_filters_all.append({"col": col, "op": op, "values": values})
+
+    if isinstance(numeric_filters_raw, list):
+        for item in numeric_filters_raw:
+            if isinstance(item, dict):
+                numeric_filters_all.append(dict(item))
+
+    if numeric_filters_all:
+        seen_numeric: set[Tuple[str, str, Tuple[Any, ...]]] = set()
+        dedup_numeric: List[Dict[str, Any]] = []
+        for entry in numeric_filters_all:
+            if not isinstance(entry, dict):
+                continue
+            col = str(entry.get("col") or entry.get("column") or "").strip().upper()
+            op = str(entry.get("op") or entry.get("operator") or "").strip().lower()
+            raw_vals = entry.get("values")
+            if raw_vals is None and entry.get("val") is not None:
+                raw_vals = [entry.get("val")]
+            if isinstance(raw_vals, (list, tuple, set)):
+                values_tuple = tuple(_builder_mod._coerce_numeric_literal(v) for v in raw_vals)  # type: ignore[attr-defined]
+            elif raw_vals is None:
+                values_tuple = tuple()
+            else:
+                values_tuple = (_builder_mod._coerce_numeric_literal(raw_vals),)  # type: ignore[attr-defined]
+            key = (col, op, values_tuple)
+            if not col or not op or key in seen_numeric:
+                continue
+            seen_numeric.add(key)
+            cleaned = dict(entry)
+            cleaned["col"] = col
+            cleaned["op"] = op
+            cleaned["values"] = list(values_tuple)
+            dedup_numeric.append(cleaned)
+        numeric_filters_all = dedup_numeric
+
+    numeric_clause = ""
+    numeric_temp_binds: Dict[str, Any] = {}
+    try:
+        logging.getLogger("dw").info(
+            {
+                "event": "answer.apply_hints.numeric_raw",
+                "count": len(numeric_filters_all),
+                "filters": numeric_filters_all,
+            }
+        )
+    except Exception:
+        pass
+    try:
+        if numeric_filters_all:
+            numeric_clause, numeric_temp_binds = _builder_mod.numeric_clause_from_filters(  # type: ignore[attr-defined]
+                numeric_filters_all,
+                numeric_temp_binds,
+                bind_prefix="num",
+            )
+    except Exception:
+        numeric_clause = ""
+        numeric_temp_binds = {}
+
+    new_eq_keys = _append_clause(eq_clause, eq_temp_binds)
+    new_num_keys = _append_clause(numeric_clause, numeric_temp_binds)
+
+    if combined_clause_parts:
+        combined_clause = " AND ".join(combined_clause_parts)
+        try:
+            logging.getLogger("dw").info(
+                {"event": "answer.apply_hints.eq_clause", "clause": combined_clause}
+            )
+        except Exception:
+            pass
+        where_clauses.append(f"({combined_clause})")
+        eq_applied = bool(new_eq_keys or new_num_keys)
+        if new_eq_keys:
             try:
-                _added = sorted(set(combined_binds.keys()) - _before_eq)
                 logging.getLogger("dw").info(
-                    {"event": "answer.apply_hints.eq", "applied": True, "bind_names": _added}
+                    {"event": "answer.apply_hints.eq", "applied": True, "bind_names": new_eq_keys}
+                )
+            except Exception:
+                pass
+        if new_num_keys:
+            try:
+                logging.getLogger("dw").info(
+                    {"event": "answer.apply_hints.num", "applied": True, "bind_names": new_num_keys}
                 )
             except Exception:
                 pass
@@ -1944,11 +2535,13 @@ def _apply_online_rate_hints(
                 "event": "answer.apply_hints.done",
                 "where_count": len(where_clauses),
                 "binds_count": len(binds or {}),
+                "numeric_filters": len(numeric_filters_all),
             }
         )
     except Exception:
         pass
     meta["eq_filters"] = eq_applied
+    meta["numeric_filters"] = len(numeric_filters_all)
     meta["fts"] = fts_meta
     return sql, binds, meta
 
@@ -2502,6 +3095,19 @@ def answer():
     except Exception:
         logger.info({"event": "answer.payload"})
 
+    # Observability: confirm env-driven feature flags per request
+    try:
+        logger.info(
+            {
+                "event": "answer.env.flags",
+                "DW_USE_LARK_INTENT": os.getenv("DW_USE_LARK_INTENT"),
+                "DW_NUM_EXTRACTOR": os.getenv("DW_NUM_EXTRACTOR"),
+                "DW_USE_SPACY_ALIASES": os.getenv("DW_USE_SPACY_ALIASES"),
+            }
+        )
+    except Exception:
+        pass
+
     settings = _get_settings()
     online_intent: Dict[str, Any] = {}
     online_hints_applied = 0
@@ -2748,12 +3354,23 @@ def answer():
         except Exception:
             pass
         try:
-            li_eq = (light_intent or {}).get("eq_filters") if isinstance(light_intent, dict) else []
+            eq_shape = (light_intent or {}).get("eq") if isinstance(light_intent, dict) else {}
+            numeric_shape = (light_intent or {}).get("numeric_shape") if isinstance(light_intent, dict) else {}
+            fts_groups = (light_intent or {}).get("fts_groups") if isinstance(light_intent, dict) else []
+            meta = (light_intent or {}).get("_meta") if isinstance(light_intent, dict) else {}
+            segments = {}
+            if isinstance(meta, dict):
+                segments = meta.get("segments") or {}
             logger.info(
                 {
-                    "event": "answer.intent.light_built",
-                    "eq_cols": len(li_eq or []),
-                    "order": (light_intent or {}).get("order"),
+                    "event": "answer.intent.built",
+                    "pipeline": (light_intent or {}).get("pipeline_version"),
+                    "parser": (light_intent or {}).get("parser"),
+                    "eq_cols": len(eq_shape or {}),
+                    "numeric_cols": len(numeric_shape or {}),
+                    "fts_groups": len(fts_groups or []),
+                    "fts_tokens": sum(len(group) for group in (fts_groups or [])),
+                    "segments": segments,
                 }
             )
         except Exception:
@@ -2912,6 +3529,20 @@ def answer():
                     for item in merged.get("eq_filters"):
                         if item not in existing:
                             existing.append(item)
+            # Prefer numeric filters from the question intent when present
+            try:
+                if merged.get("numeric_filters") and not online_intent.get("numeric_filters"):
+                    online_intent["numeric_filters"] = merged.get("numeric_filters")
+                if merged.get("numeric_shape") and not online_intent.get("numeric_shape"):
+                    online_intent["numeric_shape"] = merged.get("numeric_shape")
+                q_numeric = (light_intent or {}).get("numeric_filters") or []
+                if q_numeric:
+                    online_intent["numeric_filters"] = q_numeric
+                q_numeric_shape = (light_intent or {}).get("numeric_shape")
+                if q_numeric_shape:
+                    online_intent["numeric_shape"] = q_numeric_shape
+            except Exception:
+                pass
             # Carry over learned cross-column OR groups (e.g., alias expansions)
             try:
                 og = merged.get("or_groups") or []
@@ -2964,6 +3595,15 @@ def answer():
         # Skip early alias expansion here; we expand after inline EQ parsing to avoid duplicates.
         try:
             _ = _get_namespace_mapping(settings, namespace, "DW_EQ_ALIAS_COLUMNS", {})
+        except Exception:
+            pass
+        try:
+            logger.info(
+                {
+                    "event": "answer.eq.sanitized",
+                    "eq_filters": online_intent.get("eq_filters"),
+                }
+            )
         except Exception:
             pass
         or_groups = _extract_or_groups_from_question(question, allowed_columns_initial)
@@ -3032,8 +3672,12 @@ def answer():
                 "mode": direct_mode,
                 "groups_count": len(direct_groups or []),
                 "columns_count": len(fts_columns_initial or []),
+                "groups": direct_groups,
             }
         )
+        if direct_groups:
+            online_intent["fts_tokens"] = direct_groups
+            online_intent["full_text_search"] = True
         # Prefer direct FTS path whenever groups exist and columns are resolved.
         # This keeps strategy stable even with minor token changes.
         if direct_groups and fts_columns_initial:
@@ -3051,6 +3695,7 @@ def answer():
                         "event": "answer.apply_hints.pre",
                         "eq_len": len(online_intent.get("eq_filters") or []),
                         "or_len": len(online_intent.get("or_groups") or []),
+                        "eq_preview": online_intent.get("eq_filters"),
                     }
                 )
             except Exception:
@@ -3094,16 +3739,20 @@ def answer():
                             col = str(it[0] or "").strip().upper()
                             vals = it[1]
                             vals = list(vals) if isinstance(vals, (list,tuple,set)) else [vals]
-                            return col, vals
+                            return col, vals, "eq"
                         if isinstance(it, dict):
                             col = str((it.get("col") or it.get("field") or "")).strip().upper()
                             val = it.get("val") if it.get("val") is not None else it.get("value")
                             vals = [] if val is None else ([val] if not isinstance(val,(list,tuple,set)) else list(val))
-                            return col, vals
-                        return None, None
+                            op = str(it.get("op") or "eq").strip().lower()
+                            return col, vals, op
+                        return None, None, None
                     for it in eq_fp:
-                        col, vals = _norm_pair(it)
+                        col, vals, op = _norm_pair(it)
                         if not col:
+                            keep_eq.append(it)
+                            continue
+                        if op and op not in {"eq", "in"}:
                             keep_eq.append(it)
                             continue
                         targets = alias_map_d.get(col)

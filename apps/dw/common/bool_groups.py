@@ -36,6 +36,33 @@ _COL_PATTERN = "|".join(re.escape(col) for col in _COL_TOKENS)
 _JOIN_PATTERN = _COL_PATTERN + "|has|have|contains"
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 _OR_SPLIT_RE = re.compile(r"\s+or\s+|\s*\|\s*|,", re.IGNORECASE)
+_COMPARATOR_STARTERS = [
+    ">=",
+    "<=",
+    ">",
+    "<",
+    "=",
+    "!=",
+    "==",
+    "greater than",
+    "greater than or equal",
+    "less than",
+    "less than or equal",
+    "more than",
+    "at least",
+    "at most",
+    "between",
+    "not in",
+    "in",
+    "like",
+]
+_COMPARISON_TAIL_RE = re.compile(
+    r"(?i)^(?:"
+    r"[A-Z0-9_ ]+\s*(?:>=|<=|=|>|<|between|like|in|not in|greater than|less than|at least|at most)"
+    r"|"
+    r"(?:>=|<=|=|>|<|between|like|in|not in|greater than|less than|at least|at most)"
+    r")"
+)
 
 
 def _split_or_list(text: str) -> List[str]:
@@ -45,6 +72,24 @@ def _split_or_list(text: str) -> List[str]:
         if cleaned:
             tokens.append(re.sub(r"\s+", " ", cleaned))
     return tokens
+
+
+def _strip_comparison_tail(value: str) -> str:
+    """Trim trailing comparator clauses from an inline value (e.g., AND VAT > 200)."""
+    if not value:
+        return value
+    lower = value.lower()
+    idx = lower.find(" and ")
+    while idx != -1:
+        tail = lower[idx + 5 :].strip()
+        if not tail:
+            break
+        if any(tail.startswith(marker) for marker in _COMPARATOR_STARTERS):
+            return value[:idx].strip()
+        if _COMPARISON_TAIL_RE.match(tail):
+            return value[:idx].strip()
+        idx = lower.find(" and ", idx + 5)
+    return value.strip()
 
 
 def _normalize(text: str) -> str:
@@ -74,6 +119,7 @@ def parse_question_into_terms(question: str) -> List[Term]:
         values = _split_or_list(body)
         if not values:
             continue
+        values = [v for v in (_strip_comparison_tail(val) for val in values) if v]
         op: Op = "like" if op_token in {"has", "have", "contains"} else "eq"
         terms.append(
             Term(
@@ -103,6 +149,7 @@ def parse_question_into_terms(question: str) -> List[Term]:
         values = _split_or_list(match.group("body") or "")
         if not values:
             continue
+        values = [v for v in (_strip_comparison_tail(val) for val in values) if v]
         terms.append(
             Term(
                 kind="fts",

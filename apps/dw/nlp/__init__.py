@@ -1,5 +1,3 @@
-"""NLP helpers for DW modules."""
+from .alias_spans import detect_alias_spans  # noqa: F401
 
-from .parse import normalize_question, extract_equalities_first
-
-__all__ = ["normalize_question", "extract_equalities_first"]
+__all__ = ["detect_alias_spans"]

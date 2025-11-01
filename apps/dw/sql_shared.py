@@ -41,13 +41,18 @@ def fts_columns_for(table: str) -> List[str]:
     mapping = get_setting("DW_FTS_COLUMNS") or {}
     columns: Iterable[str] = mapping.get(table) or mapping.get("*", []) or []
     cleaned: List[str] = []
+    seen: set[str] = set()
     for col in columns:
         if not isinstance(col, str):
             continue
         text = col.strip()
         if not text:
             continue
-        cleaned.append(text.upper())
+        upper = text.upper()
+        if upper in seen:
+            continue
+        seen.add(upper)
+        cleaned.append(upper)
     return cleaned
 
 
