@@ -2710,7 +2710,9 @@ def _apply_online_rate_hints(
         numeric_temp_binds = {}
 
     new_eq_keys = _append_clause(eq_clause, eq_temp_binds)
-    new_num_keys = _append_clause(numeric_clause, numeric_temp_binds)
+    new_num_keys: List[str] = []
+    if numeric_clause:
+        new_num_keys = _append_clause(numeric_clause, numeric_temp_binds)
 
     if combined_clause_parts:
         combined_clause = " AND ".join(combined_clause_parts)
@@ -2797,7 +2799,7 @@ def _apply_online_rate_hints(
                 # Ensure bind names don't collide
                 rename_map: Dict[str, str] = {}
                 for key in list(grp_binds.keys()):
-                    base = f"ol_{key}"
+                    base = f"ol_or_{key}"
                     new_key = base
                     suffix = 1
                     while new_key in binds or new_key in combined_binds or new_key in rename_map.values():

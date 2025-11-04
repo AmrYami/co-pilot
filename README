@@ -103,7 +103,7 @@ tar -czf dw_answer_rate_stack.tgz \
   apps/dw/feedback_repo.py apps/dw/feedback_store.py apps/dw/db.py \
   core/inquiries.py
 
-# (2) سكيمات Postgres (memory)
+# (2)  Postgres (memory)
 sudo -u postgres pg_dump \
   -d copilot_mem_dev \
   --schema-only \
@@ -124,6 +124,7 @@ SQL
 
 python scripts/export_context.py --out docs/state
 
+TRUNCATE TABLE dw_examples, dw_rules, dw_feedback, dw_patches, dw_runs, mem_inquiries RESTART IDENTITY CASCADE;
 
 
 

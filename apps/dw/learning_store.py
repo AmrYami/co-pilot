@@ -346,8 +346,17 @@ _EMAIL_RE = _re.compile(r"(?i)^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$")
 _NUMBER_RE = _re.compile(r"^-?\d+(\.\d+)?$")
 
 
-def _val_type(v: str) -> str:
-    s = (v or "").strip()
+def _val_type(v: Any) -> str:
+    """Heuristic type detector for signature hashing."""
+    if v is None:
+        return "TEXT"
+    if isinstance(v, (int, float)):
+        s = str(v)
+    else:
+        s = str(v or "")
+    s = s.strip()
+    if not s:
+        return "TEXT"
     if _EMAIL_RE.match(s):
         return "EMAIL"
     if _NUMBER_RE.match(s):
@@ -678,6 +687,25 @@ def _signature_variants(intent: Dict[str, Any]) -> List[tuple[str, str, str]]:
     if knobs != DEFAULT_SIGNATURE_KNOBS:
         legacy_default = _intent_shape_only(intent, DEFAULT_SIGNATURE_KNOBS, canonicalize=False)
         _append_variant(legacy_default)
+
+    if _log_intent_match_enabled():
+        try:
+            fams = []
+            for _sha256, _sha1, sig_json in variants:
+                try:
+                    sig_obj = _json.loads(sig_json)
+                    fams.append(sorted((sig_obj.get("eq") or {}).keys()))
+                except Exception:
+                    fams.append([])
+            log.info(
+                {
+                    "event": "rules.intent.variants",
+                    "count": len(variants),
+                    "families": fams,
+                }
+            )
+        except Exception:
+            pass
 
     return variants
 

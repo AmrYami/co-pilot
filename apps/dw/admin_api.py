@@ -356,6 +356,51 @@ def approve_feedback(fid: int):
                     if intent.get("sort_desc") is not None
                     else None,
                 }
+                numeric_entries = intent.get("numeric_filters") or intent.get("numeric") or []
+                if numeric_entries:
+                    eq_filters_extended = list(eq_filters)
+                    for num_entry in numeric_entries:
+                        col = ""
+                        op = None
+                        values: List[Any] = []
+                        if isinstance(num_entry, dict):
+                            col = str(num_entry.get("col") or "").strip().upper()
+                            op_raw = num_entry.get("op")
+                            op = str(op_raw).strip().lower() if op_raw is not None else None
+                            raw_vals = num_entry.get("values")
+                            if raw_vals is None and num_entry.get("value") is not None:
+                                raw_vals = [num_entry.get("value")]
+                            if isinstance(raw_vals, (list, tuple, set)):
+                                values = list(raw_vals)
+                            elif raw_vals is not None:
+                                values = [raw_vals]
+                        elif isinstance(num_entry, (list, tuple)) and len(num_entry) >= 2:
+                            col = str(num_entry[0] or "").strip().upper()
+                            op = str(num_entry[1] or "").strip().lower()
+                            if len(num_entry) >= 3:
+                                vals_part = num_entry[2]
+                                if isinstance(vals_part, (list, tuple, set)):
+                                    values = list(vals_part)
+                                elif vals_part is not None:
+                                    values = [vals_part]
+                        if not col:
+                            continue
+                        norm_vals = [
+                            v.strip().upper() if isinstance(v, str) else v for v in values
+                        ]
+                        if op and op not in {"eq", "in"}:
+                            eq_filters_extended.append(
+                                {
+                                    "col": col,
+                                    "op": op,
+                                    "values": norm_vals,
+                                    "ci": False,
+                                    "trim": False,
+                                }
+                            )
+                        else:
+                            eq_filters_extended.append([col, norm_vals])
+                    applied_hints["eq_filters"] = eq_filters_extended
                 if aggregations_norm:
                     applied_hints["aggregations"] = aggregations_norm
 
@@ -377,10 +422,15 @@ def approve_feedback(fid: int):
                     try:
                         if intent:
                             intent_for_sig = dict(intent)
-                            eq_filters_for_sig = []
+                            eq_filters_for_sig: List[Any] = []
                             for entry in intent.get("eq_filters") or []:
                                 if isinstance(entry, (list, tuple)) and len(entry) == 2:
-                                    eq_filters_for_sig.append([str(entry[0]).upper(), list(entry[1]) if isinstance(entry[1], (list, tuple, set)) else [entry[1]]])
+                                    eq_filters_for_sig.append(
+                                        [
+                                            str(entry[0]).upper(),
+                                            list(entry[1]) if isinstance(entry[1], (list, tuple, set)) else [entry[1]],
+                                        ]
+                                    )
                                 elif isinstance(entry, dict):
                                     col = str(entry.get("col") or entry.get("field") or "").upper()
                                     vals = entry.get("val") if entry.get("val") is not None else entry.get("value")
@@ -392,11 +442,78 @@ def approve_feedback(fid: int):
                                         vals_list = [vals]
                                     if col:
                                         eq_filters_for_sig.append([col, vals_list])
+
+                            numeric_entries = intent.get("numeric_filters") or intent.get("numeric") or []
+                            for num_entry in numeric_entries:
+                                col = ""
+                                op = None
+                                values: List[Any] = []
+                                if isinstance(num_entry, dict):
+                                    col = str(num_entry.get("col") or "").strip().upper()
+                                    op_raw = num_entry.get("op")
+                                    op = str(op_raw).strip().lower() if op_raw is not None else None
+                                    raw_vals = num_entry.get("values")
+                                    if raw_vals is None and num_entry.get("value") is not None:
+                                        raw_vals = [num_entry.get("value")]
+                                    if isinstance(raw_vals, (list, tuple, set)):
+                                        values = list(raw_vals)
+                                    elif raw_vals is not None:
+                                        values = [raw_vals]
+                                elif isinstance(num_entry, (list, tuple)) and len(num_entry) >= 2:
+                                    col = str(num_entry[0] or "").strip().upper()
+                                    op = str(num_entry[1] or "").strip().lower()
+                                    if len(num_entry) >= 3:
+                                        vals_part = num_entry[2]
+                                        if isinstance(vals_part, (list, tuple, set)):
+                                            values = list(vals_part)
+                                        elif vals_part is not None:
+                                            values = [vals_part]
+                                if not col:
+                                    continue
+                                norm_vals = [
+                                    v.strip().upper() if isinstance(v, str) else v for v in values
+                                ]
+                                if op and op not in {"eq", "in"}:
+                                    eq_filters_for_sig.append(
+                                        {
+                                            "col": col,
+                                            "op": op,
+                                            "values": norm_vals,
+                                            "ci": False,
+                                            "trim": False,
+                                        }
+                                    )
+                                else:
+                                    eq_filters_for_sig.append([col, norm_vals])
+
                             if eq_filters_for_sig:
-                                has_departments = any(col == "DEPARTMENTS" for col, _ in eq_filters_for_sig)
-                                has_department = any(col == "DEPARTMENT" for col, _ in eq_filters_for_sig)
+                                def _entry_col(entry: Any) -> str:
+                                    if isinstance(entry, (list, tuple)) and entry:
+                                        return str(entry[0] or "").upper()
+                                    if isinstance(entry, dict):
+                                        return str(entry.get("col") or entry.get("field") or "").upper()
+                                    return ""
+
+                                def _entry_vals(entry: Any) -> List[Any]:
+                                    if isinstance(entry, (list, tuple)) and len(entry) >= 2:
+                                        vals = entry[1]
+                                        return list(vals) if isinstance(vals, (list, tuple, set)) else [vals]
+                                    if isinstance(entry, dict):
+                                        raw = entry.get("values")
+                                        if raw is None and entry.get("val") is not None:
+                                            raw = [entry.get("val")]
+                                        if isinstance(raw, (list, tuple, set)):
+                                            return list(raw)
+                                    return []
+
+                                has_departments = any(_entry_col(e) == "DEPARTMENTS" for e in eq_filters_for_sig)
+                                has_department = any(_entry_col(e) == "DEPARTMENT" for e in eq_filters_for_sig)
                                 if has_departments and not has_department:
-                                    dep_vals = next((vals for col, vals in eq_filters_for_sig if col == "DEPARTMENTS"), [])
+                                    dep_vals = []
+                                    for e in eq_filters_for_sig:
+                                        if _entry_col(e) == "DEPARTMENTS":
+                                            dep_vals = _entry_vals(e)
+                                            break
                                     eq_filters_for_sig.append(["DEPARTMENT", list(dep_vals)])
                                 intent_for_sig["eq_filters"] = eq_filters_for_sig
                             if intent_for_sig.get("sort_by") and not intent_for_sig.get("order"):

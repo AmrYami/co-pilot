@@ -386,6 +386,89 @@ def _apply_eq_shape(
     return eq_filters
 
 
+def _build_or_groups_from_shape(
+    shape_items: List[Dict[str, Any]],
+    question_values: Dict[str, List[Any]],
+) -> List[List[Dict[str, Any]]]:
+    """Construct OR groups from shape metadata using current question values."""
+
+    groups: List[List[Dict[str, Any]]] = []
+    for item in shape_items or []:
+        if not isinstance(item, dict):
+            continue
+        logical = str(item.get("logical") or "").strip().upper()
+        targets = item.get("columns") or item.get("targets") or []
+        if not logical or not isinstance(targets, list):
+            continue
+        cols = [str(t or "").strip().upper() for t in targets if str(t or "").strip()]
+        if not cols:
+            continue
+        values = question_values.get(logical)
+        if not values:
+            collected: List[Any] = []
+            for target in cols:
+                collected.extend(question_values.get(target, []))
+            values = collected
+        clean_vals = _normalize_value_list(values)
+        if not clean_vals:
+            continue
+        op = "in" if len(clean_vals) > 1 else "eq"
+        group_entries = [
+            {"col": col, "values": list(clean_vals), "op": op, "ci": True, "trim": True}
+            for col in cols
+        ]
+        if group_entries:
+            groups.append(group_entries)
+    return groups
+
+
+def _dedupe_or_groups(groups: List[List[Dict[str, Any]]]) -> List[List[Dict[str, Any]]]:
+    """Remove duplicate OR groups while normalizing entries."""
+
+    deduped: List[List[Dict[str, Any]]] = []
+    seen: set[tuple] = set()
+
+    for grp in groups or []:
+        if not isinstance(grp, list):
+            continue
+        normalized_group: List[Dict[str, Any]] = []
+        key_parts: List[tuple] = []
+        for item in grp:
+            if not isinstance(item, dict):
+                continue
+            col = str(item.get("col") or item.get("column") or "").strip().upper()
+            if not col:
+                continue
+            values_raw = item.get("values")
+            if isinstance(values_raw, list):
+                vals = values_raw
+            elif isinstance(values_raw, (tuple, set)):
+                vals = list(values_raw)
+            elif values_raw is None:
+                vals = []
+            else:
+                vals = [values_raw]
+            clean_vals = _normalize_value_list(vals)
+            op = str(item.get("op") or "eq").strip().lower() or "eq"
+            entry = {
+                "col": col,
+                "values": clean_vals,
+                "op": op,
+                "ci": bool(item.get("ci", True)),
+                "trim": bool(item.get("trim", True)),
+            }
+            normalized_group.append(entry)
+            key_parts.append((col, op, tuple(clean_vals)))
+        if not normalized_group:
+            continue
+        key = tuple(sorted(key_parts))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(normalized_group)
+    return deduped
+
+
 def _value_policy() -> str:
     try:
         policy = (os.getenv("DW_EQ_VALUE_POLICY") or "question_only").strip().lower()
@@ -627,18 +710,7 @@ def save_positive_rule(
 
     # Persist EQ with optional cross-column OR groups when aliases were used
     raw_eq = applied_hints.get("eq_filters") or []
-    sanitized_eq_filters = _normalize_eq_filters_list(raw_eq)
-    for item in sanitized_eq_filters:
-        if len(item) != 2:
-            continue
-        values = item[1]
-        coerced: List[Any] = []
-        for v in values:
-            if isinstance(v, str):
-                coerced.append(v.strip().upper())
-            else:
-                coerced.append(v)
-        item[1] = coerced
+    sanitized_eq_filters: List[Any] = []
 
     alias_groups_payload: List[List[Dict[str, Any]]] = []
     aliases_with_eq: set[str] = set()
@@ -652,39 +724,53 @@ def save_positive_rule(
 
         shape_items: List[Dict[str, Any]] = []
 
-        def _norm(it) -> tuple[str, List[Any]] | None:
+        def _norm(
+            it,
+        ) -> Optional[tuple[str, List[Any], Optional[str], bool, bool]]:
             if isinstance(it, (list, tuple)) and len(it) == 2:
                 col = str(it[0] or "").upper().strip()
                 vals = it[1]
-                return col, list(vals) if isinstance(vals, (list, tuple, set)) else [vals]
+                values = list(vals) if isinstance(vals, (list, tuple, set)) else [vals]
+                return col, values, None, True, True
             if isinstance(it, dict):
                 col = str(it.get("col") or it.get("field") or "").upper().strip()
                 val = it.get("val") if it.get("val") is not None else it.get("value")
+                op_hint = str(it.get("op") or "").strip().lower() or None
+                ci_hint = bool(it.get("ci", True))
+                trim_hint = bool(it.get("trim", True))
                 if val is None:
-                    vals = []
+                    values = []
                 elif isinstance(val, (list, tuple, set)):
-                    vals = list(val)
+                    values = list(val)
                 else:
-                    vals = [val]
-                return col, vals
+                    values = [val]
+                if not values and isinstance(it.get("values"), (list, tuple, set)):
+                    values = list(it.get("values"))
+                return col, values, op_hint, ci_hint, trim_hint
             return None
 
         for it in raw_eq:
             norm = _norm(it)
             if not norm:
                 continue
-            col, vals = norm
+            col, vals, op_hint, ci_hint, trim_hint = norm
             if not col:
                 continue
             clean_vals = _normalize_value_list(vals)
             if not clean_vals:
                 continue
+            normalized_vals = [
+                v.strip().upper() if isinstance(v, str) else v for v in clean_vals
+            ]
+            op_value = op_hint or ("in" if len(clean_vals) > 1 else "eq")
             entry: Dict[str, Any] = {
-                "op": "in" if len(clean_vals) > 1 else "eq",
-                "types": sorted({_val_type(v) for v in clean_vals}),
-                "ci": True,
-                "trim": True,
+                "op": op_value,
+                "types": sorted({_val_type(v) for v in normalized_vals}),
+                "ci": ci_hint,
+                "trim": trim_hint,
             }
+            if op_value in {"eq", "in"}:
+                entry["logic"] = "OR"
             targets = alias_map.get(col)
             if targets:
                 aliases_with_eq.add(col)
@@ -694,25 +780,34 @@ def save_positive_rule(
                 entry["column"] = col
             shape_items.append(entry)
 
-            if targets:
-                upper_vals = [
-                    val.strip().upper() if isinstance(val, str) else val
-                    for val in clean_vals
-                ]
-                op = "in" if len(upper_vals) > 1 else "eq"
+            if op_value in {"eq", "in"} and targets:
+                op = "in" if len(normalized_vals) > 1 else "eq"
                 group_records: List[Dict[str, Any]] = []
                 for target in targets:
                     group_records.append(
                         {
                             "col": target,
-                            "values": list(upper_vals),
+                            "values": list(normalized_vals),
                             "op": op,
-                            "ci": True,
-                            "trim": True,
+                            "ci": ci_hint,
+                            "trim": trim_hint,
                         }
                     )
                 if group_records:
                     alias_groups_payload.append(group_records)
+
+            if op_value not in {"eq", "in"}:
+                sanitized_eq_filters.append(
+                    {
+                        "col": col,
+                        "op": op_value,
+                        "values": list(normalized_vals),
+                        "ci": ci_hint,
+                        "trim": trim_hint,
+                    }
+                )
+            else:
+                sanitized_eq_filters.append([col, list(normalized_vals)])
 
         if shape_items:
             rows.append(("eq_shape", {"items": shape_items}))
@@ -749,12 +844,14 @@ def save_positive_rule(
                 norm = _norm(it)
                 if not norm:
                     continue
-                col, vals = norm
+                col, vals, op_hint, _ci_hint, _trim_hint = norm
                 if not col or not vals:
                     continue
                 if col in aliases_with_eq:
                     continue
                 if col not in alias_map:
+                    continue
+                if op_hint and op_hint not in {"eq", "in"}:
                     continue
                 toks: List[str] = []
                 for v in vals:
@@ -1368,6 +1465,20 @@ def load_rules_for_question(
                 }
             )
 
+        if _log_intent_match_enabled():
+            try:
+                log.info(
+                    {
+                        "event": "rules.intent.match.variants",
+                        "count": len(variants),
+                        "sha256_prefixes": [v[0][:12] for v in variants],
+                        "payload_sha256": str(intent_sha)[:12] if intent_sha else None,
+                        "payload_sig": bool(intent_sig),
+                    }
+                )
+            except Exception:
+                pass
+
         seen_sha: set[tuple[str, str]] = set()
         seen_sig: set[str] = set()
 
@@ -1397,6 +1508,20 @@ def load_rules_for_question(
                         matched_stage = "intent_sha"
                         matched_variant = cand.get("variant")
                         matched_source = cand.get("source")
+                        if _log_intent_match_enabled():
+                            try:
+                                log.info(
+                                    {
+                                        "event": "rules.intent.match.selected",
+                                        "stage": "intent_sha",
+                                        "variant": matched_variant,
+                                        "sha256": s256,
+                                        "sha1": s1,
+                                        "source": matched_source,
+                                    }
+                                )
+                            except Exception:
+                                pass
                         break
             sig_json = cand.get("sig")
             if sig_json:
@@ -1417,6 +1542,20 @@ def load_rules_for_question(
                         matched_stage = "rule_signature"
                         matched_variant = cand.get("variant")
                         matched_source = cand.get("source")
+                        if _log_intent_match_enabled():
+                            try:
+                                log.info(
+                                    {
+                                        "event": "rules.intent.match.selected",
+                                        "stage": "rule_signature",
+                                        "variant": matched_variant,
+                                        "sha256": None,
+                                        "sha1": None,
+                                        "source": matched_source,
+                                    }
+                                )
+                            except Exception:
+                                pass
                         break
 
         if not rows:
@@ -1444,6 +1583,9 @@ def load_rules_for_question(
                     "rows": len(rows or []),
                     "match_stage": matched_stage,
                     "match_source": matched_source,
+                    "match_variant": matched_variant,
+                    "variants_considered": len(variants),
+                    "mismatch_reason": mismatch_reason,
                 }
             )
         except Exception:
@@ -1593,8 +1735,10 @@ def load_rules_for_question(
     question_eq_normalized = _normalize_eq_filters_list(intent_norm.get("eq_filters") or [])
     question_values = _build_question_value_map(intent_norm)
     eq_from_shape: List[List[Any]] = []
+    mask_or_groups: List[List[Dict[str, Any]]] = []
     if shape_rules:
         eq_from_shape = _apply_eq_shape(shape_rules, question_values)
+        mask_or_groups = _build_or_groups_from_shape(shape_rules, question_values)
 
     eq_rules_from_store = list(eq_from_rules or [])
     eq_coverage_value = _calc_eq_coverage(intent_norm.get("eq_filters"), eq_rules_from_store)
@@ -1654,21 +1798,39 @@ def load_rules_for_question(
     except Exception:
         question_or_groups = []
 
-    rule_or_groups = []
-    try:
-        if isinstance(merged.get("or_groups"), list):
-            rule_or_groups = [grp for grp in merged.get("or_groups") if isinstance(grp, list) and grp]
-    except Exception:
+    if mask_or_groups:
+        rule_or_groups = mask_or_groups
+    else:
         rule_or_groups = []
+        try:
+            if isinstance(merged.get("or_groups"), list):
+                rule_or_groups = [grp for grp in merged.get("or_groups") if isinstance(grp, list) and grp]
+        except Exception:
+            rule_or_groups = []
 
     question_or_groups = _canonicalize_question_or_groups(question_or_groups, rule_or_groups)
 
-    if rule_or_groups:
-        merged["or_groups"] = question_or_groups if question_or_groups else rule_or_groups
-    elif question_or_groups:
-        merged["or_groups"] = question_or_groups
+    if question_or_groups:
+        merged["or_groups"] = _dedupe_or_groups(question_or_groups)
     elif rule_or_groups:
-        merged["or_groups"] = rule_or_groups
+        merged["or_groups"] = _dedupe_or_groups(rule_or_groups)
+    elif "or_groups" in merged:
+        merged.pop("or_groups", None)
+
+    if _log_intent_match_enabled() and merged.get("or_groups"):
+        try:
+            log.info(
+                {
+                    "event": "rules.intent.or_groups",
+                    "count": len(merged.get("or_groups") or []),
+                    "families": [
+                        [entry.get("col") for entry in group if isinstance(entry, dict)]
+                        for group in merged.get("or_groups") or []
+                    ],
+                }
+            )
+        except Exception:
+            pass
 
     if not merged.get("aggregations"):
         question_aggs = _normalize_aggregations_list(intent_norm.get("aggregations"))
