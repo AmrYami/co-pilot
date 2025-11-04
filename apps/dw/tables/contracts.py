@@ -254,6 +254,12 @@ def _apply_full_text_search(
 
 def _maybe_apply_stakeholder_filters(intent: Intent, where_parts: List[str], binds: Dict[str, object]) -> None:
     raw_question = intent.raw_question or intent.question or ""
+    try:
+        overrides = intent.overrides or {}
+    except Exception:
+        overrides = {}
+    if isinstance(overrides, dict) and overrides.get("_skip_stakeholder_has"):
+        return
     if not re.search(r"stake\s*holder|stackholder", raw_question, flags=re.IGNORECASE):
         return
 
@@ -261,6 +267,8 @@ def _maybe_apply_stakeholder_filters(intent: Intent, where_parts: List[str], bin
     if not match:
         return
     raw_values = match.group(2)
+    raw_values = re.split(r"(?i)\b(?:and|where|order\s+by|group\s+by|having|;)\b", raw_values, 1)[0]
+    raw_values = raw_values.strip(" )")
     parts = re.split(r"\bor\b|\bأو\b|,|،", raw_values, flags=re.IGNORECASE)
     values = [p.strip(" '\"") for p in parts if p and p.strip(" '\"")]
     if not values:

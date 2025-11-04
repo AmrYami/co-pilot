@@ -385,6 +385,9 @@ def _apply_stakeholder_has(
     if not match:
         return False, []
     tail = match.group(2)
+    # Stop at the next clause (typically introduced by "and", ";" or end of string)
+    tail = re.split(r"(?i)\b(?:and|where|order\s+by|group\s+by|having|;)\b", tail, 1)[0]
+    tail = tail.strip(" )")
     parts = re.split(r"\s+or\s+|,", tail, flags=re.IGNORECASE)
     terms = [p.strip().strip("\"'") for p in parts if p.strip()]
     if not terms:
@@ -414,7 +417,11 @@ def _build_text_filter_sql(
     where_clauses: List[str] = []
     binds: Dict[str, Any] = {}
 
-    stakeholder_applied, stakeholder_terms = _apply_stakeholder_has(question, where_clauses, binds)
+    skip_stakeholder = bool(payload.get("_skip_stakeholder_has"))
+    if skip_stakeholder:
+        stakeholder_applied, stakeholder_terms = False, []
+    else:
+        stakeholder_applied, stakeholder_terms = _apply_stakeholder_has(question, where_clauses, binds)
     eq_applied, cleaned_q, eq_filters = _apply_eq_filters_from_text(
         question, settings, where_clauses, binds
     )

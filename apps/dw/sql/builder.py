@@ -36,6 +36,22 @@ def _normalize_identifier(name: str) -> str:
     return text.upper().replace(" ", "_")
 
 
+def _coerce_numeric_literal(value: Any) -> Any:
+    if isinstance(value, (int, float)):
+        return value
+    if isinstance(value, str):
+        text = value.strip().replace(",", "")
+        if not text:
+            return value
+        try:
+            if "." in text:
+                return float(text)
+            return int(text)
+        except ValueError:
+            return value
+    return value
+
+
 def _in_list_bind_keys(
     prefix: str,
     start_idx: int,
@@ -345,6 +361,72 @@ class QueryBuilder:
                 self._where_parts.append(clause)
         if buckets:
             self._notes.append(f"eq_filters={len(buckets)}")
+        return self
+
+    def apply_numeric_filters(self, numeric_filters: Iterable[Dict[str, Any]]) -> "QueryBuilder":
+        seen: set[Tuple[str, str, Tuple[Any, ...]]] = set()
+        applied = 0
+        for filt in numeric_filters or []:
+            if not isinstance(filt, dict):
+                continue
+            column = _normalize_identifier(str(filt.get("col") or filt.get("column") or ""))
+            if not column:
+                continue
+            op = str(filt.get("op") or filt.get("operator") or "").strip().lower()
+            raw_vals = filt.get("values")
+            if raw_vals is None and filt.get("val") is not None:
+                raw_vals = [filt.get("val")]
+            values: List[Any]
+            if isinstance(raw_vals, (list, tuple, set)):
+                values = list(raw_vals)
+            elif raw_vals is None:
+                values = []
+            else:
+                values = [raw_vals]
+            normalized_values = tuple(_coerce_numeric_literal(v) for v in values if v is not None)
+            if op == "between":
+                if len(normalized_values) != 2:
+                    continue
+                key = (column, op, normalized_values)
+                if key in seen:
+                    continue
+                seen.add(key)
+                bind_lo = f"num_{self._bind_idx}"
+                self._bind_idx += 1
+                bind_hi = f"num_{self._bind_idx}"
+                self._bind_idx += 1
+                self._binds[bind_lo] = normalized_values[0]
+                self._binds[bind_hi] = normalized_values[1]
+                clause = f"{column} BETWEEN :{bind_lo} AND :{bind_hi}"
+                self._where_parts.append(clause)
+                applied += 1
+                continue
+            sql_op = {
+                "gt": ">",
+                "gte": ">=",
+                "ge": ">=",
+                "lt": "<",
+                "lte": "<=",
+                "le": "<=",
+                "eq": "=",
+                ">": ">",
+                "<": "<",
+            }.get(op)
+            if not sql_op:
+                continue
+            for value in normalized_values:
+                key = (column, op, (value,))
+                if key in seen:
+                    continue
+                seen.add(key)
+                bind = f"num_{self._bind_idx}"
+                self._bind_idx += 1
+                self._binds[bind] = value
+                clause = f"{column} {sql_op} :{bind}"
+                self._where_parts.append(clause)
+                applied += 1
+        if applied:
+            self._notes.append(f"numeric_filters={applied}")
         return self
 
     def apply_boolean_groups(self, groups: Iterable[Dict[str, Any]]) -> "QueryBuilder":

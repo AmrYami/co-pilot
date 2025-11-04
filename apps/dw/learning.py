@@ -6,7 +6,7 @@ import json
 import logging
 import os
 import re
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Optional, List, Tuple, NamedTuple
 import hashlib
 
 from sqlalchemy import text
@@ -16,9 +16,31 @@ from apps.dw.memory_db import get_mem_engine
 from apps.dw.sql_shared import eq_alias_columns
 from apps.dw.lib.intent_sig import build_intent_signature
 try:  # prefer the canonical, value-agnostic signature from learning_store
-    from apps.dw.learning_store import _canon_signature_from_intent as _canon_sig  # type: ignore
-except Exception:  # fallback stub; will recompute locally if needed
+    from apps.dw.learning_store import (  # type: ignore
+        _canon_signature_from_intent as _canon_sig,
+        signature_variants as _signature_variants,
+        intent_shape as _intent_shape_for_log,
+        signature_knobs as _signature_knobs,
+        eq_coverage as _eq_coverage_metric,
+        SignatureKnobs as _SignatureKnobs,
+        DEFAULT_SIGNATURE_KNOBS as _DEFAULT_SIGNATURE_KNOBS,
+    )
+except Exception:  # fallback stubs; will recompute locally if needed
     _canon_sig = None  # type: ignore
+    _signature_variants = None  # type: ignore
+    _intent_shape_for_log = None  # type: ignore
+    _signature_knobs = None  # type: ignore
+    _eq_coverage_metric = None  # type: ignore
+    _SignatureKnobs = None  # type: ignore
+    _DEFAULT_SIGNATURE_KNOBS = None  # type: ignore
+
+if _SignatureKnobs is None:
+    class _SignatureKnobs(NamedTuple):  # type: ignore
+        fts_shape: str = "groups_sizes"
+        eq_list_mode: str = "exact_len"
+        eq_list_min_coverage: float = 0.0
+
+    _DEFAULT_SIGNATURE_KNOBS = _SignatureKnobs()  # type: ignore
 
 log = logging.getLogger("dw")
 
@@ -145,6 +167,111 @@ def _json_dumps(obj: Any) -> str:
 
 def _sha256(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+
+_LOG_INTENT_MATCH_CACHE: Optional[bool] = None
+
+
+def _current_signature_knobs():
+    if callable(_signature_knobs):
+        try:
+            return _signature_knobs()
+        except Exception:
+            pass
+    return _DEFAULT_SIGNATURE_KNOBS
+
+
+def _intent_signature_variants(intent: Dict[str, Any]) -> List[tuple[str, str, str]]:
+    if callable(_signature_variants):
+        try:
+            return _signature_variants(intent)
+        except Exception:
+            pass
+    try:
+        _sig_dict, sig_json, sha1 = build_intent_signature(intent)
+    except Exception:
+        sig_json = _json_dumps(intent)
+        sha1 = hashlib.sha1(sig_json.encode("utf-8")).hexdigest()
+    sha256 = _sha256(sig_json)
+    return [(sha256, sha1, sig_json)]
+
+
+def _intent_shape_snapshot(intent: Dict[str, Any]) -> Dict[str, Any]:
+    if callable(_intent_shape_for_log):
+        try:
+            return _intent_shape_for_log(intent)  # type: ignore[misc]
+        except Exception:
+            pass
+    return intent
+
+
+def _log_intent_match_enabled() -> bool:
+    global _LOG_INTENT_MATCH_CACHE
+    if _LOG_INTENT_MATCH_CACHE is None:
+        raw = os.getenv("LOG_INTENT_MATCH")
+        if raw is None:
+            _LOG_INTENT_MATCH_CACHE = False
+        else:
+            raw = raw.strip().lower()
+            if raw in {"1", "true", "yes", "on"}:
+                _LOG_INTENT_MATCH_CACHE = True
+            elif raw in {"0", "false", "no", "off"}:
+                _LOG_INTENT_MATCH_CACHE = False
+            else:
+                _LOG_INTENT_MATCH_CACHE = False
+    return bool(_LOG_INTENT_MATCH_CACHE)
+
+
+def reset_intent_match_log_cache() -> None:
+    global _LOG_INTENT_MATCH_CACHE
+    _LOG_INTENT_MATCH_CACHE = None
+
+
+def _calc_eq_coverage(question_eq: Any, rule_eq: Any) -> Optional[float]:
+    if callable(_eq_coverage_metric):
+        try:
+            return _eq_coverage_metric(question_eq, rule_eq)  # type: ignore[misc]
+        except Exception:
+            pass
+
+    question_norm = _normalize_eq_filters_list(question_eq or [])
+    rule_norm = _normalize_eq_filters_list(rule_eq or [])
+    if not rule_norm:
+        return None
+
+    q_map: Dict[str, set] = {}
+    for col, values in question_norm:
+        col_key = str(col or "").strip().upper()
+        if not col_key:
+            continue
+        q_map[col_key] = {
+            str(v or "").strip().upper()
+            for v in values or []
+            if str(v or "").strip()
+        }
+
+    total = 0
+    matches = 0
+    for col, values in rule_norm:
+        col_key = str(col or "").strip().upper()
+        if not col_key:
+            continue
+        total += 1
+        if col_key not in q_map:
+            continue
+        if not values:
+            matches += 1
+            continue
+        r_set = {
+            str(v or "").strip().upper()
+            for v in values or []
+            if str(v or "").strip()
+        }
+        if q_map[col_key] & r_set:
+            matches += 1
+    if not total:
+        return None
+    return matches / total
 
 
 def _val_type(value: Any) -> str:
@@ -312,6 +439,40 @@ def _normalize_token_list(tokens: Any) -> List[str]:
     return result
 
 
+def _normalize_aggregations_list(items: Any) -> List[Dict[str, Any]]:
+    if not isinstance(items, list):
+        return []
+    normalized: List[Dict[str, Any]] = []
+    seen: set[Tuple[str, str, bool, str]] = set()
+    for entry in items:
+        if not isinstance(entry, dict):
+            continue
+        func = str(entry.get("func") or "").strip().upper()
+        if not func:
+            continue
+        column_raw = entry.get("column")
+        if column_raw == "*" or str(column_raw or "").strip() == "*":
+            column = "*"
+        else:
+            column = str(column_raw or "").strip().upper()
+        distinct = bool(entry.get("distinct"))
+        alias_raw = entry.get("alias")
+        alias = str(alias_raw or "").strip().upper() if alias_raw else None
+        key = (func, column, distinct, alias or "")
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append(
+            {
+                "func": func,
+                "column": column if column else "*",
+                "distinct": distinct,
+                "alias": alias,
+            }
+        )
+    return normalized
+
+
 def _normalize_learning_hints(hints: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     src = hints or {}
     normalized: Dict[str, Any] = {}
@@ -340,6 +501,10 @@ def _normalize_learning_hints(hints: Optional[Dict[str, Any]]) -> Dict[str, Any]
         normalized["group_by"] = src.get("group_by")
     if src.get("gross") is not None:
         normalized["gross"] = bool(src.get("gross"))
+
+    aggs = _normalize_aggregations_list(src.get("aggregations"))
+    if aggs:
+        normalized["aggregations"] = aggs
 
     sort_by = src.get("sort_by")
     if isinstance(sort_by, str) and sort_by.strip():
@@ -381,6 +546,10 @@ def _normalize_learning_intent(intent: Optional[Dict[str, Any]]) -> Dict[str, An
         normalized["group_by"] = src.get("group_by")
     if src.get("gross") is not None:
         normalized["gross"] = bool(src.get("gross"))
+
+    aggs = _normalize_aggregations_list(src.get("aggregations"))
+    if aggs:
+        normalized["aggregations"] = aggs
 
     sort_by = src.get("sort_by") or src.get("order", {}).get("col")
     if isinstance(sort_by, str) and sort_by.strip():
@@ -433,6 +602,15 @@ def save_positive_rule(
             )
         )
 
+    aggregations = applied_hints.get("aggregations") or []
+    if aggregations:
+        rows.append(
+            (
+                "agg",
+                {"aggregations": aggregations},
+            )
+        )
+
     # Accept both legacy 'fts_tokens' and new 'fts_groups'
     tokens = applied_hints.get("fts_tokens") or _flatten_fts_groups(applied_hints)
     if tokens:
@@ -449,6 +627,22 @@ def save_positive_rule(
 
     # Persist EQ with optional cross-column OR groups when aliases were used
     raw_eq = applied_hints.get("eq_filters") or []
+    sanitized_eq_filters = _normalize_eq_filters_list(raw_eq)
+    for item in sanitized_eq_filters:
+        if len(item) != 2:
+            continue
+        values = item[1]
+        coerced: List[Any] = []
+        for v in values:
+            if isinstance(v, str):
+                coerced.append(v.strip().upper())
+            else:
+                coerced.append(v)
+        item[1] = coerced
+
+    alias_groups_payload: List[List[Dict[str, Any]]] = []
+    aliases_with_eq: set[str] = set()
+
     if raw_eq:
         alias_map: Dict[str, List[str]] = {}
         try:
@@ -493,11 +687,32 @@ def save_positive_rule(
             }
             targets = alias_map.get(col)
             if targets:
+                aliases_with_eq.add(col)
                 entry["logical"] = col
                 entry["columns"] = targets
             else:
                 entry["column"] = col
             shape_items.append(entry)
+
+            if targets:
+                upper_vals = [
+                    val.strip().upper() if isinstance(val, str) else val
+                    for val in clean_vals
+                ]
+                op = "in" if len(upper_vals) > 1 else "eq"
+                group_records: List[Dict[str, Any]] = []
+                for target in targets:
+                    group_records.append(
+                        {
+                            "col": target,
+                            "values": list(upper_vals),
+                            "op": op,
+                            "ci": True,
+                            "trim": True,
+                        }
+                    )
+                if group_records:
+                    alias_groups_payload.append(group_records)
 
         if shape_items:
             rows.append(("eq_shape", {"items": shape_items}))
@@ -537,6 +752,8 @@ def save_positive_rule(
                 col, vals = norm
                 if not col or not vals:
                     continue
+                if col in aliases_with_eq:
+                    continue
                 if col not in alias_map:
                     continue
                 toks: List[str] = []
@@ -554,6 +771,12 @@ def save_positive_rule(
                     like_fragments[col] = uniq
             if like_fragments:
                 rows.append(("eq_like", {"fragments": like_fragments, "min_len": min_len}))
+
+    if sanitized_eq_filters:
+        eq_payload: Dict[str, Any] = {"eq_filters": sanitized_eq_filters}
+        if alias_groups_payload:
+            eq_payload["or_groups"] = alias_groups_payload
+        rows.append(("eq", eq_payload))
 
     sort_by = applied_hints.get("sort_by")
     sort_desc = applied_hints.get("sort_desc")
@@ -682,30 +905,361 @@ def _merge_eq_filters_prefer_question(current_eq, rule_eq):
     Accepts list-of-lists [["COL", [values...]], ...] or dict items {col/field, val/values}.
     Returns canonical list-of-lists.
     """
-    qmap = {str(c).upper(): vs for c, vs in (current_eq or [])}
-    out: List[List[Any]] = []
+
+    def _canonical_keys(value: Any) -> set[str]:
+        if value is None:
+            return set()
+        import re as _re
+
+        text = _re.sub(r"\s+", " ", str(value).strip().upper())
+        if not text:
+            return set()
+        keys = {text}
+        if len(text) > 3:
+            if text.endswith("IES"):
+                keys.add(text[:-3] + "Y")
+            if text.endswith("ES"):
+                keys.add(text[:-2])
+            if text.endswith("S"):
+                keys.add(text[:-1])
+        return keys
 
     def _norm(item):
         if isinstance(item, (list, tuple)) and len(item) == 2:
-            return str(item[0]).upper(), item[1]
+            values = item[1]
+            if values is not None and not isinstance(values, (list, tuple, set)):
+                values = [values]
+            return str(item[0]).upper(), list(values or [])
         if isinstance(item, dict):
             col = item.get("col") or item.get("field")
-            vals = item.get("val") or item.get("values") or []
-            if vals is not None and not isinstance(vals, (list, tuple, set)):
-                vals = [vals]
-            return str(col).upper(), list(vals)
+            vals = item.get("val") if item.get("val") is not None else item.get("values")
+            if vals is None:
+                vals_list: List[Any] = []
+            elif isinstance(vals, (list, tuple, set)):
+                vals_list = list(vals)
+            else:
+                vals_list = [vals]
+            return str(col).upper(), vals_list
         return None, None
+
+    def _align(question_vals: List[Any], rule_vals: List[Any]) -> List[Any]:
+        if not question_vals or not rule_vals:
+            return question_vals
+        aligned: List[Any] = []
+        used: set[int] = set()
+        changed = False
+        for qv in question_vals:
+            q_keys = _canonical_keys(qv)
+            match = None
+            for idx, rv in enumerate(rule_vals):
+                if idx in used:
+                    continue
+                if q_keys & _canonical_keys(rv):
+                    match = rv
+                    used.add(idx)
+                    break
+            if match is not None:
+                aligned.append(match)
+                if match != qv:
+                    changed = True
+            else:
+                aligned.append(qv)
+        return aligned if changed else question_vals
+
+    qmap = {str(c).upper(): list(vals or []) for c, vals in (current_eq or [])}
+    out: List[List[Any]] = []
 
     for it in (rule_eq or []):
         col, rvals = _norm(it)
         if not col:
             continue
-        out.append([col, qmap.get(col, rvals or [])])  # prefer question values if present
+        q_vals = qmap.get(col)
+        if q_vals is not None:
+            qmap[col] = _align(q_vals, rvals or [])
+            out.append([col, qmap[col]])
+        else:
+            out.append([col, rvals or []])
     for col, vals in (current_eq or []):
         c = str(col).upper()
         if not any(c == x[0] for x in out):
             out.append([c, vals])
     return out
+
+
+def _merge_or_groups_prefer_question(
+    current_groups: List[List[Dict[str, Any]]],
+    rule_groups: List[List[Dict[str, Any]]],
+) -> List[List[Dict[str, Any]]]:
+    """Align cross-column OR groups so question literals adopt stored canonical values."""
+
+    def _canonical_keys(value: Any) -> set:
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return set()
+            import re as _re
+
+            norm = _re.sub(r"\s+", " ", text.upper())
+            keys = {norm}
+            if len(norm) > 3:
+                if norm.endswith("IES"):
+                    keys.add(norm[:-3] + "Y")
+                if norm.endswith("ES"):
+                    keys.add(norm[:-2])
+                if norm.endswith("S"):
+                    keys.add(norm[:-1])
+            return keys
+        try:
+            return {value}
+        except TypeError:
+            return {str(value)}
+
+    def _normalize(groups: List[List[Dict[str, Any]]]) -> List[List[Dict[str, Any]]]:
+        normalized: List[List[Dict[str, Any]]] = []
+        for grp in groups or []:
+            if not isinstance(grp, list):
+                continue
+            entries: List[Dict[str, Any]] = []
+            for item in grp:
+                if isinstance(item, dict):
+                    col = str((item.get("col") or item.get("column") or "")).strip().upper()
+                    if not col:
+                        continue
+                    op = str(item.get("op") or "eq").strip().lower() or "eq"
+                    vals = item.get("values")
+                    if vals is None and item.get("val") is not None:
+                        vals = [item.get("val")]
+                    if isinstance(vals, (list, tuple, set)):
+                        values = list(vals)
+                    elif vals is None:
+                        values = []
+                    else:
+                        values = [vals]
+                    entries.append(
+                        {
+                            "col": col,
+                            "values": values,
+                            "op": op,
+                            "ci": bool(item.get("ci", True)),
+                            "trim": bool(item.get("trim", True)),
+                        }
+                    )
+                elif isinstance(item, (list, tuple)) and len(item) >= 2:
+                    col = str(item[0] or "").strip().upper()
+                    if not col:
+                        continue
+                    raw_vals = item[1]
+                    if isinstance(raw_vals, (list, tuple, set)):
+                        values = list(raw_vals)
+                    elif raw_vals is None:
+                        values = []
+                    else:
+                        values = [raw_vals]
+                    entries.append(
+                        {
+                            "col": col,
+                            "values": values,
+                            "op": "eq",
+                            "ci": True,
+                            "trim": True,
+                        }
+                    )
+            if entries:
+                normalized.append(entries)
+        return normalized
+
+    def _align_values(question_vals: List[Any], rule_vals: List[Any]) -> List[Any]:
+        if not question_vals or not rule_vals:
+            return question_vals
+        aligned: List[Any] = []
+        used: set[int] = set()
+        changed = False
+        for qv in question_vals:
+            q_keys = _canonical_keys(qv)
+            match = None
+            for idx, rv in enumerate(rule_vals):
+                if idx in used:
+                    continue
+                if q_keys & _canonical_keys(rv):
+                    match = rv
+                    used.add(idx)
+                    break
+            if match is not None:
+                aligned.append(match)
+                if match != qv:
+                    changed = True
+            else:
+                aligned.append(qv)
+        return aligned if changed else question_vals
+
+    def _denormalize(groups: List[List[Dict[str, Any]]]) -> List[List[Dict[str, Any]]]:
+        out: List[List[Dict[str, Any]]] = []
+        for grp in groups:
+            entries: List[Dict[str, Any]] = []
+            for item in grp:
+                values = list(item.get("values") or [])
+                entry = {
+                    "col": item.get("col"),
+                    "values": values,
+                    "op": item.get("op", "eq"),
+                    "ci": bool(item.get("ci", True)),
+                    "trim": bool(item.get("trim", True)),
+                }
+                if len(values) == 1:
+                    entry["val"] = values[0]
+                entries.append(entry)
+            if entries:
+                out.append(entries)
+        return out
+
+    question_norm = _normalize(current_groups)
+    rule_norm = _normalize(rule_groups)
+    if not rule_norm:
+        return _denormalize(question_norm)
+
+    result_norm: List[List[Dict[str, Any]]] = []
+    used_rule: set[int] = set()
+
+    for q_group in question_norm:
+        sig = frozenset(item["col"] for item in q_group)
+        match_idx = None
+        for idx, r_group in enumerate(rule_norm):
+            if idx in used_rule:
+                continue
+            r_sig = frozenset(item["col"] for item in r_group)
+            if sig == r_sig:
+                match_idx = idx
+                break
+        if match_idx is None:
+            for idx, r_group in enumerate(rule_norm):
+                if idx in used_rule:
+                    continue
+                r_sig = frozenset(item["col"] for item in r_group)
+                if sig and sig.issubset(r_sig):
+                    match_idx = idx
+                    break
+        if match_idx is not None:
+            r_group = rule_norm[match_idx]
+            used_rule.add(match_idx)
+            r_map = {item["col"]: item for item in r_group}
+            q_map = {item["col"]: item for item in q_group}
+            for col, q_entry in q_map.items():
+                if col in r_map:
+                    q_entry["values"] = _align_values(q_entry["values"], r_map[col]["values"])
+            for col, r_entry in r_map.items():
+                if col not in q_map:
+                    q_group.append(
+                        {
+                            "col": col,
+                            "values": list(r_entry["values"]),
+                            "op": r_entry.get("op", "eq"),
+                            "ci": r_entry.get("ci", True),
+                            "trim": r_entry.get("trim", True),
+                        }
+                    )
+            result_norm.append(q_group)
+        else:
+            result_norm.append(q_group)
+
+    if not question_norm:
+        for idx, r_group in enumerate(rule_norm):
+            if idx not in used_rule:
+                result_norm.append(r_group)
+
+    return _denormalize(result_norm)
+
+
+def _canonicalize_question_eq(
+    question_eq: List[List[Any]],
+    rule_eq: List[List[Any]],
+) -> List[List[Any]]:
+    try:
+        alias_map = eq_alias_columns()
+    except Exception:
+        alias_map = {}
+
+    alias_targets_index: Dict[str, Tuple[str, ...]] = {}
+    canonical_for_targets: Dict[Tuple[str, ...], str] = {}
+
+    def _score_alias(name: str) -> Tuple[int, int, str]:
+        name = name or ""
+        return (1 if name.endswith("S") else 0, len(name), name)
+
+    for alias, cols in (alias_map or {}).items():
+        cols_tuple = tuple(sorted(str(c).strip().upper() for c in cols if str(c).strip()))
+        alias_upper = str(alias or "").strip().upper()
+        alias_targets_index[alias_upper] = cols_tuple
+        if not cols_tuple:
+            continue
+        current = canonical_for_targets.get(cols_tuple)
+        if current is None or _score_alias(alias_upper) > _score_alias(current):
+            canonical_for_targets[cols_tuple] = alias_upper
+
+    def _canonical_alias(name: str) -> str:
+        alias_upper = str(name or "").strip().upper()
+        cols_tuple = alias_targets_index.get(alias_upper)
+        if not cols_tuple:
+            return alias_upper
+        return canonical_for_targets.get(cols_tuple, alias_upper)
+
+    def _canonical_keys(value: Any) -> set:
+        if isinstance(value, str):
+            import re as _re
+
+            text = _re.sub(r"\s+", " ", value.strip().upper())
+            if not text:
+                return set()
+            keys = {text}
+            if len(text) > 3:
+                if text.endswith("IES"):
+                    keys.add(text[:-3] + "Y")
+                if text.endswith("ES"):
+                    keys.add(text[:-2])
+                if text.endswith("S"):
+                    keys.add(text[:-1])
+            return keys
+        try:
+            return {value}
+        except TypeError:
+            return {str(value)}
+
+    rule_map: Dict[str, List[Any]] = {}
+    for col, vals in rule_eq or []:
+        col_key = str(col or "").strip().upper()
+        if not col_key:
+            continue
+        canon_key = _canonical_alias(col_key)
+        rule_map.setdefault(col_key, []).extend(list(vals or []))
+        if canon_key != col_key:
+            rule_map.setdefault(canon_key, []).extend(list(vals or []))
+
+    canonicalized: List[List[Any]] = []
+    for col, values in question_eq or []:
+        col_key = str(col or "").strip().upper()
+        if not col_key:
+            continue
+        replacements: List[Any] = []
+        rule_vals = rule_map.get(col_key) or rule_map.get(_canonical_alias(col_key), [])
+        for qv in values or []:
+            replaced = qv
+            if rule_vals:
+                q_keys = _canonical_keys(qv)
+                for rv in rule_vals:
+                    if q_keys & _canonical_keys(rv):
+                        replaced = rv
+                        break
+            replacements.append(replaced)
+        canonicalized.append([col_key, replacements])
+    return canonicalized
+
+
+def _canonicalize_question_or_groups(
+    question_groups: List[List[Dict[str, Any]]],
+    rule_groups: List[List[Dict[str, Any]]],
+) -> List[List[Dict[str, Any]]]:
+    if not question_groups:
+        return question_groups
+    return _merge_or_groups_prefer_question(question_groups, rule_groups)
 
 
 def load_rules_for_question(
@@ -739,84 +1293,115 @@ def load_rules_for_question(
     if isinstance(intent, dict):
         intent_norm = _normalize_learning_intent(intent)
 
-    with engine.connect() as cx:
+    knobs = _current_signature_knobs()
+    ask_shape = _intent_shape_snapshot(intent_norm) if intent_norm else {}
+    variants: List[tuple[str, str, str]] = []
+    if intent_norm:
         try:
-            sig_for_log = None
-            if intent_norm:
-                if _canon_sig:
-                    sha256, sha1, sig_text = _canon_sig(intent_norm)  # type: ignore[misc]
-                    try:
-                        log.info({"event": "rules.intent.normalized", "intent": intent_norm})
-                        log.info({"event": "rules.intent.signature", "sig_text": sig_text})
-                    except Exception:
-                        pass
-                else:
-                    sig_dict, sig_text, sha1 = build_intent_signature(intent_norm)
-                    sha256 = _sha256(sig_text)
-                sig_for_log = {"sha1": sha1, "sha256": sha256, "sig_len": len(sig_text or "")}
-            log.info({"event": "rules.signature.compute", "qnorm": norm, **(sig_for_log or {})})
+            variants = _intent_signature_variants(intent_norm)
         except Exception:
-            pass
-        # Helper to execute and return mapping rows
+            variants = []
+    primary_variant = variants[0] if variants else None
+
+    try:
+        if primary_variant:
+            sha256, sha1, sig_json = primary_variant
+            log.info(
+                {
+                    "event": "rules.signature.compute",
+                    "qnorm": norm,
+                    "sha256": sha256,
+                    "sha1": sha1,
+                    "sig_len": len(sig_json or ""),
+                }
+            )
+    except Exception:
+        pass
+
+    rows: List[Dict[str, Any]] = []
+    matched_stage: Optional[str] = None
+    matched_variant: Optional[int] = None
+    matched_source: Optional[str] = None
+    mismatch_reason: Optional[str] = None
+
+    with engine.connect() as cx:
         def _exec(sql: str, binds: Dict[str, Any]):
-            return (
-                cx.execute(text(sql), binds)
-                .mappings()
-                .all()
-            )
+            return cx.execute(text(sql), binds).mappings().all()
 
-        rows: List[Dict[str, Any]] = []
-
-        # 1) Explicit artifacts
+        candidates: List[Dict[str, Any]] = []
         if intent_sha:
-            # Accept both SHA-1 and SHA-256 by probing both slots
-            rows = _exec(
-                """
-                SELECT rule_kind AS rule_kind, rule_payload AS rule_payload
-                  FROM dw_rules
-                 WHERE enabled = TRUE
-                   AND intent_sha IN (:sha1, :sha256)
-                 ORDER BY id DESC
-                 LIMIT 50
-                """,
-                {"sha1": intent_sha, "sha256": intent_sha},
+            sha_val = str(intent_sha)
+            candidates.append(
+                {
+                    "sha1": sha_val,
+                    "sha256": sha_val,
+                    "sig": None,
+                    "source": "payload.intent_sha",
+                    "variant": None,
+                }
             )
 
-        # 2) Signature JSON matching
-        if not rows and intent_sig:
-            rows = _exec(
-                """
-                SELECT rule_kind AS rule_kind, rule_payload AS rule_payload
-                  FROM dw_rules
-                 WHERE enabled = TRUE
-                   AND rule_signature = :sig
-                 ORDER BY id DESC
-                 LIMIT 50
-                """,
-                {"sig": _json_dumps(intent_sig)},
-            )
-
-        # 3) Build from provided intent (derive both SHA-1 and SHA-256) using value-agnostic shape
-        if not rows and intent_norm:
-            try:
-                if _canon_sig:
-                    sha256, sha1, sig_str = _canon_sig(intent_norm)  # type: ignore[misc]
-                else:
-                    # Fallback to legacy: use value-based signature then convert to both hashes
-                    sig_dict, sig_str, sha1 = build_intent_signature(intent_norm)
-                    sha256 = _sha256(sig_str)
-                rows = _exec(
-                    """
-                    SELECT rule_kind AS rule_kind, rule_payload AS rule_payload
-                      FROM dw_rules
-                     WHERE enabled = TRUE
-                       AND intent_sha IN (:sha1, :sha256)
-                     ORDER BY id DESC
-                     LIMIT 50
-                    """,
-                    {"sha1": sha1, "sha256": sha256},
+        if intent_sig:
+            if isinstance(intent_sig, dict):
+                sig_payload = _json_dumps(intent_sig)
+            else:
+                sig_payload = str(intent_sig)
+            if sig_payload:
+                candidates.append(
+                    {
+                        "sha1": None,
+                        "sha256": None,
+                        "sig": sig_payload,
+                        "source": "payload.intent_sig",
+                        "variant": None,
+                    }
                 )
-                if not rows:
+
+        for idx, (sha256, sha1, sig_json) in enumerate(variants):
+            candidates.append(
+                {
+                    "sha1": sha1,
+                    "sha256": sha256,
+                    "sig": sig_json,
+                    "source": "variant",
+                    "variant": idx,
+                }
+            )
+
+        seen_sha: set[tuple[str, str]] = set()
+        seen_sig: set[str] = set()
+
+        for cand in candidates:
+            if rows:
+                break
+            sha1_val = cand.get("sha1")
+            sha256_val = cand.get("sha256")
+            if sha1_val or sha256_val:
+                s1 = sha1_val or sha256_val or ""
+                s256 = sha256_val or sha1_val or ""
+                key = (s1, s256)
+                if key not in seen_sha and (s1 or s256):
+                    seen_sha.add(key)
+                    rows = _exec(
+                        """
+                        SELECT rule_kind AS rule_kind, rule_payload AS rule_payload
+                          FROM dw_rules
+                         WHERE enabled = TRUE
+                           AND intent_sha IN (:sha1, :sha256)
+                         ORDER BY id DESC
+                         LIMIT 50
+                        """,
+                        {"sha1": s1, "sha256": s256},
+                    )
+                    if rows:
+                        matched_stage = "intent_sha"
+                        matched_variant = cand.get("variant")
+                        matched_source = cand.get("source")
+                        break
+            sig_json = cand.get("sig")
+            if sig_json:
+                if sig_json not in seen_sig:
+                    seen_sig.add(sig_json)
                     rows = _exec(
                         """
                         SELECT rule_kind AS rule_kind, rule_payload AS rule_payload
@@ -826,12 +1411,14 @@ def load_rules_for_question(
                          ORDER BY id DESC
                          LIMIT 50
                         """,
-                        {"sig": sig_str},
+                        {"sig": sig_json},
                     )
-            except Exception:
-                rows = []
+                    if rows:
+                        matched_stage = "rule_signature"
+                        matched_variant = cand.get("variant")
+                        matched_source = cand.get("source")
+                        break
 
-        # 4) Fallback to question_norm + globals
         if not rows:
             rows = _exec(
                 """
@@ -844,12 +1431,19 @@ def load_rules_for_question(
                 """,
                 {"q": norm},
             )
+            if rows:
+                matched_stage = "question_norm"
+                matched_source = "question_norm"
+            else:
+                mismatch_reason = "no_rule"
+
         try:
             log.info(
                 {
                     "event": "rules.load.summary",
-                    "by_sha": bool(intent_sha),
                     "rows": len(rows or []),
+                    "match_stage": matched_stage,
+                    "match_source": matched_source,
                 }
             )
         except Exception:
@@ -924,6 +1518,10 @@ def load_rules_for_question(
                 merged["group_by"] = payload.get("group_by")
             if payload.get("gross") is not None:
                 merged["gross"] = payload.get("gross")
+        elif k == "agg":
+            normalized_aggs = _normalize_aggregations_list(payload.get("aggregations"))
+            if normalized_aggs:
+                merged["aggregations"] = normalized_aggs
         elif k == "fts":
             if payload.get("tokens"):
                 merged["fts_tokens"] = payload.get("tokens")
@@ -998,6 +1596,23 @@ def load_rules_for_question(
     if shape_rules:
         eq_from_shape = _apply_eq_shape(shape_rules, question_values)
 
+    eq_rules_from_store = list(eq_from_rules or [])
+    eq_coverage_value = _calc_eq_coverage(intent_norm.get("eq_filters"), eq_rules_from_store)
+
+    question_eq_normalized = _canonicalize_question_eq(question_eq_normalized, eq_rules_from_store)
+
+    eq_rules_effective = eq_rules_from_store
+    eq_coverage_enforced = False
+    if (
+        eq_rules_from_store
+        and eq_coverage_value is not None
+        and getattr(knobs, "eq_list_min_coverage", 0) > 0
+        and eq_coverage_value < getattr(knobs, "eq_list_min_coverage", 0)
+    ):
+        mismatch_reason = mismatch_reason or "eq_coverage"
+        eq_rules_effective = []
+        eq_coverage_enforced = True
+
     policy = _value_policy()
     eq_final: List[List[Any]] = []
     seen_cols: set[str] = set()
@@ -1020,16 +1635,46 @@ def load_rules_for_question(
         seen_cols.add(col_key)
 
     if not eq_final:
-        if eq_from_rules and policy != "question_only":
+        if eq_rules_effective and policy != "question_only":
             eq_final = _merge_eq_filters_prefer_question(
                 question_eq_normalized,
-                eq_from_rules,
+                eq_rules_effective,
             )
         elif question_eq_normalized:
             eq_final = question_eq_normalized
 
     if eq_final:
         merged["eq_filters"] = eq_final
+
+    # Merge OR groups (alias expansions) with question preference but rule canonical values
+    question_or_groups = []
+    try:
+        if isinstance(intent_norm.get("or_groups"), list):
+            question_or_groups = [grp for grp in intent_norm.get("or_groups") if isinstance(grp, list) and grp]
+    except Exception:
+        question_or_groups = []
+
+    rule_or_groups = []
+    try:
+        if isinstance(merged.get("or_groups"), list):
+            rule_or_groups = [grp for grp in merged.get("or_groups") if isinstance(grp, list) and grp]
+    except Exception:
+        rule_or_groups = []
+
+    question_or_groups = _canonicalize_question_or_groups(question_or_groups, rule_or_groups)
+
+    if rule_or_groups:
+        merged["or_groups"] = question_or_groups if question_or_groups else rule_or_groups
+    elif question_or_groups:
+        merged["or_groups"] = question_or_groups
+    elif rule_or_groups:
+        merged["or_groups"] = rule_or_groups
+
+    if not merged.get("aggregations"):
+        question_aggs = _normalize_aggregations_list(intent_norm.get("aggregations"))
+        if question_aggs:
+            merged["aggregations"] = question_aggs
+
     try:
         log.info(
             {
@@ -1042,6 +1687,29 @@ def load_rules_for_question(
         )
     except Exception:
         pass
+
+    if _log_intent_match_enabled():
+        try:
+            log.info(
+                {
+                    "event": "rules.intent.match",
+                    "source": "learning",
+                    "question_norm": norm,
+                    "match_stage": matched_stage,
+                    "match_source": matched_source,
+                    "matched_variant": matched_variant,
+                    "variants": len(variants),
+                    "rows": len(rows or []),
+                    "signature": ask_shape,
+                    "knobs": knobs._asdict() if hasattr(knobs, "_asdict") else {},
+                    "fallback_used": bool(matched_variant and matched_variant > 0),
+                    "mismatch_reason": mismatch_reason,
+                    "eq_coverage": eq_coverage_value,
+                    "eq_coverage_enforced": eq_coverage_enforced,
+                }
+            )
+        except Exception:
+            pass
     return merged
 
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from flask import Blueprint, abort, jsonify, request
 from sqlalchemy import text
@@ -122,6 +122,40 @@ def _row_to_dict(row):
     if hasattr(row, "_mapping"):
         return dict(row._mapping)
     return dict(row)
+
+
+def _normalize_aggregations_list(value: Any) -> List[Dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    normalized: List[Dict[str, Any]] = []
+    seen: set[Tuple[str, str, bool, str]] = set()
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        func = str(item.get("func") or "").strip().upper()
+        if not func:
+            continue
+        column_raw = item.get("column")
+        if column_raw == "*" or str(column_raw or "").strip() == "*":
+            column = "*"
+        else:
+            column = str(column_raw or "").strip().upper()
+        distinct = bool(item.get("distinct"))
+        alias_raw = item.get("alias")
+        alias = str(alias_raw or "").strip().upper() if alias_raw else None
+        key = (func, column, distinct, alias or "")
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append(
+            {
+                "func": func,
+                "column": column if column else "*",
+                "distinct": distinct,
+                "alias": alias,
+            }
+        )
+    return normalized
 
 
 @bp.get("/feedback")
@@ -310,6 +344,8 @@ def approve_feedback(fid: int):
                 else:
                     eq_filters = []
 
+                aggregations_norm = _normalize_aggregations_list(intent.get("aggregations"))
+
                 applied_hints = {
                     "group_by": intent.get("group_by"),
                     "gross": intent.get("gross"),
@@ -320,6 +356,8 @@ def approve_feedback(fid: int):
                     if intent.get("sort_desc") is not None
                     else None,
                 }
+                if aggregations_norm:
+                    applied_hints["aggregations"] = aggregations_norm
 
                 has_rule = any(
                     (
@@ -327,6 +365,7 @@ def approve_feedback(fid: int):
                         applied_hints.get("gross") is not None,
                         applied_hints.get("fts_tokens"),
                         applied_hints.get("eq_filters"),
+                        applied_hints.get("aggregations"),
                         applied_hints.get("sort_by"),
                         applied_hints.get("sort_desc") is not None,
                     )
@@ -365,6 +404,8 @@ def approve_feedback(fid: int):
                                     "col": intent_for_sig.get("sort_by"),
                                     "desc": bool(intent_for_sig.get("sort_desc", True)),
                                 }
+                            if aggregations_norm:
+                                intent_for_sig["aggregations"] = aggregations_norm
                             sha256, _sha1, sig_txt = _canon_signature_from_intent(intent_for_sig)
                             sig_obj = json.loads(sig_txt)
                             sig_sha = sha256

@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any, Dict, Iterable, List, Tuple
 
 from apps.dw.logger import log
-from apps.dw.rate_intent import build_where_and_binds, parse_structured_comment
+from apps.dw.rate_intent import _normalized, build_where_and_binds, parse_structured_comment
 from apps.dw.sql_shared import dw_date_col, dw_table, exec_sql, explicit_columns, eq_alias_columns
 from apps.dw.settings import get_setting
 from apps.dw.contracts.fts import extract_fts_terms
@@ -99,8 +99,67 @@ def run_rate(inquiry_id: int, rating: int, comment: str) -> Dict[str, Any]:
         pass
 
     where_sql, binds = build_where_and_binds(table, intent)
-    order_clause = intent.order_by or f"{date_column} DESC"
-    sql = _select_sql(table, where_sql, order_clause)
+
+    group_by_cols = [col.strip().upper() for col in (intent.group_by or []) if str(col or "").strip()]
+    aggregations = intent.aggregations or []
+    gross_flag = bool(intent.gross) if intent.gross is not None else False
+
+    sort_col = None
+    sort_desc = True
+    if intent.order_by:
+        tokens = [tok for tok in intent.order_by.split() if tok]
+        if tokens:
+            sort_col = tokens[0].upper()
+            if len(tokens) > 1 and tokens[1].upper() == "ASC":
+                sort_desc = False
+    order_clause = (
+        f"{sort_col} {'DESC' if sort_desc else 'ASC'}" if sort_col else f"{date_column} DESC"
+    )
+
+    needs_aggregation = bool(group_by_cols or aggregations or gross_flag)
+    if needs_aggregation:
+        select_parts: List[str] = []
+        if group_by_cols:
+            select_parts.extend(group_by_cols)
+
+        agg_parts: List[str] = []
+        if aggregations:
+            for agg in aggregations:
+                func = str(agg.get("func") or "").upper()
+                column = str(agg.get("column") or "").upper()
+                distinct = bool(agg.get("distinct"))
+                alias = agg.get("alias")
+                if not func:
+                    continue
+                inner = "*"
+                if column and column != "*":
+                    inner = column
+                if distinct and inner != "*":
+                    inner = f"DISTINCT {inner}"
+                expr = f"{func}({inner})"
+                if alias:
+                    expr += f" AS {str(alias).upper()}"
+                agg_parts.append(expr)
+        else:
+            if gross_flag:
+                agg_parts.append("SUM(CONTRACT_VALUE_NET_OF_VAT) AS TOTAL_AMOUNT")
+            else:
+                agg_parts.append("COUNT(*) AS TOTAL_COUNT")
+
+        if agg_parts:
+            select_parts.extend(agg_parts)
+
+        if not select_parts:
+            select_parts.append("*")
+
+        select_clause = ", ".join(select_parts)
+        sql = f'SELECT {select_clause}\nFROM "{table}"\nWHERE ({where_sql})'
+        if group_by_cols:
+            sql += "\nGROUP BY " + ", ".join(group_by_cols)
+        if order_clause:
+            sql += "\nORDER BY " + order_clause
+    else:
+        sql = _select_sql(table, where_sql, order_clause)
 
     validate_only = bool(get_setting("VALIDATE_WITH_EXPLAIN_ONLY"))
 
@@ -150,7 +209,11 @@ def run_rate(inquiry_id: int, rating: int, comment: str) -> Dict[str, Any]:
         "empty_any": [list(group) for group in intent.empty_any],
         "empty_all": [list(group) for group in intent.empty_all],
         "fts_groups": [list(group) for group in intent.fts_groups],
-        "sort_by": order_clause,
+        "group_by": list(group_by_cols),
+        "aggregations": [dict(entry) for entry in aggregations],
+        "gross": intent.gross,
+        "sort_by": sort_col or date_column,
+        "sort_desc": sort_desc,
     }
 
     debug_validation = {

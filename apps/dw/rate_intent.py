@@ -31,11 +31,76 @@ class RateIntent:
     empty: List[str] = field(default_factory=list)
     not_empty: List[str] = field(default_factory=list)
     fts_groups: List[List[str]] = field(default_factory=list)
+    group_by: List[str] = field(default_factory=list)
+    aggregations: List[Dict[str, Any]] = field(default_factory=list)
+    gross: Optional[bool] = None
     order_by: str = ""
 
 
 _OR_SPLIT = r"\s+or\s+|\s*\|\|\s*|،\s*|\s+او\s+|\s+أو\s+"
 _COLNAME = r"[A-Za-z0-9_]+"
+
+
+_AGG_FUNC = r"[A-Za-z0-9_]+"
+
+
+def _split_agg_parts(value: str) -> List[str]:
+    parts: List[str] = []
+    current: List[str] = []
+    depth = 0
+    for ch in value:
+        if ch == "," and depth == 0:
+            part = "".join(current).strip()
+            if part:
+                parts.append(part)
+            current = []
+            continue
+        current.append(ch)
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth = max(0, depth - 1)
+    tail = "".join(current).strip()
+    if tail:
+        parts.append(tail)
+    return parts
+
+
+def _parse_agg_expr(raw: str, resolver) -> Dict[str, Any] | None:
+    text = (raw or "").strip().rstrip(";")
+    if not text:
+        return None
+    match = re.match(
+        rf"^(?P<func>{_AGG_FUNC})\s*\(\s*(?P<body>.*?)\s*\)\s*(?:as\s+(?P<alias>[A-Za-z0-9_\"']+))?$",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+    func = match.group("func").strip().upper()
+    body = (match.group("body") or "").strip()
+    distinct = False
+    if body.lower().startswith("distinct "):
+        distinct = True
+        body = body[8:].strip()
+    column = body or "*"
+    alias_raw = match.group("alias")
+    alias = None
+    if alias_raw:
+        alias = alias_raw.strip().strip('"').strip("'")
+        alias = alias.upper()
+    resolved_col = column
+    if column != "*":
+        try:
+            resolved_col = resolver(column)
+        except ValueError:
+            resolved_col = column.strip().upper()
+    return {
+        "func": func,
+        "column": resolved_col if resolved_col else column.upper(),
+        "distinct": distinct,
+        "alias": alias,
+    }
 
 
 def _split_values(value: str) -> List[str]:
@@ -165,8 +230,78 @@ def parse_structured_comment(
             intent.not_empty.extend(cols)
             continue
         if lowered.startswith("order_by:"):
-            intent.order_by = raw.split(":", 1)[1].strip()
+            body = raw.split(":", 1)[1].strip()
+            tokens = [tok for tok in body.replace(";", " ").split() if tok]
+            if tokens:
+                col_token = tokens[0]
+                direction_token = tokens[1] if len(tokens) > 1 else "DESC"
+                try:
+                    col_norm = _resolve_column(col_token)
+                except ValueError:
+                    col_norm = col_token.strip().upper()
+                direction = direction_token.strip().upper()
+                if direction not in {"ASC", "DESC"}:
+                    direction = "DESC"
+                intent.order_by = f"{col_norm} {direction}"
             continue
+        if lowered.startswith("group_by:"):
+            cols = raw.split(":", 1)[1]
+            values = [frag.strip() for frag in cols.replace(";", "").split(",") if frag.strip()]
+            normalized = []
+            for value in values:
+                try:
+                    normalized.append(_resolve_column(value))
+                except ValueError:
+                    normalized.append(value.strip().upper())
+            if normalized:
+                intent.group_by.extend(normalized)
+            continue
+        if lowered.startswith("gross:"):
+            flag = raw.split(":", 1)[1].strip().lower()
+            if flag in {"true", "1", "yes"}:
+                intent.gross = True
+            elif flag in {"false", "0", "no"}:
+                intent.gross = False
+            continue
+        if lowered.startswith("agg:"):
+            body = raw.split(":", 1)[1].strip()
+            for segment in _split_agg_parts(body):
+                parsed = _parse_agg_expr(segment, _resolve_column)
+                if parsed:
+                    intent.aggregations.append(parsed)
+            continue
+    if intent.group_by:
+        seen_cols: set[str] = set()
+        deduped: List[str] = []
+        for col in intent.group_by:
+            token = str(col or "").strip().upper()
+            if token and token not in seen_cols:
+                seen_cols.add(token)
+                deduped.append(token)
+        intent.group_by = deduped
+    if intent.aggregations:
+        normalized_aggs: List[Dict[str, Any]] = []
+        seen_agg: set[tuple[str, str, bool, str]] = set()
+        for agg in intent.aggregations:
+            func = str(agg.get("func") or "").upper()
+            column = str(agg.get("column") or "").upper() if agg.get("column") != "*" else "*"
+            distinct = bool(agg.get("distinct"))
+            alias = str(agg.get("alias") or "").upper()
+            key = (func, column, distinct, alias)
+            if not func or (column == "" and column != "*"):
+                continue
+            if key in seen_agg:
+                continue
+            seen_agg.add(key)
+            normalized_aggs.append(
+                {
+                    "func": func,
+                    "column": column if column else "",
+                    "distinct": distinct,
+                    "alias": alias or None,
+                }
+            )
+        intent.aggregations = normalized_aggs
     return intent
 
 

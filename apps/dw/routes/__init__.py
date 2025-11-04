@@ -799,6 +799,7 @@ def rate() -> Any:
 
     eq_filters_raw = hints.get("eq_filters") or []
     eq_filters = _inject_request_type_synonyms(eq_filters_raw, settings)
+    numeric_filters = hints.get("numeric_filters") or []
     intent = {
         "date_column": "OVERLAP",
         "fts_tokens": tokens,
@@ -813,6 +814,7 @@ def rate() -> Any:
         "top_n": top_n,
         "direction_hint": direction_hint,
         "wants_all_columns": True,
+        "numeric_filters": numeric_filters,
     }
 
     qb = QueryBuilder(table=contract_table, date_col=date_column)
@@ -827,6 +829,8 @@ def rate() -> Any:
         qb.apply_eq_filters(intent["eq_filters"])
     elif intent["boolean_groups"]:
         qb.apply_boolean_groups(intent["boolean_groups"])
+    if numeric_filters:
+        qb.apply_numeric_filters(numeric_filters)
 
     if group_col:
         qb.group_by([group_col], gross=bool(gross_flag))
@@ -906,9 +910,10 @@ def rate() -> Any:
         },
         "rate_hints": {
             "comment_present": bool(comment),
-            "where_applied": bool(tokens or intent["eq_filters"]),
+            "where_applied": bool(tokens or intent["eq_filters"] or numeric_filters or intent["boolean_groups"]),
             "order_by_applied": True,
             "eq_filters": len(intent["eq_filters"]),
+            "numeric_filters": len(numeric_filters),
         },
         "builder_notes": builder_notes,
         "final_sql": {"sql": final_sql_to_run, "size": len(final_sql_to_run)},

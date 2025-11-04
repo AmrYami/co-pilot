@@ -10,6 +10,9 @@ _DIRECTIVE_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\s*:")
 _FTS_AND_RE = re.compile(r"\s*(?:&|\band\b)\s*", re.IGNORECASE)
 _FTS_OR_RE = re.compile(r"\s*(?:\||,|\bor\b)\s*", re.IGNORECASE)
 _FLAG_RE = re.compile(r"\(([^)]*)\)\s*$")
+_BETWEEN_SPLIT_RE = re.compile(r"\s*(?:and|to)\s*", re.IGNORECASE)
+_NUMERIC_DIRECTIVES = {"gt", "ge", "gte", "lt", "le", "lte", "between"}
+_NUMERIC_ALIAS_MAP = {"ge": "gte", "le": "lte"}
 
 
 def _normalize(value: Optional[str]) -> str:
@@ -119,6 +122,41 @@ def _parse_eq(body: str) -> List[Dict[str, object]]:
     return clauses
 
 
+def _parse_numeric(body: str, directive: str) -> Optional[Dict[str, object]]:
+    if not body:
+        return None
+    text = body.strip()
+    if not text:
+        return None
+    lhs: str
+    rhs: str
+    if "=" in text:
+        lhs, rhs = text.split("=", 1)
+    else:
+        tokens = text.split(None, 1)
+        if len(tokens) != 2:
+            return None
+        lhs, rhs = tokens
+    column = _normalize(lhs).upper().replace(" ", "_")
+    rhs_norm = _normalize(rhs)
+    if not column or not rhs_norm:
+        return None
+
+    op = directive.lower()
+    op = _NUMERIC_ALIAS_MAP.get(op, op)
+
+    if op == "between":
+        pieces = [_strip_quotes(_normalize(part)) for part in _BETWEEN_SPLIT_RE.split(rhs_norm) if _normalize(part)]
+        if len(pieces) != 2:
+            return None
+        return {"col": column, "op": "between", "values": pieces}
+
+    value = _strip_quotes(rhs_norm)
+    if not value:
+        return None
+    return {"col": column, "op": op, "values": [value]}
+
+
 def _parse_group_by(body: str) -> Optional[str]:
     if not body:
         return None
@@ -155,11 +193,13 @@ def parse_rate_comment(comment: str) -> Dict[str, object]:
         "gross": None,
         "sort_by": None,
         "sort_desc": None,
+        "numeric_filters": [],
     }
     if not comment:
         return out
 
     eq_filters: List[Dict[str, object]] = []
+    numeric_filters: List[Dict[str, object]] = []
 
     for key, body in _iter_directives(comment):
         directive = key.strip().lower()
@@ -184,9 +224,15 @@ def parse_rate_comment(comment: str) -> Dict[str, object]:
                 lowered = body.strip().lower()
                 if lowered in {"true", "false"}:
                     out["gross"] = lowered == "true"
+        elif directive in _NUMERIC_DIRECTIVES:
+            parsed = _parse_numeric(body, directive)
+            if parsed:
+                numeric_filters.append(parsed)
 
     if eq_filters:
         out["eq_filters"] = eq_filters
+    if numeric_filters:
+        out["numeric_filters"] = numeric_filters
 
     return out
 

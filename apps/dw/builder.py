@@ -6,6 +6,7 @@ from collections import defaultdict
 
 from apps.dw.filters import build_boolean_groups_where
 from apps.dw.fts import build_fts_clause
+from apps.dw.common.eq_aliases import resolve_eq_targets
 
 from .intent import NLIntent
 from .sql_builders import window_predicate
@@ -156,78 +157,254 @@ def _where_from_eq_filters(eq_filters: List[dict], binds: Dict[str, Any]) -> str
 
 # --- New helpers for IN-based EQ grouping and OR group building ---
 
-def _group_eq_by_col(eq_filters) -> Dict[str, List[Any]]:
-    grouped: Dict[str, List[Any]] = defaultdict(list)
-    for item in eq_filters or []:
-        # dict shape
-        if isinstance(item, dict):
-            col = item.get("col") or item.get("column")
-            if not isinstance(col, str):
-                continue
-            op = str(item.get("op") or "eq").lower()
-            if op not in {"eq", "in"}:
-                continue
-            val = item.get("val") if item.get("val") is not None else item.get("value")
-            grouped[col].append(val)
-            continue
-        # pair shape: [col, [values]]
-        if isinstance(item, (list, tuple)) and len(item) == 2:
-            col, vals = item
-            if not isinstance(col, (str, bytes)):
-                continue
-            vals_iter = vals if isinstance(vals, (list, tuple, set)) else [vals]
-            for v in vals_iter:
-                grouped[str(col)].append(v)
-    return grouped
+def _normalize_eq_entry(item: Any) -> Tuple[str, List[Any]]:
+    if isinstance(item, dict):
+        col = item.get("col") or item.get("column") or item.get("field")
+        values = item.get("values")
+        if values is None:
+            candidate = item.get("val") if item.get("val") is not None else item.get("value")
+            if isinstance(candidate, (list, tuple, set)):
+                values = list(candidate)
+            elif candidate is not None:
+                values = [candidate]
+        return str(col or ""), list(values or [])
+    if isinstance(item, (list, tuple)) and len(item) >= 2:
+        col = item[0]
+        vals = item[1]
+        if isinstance(vals, (list, tuple, set)):
+            values = list(vals)
+        elif vals is None:
+            values = []
+        else:
+            values = [vals]
+        return str(col or ""), values
+    return "", []
 
 
-def _eq_clause_from_filters(eq_filters, binds: Dict[str, Any], *, bind_prefix: str = "eq") -> Tuple[str, Dict[str, Any]]:
-    """Build equality clause using IN(...) per column (avoids X=… AND X=…)."""
+def _eq_clause_from_filters(
+    eq_filters,
+    binds: Dict[str, Any],
+    *,
+    bind_prefix: str = "eq",
+) -> Tuple[str, Dict[str, Any], Dict[str, List[str]]]:
+    """Build equality clause using IN(...) per alias, and report expanded targets."""
     from apps.dw.lib import sql_utils
 
-    clauses: List[str] = []
-    i = len([k for k in binds.keys() if isinstance(k, str) and k.startswith(bind_prefix)])
-    grouped = _group_eq_by_col(eq_filters or [])
-    for raw_col, vals in grouped.items():
-        col = str(raw_col).strip().upper()
-        if not col:
+    alias_values: Dict[str, List[Any]] = defaultdict(list)
+    for item in eq_filters or []:
+        col_raw, values = _normalize_eq_entry(item)
+        if not col_raw:
             continue
-        bind_names: List[str] = []
-        # dedup while preserving order
-        seen: set = set()
-        ordered_vals = []
-        for v in (vals or []):
-            key = v.upper() if isinstance(v, str) else v
-            if key in seen:
+        col_key = str(col_raw).strip().upper()
+        if not col_key:
+            continue
+        for value in values or []:
+            alias_values[col_key].append(value)
+
+    if not alias_values:
+        return "", binds, {}
+
+    used_names: set[str] = {str(k) for k in binds.keys() if isinstance(k, str)}
+    temp_binds: Dict[str, Any] = dict(binds)
+    clauses: List[str] = []
+    alias_targets_map: Dict[str, List[str]] = {}
+
+    def _alloc(counter: List[int]) -> str:
+        while True:
+            name = f"{bind_prefix}_{counter[0]}"
+            counter[0] += 1
+            if name not in used_names:
+                used_names.add(name)
+                return name
+
+    for alias, raw_values in alias_values.items():
+        targets = resolve_eq_targets(alias) or [alias]
+        targets = [str(t or "").strip().upper() for t in targets if str(t or "").strip()]
+        if not targets:
+            continue
+        alias_targets_map[alias] = targets
+
+        dedup_values: List[Any] = []
+        seen_keys: set[Any] = set()
+        for value in raw_values:
+            if value is None:
                 continue
-            seen.add(key)
-            ordered_vals.append(v)
-        for v in ordered_vals:
-            b = f"{bind_prefix}_{i}"
-            i += 1
-            binds[b] = (v.upper() if isinstance(v, str) else v)
-            bind_names.append(b)
-        if bind_names:
-            clauses.append(sql_utils.in_expr(col, bind_names))
-    return (" AND ".join(clauses) if clauses else ""), binds
+            candidate = value
+            key: Any
+            if isinstance(candidate, str):
+                stripped = candidate.strip()
+                if not stripped:
+                    continue
+                key = stripped.upper()
+                candidate = stripped.upper()
+            else:
+                key = candidate
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            dedup_values.append(candidate)
+        if not dedup_values:
+            continue
+
+        bind_names: List[str] = []
+        counter = [0]
+        for candidate in dedup_values:
+            bind_name = _alloc(counter)
+            temp_binds[bind_name] = candidate
+            bind_names.append(bind_name)
+
+        per_column = [
+            sql_utils.in_expr(col, bind_names)
+            for col in targets
+            if col and bind_names
+        ]
+        per_column = [expr for expr in per_column if expr]
+        if not per_column:
+            continue
+        if len(per_column) == 1:
+            clauses.append(per_column[0])
+        else:
+            clauses.append(sql_utils.or_join(per_column))
+
+    combined = " AND ".join(expr for expr in clauses if expr)
+    return combined, temp_binds, alias_targets_map
+
+
+def _compose_in_clause(column: str, bind_names: List[str], *, ci: bool = True, trim: bool = True) -> str:
+    if not bind_names:
+        return ""
+    col_sql = column.strip().upper()
+    if not col_sql:
+        return ""
+    lhs = col_sql
+    if trim:
+        lhs = f"TRIM({lhs})"
+    if ci:
+        lhs = f"UPPER({lhs})"
+    rhs_terms: List[str] = []
+    for name in bind_names:
+        rhs = f":{name}"
+        if ci:
+            rhs = f"UPPER({rhs})"
+        rhs_terms.append(rhs)
+    return f"{lhs} IN ({', '.join(rhs_terms)})"
 
 
 def build_or_group(or_terms: List[dict]) -> Tuple[str, Dict[str, Any]]:
     """
-    Build an OR group across terms, where each term is a single EQ dict.
-    Returns: ( "(colA IN (:...)) OR (colB IN (:...))", binds )
+    Build a single OR group from equality-like terms, reusing bind names across columns.
+    Returns a tuple of the SQL snippet and the bind dictionary.
     """
     from apps.dw.lib import sql_utils
 
+    if not or_terms:
+        return "", {}
+
     binds: Dict[str, Any] = {}
-    parts: List[str] = []
-    for t in or_terms or []:
-        if not isinstance(t, dict):
+    value_to_name: Dict[Any, str] = {}
+    column_order: List[str] = []
+    column_bind_map: Dict[str, List[str]] = {}
+    column_flags: Dict[str, Dict[str, bool]] = {}
+
+    def _coerce_flag(value: Any):
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered in {"1", "true", "t", "yes", "y", "on"}:
+                return True
+            if lowered in {"0", "false", "f", "no", "n", "off"}:
+                return False
+        return None
+
+    def _ensure_bind(value: Any) -> str:
+        key = value
+        if isinstance(value, str):
+            key = value.strip().upper()
+        if key not in value_to_name:
+            name = f"eq_{len(value_to_name)}"
+            stored = value.strip() if isinstance(value, str) else value
+            value_to_name[key] = name
+            binds[name] = stored
+        return value_to_name[key]
+
+    for item in or_terms or []:
+        col = ""
+        values: List[Any] = []
+        ci_flag = None
+        trim_flag = None
+
+        if isinstance(item, dict):
+            col = str(item.get("col") or item.get("column") or item.get("field") or "").strip().upper()
+            raw_vals = (
+                item.get("values")
+                if item.get("values") is not None
+                else item.get("val")
+                if item.get("val") is not None
+                else item.get("value")
+            )
+            if isinstance(raw_vals, (list, tuple, set)):
+                values = list(raw_vals)
+            elif raw_vals is not None:
+                values = [raw_vals]
+            ci_flag = _coerce_flag(item.get("ci"))
+            trim_flag = _coerce_flag(item.get("trim"))
+        elif isinstance(item, (list, tuple)) and item:
+            col = str(item[0] or "").strip().upper()
+            raw_vals = item[1] if len(item) > 1 else None
+            if isinstance(raw_vals, (list, tuple, set)):
+                values = list(raw_vals)
+            elif raw_vals is not None:
+                values = [raw_vals]
+            ci_flag = True
+            trim_flag = True
+        else:
             continue
-        clause, b = _eq_clause_from_filters([t], binds, bind_prefix="eq")
+
+        if not col or not values:
+            continue
+
+        if col not in column_order:
+            column_order.append(col)
+        bucket = column_bind_map.setdefault(col, [])
+        flags = column_flags.setdefault(col, {"ci": True, "trim": True})
+        if ci_flag is not None:
+            flags["ci"] = flags["ci"] and bool(ci_flag)
+        if trim_flag is not None:
+            flags["trim"] = flags["trim"] and bool(trim_flag)
+
+        seen_local = set()
+        for v in values:
+            if v is None:
+                continue
+            if isinstance(v, str):
+                candidate = v.strip()
+                if not candidate:
+                    continue
+                key = candidate.upper()
+                value = candidate
+            else:
+                key = v
+                value = v
+            if key in seen_local:
+                continue
+            seen_local.add(key)
+            bind_name = _ensure_bind(value)
+            if bind_name not in bucket:
+                bucket.append(bind_name)
+
+    parts: List[str] = []
+    for col in column_order:
+        bind_names = column_bind_map.get(col, [])
+        if not bind_names:
+            continue
+        flags = column_flags.get(col, {"ci": True, "trim": True})
+        clause = _compose_in_clause(col, bind_names, ci=flags.get("ci", True), trim=flags.get("trim", True))
         if clause:
             parts.append(clause)
-            binds.update(b)
+
     return (sql_utils.or_join(parts) if parts else ""), binds
 
 
@@ -342,7 +519,7 @@ def apply_online_rate_hints(intent: dict, settings: Any) -> Tuple[str, Dict[str,
     Returns only the EQ WHERE + binds here; FTS/order handled elsewhere.
     """
     eq_filters = intent.get("eq_filters") or []
-    clause, binds = _eq_clause_from_filters(eq_filters, {}, bind_prefix="eq")
+    clause, binds, _ = _eq_clause_from_filters(eq_filters, {}, bind_prefix="eq")
     return clause, binds
 
 

@@ -78,6 +78,7 @@ from apps.dw.rate_hints import (
     parse_rate_hints,
     replace_or_add_order_by,
 )
+from apps.dw.utils import env_flag
 from apps.dw.order_utils import normalize_order_hint
 from apps.dw.fts_utils import DEFAULT_CONTRACT_FTS_COLUMNS
 from apps.dw.settings_defaults import DEFAULT_EXPLICIT_FILTER_COLUMNS
@@ -99,6 +100,10 @@ from apps.dw.learning_store import (
     record_run,
 )
 from apps.dw.learning_store import _merge_eq_filters_prefer_question as _merge_eq_prefer_question  # prefer-question EQ merge
+try:
+    from apps.dw.learning import _merge_or_groups_prefer_question as _merge_or_prefer_question
+except Exception:  # pragma: no cover - fallback when learning module unavailable
+    _merge_or_prefer_question = None
 from apps.dw.explain import build_explain
 from .contracts.fts import extract_fts_terms, build_fts_where_groups
 from .contracts.filters import parse_explicit_filters
@@ -766,6 +771,34 @@ def _coerce_oracle_binds(binds: Optional[Dict[str, Any]]) -> Dict[str, Any]:
                 return date.fromisoformat(s)
             except Exception:
                 pass
+            # Canonicalize remaining eq filter values to uppercase for stability
+            try:
+                eq_clean = sanitized_patch.get("eq_filters")
+                if isinstance(eq_clean, list):
+                    normalized_eq: List[Any] = []
+                    for entry in eq_clean:
+                        if isinstance(entry, dict):
+                            updated = dict(entry)
+                            val = updated.get("val")
+                            values = updated.get("values")
+                            if isinstance(val, str):
+                                updated["val"] = val.strip().upper()
+                            if isinstance(values, list):
+                                updated["values"] = [v.strip().upper() if isinstance(v, str) else v for v in values]
+                            normalized_eq.append(updated)
+                        elif isinstance(entry, (list, tuple)) and len(entry) == 2:
+                            col = entry[0]
+                            vals = entry[1]
+                            if isinstance(vals, list):
+                                vals = [v.strip().upper() if isinstance(v, str) else v for v in vals]
+                            elif isinstance(vals, str):
+                                vals = [vals.strip().upper()]
+                            normalized_eq.append([col, vals])
+                        else:
+                            normalized_eq.append(entry)
+                    sanitized_patch["eq_filters"] = normalized_eq
+            except Exception:
+                pass
             # Common fallbacks
             for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%Y/%m/%d"):
                 try:
@@ -1322,6 +1355,11 @@ def _build_light_intent_from_question(q: str, allowed_cols) -> dict:
         intent = _build_light_intent_via_regex(question_text, allowed_cols, config)
         parser_used = "legacy"
 
+    try:
+        _maybe_apply_entity_status_aggregation_heuristic(q or "", intent, allowed_cols)
+    except Exception:
+        pass
+
     meta = intent.setdefault("_meta", {})
     segments = meta.get("segments") or {}
     meta.update(
@@ -1454,11 +1492,15 @@ def _build_light_intent_via_lark(
             fts_groups = extracted_groups
     fts_groups = _filter_fts_groups(fts_groups, min_length=2)
 
+    aggregations = list(getattr(parsed, "aggregations", []) or [])
+    group_by_cols = list(getattr(parsed, "group_by", []) or [])
+    order_hint = getattr(parsed, "order_hint", None)
     segments = {
         "eq_filters": len(getattr(parsed, "eq_filters", []) or []),
         "num_filters": len(numeric_filters),
         "fts_groups": len(fts_groups),
         "bool_groups": len(getattr(parsed, "bool_groups", []) or []),
+        "aggregations": len(aggregations),
     }
 
     numeric_shape = {
@@ -1466,17 +1508,35 @@ def _build_light_intent_via_lark(
         for col, ops in numeric_shape_ops.items()
     }
 
+    if order_hint:
+        resolved_order = {"col": str(order_hint.get("col") or "").strip().upper(), "desc": bool(order_hint.get("desc"))}
+    else:
+        resolved_order = {"col": "REQUEST_DATE", "desc": True}
+
     intent = {
         "eq_filters": eq_filters,
         "eq": eq_shape,
         "numeric_filters": numeric_filters,
         "numeric_shape": numeric_shape,
         "fts_groups": fts_groups,
-        "order": {"col": "REQUEST_DATE", "desc": True},
+        "order": resolved_order,
         "pipeline_version": config.pipeline_version,
         "parser": config.parser,
         "_meta": {"segments": segments},
     }
+    if aggregations:
+        intent["aggregations"] = [
+            {
+                "func": str(agg.get("func") or "").upper(),
+                "column": str(agg.get("column") or "").upper(),
+                "alias": str(agg.get("alias") or "").upper(),
+                "distinct": bool(agg.get("distinct")),
+            }
+            for agg in aggregations
+        ]
+    if group_by_cols:
+        intent["group_by"] = [str(col or "").strip().upper() for col in group_by_cols if str(col or "").strip()]
+
     if getattr(parsed, "bool_tree", None):
         intent["boolean_tree"] = parsed.bool_tree
     if getattr(parsed, "clauses", None):
@@ -1499,6 +1559,18 @@ def _build_light_intent_via_regex(
     numeric_filters: List[Dict[str, Any]] = []
     numeric_shape_ops: Dict[str, set] = {}
     simple_pairs: List[Tuple[str, List[str]]] = []
+
+    # Detect inline "ENTITY NO" variants even without explicit "="
+    entity_col = "ENTITY_NO"
+    if entity_col in colset:
+        entity_matches = re.findall(r"(?i)\bENTITY(?:\s*NO|_NO)\b(?:\s*=\s*|\s+)(['\"]?[A-Z0-9\-._]+['\"]?)", q)
+        extracted_vals: List[str] = []
+        for raw in entity_matches:
+            cleaned = raw.strip().strip("'\"")
+            if cleaned:
+                extracted_vals.append(cleaned)
+        if extracted_vals:
+            simple_pairs.append((entity_col, extracted_vals))
 
     for part in re.split(r"(?i)\band\b", where_txt):
         snippet = part.strip().strip("() ")
@@ -1633,6 +1705,7 @@ def _coalesce_rate_intent(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
 
     intent: Dict[str, Any] = {}
     merged_eq: List[Dict[str, Any]] = []
+    merged_aggs: List[Dict[str, Any]] = []
     merged_numeric: List[Dict[str, Any]] = []
     numeric_shape: Optional[Dict[str, Any]] = None
 
@@ -1641,6 +1714,10 @@ def _coalesce_rate_intent(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
             for entry in source["eq_filters"]:
                 if isinstance(entry, dict):
                     merged_eq.append(dict(entry))
+        if "aggregations" in source and isinstance(source.get("aggregations"), list):
+            for entry in source["aggregations"]:
+                if isinstance(entry, dict):
+                    merged_aggs.append(dict(entry))
         if "numeric_filters" in source and isinstance(source.get("numeric_filters"), list):
             for entry in source["numeric_filters"]:
                 if isinstance(entry, dict):
@@ -1675,6 +1752,8 @@ def _coalesce_rate_intent(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
 
     if merged_eq:
         intent["eq_filters"] = merged_eq
+    if merged_aggs:
+        intent["aggregations"] = merged_aggs
     if merged_numeric:
         intent["numeric_filters"] = merged_numeric
     if numeric_shape:
@@ -1918,6 +1997,29 @@ def _expand_eq_aliases_with_map(intent: Dict[str, Any], alias_map: Dict[str, Lis
     if not isinstance(intent, dict) or not isinstance(alias_map, dict) or not alias_map:
         return
 
+    normalized_alias_map: Dict[str, List[str]] = {}
+    for raw_alias, cols in alias_map.items():
+        alias_key = str(raw_alias or "").strip().upper()
+        if not alias_key:
+            continue
+        targets: List[str] = []
+        seen_targets: set[str] = set()
+        if isinstance(cols, (list, tuple, set)):
+            iterable = cols
+        else:
+            iterable = [cols]
+        for col in iterable:
+            target = str(col or "").strip().upper()
+            if not target or target in seen_targets:
+                continue
+            seen_targets.add(target)
+            targets.append(target)
+        if targets:
+            normalized_alias_map[alias_key] = targets
+
+    if not normalized_alias_map:
+        return
+
     def _norm_item(it) -> tuple[str, List[Any]] | None:
         if isinstance(it, (list, tuple)) and len(it) == 2:
             col = str(it[0] or "").strip().upper()
@@ -1946,17 +2048,128 @@ def _expand_eq_aliases_with_map(intent: Dict[str, Any], alias_map: Dict[str, Lis
             if not norm:
                 continue
             col, _ = norm
-            if alias_map.get(col):
+            if normalized_alias_map.get(col):
                 pending_alias = True
                 break
         if not pending_alias:
             return
 
     keep: List[Any] = []
+    covered_targets: set[str] = set()
     or_groups: List[List[Dict[str, Any]]] = (
         intent.setdefault("or_groups", []) if isinstance(intent.get("or_groups"), list) else intent.setdefault("or_groups", [])
     )
     expanded_any = False
+    alias_value_map: Dict[str, List[Any]] = {}
+
+    def _collapse_alias_variants(values: List[Any]) -> List[Any]:
+        """Collapse singular/plural variants so the canonical learnt value wins."""
+        from collections import OrderedDict as _OD
+        import re as _re
+
+        def _canonical_keys(text: str) -> set[str]:
+            norm = _re.sub(r"\s+", " ", text.strip().upper())
+            keys = {norm}
+            if len(norm) > 3:
+                if norm.endswith("IES"):
+                    keys.add(norm[:-3] + "Y")
+                if norm.endswith("ES"):
+                    keys.add(norm[:-2])
+                if norm.endswith("S"):
+                    keys.add(norm[:-1])
+            return keys
+
+        def _base_key(text: str) -> str:
+            keys = sorted(_canonical_keys(text), key=lambda k: (len(k), k))
+            for key in keys:
+                if not key.endswith("S") or key.endswith("SS"):
+                    return key
+            return keys[0] if keys else text.strip().upper()
+
+        buckets: list[tuple[set[str], List[str]]] = []
+        extras: "OrderedDict[Any, Any]" = _OD()
+        for value in values:
+            if isinstance(value, str):
+                text = value.strip()
+                if not text:
+                    continue
+                keyset = _canonical_keys(text)
+                inserted = False
+                for bucket_keys, bucket_vals in buckets:
+                    if bucket_keys & keyset:
+                        up = text.upper()
+                        if up not in bucket_vals:
+                            bucket_vals.append(up)
+                        bucket_keys.update(keyset)
+                        inserted = True
+                        break
+                if not inserted:
+                    buckets.append((set(keyset), [text.upper()]))
+            else:
+                # Non-string literal – keep the first occurrence
+                if value not in extras:
+                    extras[value] = value
+        collapsed: List[Any] = []
+        for _, bucket in buckets:
+            if not bucket:
+                continue
+            canonical = max(bucket, key=lambda x: (len(x), x))
+            collapsed.append(canonical)
+        for val in extras.values():
+            collapsed.append(val)
+
+        def _prune_substrings(values: List[Any]) -> List[Any]:
+            str_entries: List[Tuple[int, str, str]] = []
+            out: List[Any] = []
+            import re as _re
+
+            for idx, value in enumerate(values):
+                if isinstance(value, str):
+                    normalized = _re.sub(r"\s+", " ", value.strip().upper())
+                    alpha = _re.sub(r"[^A-Z0-9]+", "", normalized)
+                    str_entries.append((idx, value.strip().upper(), alpha))
+                else:
+                    out.append(value)
+
+            keep: List[Tuple[int, str, str]] = []
+            for idx, text, alpha in sorted(str_entries, key=lambda x: (-len(x[1]), x[0])):
+                if not alpha:
+                    continue
+                if any(alpha and alpha in existing_alpha for _, _, existing_alpha in keep):
+                    continue
+                keep.append((idx, text, alpha))
+
+            keep_sorted = sorted(keep, key=lambda x: x[0])
+            for _, text, _ in keep_sorted:
+                out.append(text)
+            return out
+
+        return _prune_substrings(collapsed)
+
+    alias_targets_index: Dict[str, tuple] = {}
+    canonical_for_targets: Dict[tuple, str] = {}
+    target_to_alias: Dict[str, str] = {}
+
+    def _score_alias(name: str) -> tuple:
+        name = name or ""
+        return (1 if name.endswith("S") else 0, len(name), name)
+
+    for alias, cols in (normalized_alias_map or {}).items():
+        cols_tuple = tuple(sorted(str(c).strip().upper() for c in cols if str(c).strip()))
+        alias_targets_index[alias] = cols_tuple
+        if not cols_tuple:
+            continue
+        for target in cols_tuple:
+            target_to_alias[target] = alias
+        current = canonical_for_targets.get(cols_tuple)
+        if current is None or _score_alias(alias) > _score_alias(current):
+            canonical_for_targets[cols_tuple] = alias
+
+    def _canonical_alias(alias: str) -> str:
+        cols_tuple = alias_targets_index.get(alias)
+        if not cols_tuple:
+            return alias
+        return canonical_for_targets.get(cols_tuple, alias)
 
     for it in list(raw):
         norm = _norm_item(it)
@@ -1964,21 +2177,111 @@ def _expand_eq_aliases_with_map(intent: Dict[str, Any], alias_map: Dict[str, Lis
             keep.append(it)
             continue
         col, vals = norm
-        targets = alias_map.get(col)
-        if not targets:
-            keep.append(it)
+        canonical_alias: Optional[str] = None
+        targets: Optional[List[str]] = None
+        if col in normalized_alias_map:
+            canonical_alias = _canonical_alias(col)
+            targets = normalized_alias_map.get(canonical_alias)
+        elif col in target_to_alias:
+            alias_key = target_to_alias[col]
+            canonical_alias = _canonical_alias(alias_key)
+            targets = normalized_alias_map.get(canonical_alias)
+        if canonical_alias and targets:
+            if vals:
+                alias_value_map.setdefault(canonical_alias, []).extend(vals)
+            covered_targets.update(targets)
+            # Skip keeping entries covered by alias expansion
             continue
-        # For each value, create an OR-across-targets group
-        for v in vals:
-            group = []
-            for t in targets:
-                group.append({"col": t, "val": v, "op": "eq", "ci": True, "trim": True})
-            if group:
-                or_groups.append(group)
-                expanded_any = True
-        # Do not keep the alias entry itself (expanded)
+        keep.append(it)
+
+    if covered_targets:
+        filtered_keep: List[Any] = []
+        for item in keep:
+            norm = _norm_item(item)
+            if not norm:
+                filtered_keep.append(item)
+                continue
+            col, _ = norm
+            if col in covered_targets:
+                continue
+            filtered_keep.append(item)
+        keep = filtered_keep
 
     intent["eq_filters"] = keep
+
+    for alias_col, values in alias_value_map.items():
+        targets = normalized_alias_map.get(alias_col) or []
+        if not targets:
+            continue
+
+        candidate_vals: List[Any] = []
+        for v in values:
+            if isinstance(v, str):
+                text = v.strip()
+                if text:
+                    candidate_vals.append(text)
+            elif v is not None:
+                candidate_vals.append(v)
+
+        cleaned_vals = _collapse_alias_variants(candidate_vals)
+
+        if not cleaned_vals:
+            continue
+
+        normalized_targets = tuple(sorted(str(t).strip().upper() for t in targets if str(t).strip()))
+        normalized_values = tuple(sorted(str(v).strip().upper() if isinstance(v, str) else v for v in cleaned_vals))
+
+        def _group_signature(grp: Any) -> Tuple[Tuple[str, ...], Tuple[Any, ...]]:
+            columns: set[str] = set()
+            values_set: set[Any] = set()
+            for term in grp or []:
+                if not isinstance(term, dict):
+                    continue
+                col = str((term.get("col") or term.get("column") or term.get("field") or "")).strip().upper()
+                if not col:
+                    continue
+                columns.add(col)
+                raw_vals = term.get("values") if term.get("values") is not None else term.get("val")
+                if isinstance(raw_vals, (list, tuple, set)):
+                    vals_iter = raw_vals
+                elif raw_vals is None:
+                    vals_iter = []
+                else:
+                    vals_iter = [raw_vals]
+                for vv in vals_iter:
+                    values_set.add(str(vv).strip().upper() if isinstance(vv, str) else vv)
+            return tuple(sorted(columns)), tuple(sorted(values_set))
+
+        already_present = False
+        if normalized_targets and normalized_values:
+            # Remove stale groups for the same columns so canonical values replace question literals.
+            try:
+                pruned: List[List[Dict[str, Any]]] = []
+                for existing_group in or_groups:
+                    cols_sig, _values_sig = _group_signature(existing_group)
+                    if cols_sig == normalized_targets:
+                        continue
+                    pruned.append(existing_group)
+                if len(pruned) != len(or_groups):
+                    or_groups[:] = pruned
+            except Exception:
+                pass
+            for existing_group in or_groups:
+                cols_sig, values_sig = _group_signature(existing_group)
+                if cols_sig == normalized_targets and values_sig == normalized_values:
+                    already_present = True
+                    break
+        if already_present:
+            continue
+
+        group: List[Dict[str, Any]] = []
+        for target in targets:
+            group.append(
+                {"col": target, "values": list(cleaned_vals), "op": "in", "ci": True, "trim": True}
+            )
+        if group:
+            or_groups.append(group)
+            expanded_any = True
 
     # Deduplicate OR groups by (col,val) signature regardless of insertion order
     try:
@@ -2011,6 +2314,106 @@ def _expand_eq_aliases_with_map(intent: Dict[str, Any], alias_map: Dict[str, Lis
     # Mark expanded to prevent duplicates from multiple passes, but only if we actually expanded.
     if expanded_any:
         intent["_alias_expanded"] = True
+
+
+def _maybe_apply_entity_status_aggregation_heuristic(
+    question: str,
+    intent: Dict[str, Any],
+    allowed_cols: Optional[Sequence[str]],
+) -> None:
+    """Inject heuristic aggregation intent for paraphrased ENTITY_NO totals questions."""
+
+    qtext = (question or "").strip()
+    if not qtext:
+        return
+    q_lower = qtext.lower()
+    if "entity" not in q_lower or "contract status" not in q_lower:
+        return
+    if "total" not in q_lower or "count" not in q_lower:
+        return
+
+    match = re.search(
+        r"(?i)entity\s*(?:no|number)\s*(?:=|is|:)?\s*(?:['\"])?([A-Za-z0-9._-]+)(?:['\"])?",
+        qtext,
+    )
+    if not match:
+        return
+    entity_value = match.group(1).strip()
+    if not entity_value:
+        return
+
+    allowed_set = {
+        str(col or "").strip().strip('"').upper()
+        for col in (allowed_cols or [])
+        if str(col or "").strip()
+    }
+
+    entity_col = "ENTITY_NO"
+    group_col = "CONTRACT_STATUS"
+    if entity_col not in allowed_set and allowed_set:
+        return
+
+    eq_filters = intent.setdefault("eq_filters", [])
+    if not any(
+        isinstance(item, (list, tuple))
+        and len(item) == 2
+        and str(item[0]).strip().upper() == entity_col
+        for item in eq_filters
+    ):
+        eq_filters.append([entity_col, [entity_value]])
+
+    eq_shape = intent.setdefault("eq", {})
+    eq_shape[entity_col] = {
+        "op": "eq",
+        "types": ["TEXT"],
+    }
+
+    group_by_list = intent.setdefault("group_by", [])
+    if group_col not in group_by_list:
+        group_by_list.append(group_col)
+
+    order_hint = intent.setdefault("order", {})
+    order_hint["col"] = group_col
+    order_hint["desc"] = False
+
+    aggregations = intent.setdefault("aggregations", [])
+
+    def _ensure_agg(func: str, column: str, alias: str) -> None:
+        for agg in aggregations:
+            if (
+                str(agg.get("func") or "").upper() == func
+                and str(agg.get("column") or "").upper() == column
+                and str(agg.get("alias") or "").upper() == alias
+            ):
+                return
+        aggregations.append(
+            {
+                "func": func,
+                "column": column,
+                "distinct": False,
+                "alias": alias,
+            }
+        )
+
+    _ensure_agg("SUM", "CONTRACT_VALUE_NET_OF_VAT", "TOTAL_AMOUNT")
+    _ensure_agg("COUNT", "*", "TOTAL_COUNT")
+
+    segments = intent.setdefault("_meta", {}).setdefault("segments", {})
+    segments["eq_filters"] = len(eq_filters)
+    segments.setdefault("bool_groups", 0)
+    segments.setdefault("fts_groups", segments.get("fts_groups", 0))
+
+    try:
+        logging.getLogger("dw").info(
+            {
+                "event": "answer.intent.heuristic",
+                "kind": "entity_totals",
+                "group_by": group_col,
+                "alias_applied": entity_col,
+            }
+        )
+    except Exception:
+        pass
 
 def _extract_or_groups_from_question(question: str, allowed_cols: Sequence[str]) -> List[List[Dict[str, Any]]]:
     """
@@ -2207,6 +2610,8 @@ def _apply_online_rate_hints(
     eq_temp_binds: Dict[str, Any] = {}
     numeric_filters_all: List[Dict[str, Any]] = []
 
+    eq_alias_targets: Dict[str, List[str]] = {}
+
     if eq_filters_raw:
         eq_like: List[Any] = []
         range_like: List[Dict[str, Any]] = []
@@ -2226,10 +2631,11 @@ def _apply_online_rate_hints(
 
         try:
             if eq_like:
-                eq_clause, eq_temp_binds = _builder_mod._eq_clause_from_filters(eq_like, eq_temp_binds, bind_prefix="eq")  # type: ignore[attr-defined]
+                eq_clause, eq_temp_binds, eq_alias_targets = _builder_mod._eq_clause_from_filters(eq_like, eq_temp_binds, bind_prefix="eq")  # type: ignore[attr-defined]
         except Exception:
             eq_clause = ""
             eq_temp_binds = {}
+            eq_alias_targets = {}
 
         for item in range_like:
             if not isinstance(item, dict):
@@ -2337,12 +2743,57 @@ def _apply_online_rate_hints(
     except Exception:
         or_groups = []
     if isinstance(or_groups, list) and or_groups:
+        seen_group_sigs: set[Tuple[Tuple[str, Tuple[Any, ...]], ...]] = set()
         for grp in or_groups:
+            signature: Optional[Tuple[Tuple[str, Tuple[Any, ...]], ...]] = None
+            try:
+                items_sig: List[Tuple[str, Tuple[Any, ...]]] = []
+                for term in grp or []:
+                    if isinstance(term, dict):
+                        col = str(term.get("col") or term.get("column") or term.get("field") or "").strip().upper()
+                        raw_vals = (
+                            term.get("values")
+                            if term.get("values") is not None
+                            else term.get("val")
+                            if term.get("val") is not None
+                            else term.get("value")
+                        )
+                    elif isinstance(term, (list, tuple)) and term:
+                        col = str(term[0] or "").strip().upper()
+                        raw_vals = term[1] if len(term) > 1 else []
+                    else:
+                        continue
+                    if not col:
+                        continue
+                    if isinstance(raw_vals, (list, tuple, set)):
+                        vals_iter = list(raw_vals)
+                    elif raw_vals is None:
+                        vals_iter = []
+                    else:
+                        vals_iter = [raw_vals]
+                    normalized_vals: List[Any] = []
+                    for val in vals_iter:
+                        if isinstance(val, str):
+                            norm = val.strip().upper()
+                            if not norm:
+                                continue
+                            normalized_vals.append(norm)
+                        else:
+                            normalized_vals.append(val)
+                    items_sig.append((col, tuple(sorted(normalized_vals))))
+                if items_sig:
+                    signature = tuple(sorted(items_sig))
+            except Exception:
+                signature = None
+            if signature and signature in seen_group_sigs:
+                continue
             try:
                 grp_clause, grp_binds = _builder_mod.build_or_group(grp)  # type: ignore[attr-defined]
             except Exception:
                 grp_clause, grp_binds = "", {}
             if grp_clause:
+                if signature:
+                    seen_group_sigs.add(signature)
                 # Ensure bind names don't collide
                 rename_map: Dict[str, str] = {}
                 for key in list(grp_binds.keys()):
@@ -2490,31 +2941,92 @@ def _apply_online_rate_hints(
         binds.update(combined_binds)
 
     group_by_raw = intent.get("group_by")
-    group_by_clause = ""
+    group_items: List[str] = []
     if isinstance(group_by_raw, (list, tuple, set)):
         group_items = [str(item).strip() for item in group_by_raw if str(item).strip()]
-        group_by_clause = ", ".join(group_items)
     elif isinstance(group_by_raw, str) and group_by_raw.strip():
-        group_by_clause = group_by_raw.strip()
+        group_items = [group_by_raw.strip()]
+    group_by_clause = ", ".join(group_items)
+
+    aggregations_raw = intent.get("aggregations") if isinstance(intent.get("aggregations"), list) else []
+    aggregations: List[Dict[str, Any]] = []
+    for entry in aggregations_raw or []:
+        if not isinstance(entry, dict):
+            continue
+        func = str(entry.get("func") or "").strip().upper()
+        if not func:
+            continue
+        column_raw = entry.get("column")
+        if column_raw == "*" or str(column_raw or "").strip() == "*":
+            column = "*"
+        else:
+            column = str(column_raw or "").strip().upper()
+        distinct = bool(entry.get("distinct"))
+        alias = entry.get("alias")
+        alias_norm = str(alias or "").strip().upper() if alias else None
+        aggregations.append(
+            {
+                "func": func,
+                "column": column if column else "*",
+                "distinct": distinct,
+                "alias": alias_norm,
+            }
+        )
+    try:
+        logging.getLogger("dw").info(
+            {
+                "event": "answer.apply_hints.agg.loaded",
+                "count": len(aggregations),
+                "aliases": [item.get("alias") for item in aggregations],
+            }
+        )
+    except Exception:
+        pass
 
     gross_flag = intent.get("gross")
-    if group_by_clause:
+    needs_aggregation = bool(group_items or aggregations or gross_flag)
+    if needs_aggregation:
         sql = _strip_trailing_order_by(sql)
         inner = sql.strip()
-        measure_sql = "COUNT(*) AS CNT"
-        if gross_flag is True:
-            measure_sql = f"SUM({_GROSS_EXPR}) AS TOTAL_GROSS"
+        select_parts: List[str] = []
+        if group_items:
+            select_parts.extend(group_items)
+
+        measure_parts: List[str] = []
+        if aggregations:
+            for agg_entry in aggregations:
+                func = agg_entry["func"]
+                column = agg_entry["column"]
+                distinct = agg_entry["distinct"]
+                alias_norm = agg_entry.get("alias")
+                inner_arg = "*" if column == "*" else column
+                if distinct and inner_arg != "*":
+                    inner_arg = f"DISTINCT {inner_arg}"
+                expr = f"{func}({inner_arg})"
+                if alias_norm:
+                    expr += f" AS {alias_norm}"
+                measure_parts.append(expr)
+        else:
+            default_expr = "COUNT(*) AS CNT"
+            if gross_flag is True:
+                default_expr = f"SUM({_GROSS_EXPR}) AS TOTAL_GROSS"
+            measure_parts.append(default_expr)
+
+        select_parts.extend(measure_parts)
+        select_clause = ", ".join(select_parts)
         sql = (
             "SELECT "
-            + group_by_clause
-            + (", " if measure_sql else "")
-            + measure_sql
+            + select_clause
             + "\nFROM (\n"
             + inner
-            + "\n) RATE_WRAP\nGROUP BY "
-            + group_by_clause
+            + "\n) RATE_WRAP"
         )
-        meta["group_by"] = group_by_clause
+        if group_items:
+            sql += "\nGROUP BY " + group_by_clause
+            meta["group_by"] = group_by_clause
+        if aggregations:
+            meta["aggregations"] = aggregations
+            meta["agg"] = aggregations
         if gross_flag is not None:
             meta["gross"] = bool(gross_flag)
 
@@ -2522,12 +3034,50 @@ def _apply_online_rate_hints(
     sort_desc_flag = intent.get("sort_desc")
     norm_sort_by, norm_sort_desc = normalize_order_hint(sort_by, sort_desc_flag)
     if norm_sort_by:
-        intent["sort_by"] = norm_sort_by
-        intent["sort_desc"] = norm_sort_desc
-        effective_desc = True if norm_sort_desc is None else bool(norm_sort_desc)
-        clause = f"ORDER BY {norm_sort_by} {'DESC' if effective_desc else 'ASC'}"
-        sql = replace_or_add_order_by(sql, clause)
-        meta["order_by"] = clause
+        allow_order = True
+        has_group_by = bool(re.search(r"\bGROUP\s+BY\b", sql or "", flags=re.IGNORECASE))
+        select_clause = ""
+        group_clause = ""
+        if has_group_by:
+            select_match = re.search(r"SELECT\s+(?P<select>.+?)\bFROM\b", sql, flags=re.IGNORECASE | re.DOTALL)
+            if select_match:
+                select_clause = select_match.group("select") or ""
+            group_match = re.search(r"GROUP\s+BY\s+(?P<group>.+?)(\bORDER\b|\Z)", sql, flags=re.IGNORECASE | re.DOTALL)
+            if group_match:
+                group_clause = group_match.group("group") or ""
+            target_pattern = re.compile(rf"\b{re.escape(norm_sort_by)}\b", flags=re.IGNORECASE)
+            in_select = bool(target_pattern.search(select_clause))
+            in_group = bool(target_pattern.search(group_clause))
+            if not (in_select or in_group):
+                allow_order = False
+                try:
+                    logging.getLogger("dw").warning(
+                        {
+                            "event": "answer.apply_hints.order.skip",
+                            "reason": "order_target_not_grouped",
+                            "order_by": norm_sort_by,
+                        }
+                    )
+                except Exception:
+                    pass
+        try:
+            logging.getLogger("dw").info(
+                {
+                    "event": "answer.apply_hints.order.eval",
+                    "order_by": norm_sort_by,
+                    "has_group_by": has_group_by,
+                    "allow_order": allow_order,
+                }
+            )
+        except Exception:
+            pass
+        if allow_order:
+            intent["sort_by"] = norm_sort_by
+            intent["sort_desc"] = norm_sort_desc
+            effective_desc = True if norm_sort_desc is None else bool(norm_sort_desc)
+            clause = f"ORDER BY {norm_sort_by} {'DESC' if effective_desc else 'ASC'}"
+            sql = replace_or_add_order_by(sql, clause)
+            meta["order_by"] = clause
 
     try:
         logging.getLogger("dw").info(
@@ -2541,9 +3091,63 @@ def _apply_online_rate_hints(
     except Exception:
         pass
     meta["eq_filters"] = eq_applied
+    if eq_alias_targets:
+        meta["eq_alias_targets"] = {
+            str(alias).upper(): [str(col).upper() for col in targets]
+            for alias, targets in eq_alias_targets.items()
+        }
     meta["numeric_filters"] = len(numeric_filters_all)
     meta["fts"] = fts_meta
     return sql, binds, meta
+
+
+_LIKE_BIND_PATTERN = re.compile(
+    r"UPPER\(\s*TRIM\(\s*(?P<col>[A-Z0-9_]+)\s*\)\s*\)\s+LIKE\s+UPPER\(\s*TRIM\(:eq_bg_(?P<idx>\d+)\)\s*\)"
+)
+
+
+def _drop_like_when_in(
+    sql: str,
+    binds: Dict[str, Any],
+    eq_alias_targets: Optional[Dict[str, List[str]]],
+) -> Tuple[str, Dict[str, Any]]:
+    if not env_flag("PLANNER_DROP_LIKE_WHEN_IN", False):
+        return sql, binds
+    if not eq_alias_targets:
+        return sql, binds
+    columns = {
+        str(col or "").strip().upper()
+        for targets in eq_alias_targets.values()
+        for col in (targets or [])
+        if str(col or "").strip()
+    }
+    if not columns:
+        return sql, binds
+
+    removed_binds: set[str] = set()
+
+    def _replace(match: re.Match) -> str:
+        col = match.group("col").upper()
+        bind_name = f"eq_bg_{match.group('idx')}"
+        if col not in columns:
+            return match.group(0)
+        removed_binds.add(bind_name)
+        return "1=1"
+
+    new_sql = _LIKE_BIND_PATTERN.sub(_replace, sql)
+    if not removed_binds:
+        return sql, binds
+
+    for name in removed_binds:
+        binds.pop(name, None)
+
+    # Simplify trivial TRUE conjunctions introduced by replacements.
+    new_sql = re.sub(r"\(\s*1=1\s*\)", "1=1", new_sql)
+    new_sql = re.sub(r"\bAND\s+1=1\b", "", new_sql, flags=re.IGNORECASE)
+    new_sql = re.sub(r"\b1=1\s+AND\b", "", new_sql, flags=re.IGNORECASE)
+    # Collapse redundant whitespace
+    new_sql = re.sub(r"\s{2,}", " ", new_sql)
+    return new_sql, binds
 
 
 def _plan_contract_sql(
@@ -3267,6 +3871,8 @@ def answer():
     auth_email = payload.get("auth_email") or None
     full_text_search = bool(payload.get("full_text_search", False))
     overrides = {"full_text_search": full_text_search}
+    if payload.get("_skip_stakeholder_has"):
+        overrides["_skip_stakeholder_has"] = True
 
     namespace = (payload.get("namespace") or "dw::common").strip() or "dw::common"
     table_name = _resolve_contract_table(settings, namespace)
@@ -3321,6 +3927,65 @@ def answer():
                 list(allowed_columns_initial or []),
                 comparison_markers,
             )
+            if isinstance(light_intent.get("eq_filters"), list) and alias_map_raw:
+                alias_targets_index: Dict[str, Tuple[str, ...]] = {}
+                canonical_for_targets: Dict[Tuple[str, ...], str] = {}
+
+                def _score_alias(name: str) -> Tuple[int, int, str]:
+                    text = name or ""
+                    return (
+                        1 if text.endswith("S") and not text.endswith("SS") else 0,
+                        len(text),
+                        text,
+                    )
+
+                for alias, cols in alias_map_raw.items():
+                    alias_key = str(alias or "").strip().upper()
+                    cols_tuple = tuple(
+                        sorted(str(c or "").strip().upper() for c in (cols or []) if str(c or "").strip())
+                    )
+                    alias_targets_index[alias_key] = cols_tuple
+                    if not cols_tuple:
+                        continue
+                    current = canonical_for_targets.get(cols_tuple)
+                    if current is None or _score_alias(alias_key) > _score_alias(current):
+                        canonical_for_targets[cols_tuple] = alias_key
+
+                def _canonical_alias(name: str) -> str:
+                    alias_key = str(name or "").strip().upper()
+                    cols_tuple = alias_targets_index.get(alias_key)
+                    if not cols_tuple:
+                        return alias_key
+                    return canonical_for_targets.get(cols_tuple, alias_key)
+
+                existing_aliases: set[str] = set()
+                for entry in list(light_intent["eq_filters"]):
+                    if isinstance(entry, dict):
+                        col = str(entry.get("col") or entry.get("field") or "").strip().upper()
+                        canonical = _canonical_alias(col)
+                        entry["col"] = col
+                        existing_aliases.add(col)
+                        if canonical and canonical != col:
+                            existing_aliases.add(canonical)
+                            if not any(
+                                isinstance(it, dict) and str(it.get("col") or "").strip().upper() == canonical
+                                for it in light_intent["eq_filters"]
+                            ):
+                                cloned = dict(entry)
+                                cloned["col"] = canonical
+                                light_intent["eq_filters"].append(cloned)
+                    elif isinstance(entry, (list, tuple)) and len(entry) == 2:
+                        col = str(entry[0] or "").strip().upper()
+                        canonical = _canonical_alias(col)
+                        existing_aliases.add(col)
+                        if canonical and canonical != col:
+                            existing_aliases.add(canonical)
+                            values = entry[1]
+                            if not any(
+                                isinstance(it, (list, tuple)) and len(it) == 2 and str(it[0] or "").strip().upper() == canonical
+                                for it in light_intent["eq_filters"]
+                            ):
+                                light_intent["eq_filters"].append([canonical, values])
         except Exception:
             pass
         # Capture FTS groups for signature canonicalization
@@ -3380,6 +4045,23 @@ def answer():
                 logger.info({"event": "answer.rules.loader.fallback", "src": _LOAD_RULES_SRC})
         except Exception:
             pass
+        log_intent_snapshot = None
+        if str(os.getenv("LOG_INTENT_MATCH", "")).strip().lower() in {"1", "true", "yes", "on"}:
+            try:
+                from apps.dw.learning_store import intent_shape, signature_knobs  # type: ignore
+
+                log_intent_snapshot = {
+                    "question_norm": qnorm,
+                    "signature": intent_shape(light_intent or {}),
+                    "knobs": signature_knobs()._asdict(),
+                }
+            except Exception:
+                log_intent_snapshot = None
+        if log_intent_snapshot:
+            try:
+                logger.info({"event": "answer.intent.signature.snapshot", **log_intent_snapshot})
+            except Exception:
+                pass
         try:
             merged = _load_rules_by_sig(mem_engine, qnorm, intent=light_intent)
             try:
@@ -3553,6 +4235,12 @@ def answer():
                             existing_og.append(grp)
             except Exception:
                 pass
+            try:
+                if online_intent.get("or_groups"):
+                    payload.setdefault("_skip_stakeholder_has", True)
+                    overrides["_skip_stakeholder_has"] = True
+            except Exception:
+                pass
             # Support both merged["order"] or sort_by/sort_desc keys
             order_obj = merged.get("order") if isinstance(merged.get("order"), dict) else None
             if order_obj:
@@ -3568,6 +4256,8 @@ def answer():
                 online_intent["group_by"] = merged.get("group_by")
             if merged.get("gross") is not None:
                 online_intent["gross"] = bool(merged.get("gross"))
+            if merged.get("aggregations"):
+                online_intent["aggregations"] = merged.get("aggregations")
             online_hints_applied += 1
             try:
                 logger.info(
@@ -3760,13 +4450,101 @@ def answer():
                             keep_eq.append(it)
                             continue
                         for v in vals or []:
-                            grp = [{"col": t, "val": v, "op":"eq", "ci": True, "trim": True} for t in targets]
+                            if isinstance(v, str):
+                                value = v.strip().upper()
+                            else:
+                                value = v
+                            grp = [
+                                {
+                                    "col": t,
+                                    "values": [value],
+                                    "op": op,
+                                    "ci": True,
+                                    "trim": True,
+                                }
+                                for t in targets
+                            ]
                             if grp:
                                 produced.append(grp)
                     if produced:
-                        og = sanitized_patch.setdefault("or_groups", [])
-                        for g in produced:
-                            og.append(g)
+                        existing = sanitized_patch.get("or_groups")
+                        if not isinstance(existing, list):
+                            existing = []
+
+                        def _dedupe_groups(groups: List[List[Dict[str, Any]]]) -> List[List[Dict[str, Any]]]:
+                            def _canon(val: Any) -> str:
+                                if isinstance(val, str):
+                                    upper = val.strip().upper()
+                                    key = upper
+                                    if upper.endswith("IES"):
+                                        key = upper[:-3] + "Y"
+                                    elif upper.endswith("ES"):
+                                        key = upper[:-2]
+                                    elif upper.endswith("S"):
+                                        key = upper[:-1]
+                                    return key
+                                return str(val)
+
+                            seen: set[Tuple[Tuple[str, Tuple[str, ...]], ...]] = set()
+                            deduped: List[List[Dict[str, Any]]] = []
+                            for grp in groups or []:
+                                if not isinstance(grp, list):
+                                    continue
+                                cleaned_entries: List[Dict[str, Any]] = []
+                                signature_items: List[Tuple[str, Tuple[str, ...]]] = []
+                                for item in grp:
+                                    if not isinstance(item, dict):
+                                        continue
+                                    entry = dict(item)
+                                    col = str((entry.get("col") or entry.get("column") or "")).strip().upper()
+                                    vals = entry.get("values")
+                                    if isinstance(vals, list):
+                                        entry["values"] = [v.strip().upper() if isinstance(v, str) else v for v in vals]
+                                        canon_vals = tuple(_canon(v) for v in entry["values"])
+                                    else:
+                                        entry["values"] = []
+                                        canon_vals = tuple()
+                                    if isinstance(entry.get("val"), str):
+                                        entry["val"] = entry["val"].strip().upper()
+                                    if entry["values"]:
+                                        entry["val"] = entry["values"][0]
+                                    cleaned_entries.append(entry)
+                                    signature_items.append((col, canon_vals))
+                                if not cleaned_entries:
+                                    continue
+                                signature = tuple(sorted(signature_items))
+                                if signature in seen:
+                                    continue
+                                seen.add(signature)
+                                deduped.append(cleaned_entries)
+                            return deduped
+
+                        produced_cols = {
+                            str((entry.get("col") or entry.get("column") or "")).strip().upper()
+                            for grp in produced for entry in grp if isinstance(entry, dict)
+                        }
+
+                        existing_filtered: List[List[Dict[str, Any]]] = []
+                        for grp in existing:
+                            if not isinstance(grp, list):
+                                continue
+                            cols = {
+                                str((entry.get("col") or entry.get("column") or "")).strip().upper()
+                                for entry in grp if isinstance(entry, dict)
+                            }
+                            if cols and cols.issubset(produced_cols):
+                                continue
+                            existing_filtered.append(grp)
+
+                        if existing_filtered and _merge_or_prefer_question:
+                            try:
+                                merged_groups = _merge_or_prefer_question(existing_filtered, produced)
+                            except Exception:
+                                merged_groups = existing_filtered + produced
+                        else:
+                            merged_groups = existing_filtered + produced
+
+                        sanitized_patch["or_groups"] = _dedupe_groups(merged_groups)
                         sanitized_patch["eq_filters"] = keep_eq
             except Exception:
                 pass
@@ -3783,7 +4561,17 @@ def answer():
                     if m:
                         val = m.group(1).strip().strip("'\"")
                         if val:
-                            grp = [{"col": t, "val": val, "op":"eq", "ci": True, "trim": True} for t in alias_targets]
+                            value = val.upper()
+                            grp = [
+                                {
+                                    "col": t,
+                                    "values": [value],
+                                    "op": "eq",
+                                    "ci": True,
+                                    "trim": True,
+                                }
+                                for t in alias_targets
+                            ]
                             if grp:
                                 og = sanitized_patch.setdefault("or_groups", [])
                                 og.append(grp)
@@ -3794,6 +4582,9 @@ def answer():
             if sanitized_patch:
                 direct_sql, binds, online_meta = _apply_online_rate_hints(
                     direct_sql, binds, sanitized_patch
+                )
+                direct_sql, binds = _drop_like_when_in(
+                    direct_sql, binds, online_meta.get("eq_alias_targets") if isinstance(online_meta, dict) else None
                 )
 
             # LOG: تنفيذ SQL لمسار FTS المباشر
@@ -3881,7 +4672,7 @@ def answer():
         binds = _coerce_bind_dates(dict(contract_binds or {}))
         # Final guard: if no EQ present in online intent, fallback to light-intent EQ
         try:
-            if not online_intent.get("eq_filters"):
+            if not (online_intent.get("eq_filters") or online_intent.get("or_groups")):
                 li_eq = (light_intent or {}).get("eq_filters") if isinstance(light_intent, dict) else None
                 if isinstance(li_eq, list) and li_eq:
                     online_intent["eq_filters"] = li_eq
@@ -3891,7 +4682,21 @@ def answer():
                         pass
         except Exception:
             pass
+        try:
+            logger.info(
+                {
+                    "event": "answer.online_intent.snapshot",
+                    "keys": sorted(list(online_intent.keys())),
+                    "sort_by": online_intent.get("sort_by"),
+                    "sort_desc": online_intent.get("sort_desc"),
+                }
+            )
+        except Exception:
+            pass
         contract_sql, binds, online_meta = _apply_online_rate_hints(contract_sql, binds, online_intent)
+        contract_sql, binds = _drop_like_when_in(
+            contract_sql, binds, online_meta.get("eq_alias_targets") if isinstance(online_meta, dict) else None
+        )
         if ":top_n" in contract_sql and "top_n" not in binds:
             binds["top_n"] = 10
         # LOG: تنفيذ SQL للمسار الحتمي

@@ -85,6 +85,9 @@ ada0cb7fe3ce8f35023d648179118888791b7d09
 
 tar -czf dw_answer_rate_stack.tgz \
   apps/dw/app.py \
+  apps/dw/rating.py \
+  apps/dw/admin_api.py \
+  apps/dw/admin_rules.py \
   apps/dw/builder.py \
   apps/dw/contracts/contract_planner.py \
   apps/dw/contracts/filters.py \
@@ -92,10 +95,13 @@ tar -czf dw_answer_rate_stack.tgz \
   apps/dw/tables/contracts.py \
   apps/dw/lib/eq_ops.py apps/dw/lib/fts_ops.py apps/dw/lib/sql_utils.py \
   apps/dw/common/bool_groups.py apps/dw/common/debug_groups.py \
-  apps/dw/rate_hints.py apps/dw/rate_intent.py apps/dw/rate_pipeline.py \
+  apps/dw/rate_comment.py apps/dw/rate_grammar.py apps/dw/rate_hints.py \
+  apps/dw/rate_intent.py apps/dw/rate_pipeline.py apps/dw/rate_helpers.py \
+  apps/dw/rate_sql.py apps/dw/rate_dbexec.py apps/dw/rate/ \
   apps/dw/intent_parser/ apps/dw/nlp/alias_spans.py \
-  apps/dw/online_learning.py apps/dw/learning_store.py apps/dw/db.py \
-  core/inquiries.py apps/dw/learning.py
+  apps/dw/online_learning.py apps/dw/learning_store.py apps/dw/learning.py \
+  apps/dw/feedback_repo.py apps/dw/feedback_store.py apps/dw/db.py \
+  core/inquiries.py
 
 # (2) سكيمات Postgres (memory)
 sudo -u postgres pg_dump \

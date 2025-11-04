@@ -33,6 +33,10 @@ class RateHints:
 
 
 _BASIC_EQ_RE = re.compile(r"\beq\s*:\s*([A-Za-z0-9_ ]+?)\s*=\s*([^;]+)", re.IGNORECASE)
+_BASIC_NUM_RE = re.compile(
+    r"\b(gte|gt|ge|lte|lt|le)\s*:\s*([A-Za-z0-9_ ]+?)\s*(?:=\s*|\s+)([^;]+)",
+    re.IGNORECASE,
+)
 _BASIC_FTS_RE = re.compile(r"\bfts\s*:\s*([^;]+)", re.IGNORECASE)
 _BASIC_GBY_RE = re.compile(r"\bgroup_by\s*:\s*([A-Za-z0-9_, ]+)", re.IGNORECASE)
 _BASIC_OBY_RE = re.compile(r"\border_by\s*:\s*([A-Za-z0-9_]+)(?:\s+(asc|desc))?", re.IGNORECASE)
@@ -68,6 +72,7 @@ def parse_rate_comment(comment: str) -> Dict[str, Any]:
         "sort_by": None,
         "sort_desc": None,
         "gross": None,
+        "numeric_filters": [],
     }
     if not comment:
         return hints
@@ -102,6 +107,33 @@ def parse_rate_comment(comment: str) -> Dict[str, Any]:
             "trim": trim,
             "op": "eq",
         })
+
+    for match in _BASIC_NUM_RE.finditer(comment or ""):
+        op_key = (match.group(1) or "").strip().lower()
+        column_raw = (match.group(2) or "").strip()
+        value_raw = (match.group(3) or "").strip()
+        if not column_raw or not value_raw:
+            continue
+        op_map = {
+            "gt": "gt",
+            "gte": "gte",
+            "ge": "gte",
+            "lt": "lt",
+            "lte": "lte",
+            "le": "lte",
+        }
+        op = op_map.get(op_key)
+        if not op:
+            continue
+        column = column_raw.upper().replace(" ", "_")
+        cleaned_value = _clean_value_literal(value_raw)
+        hints.setdefault("numeric_filters", []).append(
+            {
+                "col": column,
+                "op": op,
+                "values": [cleaned_value],
+            }
+        )
 
     gby_match = _BASIC_GBY_RE.search(comment)
     if gby_match:
@@ -477,12 +509,41 @@ def parse_comment_to_intent(text: str) -> Dict[str, Any]:
         dir_token = (om.group(2) or "DESC").strip().lower()
         sort_desc = dir_token != "asc"
 
+    numeric_filters: List[Dict[str, Any]] = []
+    for match in _BASIC_NUM_RE.finditer(t):
+        op_key = (match.group(1) or "").strip().lower()
+        column_raw = (match.group(2) or "").strip()
+        value_raw = (match.group(3) or "").strip()
+        if not column_raw or not value_raw:
+            continue
+        op_map = {
+            "gt": "gt",
+            "gte": "gte",
+            "ge": "gte",
+            "lt": "lt",
+            "lte": "lte",
+            "le": "lte",
+        }
+        op = op_map.get(op_key)
+        if not op:
+            continue
+        column = column_raw.upper().replace(" ", "_")
+        cleaned_value = _clean_value_literal(value_raw)
+        numeric_filters.append(
+            {
+                "col": column,
+                "op": op,
+                "values": [cleaned_value],
+            }
+        )
+
     intent = {
         "eq_filters": eq_filters,
         "fts_groups": fts_groups,
         "sort_by": sort_by,
         "sort_desc": sort_desc,
         "group_by": group_by_cols,
+        "numeric_filters": numeric_filters,
     }
     try:
         intent["signature"] = build_intent_signature(intent)
