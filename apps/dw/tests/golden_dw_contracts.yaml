@@ -52,6 +52,13 @@ cases:
       - "GROUP BY CONTRACT_STATUS"
       - "COUNT(*) AS CNT"
 
+  - id: alias_departments_in_only
+    question: "list all contracts where departments = SUPPORT SERVICES"
+    expect_contains:
+      - "IN (UPPER(TRIM(:eq_bg_"
+    expect_not_contains:
+      - "LIKE UPPER(:eq_bg_"
+
   - id: patch_lowest_gross_top_n
     question: "lowest 5 contracts by gross last month"
     expect_contains:

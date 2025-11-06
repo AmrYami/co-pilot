@@ -133,7 +133,6 @@ TRUNCATE TABLE dw_examples, dw_rules, dw_feedback, dw_patches, dw_runs, mem_inqu
 
 
 
-
 python3 check_and_import_contracts.py \
   --dsn localhost:1521/FREEPDB1 \
   --user docuware \

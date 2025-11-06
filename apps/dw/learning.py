@@ -111,22 +111,92 @@ def _ensure_tables(engine) -> None:
     key = id(engine)
     if key in _INITIALIZED_ENGINES:
         return
+    dialect_name = getattr(getattr(engine, "dialect", None), "name", "").lower()
     with engine.begin() as cx:
-        for stmt in _DDL_STATEMENTS:
-            cx.execute(text(stmt))
-        cx.execute(text("ALTER TABLE dw_rules ADD COLUMN IF NOT EXISTS question_norm TEXT"))
-        cx.execute(
-            text(
-                "ALTER TABLE dw_rules ADD COLUMN IF NOT EXISTS enabled BOOLEAN NOT NULL DEFAULT TRUE"
+        if dialect_name == "sqlite":
+            cx.execute(
+                text(
+                    """
+                    CREATE TABLE IF NOT EXISTS dw_rules (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                        question_norm TEXT,
+                        rule_kind TEXT,
+                        rule_payload TEXT,
+                        enabled INTEGER DEFAULT 1,
+                        scope TEXT DEFAULT 'namespace',
+                        rule_signature TEXT,
+                        intent_sig TEXT,
+                        intent_sha TEXT
+                    )
+                    """
+                )
             )
-        )
-        cx.execute(text("ALTER TABLE dw_rules ADD COLUMN IF NOT EXISTS rule_kind TEXT"))
-        cx.execute(text("ALTER TABLE dw_rules ADD COLUMN IF NOT EXISTS rule_payload JSONB"))
-        for stmt in _MIGRATIONS:
-            try:
+            cx.execute(
+                text(
+                    """
+                    CREATE TABLE IF NOT EXISTS dw_patches (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                        inquiry_id INTEGER,
+                        question_norm TEXT,
+                        rating INTEGER,
+                        comment TEXT,
+                        patch_payload TEXT,
+                        status TEXT DEFAULT 'proposed'
+                    )
+                    """
+                )
+            )
+            cx.execute(
+                text(
+                    """
+                    CREATE TABLE IF NOT EXISTS dw_feedback (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        inquiry_id INTEGER,
+                        rating INTEGER,
+                        comment TEXT,
+                        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                    )
+                    """
+                )
+            )
+            cx.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS idx_dw_rules_enabled ON dw_rules (enabled)"
+                )
+            )
+            cx.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS idx_dw_rules_intent_sha ON dw_rules (intent_sha)"
+                )
+            )
+            cx.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS idx_dw_rules_rule_signature ON dw_rules (rule_signature)"
+                )
+            )
+            cx.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS idx_dw_rules_question_norm ON dw_rules (question_norm)"
+                )
+            )
+        else:
+            for stmt in _DDL_STATEMENTS:
                 cx.execute(text(stmt))
-            except Exception as e:  # defensive
-                log.warning("rules.migration.skip", extra={"err": str(e)})
+            cx.execute(text("ALTER TABLE dw_rules ADD COLUMN IF NOT EXISTS question_norm TEXT"))
+            cx.execute(
+                text(
+                    "ALTER TABLE dw_rules ADD COLUMN IF NOT EXISTS enabled BOOLEAN NOT NULL DEFAULT TRUE"
+                )
+            )
+            cx.execute(text("ALTER TABLE dw_rules ADD COLUMN IF NOT EXISTS rule_kind TEXT"))
+            cx.execute(text("ALTER TABLE dw_rules ADD COLUMN IF NOT EXISTS rule_payload JSONB"))
+            for stmt in _MIGRATIONS:
+                try:
+                    cx.execute(text(stmt))
+                except Exception as e:  # defensive
+                    log.warning("rules.migration.skip", extra={"err": str(e)})
     _INITIALIZED_ENGINES.add(key)
 
 
@@ -1736,11 +1806,86 @@ def load_rules_for_question(
     question_values = _build_question_value_map(intent_norm)
     eq_from_shape: List[List[Any]] = []
     mask_or_groups: List[List[Dict[str, Any]]] = []
+    shape_aliases: set[str] = set()
+    shape_targets: set[str] = set()
     if shape_rules:
         eq_from_shape = _apply_eq_shape(shape_rules, question_values)
         mask_or_groups = _build_or_groups_from_shape(shape_rules, question_values)
+        for shape_item in shape_rules:
+            if not isinstance(shape_item, dict):
+                continue
+            logical = str(shape_item.get("logical") or "").strip().upper()
+            column = str(shape_item.get("column") or "").strip().upper()
+            if logical:
+                shape_aliases.add(logical)
+            if column:
+                shape_aliases.add(column)
+            targets = shape_item.get("columns") or shape_item.get("targets") or []
+            if isinstance(targets, (list, tuple, set)):
+                for target in targets:
+                    target_key = str(target or "").strip().upper()
+                    if target_key:
+                        shape_targets.add(target_key)
 
     eq_rules_from_store = list(eq_from_rules or [])
+    if shape_aliases or shape_targets:
+        alias_to_targets: Dict[str, Tuple[str, ...]] = {}
+        target_to_alias: Dict[str, set[str]] = {}
+        for alias_name, cols in (alias_map or {}).items():
+            alias_key = str(alias_name or "").strip().upper()
+            if not alias_key:
+                continue
+            targets: List[str] = []
+            for col in cols or []:
+                col_key = str(col or "").strip().upper()
+                if not col_key:
+                    continue
+                targets.append(col_key)
+                target_to_alias.setdefault(col_key, set()).add(alias_key)
+            if targets:
+                alias_to_targets[alias_key] = tuple(sorted(targets))
+
+        def _entry_column(entry: Any) -> str:
+            if isinstance(entry, (list, tuple)) and entry:
+                return str(entry[0] or "").strip().upper()
+            if isinstance(entry, dict):
+                for key in ("col", "column", "field", "logical"):
+                    value = entry.get(key)
+                    if value is not None:
+                        return str(value or "").strip().upper()
+            return ""
+
+        def _covered_by_shape(column: str) -> bool:
+            key = str(column or "").strip().upper()
+            if not key:
+                return False
+            if key in shape_targets or key in shape_aliases:
+                return True
+            alias_targets = alias_to_targets.get(key, ())
+            if alias_targets and any(target in shape_targets for target in alias_targets):
+                return True
+            for alias_name in target_to_alias.get(key, set()):
+                if alias_name in shape_aliases:
+                    return True
+            return False
+
+        before_len = len(eq_rules_from_store)
+        eq_rules_from_store = [
+            entry for entry in eq_rules_from_store if not _covered_by_shape(_entry_column(entry))
+        ]
+        dropped = before_len - len(eq_rules_from_store)
+        if dropped > 0 and _log_intent_match_enabled():
+            try:
+                log.info(
+                    {
+                        "event": "rules.eq_shape.guard",
+                        "dropped": dropped,
+                        "shape_aliases": sorted(shape_aliases),
+                        "shape_targets": sorted(shape_targets),
+                    }
+                )
+            except Exception:
+                pass
     eq_coverage_value = _calc_eq_coverage(intent_norm.get("eq_filters"), eq_rules_from_store)
 
     question_eq_normalized = _canonicalize_question_eq(question_eq_normalized, eq_rules_from_store)

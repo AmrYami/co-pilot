@@ -25,6 +25,8 @@ import hashlib as _hashlib
 import json as _json
 import re as _re
 
+from core.settings import Settings
+
 
 class SignatureKnobs(NamedTuple):
     fts_shape: str = "groups_sizes"
@@ -42,29 +44,108 @@ _CANON_FAMILY_MAP_DEFAULT = {
     "DEPT": "DEPARTMENT",
 }
 
+_SETTINGS_OBJ: Optional[Settings] = None
 
-def _read_env_bool(name: str, default: bool = False) -> bool:
-    raw = os.getenv(name)
+
+def _settings_obj() -> Optional[Settings]:
+    global _SETTINGS_OBJ
+    if _SETTINGS_OBJ is None:
+        try:
+            _SETTINGS_OBJ = Settings(namespace="dw::common")
+        except Exception:
+            _SETTINGS_OBJ = None
+    return _SETTINGS_OBJ
+
+
+def reset_settings_cache() -> None:
+    global _SETTINGS_OBJ
+    _SETTINGS_OBJ = None
+
+
+def _settings_get(key: str) -> Any:
+    settings = _settings_obj()
+    if settings is None:
+        return None
+    for scope, namespace in (("namespace", "dw::common"), ("global", "global")):
+        try:
+            record = settings._fetch(key, scope=scope, namespace=namespace)  # type: ignore[attr-defined]
+        except Exception:
+            record = None
+        if record:
+            try:
+                return settings._coerce(record.get("value"), record.get("value_type"))  # type: ignore[attr-defined]
+            except Exception:
+                return record.get("value")
+    return None
+
+
+def _read_flag(name: str, default: bool = False) -> bool:
+    raw = _settings_get(name)
+    if raw is None:
+        raw = os.getenv(name)
     if raw is None:
         return default
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, (int, float)):
+        return bool(raw)
+    if isinstance(raw, str):
+        lowered = raw.strip().lower()
+        if lowered in {"1", "true", "t", "yes", "y", "on"}:
+            return True
+        if lowered in {"0", "false", "f", "no", "n", "off"}:
+            return False
+    return default
+
+
+def _read_setting_str(name: str) -> Optional[str]:
+    raw = _settings_get(name)
+    if raw is None:
+        raw = os.getenv(name)
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        return raw
+    return str(raw)
+
+
+def _read_setting_json(name: str) -> Any:
+    raw = _settings_get(name)
+    if raw is None:
+        raw = os.getenv(name)
+    if raw is None:
+        return None
+    if isinstance(raw, (dict, list)):
+        return raw
+    if isinstance(raw, str):
+        try:
+            return _json.loads(raw)
+        except Exception:
+            return None
+    return raw
 
 
 def _read_signature_knobs() -> SignatureKnobs:
-    fts_shape = (os.getenv("SIG_FTS_SHAPE") or DEFAULT_SIGNATURE_KNOBS.fts_shape).strip().lower()
+    fts_shape_raw = _read_setting_str("SIG_FTS_SHAPE") or DEFAULT_SIGNATURE_KNOBS.fts_shape
+    fts_shape = fts_shape_raw.strip().lower()
     if fts_shape not in {"groups_only", "groups_sizes"}:
         fts_shape = DEFAULT_SIGNATURE_KNOBS.fts_shape
 
-    eq_list_mode = (os.getenv("SIG_EQ_LIST_MODE") or DEFAULT_SIGNATURE_KNOBS.eq_list_mode).strip().lower()
+    eq_list_mode_raw = _read_setting_str("SIG_EQ_LIST_MODE") or DEFAULT_SIGNATURE_KNOBS.eq_list_mode
+    eq_list_mode = eq_list_mode_raw.strip().lower()
     if eq_list_mode not in {"exact_len", "any_len", "bins"}:
         eq_list_mode = DEFAULT_SIGNATURE_KNOBS.eq_list_mode
 
     try:
-        coverage_raw = os.getenv("SIG_EQ_LIST_MIN_COVERAGE")
-        if coverage_raw is None:
+        coverage_source = _settings_get("SIG_EQ_LIST_MIN_COVERAGE")
+        if coverage_source is None:
+            coverage_source = os.getenv("SIG_EQ_LIST_MIN_COVERAGE")
+        if coverage_source is None:
             coverage = DEFAULT_SIGNATURE_KNOBS.eq_list_min_coverage
+        elif isinstance(coverage_source, (int, float)):
+            coverage = float(coverage_source)
         else:
-            coverage = float(coverage_raw)
+            coverage = float(str(coverage_source))
     except (TypeError, ValueError):
         coverage = DEFAULT_SIGNATURE_KNOBS.eq_list_min_coverage
     coverage = max(0.0, min(1.0, coverage))
@@ -82,25 +163,33 @@ def signature_knobs() -> SignatureKnobs:
 def reset_signature_knobs_cache() -> None:
     global _SIG_KNOBS_CACHE
     _SIG_KNOBS_CACHE = None
+    reset_settings_cache()
 
 
 def _load_family_map() -> Dict[str, str]:
-    raw = os.getenv("DW_INTENT_FAMILY_CANON")
-    if not raw:
-        return dict(_CANON_FAMILY_MAP_DEFAULT)
-    try:
-        data = _json.loads(raw)
+    raw = _read_setting_json("DW_INTENT_FAMILY_CANON")
+    if raw is None:
+        raw = _CANON_FAMILY_MAP_DEFAULT
+    mapped: Dict[str, str] = {}
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            key = str(k or "").strip().upper()
+            val = str(v or "").strip().upper()
+            if key and val:
+                mapped[key] = val
+    elif isinstance(raw, str):
+        try:
+            data = _json.loads(raw)
+        except Exception:
+            data = None
         if isinstance(data, dict):
-            mapped: Dict[str, str] = {}
             for k, v in data.items():
                 key = str(k or "").strip().upper()
                 val = str(v or "").strip().upper()
                 if key and val:
                     mapped[key] = val
-            if mapped:
-                return mapped
-    except Exception:
-        pass
+    if mapped:
+        return mapped
     return dict(_CANON_FAMILY_MAP_DEFAULT)
 
 
@@ -108,7 +197,7 @@ _CANON_FAMILY_MAP = _load_family_map()
 
 
 def _log_intent_match_enabled() -> bool:
-    return _read_env_bool("LOG_INTENT_MATCH", default=False)
+    return _read_flag("LOG_INTENT_MATCH", default=False)
 
 
 def _canonical_family(name: str, canonicalize: bool = True) -> str:
@@ -120,6 +209,12 @@ def _canonical_family(name: str, canonicalize: bool = True) -> str:
 
 def reset_intent_match_log_cache() -> None:
     return None
+
+
+def reset_family_map_cache() -> None:
+    global _CANON_FAMILY_MAP
+    reset_settings_cache()
+    _CANON_FAMILY_MAP = _load_family_map()
 
 MEM_URL = os.environ.get("MEMORY_DB_URL") or os.getenv("MEMORY_DB_URL")
 if not MEM_URL:

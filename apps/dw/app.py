@@ -2208,6 +2208,7 @@ def _expand_eq_aliases_with_map(intent: Dict[str, Any], alias_map: Dict[str, Lis
         keep = filtered_keep
 
     intent["eq_filters"] = keep
+    alias_eq_entries: Dict[str, List[Any]] = {}
 
     for alias_col, values in alias_value_map.items():
         targets = normalized_alias_map.get(alias_col) or []
@@ -2227,6 +2228,7 @@ def _expand_eq_aliases_with_map(intent: Dict[str, Any], alias_map: Dict[str, Lis
 
         if not cleaned_vals:
             continue
+        alias_eq_entries[alias_col] = list(cleaned_vals)
 
         normalized_targets = tuple(sorted(str(t).strip().upper() for t in targets if str(t).strip()))
         normalized_values = tuple(sorted(str(v).strip().upper() if isinstance(v, str) else v for v in cleaned_vals))
@@ -2314,6 +2316,20 @@ def _expand_eq_aliases_with_map(intent: Dict[str, Any], alias_map: Dict[str, Lis
     # Mark expanded to prevent duplicates from multiple passes, but only if we actually expanded.
     if expanded_any:
         intent["_alias_expanded"] = True
+
+    if alias_eq_entries:
+        eq_filters_list = intent.setdefault("eq_filters", keep)
+        for alias_col, values in alias_eq_entries.items():
+            entry = {
+                "col": alias_col,
+                "values": list(values),
+                "op": "in" if len(values) > 1 else "eq",
+                "ci": True,
+                "trim": True,
+            }
+            eq_filters_list.append(entry)
+        if not expanded_any:
+            intent["_alias_expanded"] = True
 
 
 def _maybe_apply_entity_status_aggregation_heuristic(
@@ -3112,8 +3128,13 @@ def _drop_like_when_in(
     sql: str,
     binds: Dict[str, Any],
     eq_alias_targets: Optional[Dict[str, List[str]]],
+    *,
+    enabled: Optional[bool] = None,
 ) -> Tuple[str, Dict[str, Any]]:
-    if not env_flag("PLANNER_DROP_LIKE_WHEN_IN", False):
+    flag = enabled
+    if flag is None:
+        flag = env_flag("PLANNER_DROP_LIKE_WHEN_IN", False)
+    if not flag:
         return sql, binds
     if not eq_alias_targets:
         return sql, binds
@@ -3877,6 +3898,11 @@ def answer():
         overrides["_skip_stakeholder_has"] = True
 
     namespace = (payload.get("namespace") or "dw::common").strip() or "dw::common"
+    drop_like_flag_raw = _get_namespace_setting(settings, namespace, "PLANNER_DROP_LIKE_WHEN_IN", None)
+    drop_like_flag = _coerce_bool_flag(drop_like_flag_raw, default=None)
+    if drop_like_flag is None:
+        drop_like_flag = env_flag("PLANNER_DROP_LIKE_WHEN_IN", False)
+
     table_name = _resolve_contract_table(settings, namespace)
     initial_getter = getattr(settings, "get_json", None) or getattr(settings, "get", None)
     allowed_columns_initial = load_explicit_filter_columns(
@@ -3896,6 +3922,7 @@ def answer():
                 "fts_engine": fts_engine(),
                 "fts_cols_count": len(fts_columns_initial or []),
                 "allowed_eq_cols": len(allowed_columns_initial or []),
+                "drop_like_when_in": bool(drop_like_flag),
             }
         )
     except Exception:
@@ -4586,7 +4613,10 @@ def answer():
                     direct_sql, binds, sanitized_patch
                 )
                 direct_sql, binds = _drop_like_when_in(
-                    direct_sql, binds, online_meta.get("eq_alias_targets") if isinstance(online_meta, dict) else None
+                    direct_sql,
+                    binds,
+                    online_meta.get("eq_alias_targets") if isinstance(online_meta, dict) else None,
+                    enabled=drop_like_flag,
                 )
 
             # LOG: تنفيذ SQL لمسار FTS المباشر
@@ -4697,7 +4727,10 @@ def answer():
             pass
         contract_sql, binds, online_meta = _apply_online_rate_hints(contract_sql, binds, online_intent)
         contract_sql, binds = _drop_like_when_in(
-            contract_sql, binds, online_meta.get("eq_alias_targets") if isinstance(online_meta, dict) else None
+            contract_sql,
+            binds,
+            online_meta.get("eq_alias_targets") if isinstance(online_meta, dict) else None,
+            enabled=drop_like_flag,
         )
         if ":top_n" in contract_sql and "top_n" not in binds:
             binds["top_n"] = 10

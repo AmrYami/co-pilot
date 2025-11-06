@@ -1,7 +1,10 @@
 from __future__ import annotations
 
-from flask import Blueprint, current_app, jsonify, request
 from datetime import date
+import subprocess
+import sys
+from pathlib import Path
+from flask import Blueprint, current_app, jsonify, request
 from typing import Any, Dict, List
 
 # Optional imports for core NLU checks
@@ -16,6 +19,29 @@ from .golden_runner import run_golden_tests
 
 
 golden_bp = Blueprint("golden", __name__, url_prefix="/admin")
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+_ALIAS_TEST_SUITES: Dict[str, List[str]] = {
+    "eq_alias": ["apps/dw/tests/test_eq_alias_normalization.py"],
+    "sql_skeleton": ["apps/dw/tests/test_sql_skeleton.py"],
+}
+
+
+def _run_pytest_suite(paths: List[str]) -> Dict[str, Any]:
+    """Execute pytest for the provided file list and return a structured report."""
+
+    cmd = [sys.executable, "-m", "pytest", "-q", *paths]
+    completed = subprocess.run(
+        cmd,
+        cwd=str(_REPO_ROOT),
+        capture_output=True,
+        text=True,
+    )
+    return {
+        "command": " ".join(cmd),
+        "returncode": completed.returncode,
+        "stdout": (completed.stdout or "").strip(),
+        "stderr": (completed.stderr or "").strip(),
+    }
 
 
 @golden_bp.route("/run_golden", methods=["POST"])
@@ -130,6 +156,55 @@ def run_core_nlu():
 
     status = 200 if ok_all else 400
     return jsonify({"ok": ok_all, "results": results}), status
+
+
+@tests_bp.route("/tests/run_alias_suite", methods=["POST"])
+def run_alias_suite():
+    """Run alias-related pytest files (`eq_alias`, `sql_skeleton`) via HTTP."""
+
+    payload = request.get_json(silent=True) or {}
+    requested = payload.get("tests")
+    selected: List[str] = []
+    invalid: List[str] = []
+
+    if requested is None:
+        selected = list(_ALIAS_TEST_SUITES.keys())
+    else:
+        if isinstance(requested, str):
+            requested = [requested]
+        for item in requested or []:
+            key = str(item or "").strip().lower()
+            if key in _ALIAS_TEST_SUITES:
+                selected.append(key)
+            else:
+                invalid.append(item)
+
+    if not selected:
+        return jsonify(
+            {
+                "ok": False,
+                "error": "No valid tests selected. Use one of: eq_alias, sql_skeleton.",
+                "invalid": invalid,
+            }
+        ), 400
+
+    results: List[Dict[str, Any]] = []
+    ok_all = True
+    for key in selected:
+        paths = _ALIAS_TEST_SUITES[key]
+        report = _run_pytest_suite(paths)
+        report["suite"] = key
+        results.append(report)
+        if report["returncode"] != 0:
+            ok_all = False
+
+    response_body = {
+        "ok": ok_all,
+        "results": results,
+        "invalid": invalid or None,
+    }
+    status = 200 if ok_all else 400
+    return jsonify(response_body), status
 
 
 # --- Aggregated test runner (via HTTP) ---

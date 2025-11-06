@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, abort, jsonify, request
 from sqlalchemy import bindparam, text
 
 from core.settings import Settings
@@ -93,13 +93,55 @@ def settings_bulk():
     payload = request.get_json(force=True) or {}
     ns = payload.get("namespace") or "default"
     updated_by = payload.get("updated_by") or "admin"
-    settings_items = payload.get("settings") or []
+
+    settings_items: list[dict] = []
+
+    raw_settings = payload.get("settings")
+    if isinstance(raw_settings, list):
+        for entry in raw_settings:
+            if not isinstance(entry, dict):
+                abort(400, description="Each settings item must be an object")
+            if "key" in entry:
+                settings_items.append(dict(entry))
+                continue
+            if len(entry) != 1:
+                abort(400, description="Settings item missing 'key'")
+            key, value = next(iter(entry.items()))
+            if isinstance(value, dict) and "value" in value:
+                item = dict(value)
+                item.setdefault("key", key)
+            else:
+                item = {"key": key, "value": value}
+            settings_items.append(item)
+    elif isinstance(raw_settings, dict):
+        for key, entry in raw_settings.items():
+            if isinstance(entry, dict) and "value" in entry:
+                item = dict(entry)
+                item.setdefault("key", key)
+            else:
+                item = {"key": key, "value": entry}
+            settings_items.append(item)
+
+    overrides = payload.get("overrides")
+    if isinstance(overrides, dict):
+        for key, entry in overrides.items():
+            if isinstance(entry, dict) and "value" in entry:
+                item = dict(entry)
+                item.setdefault("key", key)
+            else:
+                item = {"key": key, "value": entry}
+            settings_items.append(item)
+
+    if not settings_items:
+        return jsonify({"ok": True, "namespace": ns, "upserted": 0})
 
     settings = Settings(namespace=ns)
     mem = get_mem_engine(settings)
 
     with mem.begin() as conn:
         for item in settings_items:
+            if "key" not in item:
+                abort(400, description="Missing 'key' in settings payload")
             key = item["key"]
             scope = item.get("scope") or "namespace"
             scope_id = item.get("scope_id")

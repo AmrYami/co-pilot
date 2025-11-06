@@ -13,7 +13,9 @@ from apps.dw.settings import get_setting
 from pydantic import BaseModel, Field
 from word2number import w2n
 from dateutil.relativedelta import relativedelta
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
+
+from apps.dw.utils import today_utc as _today_utc
 
 
 _SETTINGS_CACHE: Any = None
@@ -30,6 +32,11 @@ def _get_default_settings() -> Any:
     except Exception:
         _SETTINGS_CACHE = None
     return _SETTINGS_CACHE
+
+def today_utc():
+    """Expose apps.dw.utils.today_utc for tests that monkeypatch intent module."""
+    return _today_utc()
+
 
 # NOTE: English-first parsing. Arabic can be added later once EN is rock-solid.
 
@@ -184,6 +191,7 @@ _RE_YTD_EXPLICIT  = re.compile(r'\b(20\d{2})\s*(?:ytd|year\s*to\s*date)\b', re.I
 _RE_RENEWAL       = re.compile(r'\brenewal\b', re.I)
 _RE_GROSS         = re.compile(r'\bgross\b', re.I)
 _RE_NET           = re.compile(r'\bnet\b', re.I)
+_LIST_COLS_RE     = re.compile(r'\(([^)]+)\)\s*$')
 
 _EQ_COL_RE = re.compile(
     r"(?i)\b([A-Za-z0-9_ ]+?)\s*=\s*(?:'([^']*)'|\"([^\"]*)\"|([^\s,;]+))"
@@ -239,7 +247,12 @@ def parse_intent_legacy(
     spec: Optional[TableSpec] = None,
 ) -> NLIntent:
     q = (question or "").strip()
-    today = today or date.today()
+    if today is None:
+        current = today_utc()
+        if isinstance(current, datetime):
+            today = current.date()
+        else:
+            today = current
     use_spec = spec or ContractSpec
     it = NLIntent(notes={"q": q}, wants_all_columns=wants_all_columns_default)
 
@@ -262,8 +275,10 @@ def parse_intent_legacy(
     if m:
         days = _num_from_word_or_digit(m.group(1)) or 30
         it.has_time_window = True
-        it.expire = days
-        it.explicit_dates = {"start": today.isoformat(), "end": (today + timedelta(days=days)).isoformat()}
+        it.expire = True
+        it.notes["expire_days"] = days
+        start = today - timedelta(days=days)
+        it.explicit_dates = {"start": start.isoformat(), "end": today.isoformat()}
         it.date_column = "END_DATE"  # expiry asks about END_DATE
     if _RE_90_DAYS.search(q) and not it.explicit_dates:
         # last/next 90 days (default next for "expiring") — if "expiring" present we set above
@@ -307,6 +322,11 @@ def parse_intent_legacy(
         it.top_n = n
         it.user_requested_top_n = True
 
+    if not it.group_by and "stakeholder" in q.lower():
+        mapped = use_spec.synonym("stakeholder")
+        if mapped:
+            it.group_by = mapped
+
     # 5) metrics
     # default measure: net value; "gross" uses net + VAT (handling rate vs absolute)
     if _RE_GROSS.search(q):
@@ -336,6 +356,13 @@ def parse_intent_legacy(
     if it.top_n:
         it.sort_by = it.measure_sql
         it.sort_desc = True
+
+    m = _LIST_COLS_RE.search(q)
+    if m:
+        cols = [c.strip().upper().replace(" ", "_") for c in m.group(1).split(",") if c.strip()]
+        if cols:
+            it.notes["projection"] = cols
+            it.wants_all_columns = False
 
     return it
 
@@ -381,6 +408,10 @@ def parse_intent(question: str, settings: "Settings") -> Dict[str, Any]:
         intent["measure_sql"] = intent.get("measure_sql") or spec.net_expr()
 
     # Grouping synonyms via TableSpec
+    if not intent.get("group_by") and "stakeholder" in q.lower():
+        mapped = spec.synonym("stakeholder")
+        if mapped:
+            intent["group_by"] = mapped
     if not intent.get("group_by"):
         m = _RE_BY.search(q) or _RE_PER.search(q)
         if m:

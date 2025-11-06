@@ -54,6 +54,7 @@ _DIMENSIONS = {
     "entity no":             "ENTITY_NO",
     "stakeholder":           "CONTRACT_STAKEHOLDER_1",  # default slot; we can extend to 1..8 later
     "stakeholder1":          "CONTRACT_STAKEHOLDER_1",
+    "stakeholders":          "CONTRACT_STAKEHOLDER_1",
     "status":                "CONTRACT_STATUS",
     "request type":          "REQUEST_TYPE",
     "request":               "REQUEST_TYPE",
