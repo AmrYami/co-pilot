@@ -158,3 +158,25 @@ def test_eq_shape_guard_prefers_question_values(monkeypatch):
     )
 
     assert merged.get("eq_filters") == [["DEPARTMENT", ["Support Services Updated"]]]
+
+
+def test_eq_clause_normalizes_spacey_targets(monkeypatch):
+    """Ensure EQ builder canonicalizes alias targets that contain whitespace."""
+
+    from apps.dw import builder as builder_mod
+
+    def _fake_resolve(alias: str):
+        return ["REQUEST TYPE"] if alias == "REQUEST TYPE" else []
+
+    monkeypatch.setattr(builder_mod, "resolve_eq_targets", _fake_resolve, raising=False)
+
+    clause, binds, targets = builder_mod._eq_clause_from_filters(
+        [{"col": "REQUEST TYPE", "values": ["Renewal in 2023."]}],
+        {},
+        bind_prefix="eq",
+    )
+
+    assert "REQUEST TYPE" not in clause
+    assert "REQUEST_TYPE" in clause
+    assert binds == {"eq_0": "RENEWAL IN 2023."}
+    assert targets["REQUEST TYPE"] == ["REQUEST_TYPE"]

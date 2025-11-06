@@ -16,6 +16,24 @@ from apps.dw.lib.sql_utils import in_expr, upper_trim, or_join
 TABLE = '"Contract"'
 
 
+def canonicalize_column_name(name: str) -> str:
+    """
+    Normalize a column identifier to a safe uppercase token.
+    - Strip surrounding quotes and whitespace.
+    - Replace non-alphanumeric/underscore characters with underscores.
+    - Collapse duplicate underscores.
+    """
+    text = str(name or "").strip()
+    if not text:
+        return ""
+    text = text.strip('"').strip()
+    if not text:
+        return ""
+    text = re.sub(r"[^0-9A-Za-z_]+", "_", text)
+    text = re.sub(r"_+", "_", text)
+    return text.upper()
+
+
 def _cfg_get(cfg: Any, key: str, default: Any = None) -> Any:
     if isinstance(cfg, dict):
         return cfg.get(key, default)
@@ -195,11 +213,12 @@ def _eq_clause_from_filters(
         col_raw, values = _normalize_eq_entry(item)
         if not col_raw:
             continue
-        col_key = str(col_raw).strip().upper()
-        if not col_key:
+        alias_text = str(col_raw).strip()
+        alias_key = alias_text.upper()
+        if not alias_key:
             continue
         for value in values or []:
-            alias_values[col_key].append(value)
+            alias_values[alias_key].append(value)
 
     if not alias_values:
         return "", binds, {}
@@ -218,8 +237,16 @@ def _eq_clause_from_filters(
                 return name
 
     for alias, raw_values in alias_values.items():
-        targets = resolve_eq_targets(alias) or [alias]
-        targets = [str(t or "").strip().upper() for t in targets if str(t or "").strip()]
+        targets_raw = resolve_eq_targets(alias) or [alias]
+        targets: List[str] = []
+        for candidate in targets_raw:
+            normalized = canonicalize_column_name(candidate)
+            if normalized:
+                targets.append(normalized)
+        if not targets:
+            fallback = canonicalize_column_name(alias)
+            if fallback:
+                targets = [fallback]
         if not targets:
             continue
         alias_targets_map[alias] = targets
